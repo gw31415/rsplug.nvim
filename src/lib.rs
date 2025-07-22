@@ -1,6 +1,6 @@
 use std::{
     borrow::{Borrow, Cow},
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     ops::{Add, AddAssign, BitAndAssign},
     path::{Path, PathBuf},
     pin::Pin,
@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use hashbrown::HashMap;
 use itertools::Itertools;
 use rand::distr::{Alphanumeric, SampleString};
 use tokio::task::JoinSet;
