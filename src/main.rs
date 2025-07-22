@@ -1,9 +1,21 @@
 use std::{io::Write, sync::Arc};
 
+use clap::Parser;
 use rsplug::{GlobalConfig, Package, PackageType, Unit, UnitSource};
+
+#[derive(clap::Parser, Debug)]
+struct Args {
+    /// Install plugins
+    #[arg(short, long)]
+    install: bool,
+    /// Update plugins
+    #[arg(short, long)]
+    update: bool,
+}
 
 #[tokio::main]
 async fn main() {
+    let Args { install, update } = Args::parse();
     let config = Arc::new(GlobalConfig::default());
     let pkgs = Unit::unpack(
         [
@@ -25,8 +37,8 @@ async fn main() {
                 depends: vec![],
             }
         }),
-        false, // INSTALL or not
-        false, // UPDATE or not
+        install, // INSTALL or not
+        update,  // UPDATE or not
         config.clone(),
     )
     .await
