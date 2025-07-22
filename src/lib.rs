@@ -1,15 +1,17 @@
 use std::{
     borrow::{Borrow, Cow},
     collections::{BTreeSet, HashMap},
-    ops::BitAndAssign,
+    ops::{Add, AddAssign, BitAndAssign},
     path::{Path, PathBuf},
     pin::Pin,
+    process::Output,
     sync::Arc,
 };
 
 use itertools::Itertools;
 use rand::distr::{Alphanumeric, SampleString};
 use tokio::task::JoinSet;
+use xxhash_rust::xxh3::xxh3_128;
 
 #[derive(Clone)]
 pub struct GlobalConfig {
@@ -196,6 +198,25 @@ impl Unit {
                                             .await?;
                                     }
 
+                                    let id = BTreeSet::from(['id: {
+                                        let Output { stdout, status, .. } =
+                                            tokio::process::Command::new("git")
+                                                .current_dir(&download_dir)
+                                                .arg("rev-parse")
+                                                .arg("HEAD")
+                                                .output()
+                                                .await?;
+                                        if status.success() {
+                                            if let Ok(mut id) = String::from_utf8(stdout) {
+                                                if id.ends_with('\n') {
+                                                    id.pop();
+                                                }
+                                                break 'id id;
+                                            }
+                                        }
+                                        Alphanumeric.sample_string(&mut rand::rng(), 32)
+                                    }]);
+
                                     let files = {
                                         let std::process::Output {
                                             stdout,
@@ -229,6 +250,7 @@ impl Unit {
                                         .map(|fname| (fname.to_owned().into(), sourcefile.clone()))
                                         .collect();
                                     Package {
+                                        id: PackageID(id),
                                         files,
                                         package_type: package_type.clone(),
                                     }
@@ -324,10 +346,45 @@ impl<'a, Rhs: Into<Cow<'a, PackageType>>> BitAndAssign<Rhs> for PackageType {
 pub enum LoadEvent {}
 
 pub struct Package {
+    /// ID
+    id: PackageID,
     // PackageType
     package_type: PackageType,
     // 配置するファイル
     files: HashMap<PathBuf, Arc<SourceFile>>,
+}
+
+#[derive(Hash, Clone)]
+struct PackageID(pub BTreeSet<String>);
+
+impl Add for PackageID {
+    type Output = Self;
+    fn add(mut self, rhs: Self) -> Self::Output {
+        self += rhs;
+        self
+    }
+}
+
+impl AddAssign for PackageID {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0.extend(rhs.0);
+    }
+}
+
+impl From<PackageID> for String {
+    fn from(val: PackageID) -> Self {
+        let PackageID(inner) = val;
+        let bytes = inner.into_iter().flat_map(|a| a.into_bytes()).collect_vec();
+        let hash = xxh3_128(&bytes).to_ne_bytes();
+        let mut res = String::new();
+        const TABLE: &[u8; 16] = b"0123456789abcdef";
+        for b in hash {
+            let (a, r) = (b / 16u8, b % 16u8);
+            res.push(TABLE[a as usize] as char);
+            res.push(TABLE[r as usize] as char);
+        }
+        res
+    }
 }
 
 impl Package {
@@ -372,18 +429,16 @@ impl Package {
         // }
         let _ = tokio::fs::remove_dir_all(packpath.as_path()).await;
         tokio::fs::create_dir_all(packpath.as_path()).await.unwrap();
-        let mut rng = rand::rng();
         pkgs.into_iter()
             .flat_map({
                 |pkg| {
-                    let id = Alphanumeric.sample_string(&mut rng, 32);
                     let dir = Arc::new(
                         packpath
                             .join(match pkg.package_type {
                                 PackageType::Start => "start",
                                 PackageType::Opt(_) => "opt",
                             })
-                            .join(&id),
+                            .join(Into::<String>::into(pkg.id)),
                     );
                     pkg.files
                         .into_iter()
@@ -419,6 +474,7 @@ impl Package {
         let mut entries_fromrhs = Vec::<(PathBuf, Arc<SourceFile>)>::new();
         let mut conflict = false;
         let Package {
+            id,
             package_type: rhs_pkg_type,
             files,
         } = rhs;
@@ -443,6 +499,7 @@ impl Package {
             (
                 self,
                 Some(Package {
+                    id,
                     package_type: rhs_pkg_type,
                     files: {
                         let mut files = rhs_files.collect::<HashMap<_, _>>();
@@ -454,6 +511,7 @@ impl Package {
         } else {
             let mut pkg = self;
             pkg.files.extend(entries_fromrhs);
+            pkg.id += id;
 
             (pkg, None)
         }
