@@ -4,6 +4,7 @@ use clap::Parser;
 use rsplug::{GlobalConfig, Package, PackageType, Unit, UnitSource};
 
 #[derive(clap::Parser, Debug)]
+#[command(about)]
 struct Args {
     /// Install plugins
     #[arg(short, long)]
