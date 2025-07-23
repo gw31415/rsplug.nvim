@@ -35,6 +35,7 @@ async fn main() {
                     rev: None,
                 },
                 package_type: PackageType::Start,
+                depends: vec![],
             }
         }),
         install, // INSTALL or not

@@ -83,6 +83,7 @@ type MainResult<T = ()> = Result<T, Error>;
 pub struct Unit {
     pub source: UnitSource,
     pub package_type: PackageType,
+    pub depends: Vec<Arc<Unit>>,
 }
 
 pub enum UnitSource {
@@ -113,8 +114,22 @@ impl Unit {
                         let Unit {
                             source,
                             package_type,
+                            depends,
                         } = unit.borrow();
-                        let mut pkgs = Vec::new();
+                        let mut pkgs: Vec<_> = depends
+                            .iter()
+                            .map(|dep| Self::unpack([dep.clone()], install, update, config.clone()))
+                            .collect::<JoinSet<_>>()
+                            .join_all()
+                            .await
+                            .into_iter()
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        for pkg in pkgs.iter_mut() {
+                            pkg.package_type &= package_type;
+                        }
 
                         'add_pkg: {
                             let pkg: Package = match &source {
@@ -278,11 +293,11 @@ impl Unit {
                                         })
                                         .collect();
 
-                                    let sourcefile = Arc::new(SourceFile {
+                                    let sourcefile = Arc::new(FileSource {
                                         source_dir: download_dir,
                                     });
 
-                                    let files: HashMap<PathBuf, Arc<SourceFile>> = files
+                                    let files: HashMap<PathBuf, Arc<FileSource>> = files
                                         .into_iter()
                                         .map(|fname| (fname.to_owned().into(), sourcefile.clone()))
                                         .collect();
@@ -388,7 +403,7 @@ pub struct Package {
     // PackageType
     package_type: PackageType,
     // 配置するファイル
-    files: HashMap<PathBuf, Arc<SourceFile>>,
+    files: HashMap<PathBuf, Arc<FileSource>>,
 }
 
 #[derive(Hash, Clone)]
@@ -553,11 +568,11 @@ impl Add for Package {
     }
 }
 
-struct SourceFile {
+struct FileSource {
     source_dir: PathBuf,
 }
 
-impl SourceFile {
+impl FileSource {
     async fn yank(&self, whichfile: impl AsRef<Path>, install_dir: impl AsRef<Path>) -> MainResult {
         async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> MainResult {
             tokio::fs::create_dir_all(to.as_ref().parent().unwrap()).await?;
