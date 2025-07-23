@@ -174,6 +174,8 @@ impl Unit {
                                         // インストールされていない場合はスキップ
                                         break 'add_pkg;
                                     }
+                                    // TODO: 初期インストールのみの場合はアップデート処理もする
+                                    // Problem: git init しかされない
                                     if update {
                                         // アップデート処理
 
