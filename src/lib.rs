@@ -293,9 +293,8 @@ impl Unit {
                                         })
                                         .collect();
 
-                                    let sourcefile = Arc::new(FileSource {
-                                        source_dir: download_dir,
-                                    });
+                                    let sourcefile =
+                                        Arc::new(FileSource::Directory { path: download_dir });
 
                                     let files: HashMap<PathBuf, Arc<FileSource>> = files
                                         .into_iter()
@@ -568,8 +567,8 @@ impl Add for Package {
     }
 }
 
-struct FileSource {
-    source_dir: PathBuf,
+enum FileSource {
+    Directory { path: PathBuf },
 }
 
 impl FileSource {
@@ -583,8 +582,13 @@ impl FileSource {
             Ok(())
         }
 
-        let from = self.source_dir.join(&whichfile);
-        let to = install_dir.as_ref().join(&whichfile);
-        copy(from, to).await
+        use FileSource::*;
+        match self {
+            Directory { path } => {
+                let from = path.join(&whichfile);
+                let to = install_dir.as_ref().join(&whichfile);
+                copy(from, to).await
+            }
+        }
     }
 }
