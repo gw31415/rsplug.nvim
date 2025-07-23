@@ -10,7 +10,7 @@ use std::{
 
 use hashbrown::HashMap;
 use itertools::Itertools;
-use rand::distr::{Alphanumeric, SampleString};
+use rand::RngCore;
 use tokio::task::JoinSet;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -199,23 +199,43 @@ impl Unit {
                                             .await?;
                                     }
 
-                                    let id = BTreeSet::from(['id: {
-                                        let Output { stdout, status, .. } =
-                                            tokio::process::Command::new("git")
+                                    let id: BTreeSet<[u8; 16]> = BTreeSet::from(['id: {
+                                        'fallback: {
+                                            // HEAD のハッシュ
+                                            let Output {
+                                                stdout: mut bytes,
+                                                status,
+                                                ..
+                                            } = tokio::process::Command::new("git")
                                                 .current_dir(&download_dir)
                                                 .arg("rev-parse")
                                                 .arg("HEAD")
                                                 .output()
                                                 .await?;
-                                        if status.success() {
-                                            if let Ok(mut id) = String::from_utf8(stdout) {
-                                                if id.ends_with('\n') {
-                                                    id.pop();
-                                                }
-                                                break 'id id;
+                                            if !status.success() {
+                                                break 'fallback;
                                             }
+                                            // HEAD とワーキングツリーの差分
+                                            let Output { stdout, status, .. } =
+                                                tokio::process::Command::new("git")
+                                                    .current_dir(&download_dir)
+                                                    .arg("diff")
+                                                    .arg("HEAD")
+                                                    .output()
+                                                    .await?;
+                                            if !status.success() {
+                                                break 'fallback;
+                                            }
+                                            bytes.extend(stdout);
+
+                                            break 'id u128::to_ne_bytes(xxh3_128(&bytes));
                                         }
-                                        Alphanumeric.sample_string(&mut rand::rng(), 32)
+                                        unsafe {
+                                            std::mem::transmute::<[u64; 2], [u8; 16]>([
+                                                rand::rng().next_u64(),
+                                                rand::rng().next_u64(),
+                                            ])
+                                        }
                                     }]);
 
                                     let files = {
@@ -356,7 +376,7 @@ pub struct Package {
 }
 
 #[derive(Hash, Clone)]
-struct PackageID(pub BTreeSet<String>);
+struct PackageID(pub BTreeSet<[u8; 16]>);
 
 impl Add for PackageID {
     type Output = Self;
@@ -375,7 +395,7 @@ impl AddAssign for PackageID {
 impl From<PackageID> for String {
     fn from(val: PackageID) -> Self {
         let PackageID(inner) = val;
-        let bytes = inner.into_iter().flat_map(|a| a.into_bytes()).collect_vec();
+        let bytes = inner.into_iter().flatten().collect_vec();
         let hash = xxh3_128(&bytes).to_ne_bytes();
         let mut res = String::new();
         const TABLE: &[u8; 16] = b"0123456789abcdef";
