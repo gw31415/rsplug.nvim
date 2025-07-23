@@ -35,7 +35,6 @@ async fn main() {
                     rev: None,
                 },
                 package_type: PackageType::Start,
-                depends: vec![],
             }
         }),
         install, // INSTALL or not
@@ -43,10 +42,10 @@ async fn main() {
         config.clone(),
     )
     .await
-    .unwrap();
-    println!("Packages: {}", pkgs.len());
-    let pkgs = Package::merge(pkgs, config.clone());
-    println!("Packages: {}", pkgs.len());
+    .expect("Failed to parse units");
+    println!("Base Packages: {}", pkgs.len());
+    let pkgs = Package::merge(pkgs);
+    println!("Merged Packages: {}", pkgs.len());
     Package::install(pkgs, config).await.unwrap();
     std::io::stdout().flush().unwrap();
 }

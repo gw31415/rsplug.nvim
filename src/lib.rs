@@ -8,9 +8,10 @@ use std::{
     sync::Arc,
 };
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use rand::RngCore;
+use regex::RegexSet;
 use tokio::task::JoinSet;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -72,6 +73,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Utf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    Regex(#[from] regex::Error),
 }
 
 type MainResult<T = ()> = Result<T, Error>;
@@ -80,7 +83,6 @@ type MainResult<T = ()> = Result<T, Error>;
 pub struct Unit {
     pub source: UnitSource,
     pub package_type: PackageType,
-    pub depends: Vec<Arc<Unit>>,
 }
 
 pub enum UnitSource {
@@ -104,29 +106,15 @@ impl Unit {
             let pkgs = unit
                 .into_iter()
                 .map(move |unit| {
-                    let config = config.clone();
+                    let config: Arc<GlobalConfig> = config.clone();
                     async move {
                         let unit: Arc<Unit> = unit.into();
 
                         let Unit {
                             source,
                             package_type,
-                            depends,
                         } = unit.borrow();
-                        let mut pkgs: Vec<_> = depends
-                            .iter()
-                            .map(|dep| Self::unpack([dep.clone()], install, update, config.clone()))
-                            .collect::<JoinSet<_>>()
-                            .join_all()
-                            .await
-                            .into_iter()
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_iter()
-                            .flatten()
-                            .collect();
-                        for pkg in pkgs.iter_mut() {
-                            pkg.package_type &= package_type;
-                        }
+                        let mut pkgs = Vec::new();
 
                         'add_pkg: {
                             let pkg: Package = match &source {
@@ -199,42 +187,59 @@ impl Unit {
                                             .await?;
                                     }
 
-                                    let id: BTreeSet<[u8; 16]> = BTreeSet::from(['id: {
-                                        'fallback: {
-                                            // HEAD のハッシュ
-                                            let Output {
-                                                stdout: mut bytes,
-                                                status,
-                                                ..
-                                            } = tokio::process::Command::new("git")
-                                                .current_dir(&download_dir)
-                                                .arg("rev-parse")
-                                                .arg("HEAD")
-                                                .output()
-                                                .await?;
-                                            if !status.success() {
-                                                break 'fallback;
+                                    let id: BTreeSet<[u8; 16]> = BTreeSet::from([{
+                                        let (head, diff) = tokio::join!(
+                                            async {
+                                                'a: {
+                                                    // HEAD のハッシュ
+                                                    let Ok(Output { stdout, status, .. }) =
+                                                        tokio::process::Command::new("git")
+                                                            .current_dir(&download_dir)
+                                                            .arg("rev-parse")
+                                                            .arg("HEAD")
+                                                            .output()
+                                                            .await
+                                                    else {
+                                                        break 'a Err(());
+                                                    };
+                                                    if status.success() {
+                                                        Ok(stdout)
+                                                    } else {
+                                                        Err(())
+                                                    }
+                                                }
+                                            },
+                                            async {
+                                                'a: {
+                                                    // HEAD とワーキングツリーの差分
+                                                    let Ok(Output { stdout, status, .. }) =
+                                                        tokio::process::Command::new("git")
+                                                            .current_dir(&download_dir)
+                                                            .arg("diff")
+                                                            .arg("HEAD")
+                                                            .output()
+                                                            .await
+                                                    else {
+                                                        break 'a Err(());
+                                                    };
+                                                    if status.success() {
+                                                        Ok(stdout)
+                                                    } else {
+                                                        Err(())
+                                                    }
+                                                }
                                             }
-                                            // HEAD とワーキングツリーの差分
-                                            let Output { stdout, status, .. } =
-                                                tokio::process::Command::new("git")
-                                                    .current_dir(&download_dir)
-                                                    .arg("diff")
-                                                    .arg("HEAD")
-                                                    .output()
-                                                    .await?;
-                                            if !status.success() {
-                                                break 'fallback;
+                                        );
+                                        if let (Ok(mut head), Ok(diff)) = (head, diff) {
+                                            head.extend(diff);
+                                            u128::to_ne_bytes(xxh3_128(&head))
+                                        } else {
+                                            unsafe {
+                                                std::mem::transmute::<[u64; 2], [u8; 16]>([
+                                                    rand::rng().next_u64(),
+                                                    rand::rng().next_u64(),
+                                                ])
                                             }
-                                            bytes.extend(stdout);
-
-                                            break 'id u128::to_ne_bytes(xxh3_128(&bytes));
-                                        }
-                                        unsafe {
-                                            std::mem::transmute::<[u64; 2], [u8; 16]>([
-                                                rand::rng().next_u64(),
-                                                rand::rng().next_u64(),
-                                            ])
                                         }
                                     }]);
 
@@ -257,9 +262,20 @@ impl Unit {
                                         }
                                         String::from_utf8(stdout)?
                                     };
+                                    let ignore = RegexSet::new(&config.merge.ignore)?;
                                     let files: Vec<_> = files
                                         .split('\n')
-                                        .filter(|fname| download_dir.join(fname).is_file())
+                                        .filter(|fname| {
+                                            let fname = Path::new(fname);
+                                            let ignore = fname.iter().any(|k| {
+                                                let Some(k) = k.to_str() else {
+                                                    // Utf8でないファイル名を持つファイルも無視
+                                                    return true;
+                                                };
+                                                ignore.is_match(k)
+                                            });
+                                            !ignore && download_dir.join(fname).is_file()
+                                        })
                                         .collect();
 
                                     let sourcefile = Arc::new(SourceFile {
@@ -409,24 +425,19 @@ impl From<PackageID> for String {
 }
 
 impl Package {
-    pub fn merge(
-        pkgs: impl IntoIterator<Item = Self>,
-        config: impl Into<Arc<GlobalConfig>>,
-    ) -> Vec<Self> {
-        let config: Arc<GlobalConfig> = config.into();
+    pub fn merge(pkgs: impl IntoIterator<Item = Self>) -> Vec<Self> {
         let mut items = pkgs.into_iter().collect_vec();
 
         let mut done_items = Vec::new();
 
         while items.len() > 1 {
             let (tail, tail2) = (items.pop().unwrap(), items.pop().unwrap());
-            match tail.add::<Arc<GlobalConfig>>(tail2, config.clone()) {
+            match tail + tail2 {
                 (tail, Some(tail2)) => {
                     done_items.push(tail);
                     items.push(tail2);
                 }
                 (tail, _) => {
-                    println!("MERGED");
                     items.push(tail);
                 }
             }
@@ -448,12 +459,14 @@ impl Package {
         // {
         //     panic!("packpath already exists: {}", packpath.display());
         // }
-        let _ = tokio::fs::remove_dir_all(packpath.as_path()).await;
-        tokio::fs::create_dir_all(packpath.as_path()).await.unwrap();
-        pkgs.into_iter()
+        // let _ = tokio::fs::remove_dir_all(packpath.as_path()).await;
+        tokio::fs::create_dir_all(packpath.as_path()).await?;
+        let mut registered = HashSet::new();
+        let mut io_tasks: JoinSet<_> = pkgs
+            .into_iter()
             .flat_map({
                 |pkg| {
-                    let dir = Arc::new(
+                    let dir: Arc<PathBuf> = Arc::new(
                         packpath
                             .join(match pkg.package_type {
                                 PackageType::Start => "start",
@@ -461,6 +474,11 @@ impl Package {
                             })
                             .join(Into::<String>::into(pkg.id)),
                     );
+                    registered.insert(dir.clone());
+                    if dir.is_dir() {
+                        println!("Skipped: {dir:?}");
+                        return Vec::new();
+                    }
                     pkg.files
                         .into_iter()
                         .map(move |(p, s)| (p, s, dir.clone()))
@@ -468,73 +486,69 @@ impl Package {
                 }
             })
             .map(|(path, source, dir)| async move {
-                println!("{}", dir.join(&path).display());
+                println!("Yanking: {:?}", dir.join(&path));
                 source.yank(path, dir.as_path()).await
             })
-            .collect::<JoinSet<_>>()
-            .join_all()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(())
+            .collect::<JoinSet<_>>();
+        {
+            let clean = |dir: PathBuf| {
+                let registered = registered.clone();
+                async move {
+                    let dir = Arc::new(dir);
+                    let mut read_dir = tokio::fs::read_dir(dir.as_ref()).await?;
+                    let mut rm_task = JoinSet::new();
+                    while let Some(entry) = read_dir.next_entry().await? {
+                        let dir = dir.clone();
+                        let registered = registered.clone();
+                        rm_task.spawn(async move {
+                            let name = entry.file_name();
+                            let path = dir.join(name);
+                            if !registered.contains(&path) && path.is_dir() {
+                                tokio::fs::remove_dir_all(&path).await?;
+                            }
+                            Ok::<_, Error>(())
+                        });
+                    }
+                    rm_task
+                        .join_all()
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, Error>(())
+                }
+            };
+            let start = packpath.join("start");
+            if start.is_dir() {
+                io_tasks.spawn(clean(start));
+            }
+            let opt = packpath.join("opt");
+            if opt.is_dir() {
+                io_tasks.spawn(clean(opt));
+            }
+        }
+        io_tasks.join_all().await.into_iter().collect()
     }
+}
 
-    fn add<R: AsRef<GlobalConfig>>(self, rhs: Self, config: impl Into<R>) -> (Self, Option<Self>) {
+impl Add for Package {
+    type Output = (Self, Option<Self>);
+    fn add(self, rhs: Self) -> Self::Output {
         if self.package_type != rhs.package_type {
             return (self, Some(rhs));
         }
-        let config: R = config.into();
-        let GlobalConfig {
-            merge: MergeConfig { ignore },
-            ..
-        } = config.as_ref();
-        let ignore: Vec<_> = ignore
-            .iter()
-            .map(|pat| regex::Regex::new(pat).expect("Invalid regex pattern in merge config"))
-            .collect();
-        let mut entries_fromrhs = Vec::<(PathBuf, Arc<SourceFile>)>::new();
-        let mut conflict = false;
-        let Package {
-            id,
-            package_type: rhs_pkg_type,
-            files,
-        } = rhs;
-        let mut rhs_files = files.into_iter();
-        for (k, v) in rhs_files.by_ref() {
-            let conflict_ = self.files.contains_key(&k)
-                && !k.iter().any(|k| {
-                    ignore
-                        .iter()
-                        .any(|re| re.is_match(k.to_str().unwrap_or("")))
-                });
-            if conflict_ {
-                println!("Conflict: {k:?}");
-            }
-            entries_fromrhs.push((k, v));
-            if conflict_ {
-                conflict = true;
-                break;
-            }
-        }
-        if conflict {
-            (
-                self,
-                Some(Package {
-                    id,
-                    package_type: rhs_pkg_type,
-                    files: {
-                        let mut files = rhs_files.collect::<HashMap<_, _>>();
-                        files.extend(entries_fromrhs);
-                        files
-                    },
-                }),
-            )
-        } else {
+        let mergeable = {
+            let (sfname, rfname): (HashSet<_>, HashSet<_>) =
+                (self.files.keys().collect(), rhs.files.keys().collect());
+            sfname.is_disjoint(&rfname)
+        };
+        if mergeable {
             let mut pkg = self;
-            pkg.files.extend(entries_fromrhs);
-            pkg.id += id;
+            pkg.files.extend(rhs.files);
+            pkg.id += rhs.id;
 
             (pkg, None)
+        } else {
+            (self, Some(rhs))
         }
     }
 }
