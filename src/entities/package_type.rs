@@ -1,5 +1,6 @@
 use std::{
     borrow::{Borrow, Cow},
+    cmp::Ordering,
     collections::BTreeSet,
     ops::BitAndAssign,
 };
@@ -14,23 +15,23 @@ pub enum PackageType {
 }
 
 impl PartialOrd for PackageType {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for PackageType {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         if let PackageType::Start = self
             && let PackageType::Start = other
         {
-            return std::cmp::Ordering::Equal;
+            return Ordering::Equal;
         }
         if let PackageType::Opt(l_opt) = self
             && let PackageType::Opt(r_opt) = other
         {
             let len_cmp = l_opt.len().cmp(&r_opt.len());
-            if len_cmp != std::cmp::Ordering::Equal {
+            if len_cmp != Ordering::Equal {
                 return len_cmp;
             }
 
@@ -38,9 +39,9 @@ impl Ord for PackageType {
         }
 
         if let PackageType::Start = self {
-            std::cmp::Ordering::Less
+            Ordering::Less
         } else {
-            std::cmp::Ordering::Greater
+            Ordering::Greater
         }
     }
 }

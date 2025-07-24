@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::BTreeSet,
     mem::MaybeUninit,
     ops::{Add, AddAssign, Deref},
@@ -32,8 +33,29 @@ impl Deref for PackageIDStr {
 }
 
 /// パッケージID。ディレクトリ名として使用される。
-#[derive(Hash, Clone)]
+#[derive(Hash, Clone, PartialEq, Eq)]
 pub struct PackageID(pub(super) BTreeSet<[u8; 16]>);
+
+impl Ord for PackageID {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let cmp = self.0.len().cmp(&other.0.len());
+        if let Ordering::Equal = cmp {
+            for (a, b) in self.0.iter().zip(other.0.iter()) {
+                let cmp = a.cmp(b);
+                if !cmp.is_eq() {
+                    return cmp;
+                }
+            }
+        }
+        cmp
+    }
+}
+
+impl PartialOrd for PackageID {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl PackageID {
     /// 文字列に変換

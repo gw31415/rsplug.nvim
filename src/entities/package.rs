@@ -1,11 +1,12 @@
 use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
     ops::Add,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use hashbrown::{HashMap, HashSet};
-use itertools::Itertools;
 use tokio::task::JoinSet;
 
 use super::*;
@@ -19,9 +20,33 @@ pub struct Package {
     pub(super) files: HashMap<PathBuf, Arc<FileSource>>,
 }
 
+impl PartialEq for Package {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Package {}
+
+impl PartialOrd for Package {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Package {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let cmp = self.package_type.cmp(&other.package_type);
+        if let Ordering::Equal = cmp {
+            return self.id.cmp(&other.id);
+        }
+        cmp
+    }
+}
+
 impl Package {
-    pub fn merge(pkgs: impl IntoIterator<Item = Self>) -> Vec<Self> {
-        let mut items = pkgs.into_iter().collect_vec();
+    pub fn merge(pkgs: BinaryHeap<Self>) -> Vec<Self> {
+        let mut items = pkgs.into_sorted_vec();
 
         let mut done_items = Vec::new();
 

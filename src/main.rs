@@ -1,4 +1,4 @@
-use std::{io::Write, sync::Arc};
+use std::{collections::BinaryHeap, io::Write, sync::Arc};
 
 use clap::Parser;
 use rsplug::*;
@@ -18,7 +18,7 @@ struct Args {
 async fn main() {
     let Args { install, update } = Args::parse();
     let config = Arc::new(Config::default());
-    let pkgs: Vec<_> = Unit::unpack(
+    let pkgs: BinaryHeap<_> = Unit::unpack(
         [
             "vim-denops/denops.vim",
             "lambdalisue/fern-hijack.vim",
