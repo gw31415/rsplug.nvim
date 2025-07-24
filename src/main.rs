@@ -17,8 +17,8 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let Args { install, update } = Args::parse();
-    let config = Arc::new(GlobalConfig::default());
-    let pkgs = Unit::unpack(
+    let config = Arc::new(Config::default());
+    let pkgs: Vec<_> = Unit::unpack(
         [
             "vim-denops/denops.vim",
             "lambdalisue/fern-hijack.vim",
