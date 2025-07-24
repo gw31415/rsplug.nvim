@@ -44,17 +44,8 @@ impl Package {
         items
     }
 
-    pub async fn install(
-        pkgs: impl IntoIterator<Item = Self>,
-        config: impl Into<Arc<Config>>,
-    ) -> MainResult {
-        let packpath: PathBuf = config.into().packpath.join("pack").join("merged");
-        // if let Ok(exists) = std::fs::exists(&packpath)
-        //     && exists
-        // {
-        //     panic!("packpath already exists: {}", packpath.display());
-        // }
-        // let _ = tokio::fs::remove_dir_all(packpath.as_path()).await;
+    pub async fn install(pkgs: impl IntoIterator<Item = Self>, packpath: &Path) -> MainResult {
+        let packpath: PathBuf = packpath.join("pack").join("_gen");
         tokio::fs::create_dir_all(packpath.as_path()).await?;
         let mut registered = HashSet::new();
         let mut io_tasks: JoinSet<_> = pkgs

@@ -39,10 +39,11 @@ impl Unit {
     ) -> Pin<Box<dyn Future<Output = MainResult<B>> + Send + Sync>> {
         let config = config.into();
         Box::pin(async move {
+            let ignore = Arc::new(RegexSet::new(&config.merge.ignore)?);
             let pkgs: B = unit
                 .into_iter()
                 .map(move |unit| {
-                    let config: Arc<Config> = config.clone();
+                    let (config, ignore) = (config.clone(), ignore.clone());
                     async move {
                         let unit: Arc<Unit> = unit.into();
 
@@ -76,42 +77,51 @@ impl Unit {
                         'add_pkg: {
                             let pkg: Package = match &source {
                                 UnitSource::GitHub { owner, repo, rev } => {
-                                    let download_dir = config
+                                    let proj_root = config
                                         .cachepath
                                         .join("repos")
                                         .join("github.com")
                                         .join(owner)
                                         .join(repo);
 
-                                    tokio::fs::create_dir_all(&download_dir).await?;
-                                    let download_dir = download_dir.canonicalize()?;
+                                    tokio::fs::create_dir_all(&proj_root).await?;
+                                    let proj_root = proj_root.canonicalize()?;
+                                    let filesource =
+                                        Arc::new(FileSource::Directory { path: proj_root });
+                                    let FileSource::Directory { path: proj_root } =
+                                        filesource.as_ref();
+                                    // NOTE: FileSourceの種類が増えた場合は以下をアンコメント。
+                                    // else {
+                                    //     // SAFETY: すぐ上の行で `sourcefile` を `Directory` として宣言している。
+                                    //     unsafe { std::hint::unreachable_unchecked() };
+                                    // };
 
-                                    if let Ok(true) = tokio::fs::try_exists(
-                                        &download_dir.join(".git").join("HEAD"),
-                                    )
-                                    .await
-                                    {
-                                        // インストール済みは無視
-                                    } else if install {
-                                        git::init(
-                                            format!("https://github.com/{owner}/{repo}"),
-                                            &download_dir,
-                                        )
-                                        .await?;
-                                    } else {
-                                        // インストールされていない場合はスキップ
-                                        break 'add_pkg;
+                                    // リポジトリがない場合のインストール処理
+                                    if !git::exists(proj_root).await {
+                                        if install {
+                                            git::init(
+                                                format!("https://github.com/{owner}/{repo}"),
+                                                proj_root,
+                                            )
+                                            .await?;
+                                            // 初期インストール時はfetchも行う
+                                            git::fetch(rev, proj_root).await?;
+                                        } else {
+                                            // インストールされていない場合はスキップ
+                                            break 'add_pkg;
+                                        }
                                     }
-                                    // TODO: 初期インストールのみの場合はアップデート処理もする
-                                    // Problem: git init しかされない
+
+                                    // アップデート処理
                                     if update {
-                                        git::fetch(rev, &download_dir).await?;
+                                        git::fetch(rev, proj_root).await?;
                                     }
 
+                                    // ディレクトリ内容からのIDの決定
                                     let id: BTreeSet<[u8; 16]> = BTreeSet::from([{
                                         let (head, diff) = tokio::join!(
-                                            git::head(&download_dir),
-                                            git::diff(&download_dir),
+                                            git::head(proj_root),
+                                            git::diff(proj_root),
                                         );
                                         if let (Some(mut head), Some(diff)) = (head, diff) {
                                             head.extend(diff);
@@ -126,13 +136,13 @@ impl Unit {
                                         }
                                     }]);
 
-                                    let files = {
+                                    let files: HashMap<PathBuf, Arc<FileSource>> = {
                                         let std::process::Output {
                                             stdout,
                                             status,
                                             stderr,
                                         } = tokio::process::Command::new("git")
-                                            .current_dir(&download_dir)
+                                            .current_dir(proj_root)
                                             .arg("ls-files")
                                             .arg("--full-name")
                                             .output()
@@ -144,30 +154,21 @@ impl Unit {
                                             ))?;
                                         }
                                         String::from_utf8(stdout)?
-                                    };
-                                    let ignore = RegexSet::new(&config.merge.ignore)?;
-                                    let files: Vec<_> = files
-                                        .split('\n')
-                                        .filter(|fname| {
-                                            let fname = Path::new(fname);
-                                            let ignore = fname.iter().any(|k| {
-                                                let Some(k) = k.to_str() else {
-                                                    // Utf8でないファイル名を持つファイルも無視
-                                                    return true;
-                                                };
-                                                ignore.is_match(k)
-                                            });
-                                            !ignore && download_dir.join(fname).is_file()
-                                        })
-                                        .collect();
-
-                                    let sourcefile =
-                                        Arc::new(FileSource::Directory { path: download_dir });
-
-                                    let files: HashMap<PathBuf, Arc<FileSource>> = files
-                                        .into_iter()
-                                        .map(|fname| (fname.to_owned().into(), sourcefile.clone()))
-                                        .collect();
+                                    }
+                                    .split('\n')
+                                    .filter(|fname| {
+                                        let fname = Path::new(fname);
+                                        let ignore = fname.iter().any(|k| {
+                                            let Some(k) = k.to_str() else {
+                                                // Utf8でないファイル名を持つファイルも無視
+                                                return true;
+                                            };
+                                            ignore.is_match(k)
+                                        });
+                                        !ignore && proj_root.join(fname).is_file()
+                                    })
+                                    .map(|fname| (fname.to_owned().into(), filesource.clone()))
+                                    .collect();
                                     Package {
                                         id: PackageID(id),
                                         files,
@@ -198,6 +199,14 @@ mod git {
     use std::{path::Path, process::Output};
 
     use super::MainResult;
+
+    /// リポジトリが存在するかどうか
+    pub async fn exists(dir: &Path) -> bool {
+        matches!(
+            tokio::fs::try_exists(dir.join(".git").join("HEAD")).await,
+            Ok(true)
+        )
+    }
 
     /// リポジトリ初期化処理
     pub async fn init(repo: String, dir: &Path) -> MainResult {
@@ -245,8 +254,8 @@ mod git {
         Ok(())
     }
 
+    /// HEAD のハッシュ
     pub async fn head(dir: &Path) -> Option<Vec<u8>> {
-        // HEAD のハッシュ
         let Ok(Output { stdout, status, .. }) = tokio::process::Command::new("git")
             .current_dir(dir)
             .arg("rev-parse")
@@ -259,8 +268,8 @@ mod git {
         if status.success() { Some(stdout) } else { None }
     }
 
+    /// diff の出力
     pub async fn diff(dir: &Path) -> Option<Vec<u8>> {
-        // HEAD のハッシュ
         let Ok(Output { stdout, status, .. }) = tokio::process::Command::new("git")
             .current_dir(dir)
             .arg("diff")

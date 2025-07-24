@@ -47,6 +47,6 @@ async fn main() {
     println!("Base Packages: {}", pkgs.len());
     let pkgs = Package::merge(pkgs);
     println!("Merged Packages: {}", pkgs.len());
-    Package::install(pkgs, config).await.unwrap();
+    Package::install(pkgs, &config.packpath).await.unwrap();
     std::io::stdout().flush().unwrap();
 }
