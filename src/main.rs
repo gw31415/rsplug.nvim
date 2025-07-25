@@ -18,7 +18,7 @@ struct Args {
 async fn main() {
     let Args { install, update } = Args::parse();
     let config = Arc::new(Config::default());
-    let pkgs: BinaryHeap<_> = Unit::unpack(
+    let mut pkgs: BinaryHeap<_> = Unit::unpack(
         [
             "vim-denops/denops.vim",
             "lambdalisue/fern-hijack.vim",
@@ -44,9 +44,18 @@ async fn main() {
     )
     .await
     .expect("Failed to parse units");
-    println!("Base Packages: {}", pkgs.len());
-    let pkgs = Package::merge(pkgs);
-    println!("Merged Packages: {}", pkgs.len());
-    Package::install(pkgs, &config.packpath).await.unwrap();
+    println!("Total Packages: {}", pkgs.len());
+    Package::merge(&mut pkgs);
+    println!("Merge Packages: {}", pkgs.len());
+
+    let mut state = PackPathState::new();
+    while let Some(pkg) = pkgs.pop() {
+        let Some(pkg) = state.insert(pkg) else {
+            continue;
+        };
+        pkgs.push(pkg);
+        Package::merge(&mut pkgs);
+    }
+    state.install(&config.packpath).await.unwrap();
     std::io::stdout().flush().unwrap();
 }

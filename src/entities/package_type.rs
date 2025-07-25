@@ -14,6 +14,13 @@ pub enum PackageType {
     Opt(BTreeSet<LoadEvent>),
 }
 
+impl PackageType {
+    #[inline]
+    pub fn is_start(&self) -> bool {
+        matches!(self, PackageType::Start)
+    }
+}
+
 impl PartialOrd for PackageType {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))

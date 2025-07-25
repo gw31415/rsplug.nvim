@@ -1,6 +1,5 @@
 use std::{
     borrow::Borrow,
-    collections::BTreeSet,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -89,12 +88,11 @@ impl Unit {
                                     let filesource =
                                         Arc::new(FileSource::Directory { path: proj_root });
                                     let FileSource::Directory { path: proj_root } =
-                                        filesource.as_ref();
-                                    // NOTE: FileSourceの種類が増えた場合は以下をアンコメント。
-                                    // else {
-                                    //     // SAFETY: すぐ上の行で `sourcefile` を `Directory` として宣言している。
-                                    //     unsafe { std::hint::unreachable_unchecked() };
-                                    // };
+                                        filesource.as_ref()
+                                    else {
+                                        // SAFETY: すぐ上の行で `sourcefile` を `Directory` として宣言している。
+                                        unsafe { std::hint::unreachable_unchecked() };
+                                    };
 
                                     // リポジトリがない場合のインストール処理
                                     if !git::exists(proj_root).await {
@@ -118,7 +116,7 @@ impl Unit {
                                     }
 
                                     // ディレクトリ内容からのIDの決定
-                                    let id: BTreeSet<[u8; 16]> = BTreeSet::from([{
+                                    let id = PackageID::new({
                                         let (head, diff) = tokio::join!(
                                             git::head(proj_root),
                                             git::diff(proj_root),
@@ -134,7 +132,7 @@ impl Unit {
                                                 ])
                                             }
                                         }
-                                    }]);
+                                    });
 
                                     let files: HashMap<PathBuf, Arc<FileSource>> = {
                                         let std::process::Output {
@@ -170,7 +168,7 @@ impl Unit {
                                     .map(|fname| (fname.to_owned().into(), filesource.clone()))
                                     .collect();
                                     Package {
-                                        id: PackageID(id),
+                                        id,
                                         files,
                                         package_type: package_type.clone(),
                                     }

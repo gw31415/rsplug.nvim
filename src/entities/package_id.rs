@@ -9,7 +9,14 @@ use std::{
 use itertools::Itertools;
 use xxhash_rust::xxh3::xxh3_128;
 
-struct PackageIDStr([u8; 32]);
+#[derive(Hash, PartialEq, Eq)]
+pub(super) struct PackageIDStr([u8; 32]);
+
+impl From<PackageIDStr> for Box<[u8]> {
+    fn from(val: PackageIDStr) -> Self {
+        val.0.into()
+    }
+}
 
 impl AsRef<str> for PackageIDStr {
     fn as_ref(&self) -> &str {
@@ -32,8 +39,14 @@ impl Deref for PackageIDStr {
     }
 }
 
+impl std::fmt::Display for PackageIDStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (self as &str).fmt(f)
+    }
+}
+
 /// パッケージID。ディレクトリ名として使用される。
-#[derive(Hash, Clone, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq)]
 pub struct PackageID(pub(super) BTreeSet<[u8; 16]>);
 
 impl Ord for PackageID {
@@ -58,11 +71,14 @@ impl PartialOrd for PackageID {
 }
 
 impl PackageID {
+    pub(super) fn new(data: impl AsRef<[u8]>) -> Self {
+        Self(BTreeSet::from([u128::to_ne_bytes(xxh3_128(data.as_ref()))]))
+    }
     /// 文字列に変換
-    pub fn into_str(self) -> impl AsRef<Path> + AsRef<str> + Deref<Target = str> {
+    pub fn as_str(&self) -> PackageIDStr {
         const TABLE: &[u8; 16] = b"0123456789abcdef";
         let PackageID(inner) = self;
-        let bytes = inner.into_iter().flatten().collect_vec();
+        let bytes = inner.iter().flat_map(ToOwned::to_owned).collect_vec();
         let hash: [u8; 16] = xxh3_128(&bytes).to_ne_bytes();
         let mut res = const { [MaybeUninit::<u8>::uninit(); 32] };
         for (i, b) in hash.iter().enumerate() {
