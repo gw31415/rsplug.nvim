@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::BinaryHeap,
     ops::Add,
@@ -91,7 +92,7 @@ impl Add for Package {
 
 pub enum FileSource {
     Directory { path: PathBuf },
-    File { data: Vec<u8> },
+    File { data: Cow<'static, [u8]> },
 }
 
 impl FileSource {
@@ -134,7 +135,7 @@ impl PackPathState {
     pub fn new() -> Self {
         Default::default()
     }
-    pub fn insert(&mut self, pkg: Package) -> Option<Package> {
+    pub fn insert(&mut self, pkg: Package) -> Vec<Package> {
         let Package {
             id,
             package_type,
@@ -143,7 +144,7 @@ impl PackPathState {
 
         let already_installed = !self.installing.insert(id.as_str().into());
         if already_installed {
-            return None;
+            return Vec::new();
         }
 
         let pkg_type_str = if package_type.is_start() {
@@ -160,7 +161,9 @@ impl PackPathState {
             files.push((path, source));
         }
 
-        Loader::create(id, package_type).map(Into::<Option<Package>>::into)?
+        Loader::create(id, package_type)
+            .map(Into::<Vec<Package>>::into)
+            .unwrap_or_default()
     }
 
     pub async fn install(self, packpath: &Path) -> MainResult {

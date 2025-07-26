@@ -10,22 +10,40 @@ pub struct Loader {
     autocmds: HashMap<String, Vec<Arc<PackageID>>>,
 }
 
-impl From<Loader> for Option<Package> {
+impl From<Loader> for Vec<Package> {
     fn from(value: Loader) -> Self {
-        if value.autocmds.is_empty() {
-            return None;
+        let mut pkgs = Vec::new();
+        if !value.autocmds.is_empty() {
+            pkgs.push({
+                let data = include_bytes!("../../lua/autocmd.lua").into();
+
+                let id = PackageID::new(&data);
+                let files = HashMap::from([(
+                    PathBuf::from("lua/_rsplug/autocmd.lua"),
+                    Arc::new(FileSource::File { data }),
+                )]);
+                Package {
+                    id,
+                    package_type: PackageType::Start,
+                    files,
+                }
+            });
+
+            pkgs.push({
+                let data = value.lua_code().into_bytes().into();
+                let id = PackageID::new(&data);
+                let files = HashMap::from([(
+                    PathBuf::from(format!("plugin/{}.lua", id.as_str())),
+                    Arc::new(FileSource::File { data }),
+                )]);
+                Package {
+                    id,
+                    package_type: PackageType::Start,
+                    files,
+                }
+            });
         }
-        let data = value.lua_code().into_bytes();
-        let id = PackageID::new(&data);
-        let files = HashMap::from([(
-            PathBuf::from(format!("plugin/{}.lua", id.as_str())),
-            Arc::new(FileSource::File { data }),
-        )]);
-        Some(Package {
-            id,
-            package_type: PackageType::Start,
-            files,
-        })
+        pkgs
     }
 }
 
