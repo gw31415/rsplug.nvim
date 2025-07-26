@@ -83,7 +83,7 @@ impl Loader {
 
     fn lua_code(&self) -> String {
         let Self { autocmds } = self;
-        Autocmd { autocmds }.render_once().unwrap()
+        LoaderLuaTemplate { autocmds }.render_once().unwrap()
     }
 }
 
@@ -91,6 +91,6 @@ impl Loader {
 #[template(path = "loader_lua.stpl")]
 #[template(escape = false)]
 #[template(rm_whitespace = true)]
-struct Autocmd<'a> {
+struct LoaderLuaTemplate<'a> {
     autocmds: &'a HashMap<String, Vec<PackageIDStr>>,
 }
