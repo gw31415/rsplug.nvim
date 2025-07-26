@@ -1,17 +1,16 @@
 use std::{ops::AddAssign, path::PathBuf, sync::Arc};
 
 use hashbrown::HashMap;
-use itertools::Itertools;
 use sailfish::TemplateSimple;
 
 use super::{FileSource, LoadEvent, Package, PackageID, PackageIDStr, PackageType};
 
 pub struct Loader {
-    autocmds: HashMap<String, Vec<Arc<PackageID>>>,
+    autocmds: HashMap<String, Vec<PackageIDStr>>,
 }
 
 impl From<Loader> for Vec<Package> {
-    fn from(value: Loader) -> Self {
+    fn from(value: Loader) -> Vec<Package> {
         let mut pkgs = Vec::new();
         if !value.autocmds.is_empty() {
             pkgs.push({
@@ -70,7 +69,7 @@ impl Loader {
             use LoadEvent::*;
             match ev {
                 Autocmd(autocmd) => {
-                    autocmds.entry(autocmd).or_default().push(id.clone());
+                    autocmds.entry(autocmd).or_default().push(id.as_str());
                 }
             }
         }
@@ -78,22 +77,13 @@ impl Loader {
     }
 
     fn lua_code(&self) -> String {
-        self.autocmds
-            .iter()
-            .map(|(event, ids)| {
-                let ids = ids
-                    .iter()
-                    .map(|id| id.as_str())
-                    .collect::<Vec<PackageIDStr>>();
-                Autocmd { event, ids }.render_once().unwrap()
-            })
-            .join("\n")
+        let Self { autocmds } = self;
+        Autocmd { autocmds }.render_once().unwrap()
     }
 }
 
 #[derive(sailfish::TemplateSimple)]
 #[template(path = "loader_lua.stpl")]
 struct Autocmd<'a> {
-    event: &'a String,
-    ids: Vec<PackageIDStr>,
+    autocmds: &'a HashMap<String, Vec<PackageIDStr>>,
 }

@@ -1,3 +1,5 @@
+<% for (event, ids) in autocmds { %>
 vim.api.nvim_create_autocmd('<%= event %>', {callback=function(ctx)
 	require '_rsplug/autocmd'.load_event(ctx, {<% for id in ids {%>'<%= id %>', <%} %>})
 end, once=true})
+<% } %>
