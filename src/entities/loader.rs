@@ -90,7 +90,6 @@ impl Loader {
 #[derive(TemplateSimple)]
 #[template(path = "loader_lua.stpl")]
 #[template(escape = false)]
-#[template(rm_whitespace = true)]
 struct LoaderLuaTemplate<'a> {
     autocmds: &'a HashMap<String, Vec<PackageIDStr>>,
 }
