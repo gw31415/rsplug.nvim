@@ -74,8 +74,8 @@ async fn main() {
     while let Some(pkg) = pkgs.pop() {
         for pkg in state.insert(pkg) {
             pkgs.push(pkg);
-            Package::merge(&mut pkgs);
         }
+        Package::merge(&mut pkgs);
     }
     state.install(&config.packpath).await.unwrap();
     std::io::stdout().flush().unwrap();
