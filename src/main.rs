@@ -35,27 +35,27 @@ async fn main() {
         [
             Unit {
                 source: github("vim-denops/denops.vim"),
-                package_type: PackageType::Start,
+                lazy_type: LazyType::Start,
                 depends: vec![],
             },
             Unit {
                 source: github("lambdalisue/fern-hijack.vim"),
-                package_type: PackageType::Start,
+                lazy_type: LazyType::Start,
                 depends: vec![],
             },
             Unit {
                 source: github("gw31415/mstdn-editor.vim"),
-                package_type: PackageType::Start,
+                lazy_type: LazyType::Start,
                 depends: vec![],
             },
             Unit {
                 source: github("gw31415/edisch.vim"),
-                package_type: PackageType::Start,
+                lazy_type: LazyType::Start,
                 depends: vec![],
             },
             Unit {
                 source: github("gw31415/mkdir.vim"),
-                package_type: PackageType::Opt(BTreeSet::from([LoadEvent::Autocmd(
+                lazy_type: LazyType::Opt(BTreeSet::from([LoadEvent::Autocmd(
                     "BufWritePre".to_string(),
                 )])),
                 depends: vec![],

@@ -8,7 +8,7 @@ pub struct Config {
     /// Vim の 'packpath' に設定されるディレクトリ
     pub packpath: PathBuf,
     /// マージに関する設定
-    pub merge: MergeConfig,
+    pub install: InstallConfig,
 }
 
 impl Default for Config {
@@ -19,21 +19,21 @@ impl Default for Config {
         Config {
             cachepath: appdir.clone(),
             packpath: appdir,
-            merge: Default::default(),
+            install: Default::default(),
         }
     }
 }
 
-/// マージに関する設定
+/// インストールに関する設定
 #[derive(Clone)]
-pub struct MergeConfig {
-    // Regexパターンで、マージ時に無視するファイルを指定する
+pub struct InstallConfig {
+    // インストールを無視するファイル名パターン (Regexパターン)
     pub ignore: Vec<String>,
 }
 
-impl Default for MergeConfig {
+impl Default for InstallConfig {
     fn default() -> Self {
-        MergeConfig {
+        InstallConfig {
             ignore: vec![
                 r"^README\.md$".to_string(),
                 r"^LICENSE$".to_string(),

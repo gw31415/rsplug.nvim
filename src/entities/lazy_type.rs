@@ -7,36 +7,36 @@ use std::{
 
 /// Startプラグインとするか、Optプラグインとするか
 #[derive(PartialEq, Eq, Clone, Hash)]
-pub enum PackageType {
+pub enum LazyType {
     /// Startプラグイン。起動時に読み込まれる。
     Start,
     /// Optプラグイン。読み込みのタイミングがある。
     Opt(BTreeSet<LoadEvent>),
 }
 
-impl PackageType {
+impl LazyType {
     #[inline]
     /// Startプラグインかどうかを判定する。
     pub fn is_start(&self) -> bool {
-        matches!(self, PackageType::Start)
+        matches!(self, LazyType::Start)
     }
 }
 
-impl PartialOrd for PackageType {
+impl PartialOrd for LazyType {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for PackageType {
+impl Ord for LazyType {
     fn cmp(&self, other: &Self) -> Ordering {
-        if let PackageType::Start = self
-            && let PackageType::Start = other
+        if let LazyType::Start = self
+            && let LazyType::Start = other
         {
             return Ordering::Equal;
         }
-        if let PackageType::Opt(l_opt) = self
-            && let PackageType::Opt(r_opt) = other
+        if let LazyType::Opt(l_opt) = self
+            && let LazyType::Opt(r_opt) = other
         {
             let len_cmp = l_opt.len().cmp(&r_opt.len());
             if len_cmp != Ordering::Equal {
@@ -46,7 +46,7 @@ impl Ord for PackageType {
             return l_opt.iter().cmp(r_opt.iter());
         }
 
-        if let PackageType::Start = self {
+        if let LazyType::Start = self {
             Ordering::Less
         } else {
             Ordering::Greater
@@ -54,23 +54,23 @@ impl Ord for PackageType {
     }
 }
 
-impl<'a> From<&'a PackageType> for Cow<'a, PackageType> {
-    fn from(val: &'a PackageType) -> Self {
+impl<'a> From<&'a LazyType> for Cow<'a, LazyType> {
+    fn from(val: &'a LazyType) -> Self {
         Cow::Borrowed(val)
     }
 }
 
-impl From<PackageType> for Cow<'_, PackageType> {
-    fn from(value: PackageType) -> Self {
+impl From<LazyType> for Cow<'_, LazyType> {
+    fn from(value: LazyType) -> Self {
         Cow::Owned(value)
     }
 }
 
-impl<'a, Rhs: Into<Cow<'a, PackageType>>> BitAndAssign<Rhs> for PackageType {
+impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAndAssign<Rhs> for LazyType {
     fn bitand_assign(&mut self, rhs: Rhs) {
-        let rhs: Cow<'a, PackageType> = rhs.into();
-        if let PackageType::Opt(events) = self {
-            if let PackageType::Opt(events_rhs) = rhs.borrow() {
+        let rhs: Cow<'a, LazyType> = rhs.into();
+        if let LazyType::Opt(events) = self {
+            if let LazyType::Opt(events_rhs) = rhs.borrow() {
                 events.extend(events_rhs.clone());
             } else {
                 *self = rhs.into_owned();

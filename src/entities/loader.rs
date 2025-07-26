@@ -24,7 +24,7 @@ impl From<Loader> for Vec<Package> {
                 )]);
                 Package {
                     id,
-                    package_type: PackageType::Start,
+                    lazy_type: LazyType::Start,
                     files,
                 }
             });
@@ -38,7 +38,7 @@ impl From<Loader> for Vec<Package> {
                 )]);
                 Package {
                     id,
-                    package_type: PackageType::Start,
+                    lazy_type: LazyType::Start,
                     files,
                 }
             });
@@ -63,8 +63,8 @@ impl Loader {
     /// 読み込む情報が要らない場合は `None` を返す。
     /// NOTE: Package はインストールされる必要があるため、変更を抑制する意図で PackageID の所有権を奪う。
     /// その他必要な情報のみ引数に取る。
-    pub(super) fn create(id: PackageID, package_type: PackageType) -> Option<Self> {
-        let PackageType::Opt(events) = package_type else {
+    pub(super) fn create(id: PackageID, lazy_type: LazyType) -> Option<Self> {
+        let LazyType::Opt(events) = lazy_type else {
             return None;
         };
         let mut autocmds: HashMap<String, Vec<_>> = HashMap::new();

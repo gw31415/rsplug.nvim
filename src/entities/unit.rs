@@ -18,7 +18,7 @@ pub struct Unit {
     /// 取得元
     pub source: UnitSource,
     /// Unitに対応する読み込みタイプ
-    pub package_type: PackageType,
+    pub lazy_type: LazyType,
     /// 依存する Unit のリスト
     pub depends: Vec<Arc<Unit>>,
 }
@@ -46,7 +46,7 @@ impl Unit {
     ) -> Pin<Box<dyn Future<Output = MainResult<B>> + Send + Sync>> {
         let config = config.into();
         Box::pin(async move {
-            let ignore = Arc::new(RegexSet::new(&config.merge.ignore)?);
+            let ignore = Arc::new(RegexSet::new(&config.install.ignore)?);
             let pkgs: B = unit
                 .into_iter()
                 .map(move |unit| {
@@ -56,7 +56,7 @@ impl Unit {
 
                         let Unit {
                             source,
-                            package_type,
+                            lazy_type,
                             depends,
                         } = unit.borrow();
                         let mut pkgs: Vec<_> = depends
@@ -78,7 +78,7 @@ impl Unit {
                             .flatten()
                             .collect();
                         for pkg in pkgs.iter_mut() {
-                            pkg.package_type &= package_type;
+                            pkg.lazy_type &= lazy_type;
                         }
 
                         'add_pkg: {
@@ -178,7 +178,7 @@ impl Unit {
                                     Package {
                                         id,
                                         files,
-                                        package_type: package_type.clone(),
+                                        lazy_type: lazy_type.clone(),
                                     }
                                 }
                             };

@@ -20,7 +20,7 @@ pub struct Package {
     /// ID
     pub(super) id: PackageID,
     // PackageType
-    pub(super) package_type: PackageType,
+    pub(super) lazy_type: LazyType,
     // 配置するファイル
     pub(super) files: HashMap<PathBuf, Arc<FileSource>>,
 }
@@ -41,7 +41,7 @@ impl PartialOrd for Package {
 
 impl Ord for Package {
     fn cmp(&self, other: &Self) -> Ordering {
-        let cmp = self.package_type.cmp(&other.package_type);
+        let cmp = self.lazy_type.cmp(&other.lazy_type);
         if let Ordering::Equal = cmp {
             return self.id.cmp(&other.id);
         }
@@ -74,7 +74,7 @@ impl Package {
 impl Add for Package {
     type Output = (Self, Option<Self>);
     fn add(self, rhs: Self) -> Self::Output {
-        if self.package_type != rhs.package_type {
+        if self.lazy_type != rhs.lazy_type {
             return (self, Some(rhs));
         }
         let mergeable = {
@@ -147,7 +147,7 @@ impl PackPathState {
     pub fn insert(&mut self, pkg: Package) -> Vec<Package> {
         let Package {
             id,
-            package_type,
+            lazy_type,
             files,
         } = pkg;
 
@@ -156,11 +156,7 @@ impl PackPathState {
             return Vec::new();
         }
 
-        let pkg_type_str = if package_type.is_start() {
-            "start"
-        } else {
-            "opt"
-        };
+        let pkg_type_str = if lazy_type.is_start() { "start" } else { "opt" };
         for (path, source) in files {
             let (_, files) = self
                 .files
@@ -170,7 +166,7 @@ impl PackPathState {
             files.push((path, source));
         }
 
-        Loader::create(id, package_type)
+        Loader::create(id, lazy_type)
             .map(Into::<Vec<Package>>::into)
             .unwrap_or_default()
     }
