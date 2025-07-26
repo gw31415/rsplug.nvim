@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 /// グローバルな設定
-#[derive(Clone)]
 pub struct Config {
     /// キャッシュ先
     pub cachepath: PathBuf,
@@ -25,7 +24,6 @@ impl Default for Config {
 }
 
 /// インストールに関する設定
-#[derive(Clone)]
 pub struct InstallConfig {
     // インストールを無視するファイル名パターン (Regexパターン)
     pub ignore: Vec<String>,
