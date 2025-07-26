@@ -1,4 +1,8 @@
-use std::{collections::BinaryHeap, io::Write, sync::Arc};
+use std::{
+    collections::{BTreeSet, BinaryHeap},
+    io::Write,
+    sync::Arc,
+};
 
 use clap::Parser;
 use rsplug::*;
@@ -14,30 +18,49 @@ struct Args {
     update: bool,
 }
 
+fn github(repo: &str) -> UnitSource {
+    let (owner, repo) = repo.split_once('/').unwrap();
+    UnitSource::GitHub {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        rev: None,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let Args { install, update } = Args::parse();
     let config = Arc::new(Config::default());
     let mut pkgs: BinaryHeap<_> = Unit::unpack(
         [
-            "vim-denops/denops.vim",
-            "lambdalisue/fern-hijack.vim",
-            "gw31415/mstdn-editor.vim",
-            "gw31415/edisch.vim",
-        ]
-        .into_iter()
-        .map(|repo| {
-            let (owner, repo) = repo.split_once('/').unwrap();
             Unit {
-                source: UnitSource::GitHub {
-                    owner: owner.to_string(),
-                    repo: repo.to_string(),
-                    rev: None,
-                },
+                source: github("vim-denops/denops.vim"),
                 package_type: PackageType::Start,
                 depends: vec![],
-            }
-        }),
+            },
+            Unit {
+                source: github("lambdalisue/fern-hijack.vim"),
+                package_type: PackageType::Start,
+                depends: vec![],
+            },
+            Unit {
+                source: github("gw31415/mstdn-editor.vim"),
+                package_type: PackageType::Start,
+                depends: vec![],
+            },
+            Unit {
+                source: github("gw31415/edisch.vim"),
+                package_type: PackageType::Start,
+                depends: vec![],
+            },
+            Unit {
+                source: github("gw31415/mkdir.vim"),
+                package_type: PackageType::Opt(BTreeSet::from([LoadEvent::Autocmd(
+                    "BufWritePre".to_string(),
+                )])),
+                depends: vec![],
+            },
+        ],
         install, // INSTALL or not
         update,  // UPDATE or not
         config.clone(),
@@ -45,10 +68,9 @@ async fn main() {
     .await
     .expect("Failed to parse units");
     println!("Total Packages: {}", pkgs.len());
-    Package::merge(&mut pkgs);
-    println!("Merge Packages: {}", pkgs.len());
 
     let mut state = PackPathState::new();
+    Package::merge(&mut pkgs);
     while let Some(pkg) = pkgs.pop() {
         let Some(pkg) = state.insert(pkg) else {
             continue;

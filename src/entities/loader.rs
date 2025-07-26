@@ -2,8 +2,9 @@ use std::{ops::AddAssign, path::PathBuf, sync::Arc};
 
 use hashbrown::HashMap;
 use itertools::Itertools;
+use sailfish::TemplateSimple;
 
-use super::{FileSource, LoadEvent, Package, PackageID, PackageType};
+use super::{FileSource, LoadEvent, Package, PackageID, PackageIDStr, PackageType};
 
 pub struct Loader {
     autocmds: HashMap<String, Vec<Arc<PackageID>>>,
@@ -59,18 +60,22 @@ impl Loader {
     }
 
     fn lua_code(&self) -> String {
-        // TODO: Use sailfish template engine
         self.autocmds
             .iter()
             .map(|(event, ids)| {
-                let ids_str = format!(
-                    "{{{}}}",
-                    ids.iter().map(|id| format!("'{}'", id.as_str())).join(",")
-                );
-                let loadfunc =
-                    format!("function() for _,i in pairs {ids_str} do vim.cmd.packadd(i) end end");
-                format!(r#"vim.api.nvim_create_autocmd('{event}', {{ callback={loadfunc} }})"#)
+                let ids = ids
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<PackageIDStr>>();
+                Autocmd { event, ids }.render_once().unwrap()
             })
             .join("\n")
     }
+}
+
+#[derive(sailfish::TemplateSimple)]
+#[template(path = "loader_lua.stpl")]
+struct Autocmd<'a> {
+    event: &'a String,
+    ids: Vec<PackageIDStr>,
 }

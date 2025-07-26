@@ -7,10 +7,18 @@ use std::{
 };
 
 use itertools::Itertools;
+use sailfish::runtime::Render;
 use xxhash_rust::xxh3::xxh3_128;
 
 #[derive(Hash, PartialEq, Eq)]
 pub(super) struct PackageIDStr([u8; 32]);
+
+impl Render for PackageIDStr {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        b.push_str(self);
+        Ok(())
+    }
+}
 
 impl From<PackageIDStr> for Box<[u8]> {
     fn from(val: PackageIDStr) -> Self {

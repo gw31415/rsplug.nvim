@@ -1,0 +1,85 @@
+---@param ctx vim.api.keyset.create_autocmd.callback_args
+---@param ids string[]
+local function load_event(ctx, ids)
+	---@param options vim.api.keyset.exec_autocmds
+	local function doautocmd(options)
+		local opts = options or {}
+		vim.api.nvim_exec_autocmds(ctx.event, vim.tbl_deep_extend('force', {
+			buffer = ctx.buf,
+			modeline = false,
+			data = ctx.data,
+		}, opts))
+	end
+
+	local old_autocmds = vim.api.nvim_get_autocmds { event = ctx.event }
+	for _, id in pairs(ids) do
+		vim.cmd.packadd(id)
+	end
+	local autocmds = vim.api.nvim_get_autocmds { event = ctx.event }
+
+	---@param autocmd vim.api.keyset.get_autocmds.ret
+	---@return boolean
+	local function filter(autocmd)
+		for _, old in ipairs(old_autocmds) do
+			if autocmd.id and autocmd.id == old.id then
+				return false
+			end
+			if autocmd.group and autocmd.group == old.group then
+				return false
+			end
+			if autocmd.callback and autocmd.callback == old.callback then
+				return false
+			end
+			local is_same = true
+			for _, property in ipairs { 'buffer', 'buflocal', 'command', 'desc', 'once', 'pattern' } do
+				if autocmd[property] ~= autocmd.callback then
+					is_same = false
+					break
+				end
+			end
+			if is_same then
+				return false
+			end
+		end
+		return true
+	end
+	local new_autocmds = vim.tbl_filter(filter, autocmds)
+
+	if #new_autocmds == 0 then
+		return
+	end
+
+	-- Some workarounds
+	if ctx.event == 'InsertCharPre' then
+		vim.fn.feedkeys(vim.v.char)
+		vim.v.char = ''
+	end
+	if vim.fn.exists '#BufReadCmd' and ctx.event == 'BufNew' then
+		pcall(doautocmd)
+		return
+	end
+
+
+	local executed_groups = {}
+	local execute_functions = {}
+	for _, autocmd in ipairs(new_autocmds) do
+		if autocmd.group and not executed_groups[autocmd.group] then
+			executed_groups[autocmd.group] = true
+			table.insert(execute_functions, function()
+				doautocmd { group = autocmd.group }
+			end)
+		else
+			-- Fallback
+			pcall(doautocmd)
+			return
+		end
+	end
+
+	for _, func in ipairs(execute_functions) do
+		pcall(func)
+	end
+end
+
+vim.api.nvim_create_autocmd('<%= event %>', {callback=function(ctx)
+	load_event(ctx, {<% for id in ids {%>'<%= id %>', <%} %>})
+end, once=true})
