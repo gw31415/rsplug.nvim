@@ -15,7 +15,7 @@ impl From<Loader> for Vec<Package> {
         let mut pkgs = Vec::new();
         if !value.autocmds.is_empty() {
             pkgs.push({
-                let data = include_bytes!("../../lua/autocmd.lua").into();
+                let data = include_bytes!("../../lua/_rsplug/autocmd.lua").into();
 
                 let id = PackageID::new(&data);
                 let files = HashMap::from([(
