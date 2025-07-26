@@ -7,14 +7,12 @@ description = "Vim plugin manager written in Rust"
 
 [dependencies]
 anyhow = "1.0.98"
-async-trait = "0.1.88"
 clap = { version = "4.5.41", features = ["derive"] }
 hashbrown = "0.15.4"
 itertools = "0.14.0"
 rand = "0.9.2"
 regex = "1.11.1"
 sailfish = "0.9.1"
-serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0.12"
 tokio = { version = "1.46.1", features = ["full"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
