@@ -13,23 +13,31 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use super::*;
 
-/// 1つのプラグインを表す。GitHubかもしれないし、Hookスクリプトかもしれない
+/// 設定を構成する基本単位
 pub struct Unit {
+    /// 取得元
     pub source: UnitSource,
+    /// Unitに対応する読み込みタイプ
     pub package_type: PackageType,
+    /// 依存する Unit のリスト
     pub depends: Vec<Arc<Unit>>,
 }
 
+/// プラグインの取得元
 pub enum UnitSource {
+    /// GitHub リポジトリ
     GitHub {
+        /// リポジトリの所有者
         owner: String,
+        /// リポジトリ
         repo: String,
+        /// リビジョン
         rev: Option<String>,
     },
 }
 
 impl Unit {
-    /// キャッシュし、展開して Vec<Package> にする
+    /// キャッシュし、展開して Package のコレクションにする
     pub fn unpack<B: FromIterator<Package>>(
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
@@ -194,6 +202,8 @@ impl Unit {
 }
 
 mod git {
+    //! 各種 Git 操作を行うモジュール
+
     use std::{path::Path, process::Output};
 
     use super::MainResult;

@@ -13,6 +13,9 @@ use tokio::task::JoinSet;
 
 use super::*;
 
+/// インストール単位となるプラグイン。
+/// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
+/// Packageに変換する。
 pub struct Package {
     /// ID
     pub(super) id: PackageID,
@@ -47,6 +50,7 @@ impl Ord for Package {
 }
 
 impl Package {
+    /// BinaryHeap に保存された Package 群を可能な範囲でマージする
     pub fn merge(pkgs: &mut BinaryHeap<Self>) {
         let mut done_items = Vec::new();
 
@@ -90,12 +94,14 @@ impl Add for Package {
     }
 }
 
-pub enum FileSource {
+/// ファイルの取得(生成)元。
+pub(super) enum FileSource {
     Directory { path: PathBuf },
     File { data: Cow<'static, [u8]> },
 }
 
 impl FileSource {
+    /// whichfile が install_dir からの相対パスとなるようにデータを配置する。
     async fn yank(&self, whichfile: impl AsRef<Path>, install_dir: impl AsRef<Path>) -> MainResult {
         async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> MainResult {
             tokio::fs::create_dir_all(to.as_ref().parent().unwrap()).await?;
@@ -125,6 +131,7 @@ impl FileSource {
 
 type PackageFiles = (&'static str, Vec<(PathBuf, Arc<FileSource>)>);
 
+/// PackPath の象徴となる状態。この構造体に Package をインサートしていき、最後に実際のパスを指定して install を行う。
 #[derive(Default)]
 pub struct PackPathState {
     installing: HashSet<Box<[u8]>>,
@@ -132,9 +139,11 @@ pub struct PackPathState {
 }
 
 impl PackPathState {
+    /// 空の PackPathState を生成する。
     pub fn new() -> Self {
         Default::default()
     }
+    /// Package をインサートする。その Package の実行制御や設定に必要な Loader を Package に変換して返す。
     pub fn insert(&mut self, pkg: Package) -> Vec<Package> {
         let Package {
             id,
@@ -166,6 +175,9 @@ impl PackPathState {
             .unwrap_or_default()
     }
 
+    /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
+    /// NOTE: インストール後のディレクトリ構成は以下のようになる。
+    /// {packpath}/pack/_gen/{start_or_opt}/{id}/
     pub async fn install(self, packpath: &Path) -> MainResult {
         let gen_root = packpath.join("pack").join("_gen");
         tokio::fs::create_dir_all(&gen_root).await?;

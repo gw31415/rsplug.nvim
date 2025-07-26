@@ -3,8 +3,9 @@ use std::{ops::AddAssign, path::PathBuf, sync::Arc};
 use hashbrown::HashMap;
 use sailfish::TemplateSimple;
 
-use super::{FileSource, LoadEvent, Package, PackageID, PackageIDStr, PackageType};
+use super::*;
 
+/// プラグインの読み込み制御や、ロード後の設定 (lua_source等) にまつわる情報を保持し、Package に変換するための構造体。
 pub struct Loader {
     autocmds: HashMap<String, Vec<PackageIDStr>>,
 }
@@ -58,6 +59,10 @@ impl AddAssign for Loader {
 }
 
 impl Loader {
+    /// パッケージ情報を読み込み、 Loader を作成する。
+    /// 読み込む情報が要らない場合は `None` を返す。
+    /// NOTE: Package はインストールされる必要があるため、変更を抑制する意図で PackageID の所有権を奪う。
+    /// その他必要な情報のみ引数に取る。
     pub(super) fn create(id: PackageID, package_type: PackageType) -> Option<Self> {
         let PackageType::Opt(events) = package_type else {
             return None;
@@ -82,7 +87,7 @@ impl Loader {
     }
 }
 
-#[derive(sailfish::TemplateSimple)]
+#[derive(TemplateSimple)]
 #[template(path = "loader_lua.stpl")]
 struct Autocmd<'a> {
     autocmds: &'a HashMap<String, Vec<PackageIDStr>>,

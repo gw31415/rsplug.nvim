@@ -16,6 +16,7 @@ pub enum PackageType {
 
 impl PackageType {
     #[inline]
+    /// Startプラグインかどうかを判定する。
     pub fn is_start(&self) -> bool {
         matches!(self, PackageType::Start)
     }
@@ -81,6 +82,6 @@ impl<'a, Rhs: Into<Cow<'a, PackageType>>> BitAndAssign<Rhs> for PackageType {
 /// Optプラグインの読み込みイベントを表す。
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum LoadEvent {
-    /// 手動で packadd
+    /// Vim の自動コマンドイベント。
     Autocmd(String),
 }

@@ -10,6 +10,8 @@ use itertools::Itertools;
 use sailfish::runtime::Render;
 use xxhash_rust::xxh3::xxh3_128;
 
+/// 固定されたパッケージID(表示や書き込み用)。
+/// インストールが済んだ後に使用するのが望ましい。未インストールの PackageID は変更される可能性があるため。
 #[derive(Hash, PartialEq, Eq)]
 pub(super) struct PackageIDStr([u8; 32]);
 
@@ -79,6 +81,7 @@ impl PartialOrd for PackageID {
 }
 
 impl PackageID {
+    /// (内部用) 任意のデータからハッシュ利用し生成する。
     pub(super) fn new(data: impl AsRef<[u8]>) -> Self {
         Self(BTreeSet::from([u128::to_ne_bytes(xxh3_128(data.as_ref()))]))
     }
