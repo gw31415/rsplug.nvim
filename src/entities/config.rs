@@ -1,4 +1,3 @@
-
 use std::{iter::Sum, ops::AddAssign};
 
 use serde::Deserialize;

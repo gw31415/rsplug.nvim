@@ -7,7 +7,6 @@ pub mod package;
 pub mod package_id;
 pub mod unit;
 
-use config::*;
 use error::*;
 use lazy_type::*;
 use loader::*;

@@ -31,11 +31,11 @@ pub enum UnitSource {
 
 impl Unit {
     /// 設定ファイルから Unit のコレクションを構築する
-    pub fn new(config: impl Into<Config>) -> MainResult<Vec<Arc<Unit>>> {
+    pub fn new(config: Config) -> MainResult<Vec<Arc<Unit>>> {
         static GITHUB_REPO_REGEX: Lazy<Regex> = Lazy::new(|| {
             Regex::new(r"^(?<owner>[a-zA-Z0-9]([a-zA-Z0-9]?|[\-]?([a-zA-Z0-9])){0,38})/(?<repo>[a-zA-Z0-9][a-zA-Z0-9_.-]{0,38})$").unwrap()
         });
-        let Config { plugins } = config.into();
+        let Config { plugins } = config;
         let mut units: Vec<Arc<Unit>> = Vec::new();
         for plugin in plugins {
             let lazy_type = if plugin.start {

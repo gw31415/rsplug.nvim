@@ -5,6 +5,7 @@ pub use entities::package;
 pub use entities::unit;
 
 pub use entities::cache::Cache;
+pub use entities::config::Config;
 pub use error::Error;
 pub use lazy_type::{LazyType, LoadEvent};
 pub use package::{PackPathState, Package};
