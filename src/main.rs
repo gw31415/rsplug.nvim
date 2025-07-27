@@ -16,7 +16,7 @@ struct Args {
     update: bool,
     /// Config files to process
     #[arg()]
-    paths: Vec<PathBuf>,
+    config_files: Vec<PathBuf>,
 }
 
 static DEFAULT_APP_DIR: Lazy<PathBuf> = Lazy::new(|| {
@@ -30,23 +30,25 @@ async fn main() {
     let Args {
         install,
         update,
-        paths,
+        config_files,
     } = Args::parse();
 
     let units = {
-        let config = paths
+        let configs = config_files
             .into_iter()
-            .map(tokio::fs::read_to_string)
+            .map(|path| async {
+                let content = tokio::fs::read_to_string(path).await?;
+                let config = toml::from_str::<Config>(&content)?;
+                Ok::<_, Error>(config)
+            })
             .collect::<JoinSet<_>>()
             .join_all()
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
-            .expect("Could not load some configuration files")
-            .into_iter()
-            .map(|content| toml::from_str::<Config>(&content).unwrap())
-            .sum();
-        Unit::new(config).unwrap()
+            .expect("Some config files failed to parse")
+            .into_iter();
+        Unit::new(configs.sum()).unwrap()
     };
 
     let mut pkgs: BinaryHeap<_> = Cache::new(DEFAULT_APP_DIR.as_path())
