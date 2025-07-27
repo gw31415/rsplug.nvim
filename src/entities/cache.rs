@@ -205,21 +205,23 @@ impl Default for Cache {
     fn default() -> Self {
         Cache {
             ignore: vec![
-                r"^README\.md$".to_string(),
-                r"^LICENSE$".to_string(),
-                r"^LICENSE\.txt$".to_string(),
-                r"^LICENSE\.md$".to_string(),
                 r"^COPYING$".to_string(),
                 r"^COPYING\.txt$".to_string(),
+                r"^LICENSE$".to_string(),
+                r"^LICENSE\.md$".to_string(),
+                r"^LICENSE\.txt$".to_string(),
+                r"^README$".to_string(),
+                r"^README\.md$".to_string(),
+                r"^README\.txt$".to_string(),
+                r"^\.gitattributes$".to_string(),
+                r"^\.github$".to_string(),
                 r"^\.gitignore$".to_string(),
+                r"^\.gitmessage$".to_string(),
                 r"^\.tool-versions$".to_string(),
                 r"^\.vscode$".to_string(),
                 r"^deno\.json$".to_string(),
-                r"^deno\.lock$".to_string(),
                 r"^deno\.jsonc$".to_string(),
-                r"^\.gitmessage$".to_string(),
-                r"^\.gitattributes$".to_string(),
-                r"^\.github$".to_string(),
+                r"^deno\.lock$".to_string(),
             ],
             cachepath: {
                 let homedir = std::env::home_dir().unwrap();
