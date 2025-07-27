@@ -8,6 +8,8 @@ pub enum Error {
     #[error(transparent)]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error(transparent)]
+    Serde(#[from] toml::de::Error),
+    #[error(transparent)]
     Regex(#[from] regex::Error),
 }
 

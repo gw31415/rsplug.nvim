@@ -1,15 +1,8 @@
-use std::{
-    borrow::Borrow,
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
-};
+use std::sync::Arc;
 
-use hashbrown::HashMap;
-use rand::RngCore;
-use regex::RegexSet;
-use tokio::task::JoinSet;
-use xxhash_rust::xxh3::xxh3_128;
+use config_file::PluginConfig;
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 use super::*;
 
@@ -37,256 +30,97 @@ pub enum UnitSource {
 }
 
 impl Unit {
-    /// キャッシュし、展開して Package のコレクションにする
-    pub fn unpack<B: FromIterator<Package>>(
-        unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
-        install: bool,
-        update: bool,
-        config: impl Into<Arc<Config>>,
-    ) -> Pin<Box<dyn Future<Output = MainResult<B>> + Send + Sync>> {
-        let config = config.into();
-        Box::pin(async move {
-            let ignore = Arc::new(RegexSet::new(&config.install.ignore)?);
-            let pkgs: B = unit
-                .into_iter()
-                .map(move |unit| {
-                    let (config, ignore) = (config.clone(), ignore.clone());
-                    async move {
-                        let unit: Arc<Unit> = unit.into();
-
-                        let Unit {
-                            source,
-                            lazy_type,
-                            depends,
-                        } = unit.borrow();
-                        let mut pkgs: Vec<_> = depends
-                            .iter()
-                            .map(|dep| {
-                                Self::unpack::<Vec<_>>(
-                                    [dep.clone()],
-                                    install,
-                                    update,
-                                    config.clone(),
-                                )
-                            })
-                            .collect::<JoinSet<_>>()
-                            .join_all()
-                            .await
-                            .into_iter()
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_iter()
-                            .flatten()
-                            .collect();
-                        for pkg in pkgs.iter_mut() {
-                            pkg.lazy_type &= lazy_type;
-                        }
-
-                        'add_pkg: {
-                            let pkg: Package = match &source {
-                                UnitSource::GitHub { owner, repo, rev } => {
-                                    let proj_root = config
-                                        .cachepath
-                                        .join("repos")
-                                        .join("github.com")
-                                        .join(owner)
-                                        .join(repo);
-
-                                    tokio::fs::create_dir_all(&proj_root).await?;
-                                    let proj_root = proj_root.canonicalize()?;
-                                    let filesource =
-                                        Arc::new(FileSource::Directory { path: proj_root });
-                                    let FileSource::Directory { path: proj_root } =
-                                        filesource.as_ref()
-                                    else {
-                                        // SAFETY: すぐ上の行で `sourcefile` を `Directory` として宣言している。
-                                        unsafe { std::hint::unreachable_unchecked() };
-                                    };
-
-                                    // リポジトリがない場合のインストール処理
-                                    if !git::exists(proj_root).await {
-                                        if install {
-                                            git::init(
-                                                format!("https://github.com/{owner}/{repo}"),
-                                                proj_root,
-                                            )
-                                            .await?;
-                                            // 初期インストール時はfetchも行う
-                                            git::fetch(rev, proj_root).await?;
-                                        } else {
-                                            // インストールされていない場合はスキップ
-                                            break 'add_pkg;
-                                        }
-                                    }
-
-                                    // アップデート処理
-                                    if update {
-                                        git::fetch(rev, proj_root).await?;
-                                    }
-
-                                    // ディレクトリ内容からのIDの決定
-                                    let id = PackageID::new({
-                                        let (head, diff) = tokio::join!(
-                                            git::head(proj_root),
-                                            git::diff(proj_root),
-                                        );
-                                        if let (Some(mut head), Some(diff)) = (head, diff) {
-                                            head.extend(diff);
-                                            u128::to_ne_bytes(xxh3_128(&head))
-                                        } else {
-                                            unsafe {
-                                                std::mem::transmute::<[u64; 2], [u8; 16]>([
-                                                    rand::rng().next_u64(),
-                                                    rand::rng().next_u64(),
-                                                ])
-                                            }
-                                        }
-                                    });
-
-                                    let files: HashMap<PathBuf, Arc<FileSource>> = {
-                                        let std::process::Output {
-                                            stdout,
-                                            status,
-                                            stderr,
-                                        } = tokio::process::Command::new("git")
-                                            .current_dir(proj_root)
-                                            .arg("ls-files")
-                                            .arg("--full-name")
-                                            .output()
-                                            .await?;
-                                        if !status.success() {
-                                            return Err(std::io::Error::new(
-                                                std::io::ErrorKind::Interrupted,
-                                                String::from_utf8_lossy(&stderr),
-                                            ))?;
-                                        }
-                                        String::from_utf8(stdout)?
-                                    }
-                                    .split('\n')
-                                    .filter(|fname| {
-                                        let fname = Path::new(fname);
-                                        let ignore = fname.iter().any(|k| {
-                                            let Some(k) = k.to_str() else {
-                                                // Utf8でないファイル名を持つファイルも無視
-                                                return true;
-                                            };
-                                            ignore.is_match(k)
-                                        });
-                                        !ignore && proj_root.join(fname).is_file()
-                                    })
-                                    .map(|fname| (fname.to_owned().into(), filesource.clone()))
-                                    .collect();
-                                    Package {
-                                        id,
-                                        files,
-                                        lazy_type: lazy_type.clone(),
-                                    }
-                                }
-                            };
-                            pkgs.push(pkg);
-                        }
-
-                        Ok::<_, Error>(pkgs)
+    /// 設定ファイルから Unit のコレクションを構築する
+    pub fn new(config: impl Into<PluginConfig>) -> MainResult<Vec<Arc<Unit>>> {
+        static GITHUB_REPO_REGEX: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"^(?<owner>[a-zA-Z0-9]([a-zA-Z0-9]?|[\-]?([a-zA-Z0-9])){0,38})/(?<repo>[a-zA-Z0-9][a-zA-Z0-9_.-]{0,38})$").unwrap()
+        });
+        let PluginConfig { plugins } = config.into();
+        let mut units: Vec<Arc<Unit>> = Vec::new();
+        for plugin in plugins {
+            let lazy_type = if plugin.start {
+                LazyType::Start
+            } else {
+                LazyType::Opt(
+                    plugin
+                        .on_event
+                        .into_iter()
+                        .map(LoadEvent::Autocmd)
+                        .collect(),
+                )
+            };
+            let source = {
+                if let Some(captures) = GITHUB_REPO_REGEX.captures(&plugin.repo) {
+                    let (owner, repo) = (&captures["owner"], &captures["repo"]);
+                    UnitSource::GitHub {
+                        owner: owner.to_string(),
+                        repo: repo.to_string(),
+                        rev: plugin.rev,
                     }
-                })
-                .collect::<JoinSet<_>>()
-                .join_all()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect::<B>();
-            Ok(pkgs)
-        })
+                } else {
+                    return Err(Error::Serde(serde::de::Error::custom(format!(
+                        "Invalid repo format: {}",
+                        plugin.repo
+                    ))));
+                }
+            };
+            let unit = Arc::new(Unit {
+                source,
+                lazy_type,
+                depends: Vec::new(),
+            });
+            units.push(unit);
+        }
+        Ok(units)
     }
 }
 
-mod git {
-    //! 各種 Git 操作を行うモジュール
+mod config_file {
+    use std::{iter::Sum, ops::AddAssign};
 
-    use std::{path::Path, process::Output};
+    use serde::Deserialize;
+    use serde_with::{OneOrMany, serde_as};
 
-    use super::MainResult;
-
-    /// リポジトリが存在するかどうか
-    pub async fn exists(dir: &Path) -> bool {
-        matches!(
-            tokio::fs::try_exists(dir.join(".git").join("HEAD")).await,
-            Ok(true)
-        )
+    impl<T: IntoIterator<Item = PluginConfig>> From<T> for PluginConfig {
+        fn from(value: T) -> Self {
+            value.into_iter().sum()
+        }
     }
 
-    /// リポジトリ初期化処理
-    pub async fn init(repo: String, dir: &Path) -> MainResult {
-        let _ = tokio::fs::remove_dir_all(dir.join(".git")).await;
-        tokio::process::Command::new("git")
-            .current_dir(dir)
-            .arg("init")
-            .spawn()?
-            .wait()
-            .await?;
-
-        tokio::process::Command::new("git")
-            .current_dir(dir)
-            .arg("remote")
-            .arg("add")
-            .arg("origin")
-            .arg(repo)
-            .spawn()?
-            .wait()
-            .await?;
-        Ok(())
+    /// 設定ファイルの構造体
+    #[serde_as]
+    #[derive(Deserialize)]
+    pub struct PluginConfig {
+        pub(super) plugins: Vec<Plugin>,
     }
 
-    /// リポジトリ同期処理
-    pub async fn fetch(rev: &Option<String>, dir: &Path) -> MainResult {
-        let rev: &[&str] = if let Some(rev) = rev { &[rev] } else { &[] };
-        tokio::process::Command::new("git")
-            .current_dir(dir)
-            .arg("fetch")
-            .arg("--depth=1")
-            .arg("origin")
-            .args(rev)
-            .spawn()?
-            .wait()
-            .await?;
-
-        tokio::process::Command::new("git")
-            .current_dir(dir)
-            .arg("switch")
-            .arg("--detach")
-            .arg("FETCH_HEAD")
-            .spawn()?
-            .wait()
-            .await?;
-        Ok(())
+    impl AddAssign for PluginConfig {
+        fn add_assign(&mut self, rhs: Self) {
+            self.plugins.extend(rhs.plugins);
+        }
     }
 
-    /// HEAD のハッシュ
-    pub async fn head(dir: &Path) -> Option<Vec<u8>> {
-        let Ok(Output { stdout, status, .. }) = tokio::process::Command::new("git")
-            .current_dir(dir)
-            .arg("rev-parse")
-            .arg("HEAD")
-            .output()
-            .await
-        else {
-            return None;
-        };
-        if status.success() { Some(stdout) } else { None }
+    impl Sum for PluginConfig {
+        fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+            let mut res = PluginConfig {
+                plugins: Default::default(),
+            };
+            for plugin in iter {
+                res += plugin;
+            }
+            res
+        }
     }
 
-    /// diff の出力
-    pub async fn diff(dir: &Path) -> Option<Vec<u8>> {
-        let Ok(Output { stdout, status, .. }) = tokio::process::Command::new("git")
-            .current_dir(dir)
-            .arg("diff")
-            .arg("HEAD")
-            .output()
-            .await
-        else {
-            return None;
-        };
-        if status.success() { Some(stdout) } else { None }
+    #[serde_as]
+    #[derive(Deserialize)]
+    pub(super) struct Plugin {
+        pub repo: String,
+        #[serde(default)]
+        pub start: bool,
+        #[serde_as(as = "OneOrMany<_>")]
+        #[serde(default)]
+        pub on_event: Vec<String>,
+        pub rev: Option<String>,
     }
 }

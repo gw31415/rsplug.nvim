@@ -25,6 +25,8 @@ pub struct Package {
     pub(super) files: HashMap<PathBuf, Arc<FileSource>>,
 }
 
+pub struct PackageConfig {}
+
 impl PartialEq for Package {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
