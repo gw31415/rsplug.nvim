@@ -52,7 +52,7 @@ async fn main() {
     };
 
     let mut pkgs: BinaryHeap<_> = Cache::new(DEFAULT_APP_DIR.as_path())
-        .install(units, install, update)
+        .fetch(units, install, update)
         .await
         .expect("Failed to parse units");
     println!("Total Packages: {}", pkgs.len());

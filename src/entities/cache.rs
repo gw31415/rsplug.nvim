@@ -29,16 +29,16 @@ impl Cache {
         }
     }
     /// キャッシュし、展開して Package のコレクションにする
-    pub fn install<B: FromIterator<Package>>(
+    pub fn fetch<B: FromIterator<Package>>(
         self,
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
     ) -> Pin<Box<dyn Future<Output = MainResult<B>> + Send + Sync>> {
-        Self::install_inner(self.into(), unit, install, update)
+        Self::fetch_inner(self.into(), unit, install, update)
     }
 
-    fn install_inner<B: FromIterator<Package>>(
+    fn fetch_inner<B: FromIterator<Package>>(
         config: Arc<Self>,
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
@@ -62,7 +62,7 @@ impl Cache {
                         let mut pkgs: Vec<_> = depends
                             .iter()
                             .map(|dep| {
-                                Self::install_inner::<Vec<_>>(
+                                Self::fetch_inner::<Vec<_>>(
                                     config.clone(),
                                     [dep.clone()],
                                     install,
