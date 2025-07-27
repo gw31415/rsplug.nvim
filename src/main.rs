@@ -15,7 +15,6 @@ struct Args {
     #[arg(short, long)]
     update: bool,
     /// Config files to process
-    #[arg()]
     config_files: Vec<PathBuf>,
 }
 
@@ -34,6 +33,7 @@ async fn main() {
     } = Args::parse();
 
     let units = {
+        // parse config files into Vec<Arc<Unit>>
         let configs = config_files
             .into_iter()
             .map(|path| async {
@@ -51,21 +51,26 @@ async fn main() {
         Unit::new(configs.sum()).unwrap()
     };
 
+    // Fetch packages through Cache based on the Units
     let mut pkgs: BinaryHeap<_> = Cache::new(DEFAULT_APP_DIR.as_path())
         .fetch(units, install, update)
         .await
         .expect("Failed to parse units");
     println!("Total Packages: {}", pkgs.len());
 
+    // Create PackPathState and insert packages into it
     let mut state = PackPathState::new();
     Package::merge(&mut pkgs);
     while let Some(pkg) = pkgs.pop() {
         for pkg in state.insert(pkg) {
+            // Some Packages to manage lazy-loading may be returned,
+            // so insert them next iteration.
             pkgs.push(pkg);
         }
         Package::merge(&mut pkgs);
     }
 
+    // Install the packages into the packpath.
     state.install(DEFAULT_APP_DIR.as_path()).await.unwrap();
     std::io::stdout().flush().unwrap();
 }

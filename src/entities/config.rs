@@ -13,6 +13,7 @@ impl<T: IntoIterator<Item = Config>> From<T> for Config {
 #[serde_as]
 #[derive(Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub(super) plugins: Vec<Plugin>,
 }
 

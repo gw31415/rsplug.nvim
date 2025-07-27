@@ -1,3 +1,4 @@
+mod util;
 mod entities;
 pub use entities::error;
 pub use entities::lazy_type;

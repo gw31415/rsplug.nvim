@@ -7,6 +7,8 @@ pub mod package;
 pub mod package_id;
 pub mod unit;
 
+use crate::util;
+
 use error::*;
 use lazy_type::*;
 use loader::*;
