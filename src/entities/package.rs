@@ -11,7 +11,7 @@ use std::{
 use hashbrown::{HashMap, HashSet};
 use tokio::task::JoinSet;
 
-use super::*;
+use super::{config::SetupScript, *};
 
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
@@ -19,10 +19,12 @@ use super::*;
 pub struct Package {
     /// ID
     pub(super) id: PackageID,
-    // PackageType
+    /// PackageType
     pub(super) lazy_type: LazyType,
-    // 配置するファイル
+    /// 配置するファイル
     pub(super) files: HashMap<PathBuf, Arc<FileSource>>,
+    /// セットアップスクリプト
+    pub(super) script: SetupScript,
 }
 
 pub struct PackageConfig {}
@@ -151,6 +153,7 @@ impl PackPathState {
             id,
             lazy_type,
             files,
+            script,
         } = pkg;
 
         let already_installed = !self.installing.insert(id.as_str().into());
@@ -168,7 +171,7 @@ impl PackPathState {
             files.push((path, source));
         }
 
-        Loader::create(id, lazy_type)
+        Loader::create(id, lazy_type, script)
             .map(Into::<Vec<Package>>::into)
             .unwrap_or_default()
     }

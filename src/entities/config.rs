@@ -45,4 +45,11 @@ pub(super) struct Plugin {
     #[serde(default)]
     pub on_event: Vec<String>,
     pub rev: Option<String>,
+    #[serde(flatten)]
+    pub script: SetupScript,
+}
+
+#[derive(Deserialize, Clone, Default)]
+pub(super) struct SetupScript {
+    pub lua_source: Option<String>,
 }

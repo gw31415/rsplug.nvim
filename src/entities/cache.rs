@@ -58,6 +58,7 @@ impl Cache {
                             source,
                             lazy_type,
                             depends,
+                            script,
                         } = unit.borrow();
                         let mut pkgs: Vec<_> = depends
                             .iter()
@@ -179,6 +180,7 @@ impl Cache {
                                         id,
                                         files,
                                         lazy_type: lazy_type.clone(),
+                                        script: script.clone(),
                                     }
                                 }
                             };

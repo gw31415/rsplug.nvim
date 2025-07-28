@@ -4,7 +4,9 @@ use config::Config;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::*;
+use crate::entities::config::Plugin;
+
+use super::{config::SetupScript, *};
 
 /// 設定を構成する基本単位
 pub struct Unit {
@@ -14,6 +16,8 @@ pub struct Unit {
     pub lazy_type: LazyType,
     /// 依存する Unit のリスト
     pub depends: Vec<Arc<Unit>>,
+    /// セットアップスクリプト
+    pub script: SetupScript,
 }
 
 /// プラグインの取得元
@@ -38,29 +42,30 @@ impl Unit {
         let Config { plugins } = config;
         let mut units: Vec<Arc<Unit>> = Vec::new();
         for plugin in plugins {
-            let lazy_type = if plugin.start {
+            let Plugin {
+                start,
+                repo,
+                on_event,
+                rev,
+                script,
+            } = plugin;
+            let lazy_type = if start {
                 LazyType::Start
             } else {
-                LazyType::Opt(
-                    plugin
-                        .on_event
-                        .into_iter()
-                        .map(LoadEvent::Autocmd)
-                        .collect(),
-                )
+                LazyType::Opt(on_event.into_iter().map(LoadEvent::Autocmd).collect())
             };
             let source = {
-                if let Some(captures) = GITHUB_REPO_REGEX.captures(&plugin.repo) {
+                if let Some(captures) = GITHUB_REPO_REGEX.captures(&repo) {
                     let (owner, repo) = (&captures["owner"], &captures["repo"]);
                     UnitSource::GitHub {
                         owner: owner.to_string(),
                         repo: repo.to_string(),
-                        rev: plugin.rev,
+                        rev,
                     }
                 } else {
                     return Err(Error::Serde(serde::de::Error::custom(format!(
                         "Invalid repo format: {}",
-                        plugin.repo
+                        repo
                     ))));
                 }
             };
@@ -68,6 +73,7 @@ impl Unit {
                 source,
                 lazy_type,
                 depends: Vec::new(),
+                script,
             });
             units.push(unit);
         }

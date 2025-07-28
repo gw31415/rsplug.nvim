@@ -1,5 +1,5 @@
-mod util;
 mod entities;
+mod util;
 pub use entities::error;
 pub use entities::lazy_type;
 pub use entities::package;
