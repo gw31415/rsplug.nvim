@@ -19,8 +19,8 @@ use super::{config::SetupScript, *};
 pub struct Package {
     /// ID
     pub(super) id: PackageID,
-    /// PackageType
-    pub(super) lazy_type: LazyType,
+    /// プラグインの遅延実行タイプ
+    pub lazy_type: LazyType,
     /// 配置するファイル
     pub(super) files: HashMap<PathBuf, Arc<FileSource>>,
     /// セットアップスクリプト
@@ -152,8 +152,8 @@ impl PackPathState {
     pub fn new() -> Self {
         Default::default()
     }
-    /// Package をインサートする。その Package の実行制御や設定に必要な Loader を Package に変換して返す。
-    pub fn insert(&mut self, pkg: Package) -> Vec<Package> {
+    /// Package をインサートする。その Package の実行制御や設定に必要な Loader を返す。
+    pub fn insert(&mut self, pkg: Package) -> Option<Loader> {
         let Package {
             id,
             lazy_type,
@@ -163,7 +163,7 @@ impl PackPathState {
 
         let already_installed = !self.installing.insert(id.as_str().into());
         if already_installed {
-            return Vec::new();
+            return None;
         }
 
         let pkg_type_str = if lazy_type.is_start() { "start" } else { "opt" };
@@ -177,8 +177,6 @@ impl PackPathState {
         }
 
         Loader::create(id, lazy_type, script)
-            .map(Into::<Vec<Package>>::into)
-            .unwrap_or_default()
     }
 
     /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。

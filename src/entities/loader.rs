@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::AddAssign, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, iter::Sum, ops::AddAssign, path::PathBuf, sync::Arc};
 
 use hashbrown::HashMap;
 use sailfish::TemplateSimple;
@@ -96,12 +96,27 @@ impl From<Loader> for Vec<Package> {
 
 impl AddAssign for Loader {
     fn add_assign(&mut self, other: Self) {
-        for (event, ids) in other.autocmds {
+        let Self { autocmds, scripts } = other;
+        for (event, ids) in autocmds {
             self.autocmds
                 .entry(event)
                 .or_default()
                 .extend(ids.into_iter());
         }
+        self.scripts.extend(scripts);
+    }
+}
+
+impl Sum for Loader {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        let mut res = Loader {
+            autocmds: HashMap::new(),
+            scripts: HashMap::new(),
+        };
+        for l in iter {
+            res += l
+        }
+        res
     }
 }
 

@@ -60,14 +60,31 @@ async fn main() {
 
     // Create PackPathState and insert packages into it
     let mut state = PackPathState::new();
+    let mut loader = None;
     Package::merge(&mut pkgs);
-    while let Some(pkg) = pkgs.pop() {
-        for pkg in state.insert(pkg) {
-            // Some Packages to manage lazy-loading may be returned,
-            // so insert them next iteration.
+    loop {
+        let Some(pkg) = pkgs.pop() else {
+            break;
+        };
+
+        // Merging more by accumulating Loader until all the rest of the pkgs are Start
+        if pkg.lazy_type.is_start()
+            && let Some(l) = loader
+        {
+            loader = None;
             pkgs.push(pkg);
+            pkgs.extend(Into::<Vec<Package>>::into(l));
+            Package::merge(&mut pkgs);
+            continue;
         }
-        Package::merge(&mut pkgs);
+
+        if let Some(l) = state.insert(pkg) {
+            if let Some(ref mut loader) = loader {
+                *loader += l;
+            } else {
+                loader = Some(l);
+            }
+        }
     }
 
     // Install the packages into the packpath.
