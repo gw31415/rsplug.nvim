@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use config::Config;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::entities::config::Plugin;
 
-use super::{config::SetupScript, *};
+use super::*;
 
 /// 設定を構成する基本単位
 pub struct Unit {
@@ -64,8 +63,7 @@ impl Unit {
                     }
                 } else {
                     return Err(Error::Serde(serde::de::Error::custom(format!(
-                        "Invalid repo format: {}",
-                        repo
+                        "Invalid repo format: {repo}",
                     ))));
                 }
             };

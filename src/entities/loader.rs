@@ -1,9 +1,9 @@
-use std::{ops::AddAssign, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, ops::AddAssign, path::PathBuf, sync::Arc};
 
 use hashbrown::HashMap;
 use sailfish::TemplateSimple;
 
-use super::{config::SetupScript, *};
+use super::*;
 
 /// プラグインの読み込み制御や、ロード後の設定 (lua_source等) にまつわる情報を保持し、Package に変換するための構造体。
 pub struct Loader {
@@ -11,31 +11,64 @@ pub struct Loader {
     scripts: HashMap<PackageIDStr, SetupScript>,
 }
 
+/// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
+fn startup_instant_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Package {
+    let data = data.into();
+    let id = PackageID::new(&data) + PackageID::new(path);
+    let files = HashMap::from([(PathBuf::from(path), Arc::new(FileSource::File { data }))]);
+    Package {
+        id,
+        lazy_type: LazyType::Start,
+        files,
+        script: Default::default(),
+    }
+}
+
 impl From<Loader> for Vec<Package> {
     fn from(value: Loader) -> Vec<Package> {
         let Loader {
             autocmds,
-            scripts: _,
+            scripts: base_scripts,
         } = value;
 
         let mut pkgs = Vec::new();
         if !autocmds.is_empty() {
-            pkgs.push({
-                let data = include_bytes!("../../lua/_rsplug/init.lua").into();
+            // Add the basic lazy loading modules
+            pkgs.push(startup_instant_pkg(
+                "lua/_rsplug/init.lua",
+                include_bytes!("../../lua/_rsplug/init.lua"),
+            ));
 
-                let id = PackageID::new(&data);
-                let files = HashMap::from([(
-                    PathBuf::from("lua/_rsplug/init.lua"),
-                    Arc::new(FileSource::File { data }),
-                )]);
-                Package {
-                    id,
-                    lazy_type: LazyType::Start,
-                    files,
-                    script: Default::default(),
+            // Add packages to place scripts that does the initial setup of the plugin
+            let mut scripts = HashMap::new();
+            for (pkgid, script) in base_scripts {
+                let mut script_set = HashMap::new();
+                let mut add_script = |script_type: &'static str, content: Option<String>| {
+                    if let Some(content) = content {
+                        let module_id = format!("{script_type}_{pkgid}");
+                        pkgs.push(startup_instant_pkg(
+                            &format!("lua/{module_id}.lua"),
+                            content.into_bytes(),
+                        ));
+                        script_set.insert(script_type, module_id);
+                    }
+                };
+
+                let SetupScript { lua_source } = script;
+                add_script("lua_source", lua_source);
+                if !script_set.is_empty() {
+                    scripts.insert(pkgid, script_set);
                 }
-            });
+            }
+            pkgs.push(startup_instant_pkg(
+                "plugin/_rsplug_setup_scripts.lua",
+                SetupScriptsTemplate { scripts }
+                    .render_once()
+                    .unwrap()
+                    .into_bytes(),
+            ));
 
+            // Add autocmd setup
             pkgs.push({
                 let data = AutocmdTemplate {
                     autocmds: &autocmds,
@@ -95,6 +128,13 @@ impl Loader {
         }
         Some(Self { autocmds, scripts })
     }
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "setup_scripts.stpl")]
+#[template(escape = false)]
+struct SetupScriptsTemplate {
+    scripts: HashMap<PackageIDStr, HashMap<&'static str, String>>,
 }
 
 #[derive(TemplateSimple)]

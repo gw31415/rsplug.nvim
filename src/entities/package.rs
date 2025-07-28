@@ -81,6 +81,11 @@ impl Add for Package {
         if self.lazy_type != rhs.lazy_type {
             return (self, Some(rhs));
         }
+        if self.id.0.is_superset(&rhs.id.0) {
+            return (self, None);
+        } else if rhs.id.0.is_superset(&self.id.0) {
+            return (rhs, None);
+        }
         let mergeable = {
             let (sfname, rfname): (HashSet<_>, HashSet<_>) =
                 (self.files.keys().collect(), rhs.files.keys().collect());

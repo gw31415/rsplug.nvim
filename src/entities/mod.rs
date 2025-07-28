@@ -9,6 +9,7 @@ pub mod unit;
 
 use crate::util;
 
+use config::*;
 use error::*;
 use lazy_type::*;
 use loader::*;

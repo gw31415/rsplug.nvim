@@ -49,7 +49,9 @@ pub(super) struct Plugin {
     pub script: SetupScript,
 }
 
+/// プラグインのセットアップに用いるスクリプト群
 #[derive(Deserialize, Clone, Default)]
-pub(super) struct SetupScript {
+pub struct SetupScript {
+    /// プラグイン読み込み直後に実行される Lua スクリプト
     pub lua_source: Option<String>,
 }
