@@ -219,6 +219,7 @@ impl Default for Cache {
                 r"^\.github$".to_string(),
                 r"^\.gitignore$".to_string(),
                 r"^\.gitmessage$".to_string(),
+                r"^\.luacheckrc$".to_string(),
                 r"^\.tool-versions$".to_string(),
                 r"^\.vscode$".to_string(),
                 r"^deno\.json$".to_string(),
