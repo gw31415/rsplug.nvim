@@ -212,6 +212,7 @@ impl Default for Cache {
                 r"^LICENSE$".to_string(),
                 r"^LICENSE\.md$".to_string(),
                 r"^LICENSE\.txt$".to_string(),
+                r"^Makefile$".to_string(),
                 r"^README$".to_string(),
                 r"^README\.md$".to_string(),
                 r"^README\.txt$".to_string(),
