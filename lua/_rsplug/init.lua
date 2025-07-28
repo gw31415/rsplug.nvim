@@ -1,13 +1,11 @@
----@alias Package { id: string }
-
----@param pkg Package
+---@param pkg string
 local function packadd(pkg)
-	vim.cmd.packadd(pkg.id)
+	vim.cmd.packadd(pkg)
 end
 return {
 	packadd = packadd,
 	---@param ctx vim.api.keyset.create_autocmd.callback_args
-	---@param pkgs Package[]
+	---@param pkgs string[]
 	autocmd_callback = function(ctx, pkgs)
 		---@param options vim.api.keyset.exec_autocmds
 		local function doautocmd(options)
