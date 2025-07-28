@@ -153,7 +153,7 @@ impl PackPathState {
         Default::default()
     }
     /// Package をインサートする。その Package の実行制御や設定に必要な Loader を返す。
-    pub fn insert(&mut self, pkg: Package) -> Option<Loader> {
+    pub fn insert(&mut self, pkg: Package) -> Loader {
         let Package {
             id,
             lazy_type,
@@ -163,7 +163,7 @@ impl PackPathState {
 
         let already_installed = !self.installing.insert(id.as_str().into());
         if already_installed {
-            return None;
+            return Default::default();
         }
 
         let pkg_type_str = if lazy_type.is_start() { "start" } else { "opt" };

@@ -1,4 +1,6 @@
-use std::{borrow::Cow, iter::Sum, ops::AddAssign, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow, collections::BTreeMap, iter::Sum, ops::AddAssign, path::PathBuf, sync::Arc,
+};
 
 use hashbrown::HashMap;
 use sailfish::TemplateSimple;
@@ -6,9 +8,10 @@ use sailfish::TemplateSimple;
 use super::*;
 
 /// プラグインの読み込み制御や、ロード後の設定 (lua_source等) にまつわる情報を保持し、Package に変換するための構造体。
+#[derive(Default)]
 pub struct Loader {
-    autocmds: HashMap<String, Vec<PackageIDStr>>,
-    scripts: HashMap<PackageIDStr, SetupScript>,
+    autocmds: BTreeMap<String, Vec<PackageIDStr>>,
+    scripts: BTreeMap<PackageIDStr, SetupScript>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -40,9 +43,9 @@ impl From<Loader> for Vec<Package> {
             ));
 
             // Add packages to place scripts that does the initial setup of the plugin
-            let mut scripts = HashMap::new();
+            let mut scripts = BTreeMap::new();
             for (pkgid, script) in base_scripts {
-                let mut script_set = HashMap::new();
+                let mut script_set = BTreeMap::new();
                 let mut add_script = |script_type: &'static str, content: Option<String>| {
                     if let Some(content) = content {
                         let module_id = format!("{script_type}_{pkgid}");
@@ -109,10 +112,7 @@ impl AddAssign for Loader {
 
 impl Sum for Loader {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        let mut res = Loader {
-            autocmds: HashMap::new(),
-            scripts: HashMap::new(),
-        };
+        let mut res = Loader::new();
         for l in iter {
             res += l
         }
@@ -121,18 +121,30 @@ impl Sum for Loader {
 }
 
 impl Loader {
+    /// Create empty loader
+    pub fn new() -> Self {
+        Default::default()
+    }
+    /// Loaderが空かどうか
+    pub fn is_empty(&self) -> bool {
+        self.autocmds.is_empty() && self.scripts.is_empty()
+    }
+    /// Loaderを Package のベクタに変換する。
+    pub fn into_pkgs(self) -> Vec<Package> {
+        self.into()
+    }
     /// パッケージ情報を読み込み、 Loader を作成する。
     /// 読み込む情報が要らない場合は `None` を返す。
     /// NOTE: Package はインストールされる必要があるため、変更を抑制する意図で PackageID の所有権を奪う。
     /// その他必要な情報のみ引数に取る。
-    pub(super) fn create(id: PackageID, lazy_type: LazyType, script: SetupScript) -> Option<Self> {
+    pub(super) fn create(id: PackageID, lazy_type: LazyType, script: SetupScript) -> Self {
         let LazyType::Opt(events) = lazy_type else {
-            return None;
+            return Default::default();
         };
-        let mut autocmds: HashMap<String, Vec<_>> = HashMap::new();
+        let mut autocmds: BTreeMap<String, Vec<_>> = BTreeMap::new();
 
         let id = Arc::new(id);
-        let scripts = HashMap::from([(id.as_str(), script)]);
+        let scripts = BTreeMap::from([(id.as_str(), script)]);
         for ev in events {
             use LoadEvent::*;
             match ev {
@@ -141,7 +153,7 @@ impl Loader {
                 }
             }
         }
-        Some(Self { autocmds, scripts })
+        Self { autocmds, scripts }
     }
 }
 
@@ -149,12 +161,12 @@ impl Loader {
 #[template(path = "setup_scripts.stpl")]
 #[template(escape = false)]
 struct SetupScriptsTemplate {
-    scripts: HashMap<PackageIDStr, HashMap<&'static str, String>>,
+    scripts: BTreeMap<PackageIDStr, BTreeMap<&'static str, String>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "autocmd.stpl")]
 #[template(escape = false)]
 struct AutocmdTemplate<'a> {
-    autocmds: &'a HashMap<String, Vec<PackageIDStr>>,
+    autocmds: &'a BTreeMap<String, Vec<PackageIDStr>>,
 }
