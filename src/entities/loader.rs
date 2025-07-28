@@ -11,7 +11,7 @@ use super::*;
 #[derive(Default)]
 pub struct Loader {
     autocmds: BTreeMap<String, Vec<PackageIDStr>>,
-    scripts: BTreeMap<PackageIDStr, SetupScript>,
+    scripts: Vec<(PackageIDStr, SetupScript)>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -43,7 +43,7 @@ impl From<Loader> for Vec<Package> {
             ));
 
             // Add packages to place scripts that does the initial setup of the plugin
-            let mut scripts = BTreeMap::new();
+            let mut scripts = Vec::new();
             for (pkgid, script) in base_scripts {
                 let mut script_set = BTreeMap::new();
                 let mut add_script = |script_type: &'static str, content: Option<String>| {
@@ -60,7 +60,7 @@ impl From<Loader> for Vec<Package> {
                 let SetupScript { lua_source } = script;
                 add_script("lua_source", lua_source);
                 if !script_set.is_empty() {
-                    scripts.insert(pkgid, script_set);
+                    scripts.push((pkgid, script_set));
                 }
             }
             pkgs.push(startup_instant_pkg(
@@ -144,7 +144,7 @@ impl Loader {
         let mut autocmds: BTreeMap<String, Vec<_>> = BTreeMap::new();
 
         let id = Arc::new(id);
-        let scripts = BTreeMap::from([(id.as_str(), script)]);
+        let scripts = Vec::from([(id.as_str(), script)]);
         for ev in events {
             use LoadEvent::*;
             match ev {
@@ -161,7 +161,7 @@ impl Loader {
 #[template(path = "setup_scripts.stpl")]
 #[template(escape = false)]
 struct SetupScriptsTemplate {
-    scripts: BTreeMap<PackageIDStr, BTreeMap<&'static str, String>>,
+    scripts: Vec<(PackageIDStr, BTreeMap<&'static str, String>)>,
 }
 
 #[derive(TemplateSimple)]
