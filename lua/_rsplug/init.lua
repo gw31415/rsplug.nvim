@@ -1,7 +1,14 @@
+---@alias Package { id: string }
+
+---@param pkg Package
+local function packadd(pkg)
+	vim.cmd.packadd(pkg.id)
+end
 return {
+	packadd = packadd,
 	---@param ctx vim.api.keyset.create_autocmd.callback_args
-	---@param ids string[]
-	autocmd_callback = function(ctx, ids)
+	---@param pkgs Package[]
+	autocmd_callback = function(ctx, pkgs)
 		---@param options vim.api.keyset.exec_autocmds
 		local function doautocmd(options)
 			local opts = options or {}
@@ -13,8 +20,8 @@ return {
 		end
 
 		local old_autocmds = vim.api.nvim_get_autocmds { event = ctx.event }
-		for _, id in pairs(ids) do
-			vim.cmd.packadd(id)
+		for _, pkg in pairs(pkgs) do
+			packadd(pkg)
 		end
 		local autocmds = vim.api.nvim_get_autocmds { event = ctx.event }
 
