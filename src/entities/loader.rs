@@ -15,11 +15,11 @@ impl From<Loader> for Vec<Package> {
         let mut pkgs = Vec::new();
         if !value.autocmds.is_empty() {
             pkgs.push({
-                let data = include_bytes!("../../lua/_rsplug/autocmd.lua").into();
+                let data = include_bytes!("../../lua/_rsplug/init.lua").into();
 
                 let id = PackageID::new(&data);
                 let files = HashMap::from([(
-                    PathBuf::from("lua/_rsplug/autocmd.lua"),
+                    PathBuf::from("lua/_rsplug/init.lua"),
                     Arc::new(FileSource::File { data }),
                 )]);
                 Package {

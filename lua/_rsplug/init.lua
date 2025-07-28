@@ -1,7 +1,7 @@
 return {
 	---@param ctx vim.api.keyset.create_autocmd.callback_args
 	---@param ids string[]
-	load_event = function(ctx, ids)
+	autocmd_callback = function(ctx, ids)
 		---@param options vim.api.keyset.exec_autocmds
 		local function doautocmd(options)
 			local opts = options or {}
