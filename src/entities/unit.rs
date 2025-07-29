@@ -55,12 +55,11 @@ impl Unit {
             };
             let source = {
                 if let Some(captures) = GITHUB_REPO_REGEX.captures(&repo) {
-                    let (owner, repo) = (&captures["owner"], &captures["repo"]);
-                    UnitSource::GitHub {
-                        owner: owner.to_string(),
-                        repo: repo.to_string(),
-                        rev,
-                    }
+                    let repo_start = captures.name("repo").unwrap().start();
+                    let mut owner = repo;
+                    let repo = owner.split_off(repo_start);
+                    owner.pop();
+                    UnitSource::GitHub { owner, repo, rev }
                 } else {
                     return Err(Error::Serde(serde::de::Error::custom(format!(
                         "Invalid repo format: {repo}",
