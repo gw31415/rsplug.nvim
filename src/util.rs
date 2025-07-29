@@ -5,7 +5,7 @@ pub mod git {
 
     use tokio::process::Command;
 
-    use super::super::error::ExternalCommandError;
+    use crate::rsplug::error::ExternalCommandError;
 
     type ExecuteResult<T = Vec<u8>> = Result<T, ExternalCommandError>;
 

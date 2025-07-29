@@ -4,8 +4,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_with::DeserializeFromStr;
 
-use crate::entities::config::Plugin;
-
 use super::*;
 
 /// 設定を構成する基本単位

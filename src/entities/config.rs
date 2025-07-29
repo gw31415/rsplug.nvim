@@ -3,7 +3,7 @@ use std::{iter::Sum, ops::AddAssign};
 use serde::Deserialize;
 use serde_with::{OneOrMany, serde_as};
 
-use crate::UnitSource;
+use super::*;
 
 impl<T: IntoIterator<Item = Config>> From<T> for Config {
     fn from(value: T) -> Self {

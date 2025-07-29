@@ -12,7 +12,7 @@ use std::{
 use hashbrown::{HashMap, HashSet};
 use tokio::task::JoinSet;
 
-use super::{config::SetupScript, *};
+use super::*;
 
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
@@ -27,8 +27,6 @@ pub struct Package {
     /// セットアップスクリプト
     pub(super) script: SetupScript,
 }
-
-pub struct PackageConfig {}
 
 impl PartialEq for Package {
     fn eq(&self, other: &Self) -> bool {

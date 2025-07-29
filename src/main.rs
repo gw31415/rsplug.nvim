@@ -1,8 +1,27 @@
+mod entities;
+mod util;
+
+mod rsplug {
+    use super::*;
+
+    pub use entities::error;
+    pub use entities::lazy_type;
+    pub use entities::package;
+    pub use entities::unit;
+
+    pub use entities::cache::Cache;
+    pub use entities::config::Config;
+    pub use entities::loader::Loader;
+    pub use error::Error;
+    pub use lazy_type::{LazyType, LoadEvent};
+    pub use package::{PackPathState, Package};
+    pub use unit::{Unit, UnitSource};
+}
+
 use std::{collections::BinaryHeap, io::Write, path::PathBuf};
 
 use clap::Parser;
 use once_cell::sync::Lazy;
-use rsplug::*;
 use tokio::task::JoinSet;
 
 #[derive(clap::Parser, Debug)]
@@ -38,8 +57,8 @@ async fn main() {
             .into_iter()
             .map(|path| async {
                 let content = tokio::fs::read_to_string(path).await?;
-                let config = toml::from_str::<Config>(&content)?;
-                Ok::<_, Error>(config)
+                let config = toml::from_str::<rsplug::Config>(&content)?;
+                Ok::<_, rsplug::Error>(config)
             })
             .collect::<JoinSet<_>>()
             .join_all()
@@ -48,26 +67,26 @@ async fn main() {
             .collect::<Result<Vec<_>, _>>()
             .expect("Some config files failed to parse")
             .into_iter();
-        Unit::new(configs.sum())
+        rsplug::Unit::new(configs.sum())
     };
 
     // Fetch packages through Cache based on the Units
-    let mut pkgs: BinaryHeap<_> = Cache::new(DEFAULT_APP_DIR.as_path())
+    let mut pkgs: BinaryHeap<_> = rsplug::Cache::new(DEFAULT_APP_DIR.as_path())
         .fetch(units, install, update)
         .await
         .expect("Failed to parse units");
     println!("Total Packages: {}", pkgs.len());
 
     // Create PackPathState and insert packages into it
-    let mut state = PackPathState::new();
-    let loader = &mut Loader::new();
-    Package::merge(&mut pkgs);
+    let mut state = rsplug::PackPathState::new();
+    let loader = &mut rsplug::Loader::new();
+    rsplug::Package::merge(&mut pkgs);
     while let Some(pkg) = pkgs.pop() {
         // Merging more by accumulating Loader until all the rest of the pkgs are Start
         if pkg.lazy_type.is_start() && !loader.is_empty() {
             pkgs.push(pkg);
             pkgs.extend(std::mem::take(loader).into_pkgs());
-            Package::merge(&mut pkgs);
+            rsplug::Package::merge(&mut pkgs);
             continue;
         }
 
