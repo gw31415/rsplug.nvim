@@ -5,7 +5,7 @@ mod rsplug {
     use super::*;
 
     pub use entities::error;
-    pub use entities::lazy_type;
+    // pub use entities::lazy_type;
     pub use entities::package;
     pub use entities::unit;
 
@@ -13,9 +13,9 @@ mod rsplug {
     pub use entities::config::Config;
     pub use entities::loader::Loader;
     pub use error::Error;
-    pub use lazy_type::{LazyType, LoadEvent};
+    // pub use lazy_type::{LazyType, LoadEvent};
     pub use package::{PackPathState, Package};
-    pub use unit::{Unit, UnitSource};
+    pub use unit::{Unit /*UnitSource*/};
 }
 
 use std::{collections::BinaryHeap, io::Write, path::PathBuf};
