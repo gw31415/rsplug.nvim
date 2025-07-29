@@ -16,6 +16,7 @@ struct Args {
     #[arg(short, long)]
     update: bool,
     /// Config files to process
+    #[arg(required = true)]
     config_files: Vec<PathBuf>,
 }
 
