@@ -53,7 +53,7 @@ impl Cache {
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<B, ExternalSystemError>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<B, Error>> + Send + Sync>> {
         Self::fetch_inner(self.into(), unit, install, update)
     }
 
@@ -62,7 +62,7 @@ impl Cache {
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<B, ExternalSystemError>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<B, Error>> + Send + Sync>> {
         let config = config.clone();
         let ignore = Arc::new(config.ignore.clone());
         Box::pin(async move {
@@ -192,7 +192,7 @@ impl Cache {
                             pkgs.push(pkg);
                         }
 
-                        Ok::<_, ExternalSystemError>(pkgs)
+                        Ok::<_, Error>(pkgs)
                     }
                 })
                 .collect::<JoinSet<_>>()

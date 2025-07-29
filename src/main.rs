@@ -12,7 +12,6 @@ mod rsplug {
     pub use entities::cache::Cache;
     pub use entities::config::Config;
     pub use entities::loader::Loader;
-    pub use error::Error;
     // pub use lazy_type::{LazyType, LoadEvent};
     pub use package::{PackPathState, Package};
     pub use unit::{Unit /*UnitSource*/};
@@ -56,9 +55,8 @@ async fn main() {
         let configs = config_files
             .into_iter()
             .map(|path| async {
-                let content = tokio::fs::read_to_string(path).await?;
-                let config = toml::from_str::<rsplug::Config>(&content)?;
-                Ok::<_, rsplug::Error>(config)
+                let content = tokio::fs::read_to_string(path).await.expect("System Error");
+                toml::from_str::<rsplug::Config>(&content)
             })
             .collect::<JoinSet<_>>()
             .join_all()
@@ -74,23 +72,23 @@ async fn main() {
     let mut pkgs: BinaryHeap<_> = rsplug::Cache::new(DEFAULT_APP_DIR.as_path())
         .fetch(units, install, update)
         .await
-        .expect("Failed to parse units");
+        .expect("System Error");
     println!("Total Packages: {}", pkgs.len());
 
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
-    let loader = &mut rsplug::Loader::new();
+    let mut loader = rsplug::Loader::new();
     rsplug::Package::merge(&mut pkgs);
     while let Some(pkg) = pkgs.pop() {
         // Merging more by accumulating Loader until all the rest of the pkgs are Start
         if pkg.lazy_type.is_start() && !loader.is_empty() {
             pkgs.push(pkg);
-            pkgs.extend(std::mem::take(loader).into_pkgs());
+            pkgs.extend(std::mem::take(&mut loader).into_pkgs());
             rsplug::Package::merge(&mut pkgs);
             continue;
         }
 
-        *loader += state.insert(pkg);
+        loader += state.insert(pkg);
     }
 
     // Install the packages into the packpath.
