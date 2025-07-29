@@ -48,7 +48,7 @@ async fn main() {
             .collect::<Result<Vec<_>, _>>()
             .expect("Some config files failed to parse")
             .into_iter();
-        Unit::new(configs.sum()).unwrap()
+        Unit::new(configs.sum())
     };
 
     // Fetch packages through Cache based on the Units

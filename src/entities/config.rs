@@ -3,6 +3,8 @@ use std::{iter::Sum, ops::AddAssign};
 use serde::Deserialize;
 use serde_with::{OneOrMany, serde_as};
 
+use crate::UnitSource;
+
 impl<T: IntoIterator<Item = Config>> From<T> for Config {
     fn from(value: T) -> Self {
         value.into_iter().sum()
@@ -38,13 +40,12 @@ impl Sum for Config {
 #[serde_as]
 #[derive(Deserialize)]
 pub(super) struct Plugin {
-    pub repo: String,
+    pub repo: UnitSource,
     #[serde(default)]
     pub start: bool,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     pub on_event: Vec<String>,
-    pub rev: Option<String>,
     #[serde(flatten)]
     pub script: SetupScript,
 }
