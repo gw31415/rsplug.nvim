@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     cmp::Ordering,
     collections::BinaryHeap,
+    io,
     ops::Add,
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
@@ -111,8 +112,12 @@ pub(super) enum FileSource {
 
 impl FileSource {
     /// whichfile が install_dir からの相対パスとなるようにデータを配置する。
-    async fn yank(&self, whichfile: impl AsRef<Path>, install_dir: impl AsRef<Path>) -> MainResult {
-        async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> MainResult {
+    async fn yank(
+        &self,
+        whichfile: impl AsRef<Path>,
+        install_dir: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
             tokio::fs::create_dir_all(to.as_ref().parent().unwrap()).await?;
             #[cfg(target_os = "macos")]
             tokio::fs::copy(from, to).await?;
@@ -182,11 +187,11 @@ impl PackPathState {
     /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
     /// NOTE: インストール後のディレクトリ構成は以下のようになる。
     /// {packpath}/pack/_gen/{start_or_opt}/{id}/
-    pub async fn install(self, packpath: &Path) -> MainResult {
+    pub async fn install(self, packpath: &Path) -> io::Result<()> {
         let gen_root = packpath.join("pack").join("_gen");
         tokio::fs::create_dir_all(&gen_root).await?;
         let Self { installing, files } = self;
-        let mut tasks = JoinSet::<MainResult>::new();
+        let mut tasks = JoinSet::new();
 
         for (id, (start_or_opt, files)) in files {
             let dir = Arc::new(gen_root.join(start_or_opt).join(id));
