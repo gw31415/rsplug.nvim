@@ -10,7 +10,7 @@ use regex::RegexSet;
 use tokio::task::JoinSet;
 use xxhash_rust::xxh3::xxh3_128;
 
-use super::{util::git, *};
+use super::*;
 
 /// プラグインのキャッシュ
 pub struct Cache {

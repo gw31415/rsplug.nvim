@@ -7,7 +7,7 @@ pub mod package;
 pub mod package_id;
 pub mod unit;
 
-use crate::util;
+use crate::util::*;
 
 use config::*;
 use error::*;
