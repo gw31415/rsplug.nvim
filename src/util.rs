@@ -5,11 +5,12 @@ pub mod git {
 
     use tokio::process::Command;
 
-    use crate::rsplug::error::ExternalCommandError;
+    use crate::rsplug::error::ExternalSystemError;
 
-    type ExecuteResult<T = Vec<u8>> = Result<T, ExternalCommandError>;
+    type ExecuteResult<T = Vec<u8>> = Result<T, ExternalSystemError>;
 
-    async fn execute(cmd: &mut Command) -> ExecuteResult {
+    /// 外部コマンドを実行する
+    pub async fn execute(cmd: &mut Command) -> ExecuteResult {
         let Output {
             stdout,
             status,
@@ -18,7 +19,7 @@ pub mod git {
         if status.success() {
             Ok(stdout)
         } else {
-            Err(ExternalCommandError::Failed { stderr })
+            Err(ExternalSystemError::ProcessFailed { stderr })
         }
     }
 

@@ -10,12 +10,32 @@ use regex::RegexSet;
 use tokio::task::JoinSet;
 use xxhash_rust::xxh3::xxh3_128;
 
+use crate::util::git::execute;
+
 use super::*;
+
+struct IntoStringSplit(String, char);
+
+impl Iterator for IntoStringSplit {
+    type Item = String;
+    fn next(&mut self) -> Option<Self::Item> {
+        let Self(data, c) = self;
+        if data.is_empty() {
+            return None;
+        }
+        let Some(pos) = data.rfind(|ch| &ch == c) else {
+            return Some(std::mem::take(data));
+        };
+        let item = data.split_off(pos + 1);
+        data.pop();
+        Some(item)
+    }
+}
 
 /// プラグインのキャッシュ
 pub struct Cache {
     // インストールを無視するファイル名パターン (Regexパターン)
-    pub ignore: Vec<String>,
+    pub ignore: RegexSet,
     // キャッシュディレクトリのパス
     pub cachepath: Cow<'static, Path>,
 }
@@ -33,7 +53,7 @@ impl Cache {
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Pin<Box<dyn Future<Output = MainResult<B>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<B, ExternalSystemError>> + Send + Sync>> {
         Self::fetch_inner(self.into(), unit, install, update)
     }
 
@@ -42,10 +62,10 @@ impl Cache {
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Pin<Box<dyn Future<Output = MainResult<B>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<B, ExternalSystemError>> + Send + Sync>> {
         let config = config.clone();
+        let ignore = Arc::new(config.ignore.clone());
         Box::pin(async move {
-            let ignore = Arc::new(RegexSet::new(&config.ignore)?);
             let pkgs: B = unit
                 .into_iter()
                 .map(move |unit| {
@@ -139,37 +159,27 @@ impl Cache {
                                     });
 
                                     let files: HashMap<PathBuf, Arc<FileSource>> = {
-                                        let std::process::Output {
-                                            stdout,
-                                            status,
-                                            stderr,
-                                        } = tokio::process::Command::new("git")
-                                            .current_dir(proj_root)
-                                            .arg("ls-files")
-                                            .arg("--full-name")
-                                            .output()
-                                            .await?;
-                                        if !status.success() {
-                                            return Err(std::io::Error::new(
-                                                std::io::ErrorKind::Interrupted,
-                                                String::from_utf8_lossy(&stderr),
-                                            ))?;
-                                        }
-                                        String::from_utf8(stdout)?
+                                        let stdout = execute(
+                                            tokio::process::Command::new("git")
+                                                .current_dir(proj_root)
+                                                .arg("ls-files")
+                                                .arg("--full-name"),
+                                        )
+                                        .await?;
+                                        IntoStringSplit(String::from_utf8(stdout)?, '\n')
                                     }
-                                    .split('\n')
-                                    .filter(|fname| {
-                                        let fname = Path::new(fname);
-                                        let ignore = fname.iter().any(|k| {
-                                            let Some(k) = k.to_str() else {
-                                                // Utf8でないファイル名を持つファイルも無視
-                                                return true;
-                                            };
+                                    .filter_map(|fname| {
+                                        let fname = PathBuf::from(fname);
+                                        let ignored = fname.iter().any(|k| {
+                                            let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
                                             ignore.is_match(k)
                                         });
-                                        !ignore && proj_root.join(fname).is_file()
+                                        if !ignored && proj_root.join(&fname).is_file() {
+                                            Some((fname, filesource.clone()))
+                                        } else {
+                                            None
+                                        }
                                     })
-                                    .map(|fname| (fname.to_owned().into(), filesource.clone()))
                                     .collect();
                                     Package {
                                         id,
@@ -182,7 +192,7 @@ impl Cache {
                             pkgs.push(pkg);
                         }
 
-                        Ok::<_, Error>(pkgs)
+                        Ok::<_, ExternalSystemError>(pkgs)
                     }
                 })
                 .collect::<JoinSet<_>>()
@@ -201,7 +211,7 @@ impl Cache {
 impl Default for Cache {
     fn default() -> Self {
         Cache {
-            ignore: vec![
+            ignore: RegexSet::new(vec![
                 r"^COPYING$".to_string(),
                 r"^COPYING\.txt$".to_string(),
                 r"^LICENSE$".to_string(),
@@ -221,7 +231,8 @@ impl Default for Cache {
                 r"^deno\.json$".to_string(),
                 r"^deno\.jsonc$".to_string(),
                 r"^deno\.lock$".to_string(),
-            ],
+            ])
+            .unwrap(),
             cachepath: {
                 let homedir = std::env::home_dir().unwrap();
                 let cachedir = homedir.join(".cache");

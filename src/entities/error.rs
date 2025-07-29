@@ -14,17 +14,16 @@ pub enum Error {
     #[error(transparent)]
     Regex(#[from] regex::Error),
     #[error(transparent)]
-    ExternalCommand(#[from] ExternalCommandError),
+    ExternalSystem(#[from] ExternalSystemError),
 }
 
-/// メインの結果型
-pub type MainResult<T = ()> = Result<T, Error>;
-
-/// 外部コマンドのエラー型
+/// システム由来のエラー型
 #[derive(thiserror::Error, Debug)]
-pub enum ExternalCommandError {
+pub enum ExternalSystemError {
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error("Execution failed: {}", String::from_utf8_lossy(stderr))]
-    Failed { stderr: Vec<u8> },
+    #[error("Process failed: {}", String::from_utf8_lossy(stderr))]
+    ProcessFailed { stderr: Vec<u8> },
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
 }
