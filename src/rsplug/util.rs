@@ -1,27 +1,30 @@
+use std::process::Output;
+
+use tokio::process::Command;
+
+use super::error::Error;
+
+type ExecuteResult<T = Vec<u8>> = Result<T, Error>;
+
+/// 外部コマンドを実行する
+pub async fn execute(cmd: &mut Command) -> ExecuteResult {
+    let Output {
+        stdout,
+        status,
+        stderr,
+    } = cmd.output().await?;
+    if status.success() {
+        Ok(stdout)
+    } else {
+        Err(Error::ProcessFailed { stderr })
+    }
+}
+
 pub mod git {
     //! 各種 Git 操作を行うモジュール
+    use std::path::Path;
 
-    use std::{path::Path, process::Output};
-
-    use tokio::process::Command;
-
-    use crate::rsplug::error::Error;
-
-    type ExecuteResult<T = Vec<u8>> = Result<T, Error>;
-
-    /// 外部コマンドを実行する
-    pub async fn execute(cmd: &mut Command) -> ExecuteResult {
-        let Output {
-            stdout,
-            status,
-            stderr,
-        } = cmd.output().await?;
-        if status.success() {
-            Ok(stdout)
-        } else {
-            Err(Error::ProcessFailed { stderr })
-        }
-    }
+    use super::*;
 
     /// リポジトリが存在するかどうか
     pub async fn exists(dir: &Path) -> bool {

@@ -10,9 +10,10 @@ use regex::RegexSet;
 use tokio::task::JoinSet;
 use xxhash_rust::xxh3::xxh3_128;
 
-use crate::util::git::execute;
-
-use super::*;
+use super::{
+    util::{execute, git},
+    *,
+};
 
 struct IntoStringSplit(String, char);
 

@@ -1,22 +1,4 @@
-mod entities;
-mod util;
-
-mod rsplug {
-    use super::*;
-
-    pub use entities::error;
-    // pub use entities::lazy_type;
-    pub use entities::package;
-    pub use entities::unit;
-
-    pub use entities::cache::Cache;
-    pub use entities::config::Config;
-    pub use entities::loader::Loader;
-    // pub use lazy_type::{LazyType, LoadEvent};
-    pub use package::{PackPathState, Package};
-    pub use unit::{Unit /*UnitSource*/};
-}
-
+mod rsplug;
 use std::{collections::BinaryHeap, io::Write, path::PathBuf};
 
 use clap::Parser;

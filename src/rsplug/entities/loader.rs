@@ -39,7 +39,7 @@ impl From<Loader> for Vec<Package> {
             // Add the basic lazy loading modules
             pkgs.push(startup_instant_pkg(
                 "lua/_rsplug/init.lua",
-                include_bytes!("../../lua/_rsplug/init.lua"),
+                include_bytes!("../../../lua/_rsplug/init.lua"),
             ));
 
             // Add packages to place scripts that does the initial setup of the plugin
