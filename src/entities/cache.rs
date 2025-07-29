@@ -6,7 +6,6 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use rand::RngCore;
 use regex::RegexSet;
 use tokio::task::JoinSet;
 use xxhash_rust::xxh3::xxh3_128;
@@ -130,16 +129,12 @@ impl Cache {
                                             git::head(proj_root),
                                             git::diff(proj_root),
                                         );
-                                        if let (Some(mut head), Some(diff)) = (head, diff) {
-                                            head.extend(diff);
-                                            u128::to_ne_bytes(xxh3_128(&head))
-                                        } else {
-                                            unsafe {
-                                                std::mem::transmute::<[u64; 2], [u8; 16]>([
-                                                    rand::rng().next_u64(),
-                                                    rand::rng().next_u64(),
-                                                ])
+                                        match (head, diff) {
+                                            (Ok(mut head), Ok(diff)) => {
+                                                head.extend(diff);
+                                                u128::to_ne_bytes(xxh3_128(&head))
                                             }
+                                            (Err(err), _) | (_, Err(err)) => Err(err)?,
                                         }
                                     });
 
