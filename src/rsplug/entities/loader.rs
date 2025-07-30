@@ -88,22 +88,37 @@ impl From<Loader> for Vec<Package> {
         }
 
         if !event2pkgid.is_empty() {
-            // Add autocmd setup
+            // on_event setup
             pkgs.push({
-                let data = OnEventSetupTemplate {
+                let events = event2pkgid.keys();
+                let on_event_setup = OnEventSetupTemplate { events }
+                    .render_once()
+                    .unwrap()
+                    .into_bytes()
+                    .into();
+                let on_event_setup_id = PackageID::new(&on_event_setup);
+                let on_event = OnEventTemplate {
                     event2pkgid: &event2pkgid,
                 }
                 .render_once()
                 .unwrap()
                 .into_bytes()
                 .into();
-                let id = PackageID::new(&data);
-                let files = HashMap::from([(
-                    PathBuf::from(format!("plugin/{}.lua", id.as_str())),
-                    Arc::new(FileSource::File { data }),
-                )]);
+                let on_event_id = PackageID::new(&on_event);
+                let files = HashMap::from([
+                    (
+                        PathBuf::from("lua/_rsplug/on_event.lua"),
+                        Arc::new(FileSource::File { data: on_event }),
+                    ),
+                    (
+                        PathBuf::from(format!("plugin/{}.lua", on_event_setup_id.as_str())),
+                        Arc::new(FileSource::File {
+                            data: on_event_setup,
+                        }),
+                    ),
+                ]);
                 Package {
-                    id,
+                    id: on_event_setup_id + on_event_id,
                     lazy_type: LazyType::Start,
                     files,
                     script: Default::default(),
@@ -112,7 +127,7 @@ impl From<Loader> for Vec<Package> {
         }
 
         if !cmd2pkgid.is_empty() {
-            // Add autocmd setup
+            // on_cmd setup
             pkgs.push({
                 let cmds = cmd2pkgid.keys();
                 let on_cmd_setup = OnCmdSetupTemplate { cmds }
@@ -241,6 +256,13 @@ struct SetupScriptsTemplate {
 #[template(path = "plugin/on_event.stpl")]
 #[template(escape = false)]
 struct OnEventSetupTemplate<'a> {
+    events: Keys<'a, String, Vec<PackageIDStr>>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "lua/_rsplug/on_event.stpl")]
+#[template(escape = false)]
+struct OnEventTemplate<'a> {
     event2pkgid: &'a BTreeMap<String, Vec<PackageIDStr>>,
 }
 
