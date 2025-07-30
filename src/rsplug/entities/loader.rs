@@ -15,9 +15,9 @@ use super::*;
 /// プラグインの読み込み制御や、ロード後の設定 (lua_source等) にまつわる情報を保持し、Package に変換するための構造体。
 #[derive(Default)]
 pub struct Loader {
-    autocmds: BTreeMap<String, Vec<PackageIDStr>>,
     scripts: Vec<(PackageIDStr, SetupScript)>,
-    cmd_id_map: BTreeMap<String, PackageIDStr>,
+    event2pkgid: BTreeMap<String, Vec<PackageIDStr>>,
+    cmd2pkgid: BTreeMap<String, PackageIDStr>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -39,9 +39,9 @@ impl From<Loader> for Vec<Package> {
             return Vec::with_capacity(0);
         }
         let Loader {
-            autocmds,
             scripts,
-            cmd_id_map,
+            event2pkgid,
+            cmd2pkgid,
         } = value;
 
         let mut pkgs = vec![
@@ -87,11 +87,11 @@ impl From<Loader> for Vec<Package> {
             ));
         }
 
-        if !autocmds.is_empty() {
+        if !event2pkgid.is_empty() {
             // Add autocmd setup
             pkgs.push({
-                let data = AutocmdTemplate {
-                    autocmds: &autocmds,
+                let data = OnEventSetupTemplate {
+                    event2pkgid: &event2pkgid,
                 }
                 .render_once()
                 .unwrap()
@@ -111,36 +111,36 @@ impl From<Loader> for Vec<Package> {
             });
         }
 
-        if !cmd_id_map.is_empty() {
+        if !cmd2pkgid.is_empty() {
             // Add autocmd setup
             pkgs.push({
-                let cmds = cmd_id_map.keys();
-                let command = CommandTemplate { cmds }
+                let cmds = cmd2pkgid.keys();
+                let on_cmd_setup = OnCmdSetupTemplate { cmds }
                     .render_once()
                     .unwrap()
                     .into_bytes()
                     .into();
-                let command_id = PackageID::new(&command);
-                let lazycmd = LazycmdTemplate {
-                    cmd_id_map: &cmd_id_map,
+                let on_cmd_setup_id = PackageID::new(&on_cmd_setup);
+                let on_cmd = OnCmdTemplate {
+                    cmd2pkgid: &cmd2pkgid,
                 }
                 .render_once()
                 .unwrap()
                 .into_bytes()
                 .into();
-                let lazycmd_id = PackageID::new(&lazycmd);
+                let on_cmd_id = PackageID::new(&on_cmd);
                 let files = HashMap::from([
                     (
-                        PathBuf::from("lua/_rsplug/lazycmd.lua"),
-                        Arc::new(FileSource::File { data: lazycmd }),
+                        PathBuf::from("lua/_rsplug/on_cmd.lua"),
+                        Arc::new(FileSource::File { data: on_cmd }),
                     ),
                     (
-                        PathBuf::from(format!("plugin/{}.lua", command_id.as_str())),
-                        Arc::new(FileSource::File { data: command }),
+                        PathBuf::from(format!("plugin/{}.lua", on_cmd_setup_id.as_str())),
+                        Arc::new(FileSource::File { data: on_cmd_setup }),
                     ),
                 ]);
                 Package {
-                    id: lazycmd_id + command_id,
+                    id: on_cmd_id + on_cmd_setup_id,
                     lazy_type: LazyType::Start,
                     files,
                     script: Default::default(),
@@ -155,18 +155,18 @@ impl From<Loader> for Vec<Package> {
 impl AddAssign for Loader {
     fn add_assign(&mut self, other: Self) {
         let Self {
-            autocmds,
             scripts,
-            cmd_id_map,
+            event2pkgid,
+            cmd2pkgid,
         } = other;
-        for (event, ids) in autocmds {
-            self.autocmds
+        for (event, ids) in event2pkgid {
+            self.event2pkgid
                 .entry(event)
                 .or_default()
                 .extend(ids.into_iter());
         }
         self.scripts.extend(scripts);
-        self.cmd_id_map.extend(cmd_id_map);
+        self.cmd2pkgid.extend(cmd2pkgid);
     }
 }
 
@@ -188,11 +188,11 @@ impl Loader {
     /// Loaderが空かどうか
     pub fn is_empty(&self) -> bool {
         let Self {
-            autocmds,
-            cmd_id_map,
             scripts,
+            event2pkgid,
+            cmd2pkgid,
         } = self;
-        autocmds.is_empty() && scripts.is_empty() && cmd_id_map.is_empty()
+        event2pkgid.is_empty() && scripts.is_empty() && cmd2pkgid.is_empty()
     }
     /// Loaderを Package のベクタに変換する。
     pub fn into_pkgs(self) -> Vec<Package> {
@@ -206,8 +206,8 @@ impl Loader {
         let LazyType::Opt(events) = lazy_type else {
             return Default::default();
         };
-        let mut autocmds: BTreeMap<String, Vec<_>> = BTreeMap::new();
-        let mut cmd_id_map: BTreeMap<String, PackageIDStr> = BTreeMap::new();
+        let mut event2pkgid: BTreeMap<String, Vec<_>> = BTreeMap::new();
+        let mut cmd2pkgid: BTreeMap<String, PackageIDStr> = BTreeMap::new();
 
         let id = Arc::new(id);
         let scripts = Vec::from([(id.as_str(), script)]);
@@ -215,26 +215,19 @@ impl Loader {
             use LoadEvent::*;
             match ev {
                 Autocmd(autocmd) => {
-                    autocmds.entry(autocmd).or_default().push(id.as_str());
+                    event2pkgid.entry(autocmd).or_default().push(id.as_str());
                 }
                 Cmd(cmd) => {
-                    cmd_id_map.insert(cmd, id.as_str());
+                    cmd2pkgid.insert(cmd, id.as_str());
                 }
             }
         }
         Self {
-            autocmds,
             scripts,
-            cmd_id_map,
+            event2pkgid,
+            cmd2pkgid,
         }
     }
-}
-
-#[derive(TemplateSimple)]
-#[template(path = "autocmd.stpl")]
-#[template(escape = false)]
-struct AutocmdTemplate<'a> {
-    autocmds: &'a BTreeMap<String, Vec<PackageIDStr>>,
 }
 
 #[derive(TemplateSimple)]
@@ -245,15 +238,22 @@ struct SetupScriptsTemplate {
 }
 
 #[derive(TemplateSimple)]
-#[template(path = "command.stpl")]
+#[template(path = "plugin/on_event.stpl")]
 #[template(escape = false)]
-struct CommandTemplate<'a> {
+struct OnEventSetupTemplate<'a> {
+    event2pkgid: &'a BTreeMap<String, Vec<PackageIDStr>>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "plugin/on_cmd.stpl")]
+#[template(escape = false)]
+struct OnCmdSetupTemplate<'a> {
     cmds: Keys<'a, String, PackageIDStr>,
 }
 
 #[derive(TemplateSimple)]
-#[template(path = "lazycmd.stpl")]
+#[template(path = "lua/_rsplug/on_cmd.stpl")]
 #[template(escape = false)]
-struct LazycmdTemplate<'a> {
-    cmd_id_map: &'a BTreeMap<String, PackageIDStr>,
+struct OnCmdTemplate<'a> {
+    cmd2pkgid: &'a BTreeMap<String, PackageIDStr>,
 }
