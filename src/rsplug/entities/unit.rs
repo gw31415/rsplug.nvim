@@ -58,12 +58,19 @@ impl Unit {
                 start,
                 repo: source,
                 on_event,
+                on_cmd,
                 script,
             } = plugin;
             let lazy_type = if start {
                 LazyType::Start
             } else {
-                LazyType::Opt(on_event.into_iter().map(LoadEvent::Autocmd).collect())
+                LazyType::Opt(
+                    on_event
+                        .into_iter()
+                        .map(LoadEvent::Autocmd)
+                        .chain(on_cmd.into_iter().map(LoadEvent::Cmd))
+                        .collect(),
+                )
             };
             let unit = Arc::new(Unit {
                 source,

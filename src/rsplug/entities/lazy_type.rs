@@ -84,4 +84,6 @@ impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAndAssign<Rhs> for LazyType {
 pub enum LoadEvent {
     /// Vim の自動コマンドイベント。
     Autocmd(String),
+    /// Vimのユーザーコマンド
+    Cmd(String),
 }

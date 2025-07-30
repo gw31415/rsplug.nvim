@@ -46,6 +46,9 @@ pub(super) struct Plugin {
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     pub on_event: Vec<String>,
+    #[serde_as(as = "OneOrMany<_>")]
+    #[serde(default)]
+    pub on_cmd: Vec<String>,
     #[serde(flatten)]
     pub script: SetupScript,
 }
