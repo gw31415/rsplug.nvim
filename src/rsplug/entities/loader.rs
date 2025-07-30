@@ -15,7 +15,7 @@ use super::*;
 /// プラグインの読み込み制御や、ロード後の設定 (lua_source等) にまつわる情報を保持し、Package に変換するための構造体。
 #[derive(Default)]
 pub struct Loader {
-    scripts: Vec<(PackageIDStr, SetupScript)>,
+    pkgid2scripts: Vec<(PackageIDStr, SetupScript)>,
     event2pkgid: BTreeMap<String, Vec<PackageIDStr>>,
     cmd2pkgid: BTreeMap<String, PackageIDStr>,
 }
@@ -39,22 +39,16 @@ impl From<Loader> for Vec<Package> {
             return Vec::with_capacity(0);
         }
         let Loader {
-            scripts,
+            pkgid2scripts,
             event2pkgid,
             cmd2pkgid,
         } = value;
 
-        let mut pkgs = vec![
-            // Add the basic lazy loading modules
-            instant_startup_pkg(
-                "lua/_rsplug/init.lua",
-                include_bytes!("../../../lua/_rsplug/init.lua"),
-            ),
-        ];
+        let mut pkgs = Vec::new();
 
-        if !scripts.is_empty() {
+        {
             // Add packages to place scripts that does the initial setup of the plugin
-            let scripts = scripts
+            let pkgid2scripts = pkgid2scripts
                 .into_iter()
                 .filter_map(|(pkgid, script)| {
                     let mut script_set = BTreeMap::new();
@@ -79,8 +73,8 @@ impl From<Loader> for Vec<Package> {
                 })
                 .collect();
             pkgs.push(instant_startup_pkg(
-                "plugin/_rsplug_setup_scripts.lua",
-                SetupScriptsTemplate { scripts }
+                "lua/_rsplug/init.lua",
+                CustomPackaddTemplate { pkgid2scripts }
                     .render_once()
                     .unwrap()
                     .into_bytes(),
@@ -170,7 +164,7 @@ impl From<Loader> for Vec<Package> {
 impl AddAssign for Loader {
     fn add_assign(&mut self, other: Self) {
         let Self {
-            scripts,
+            pkgid2scripts: scripts,
             event2pkgid,
             cmd2pkgid,
         } = other;
@@ -180,7 +174,7 @@ impl AddAssign for Loader {
                 .or_default()
                 .extend(ids.into_iter());
         }
-        self.scripts.extend(scripts);
+        self.pkgid2scripts.extend(scripts);
         self.cmd2pkgid.extend(cmd2pkgid);
     }
 }
@@ -203,7 +197,7 @@ impl Loader {
     /// Loaderが空かどうか
     pub fn is_empty(&self) -> bool {
         let Self {
-            scripts,
+            pkgid2scripts: scripts,
             event2pkgid,
             cmd2pkgid,
         } = self;
@@ -238,7 +232,7 @@ impl Loader {
             }
         }
         Self {
-            scripts,
+            pkgid2scripts: scripts,
             event2pkgid,
             cmd2pkgid,
         }
@@ -246,10 +240,10 @@ impl Loader {
 }
 
 #[derive(TemplateSimple)]
-#[template(path = "setup_scripts.stpl")]
+#[template(path = "lua/_rsplug/init.stpl")]
 #[template(escape = false)]
-struct SetupScriptsTemplate {
-    scripts: Vec<(PackageIDStr, BTreeMap<&'static str, String>)>,
+struct CustomPackaddTemplate {
+    pkgid2scripts: Vec<(PackageIDStr, BTreeMap<&'static str, String>)>,
 }
 
 #[derive(TemplateSimple)]
