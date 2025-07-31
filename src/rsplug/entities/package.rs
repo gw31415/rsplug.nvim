@@ -192,13 +192,22 @@ impl PackPathState {
         let mut tasks = JoinSet::new();
 
         for (id, (start_or_opt, files)) in files {
+            let log_target = Arc::new({
+                let mut res = "install:yank:".to_string();
+                res.push_str(&id);
+                res
+            });
             let dir = Arc::new(gen_root.join(start_or_opt).join(id));
             if dir.is_dir() {
-                // println!("Skipped: {dir:?}");
+                log::info!(target: "install:skipped", "{dir:?}");
             } else {
                 for (which, source) in files {
                     let dir = dir.clone();
-                    tasks.spawn(async move { source.yank(which, dir.as_path()).await });
+                    let log_target = log_target.clone();
+                    tasks.spawn(async move {
+                        log::info!(target: &log_target, "{}", which.to_string_lossy());
+                        source.yank(which, dir.as_path()).await
+                    });
                 }
             }
         }

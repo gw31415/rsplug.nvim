@@ -35,7 +35,7 @@ pub mod git {
     }
 
     /// リポジトリ初期化処理
-    pub async fn init(repo: String, dir: &Path) -> ExecuteResult<()> {
+    pub async fn init(repo: &str, dir: &Path) -> ExecuteResult<()> {
         let _ = tokio::fs::remove_dir_all(dir.join(".git")).await;
         execute(Command::new("git").current_dir(dir).arg("init")).await?;
 

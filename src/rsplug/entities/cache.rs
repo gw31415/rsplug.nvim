@@ -123,15 +123,15 @@ impl Cache {
                                         unsafe { std::hint::unreachable_unchecked() };
                                     };
 
+                                    let url = format!("https://github.com/{owner}/{repo}");
+
                                     // リポジトリがない場合のインストール処理
                                     if !git::exists(proj_root).await {
                                         if install {
-                                            git::init(
-                                                format!("https://github.com/{owner}/{repo}"),
-                                                proj_root,
-                                            )
-                                            .await?;
+                                            log::info!(target:"cache:init", "{url}");
+                                            git::init(&url, proj_root).await?;
                                             // 初期インストール時はfetchも行う
+                                            log::info!(target:"cache:fetch", "{url}");
                                             git::fetch(rev, proj_root).await?;
                                         } else {
                                             // インストールされていない場合はスキップ
@@ -141,6 +141,7 @@ impl Cache {
 
                                     // アップデート処理
                                     if update {
+                                        log::info!(target:"cache:fetch", "{url}");
                                         git::fetch(rev, proj_root).await?;
                                     }
 

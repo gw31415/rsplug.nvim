@@ -50,7 +50,7 @@ async fn app() -> Result<(), Error> {
     let mut pkgs: BinaryHeap<_> = rsplug::Cache::new(DEFAULT_APP_DIR.as_path())
         .fetch(units, install, update)
         .await?;
-    println!("Total Packages: {}", pkgs.len());
+    log::info!("Total Packages: {}", pkgs.len());
 
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
@@ -110,7 +110,7 @@ impl fmt::Display for Error {
 #[tokio::main]
 async fn main() {
     if let Err(e) = app().await {
-        eprint!("{e}");
+        log::error!("{e}");
         std::process::exit(1);
     }
 }
