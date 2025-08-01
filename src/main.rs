@@ -1,10 +1,40 @@
 use std::{collections::BinaryHeap, fmt, path::PathBuf};
 
 use clap::Parser;
+use logger::CustomLogger;
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 
 mod rsplug;
+
+mod logger {
+    use std::io::Write;
+
+    use colored::Colorize;
+    use log::Log;
+
+    pub struct CustomLogger;
+
+    impl Log for CustomLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            let level = match record.level() {
+                log::Level::Error => "error:".red(),
+                log::Level::Warn => "warn:".yellow(),
+                log::Level::Info => "info:".blue(),
+                log::Level::Debug => "debug:".on_yellow(),
+                log::Level::Trace => "trace:".on_blue(),
+            }
+            .bold();
+            println!("{level} [{}] {}", record.target(), record.args());
+        }
+        fn flush(&self) {
+            std::io::stdout().flush().unwrap();
+        }
+    }
+}
 
 #[derive(clap::Parser, Debug)]
 #[command(about)]
@@ -109,6 +139,8 @@ impl fmt::Display for Error {
 
 #[tokio::main]
 async fn main() {
+    log::set_logger(&CustomLogger).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
     if let Err(e) = app().await {
         log::error!("{e}");
         std::process::exit(1);

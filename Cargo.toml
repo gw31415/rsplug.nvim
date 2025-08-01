@@ -8,6 +8,7 @@ description = "Vim plugin manager written in Rust"
 [dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.41", features = ["derive"] }
+colored = "3.0.0"
 hashbrown = "0.15.4"
 indicatif = "0.18.0"
 itertools = "0.14.0"
