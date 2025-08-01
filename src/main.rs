@@ -1,40 +1,12 @@
 use std::{collections::BinaryHeap, fmt, path::PathBuf};
 
 use clap::Parser;
-use logger::CustomLogger;
+use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 
+mod log;
 mod rsplug;
-
-mod logger {
-    use std::io::Write;
-
-    use colored::Colorize;
-    use log::Log;
-
-    pub struct CustomLogger;
-
-    impl Log for CustomLogger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record) {
-            let level = match record.level() {
-                log::Level::Error => "error:".red(),
-                log::Level::Warn => "warn:".yellow(),
-                log::Level::Info => "info:".blue(),
-                log::Level::Debug => "debug:".on_yellow(),
-                log::Level::Trace => "trace:".on_blue(),
-            }
-            .bold();
-            println!("{level} [{}] {}", record.target(), record.args());
-        }
-        fn flush(&self) {
-            std::io::stdout().flush().unwrap();
-        }
-    }
-}
 
 #[derive(clap::Parser, Debug)]
 #[command(about)]
@@ -80,7 +52,7 @@ async fn app() -> Result<(), Error> {
     let mut pkgs: BinaryHeap<_> = rsplug::Cache::new(DEFAULT_APP_DIR.as_path())
         .fetch(units, install, update)
         .await?;
-    log::info!("Total Packages: {}", pkgs.len());
+    msg(Message::TotalPackages(pkgs.len()));
 
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
@@ -124,7 +96,7 @@ impl fmt::Display for Error {
         use Error::*;
         match self {
             Io(e) => {
-                writeln!(f, "{e}")
+                write!(f, "{e}")
             }
             Parse(e, file) => {
                 writeln!(f, "failed to parse {file:?}:")?;
@@ -139,10 +111,9 @@ impl fmt::Display for Error {
 
 #[tokio::main]
 async fn main() {
-    log::set_logger(&CustomLogger).unwrap();
-    log::set_max_level(log::LevelFilter::Info);
     if let Err(e) = app().await {
-        log::error!("{e}");
-        std::process::exit(1);
+        msg(Message::Error(Box::new(e)));
+        close(1).await;
     }
+    close(0).await;
 }

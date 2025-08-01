@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::log::{self, Message};
 use hashbrown::{HashMap, HashSet};
 use tokio::task::JoinSet;
 
@@ -192,21 +193,19 @@ impl PackPathState {
         let mut tasks = JoinSet::new();
 
         for (id, (start_or_opt, files)) in files {
-            let log_target = Arc::new({
-                let mut res = "install:yank:".to_string();
-                res.push_str(&id);
-                res
-            });
-            let dir = Arc::new(gen_root.join(start_or_opt).join(id));
+            let id: Arc<str> = id.into();
+            let dir = gen_root.join(start_or_opt).join(id.as_ref());
             if dir.is_dir() {
-                log::info!(target: "install:skipped", "{dir:?}");
+                log::msg(Message::InstallSkipped(id));
             } else {
+                let dir = Arc::new(dir);
                 for (which, source) in files {
                     let dir = dir.clone();
-                    let log_target = log_target.clone();
+                    let id = id.clone();
                     tasks.spawn(async move {
-                        log::info!(target: &log_target, "{}", which.to_string_lossy());
-                        source.yank(which, dir.as_path()).await
+                        source.yank(&which, dir.as_path()).await?;
+                        log::msg(Message::InstallYank { id, which });
+                        Ok(())
                     });
                 }
             }

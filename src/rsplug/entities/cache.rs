@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::log::{self, Message};
 use hashbrown::HashMap;
 use regex::RegexSet;
 use tokio::task::JoinSet;
@@ -123,15 +124,15 @@ impl Cache {
                                         unsafe { std::hint::unreachable_unchecked() };
                                     };
 
-                                    let url = format!("https://github.com/{owner}/{repo}");
+                                    let url: Arc<str> =
+                                        Arc::from(format!("https://github.com/{owner}/{repo}"));
 
                                     // リポジトリがない場合のインストール処理
                                     if !git::exists(proj_root).await {
                                         if install {
-                                            log::info!(target:"cache:init", "{url}");
+                                            log::msg(Message::Cache("Initializing", url.clone()));
                                             git::init(&url, proj_root).await?;
-                                            // 初期インストール時はfetchも行う
-                                            log::info!(target:"cache:fetch", "{url}");
+                                            log::msg(Message::Cache("Fetching", url.clone()));
                                             git::fetch(rev, proj_root).await?;
                                         } else {
                                             // インストールされていない場合はスキップ
@@ -141,7 +142,7 @@ impl Cache {
 
                                     // アップデート処理
                                     if update {
-                                        log::info!(target:"cache:fetch", "{url}");
+                                        log::msg(Message::Cache("Updating", url.clone()));
                                         git::fetch(rev, proj_root).await?;
                                     }
 
