@@ -4,6 +4,7 @@ use std::{
     mem::MaybeUninit,
     ops::{Add, AddAssign, Deref},
     path::Path,
+    sync::Arc,
 };
 
 use itertools::Itertools;
@@ -46,6 +47,12 @@ impl Deref for PackageIDStr {
     #[inline]
     fn deref(&self) -> &Self::Target {
         unsafe { str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl From<PackageIDStr> for Arc<str> {
+    fn from(val: PackageIDStr) -> Self {
+        Arc::from(unsafe { str::from_utf8_unchecked(&val.0) })
     }
 }
 
