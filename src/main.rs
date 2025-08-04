@@ -98,7 +98,7 @@ enum Error {
 #[tokio::main]
 async fn main() {
     if let Err(e) = app().await {
-        msg(Message::Error(Box::new(e)));
+        msg(Message::Error(e.into()));
         close(1).await;
     }
     close(0).await;
