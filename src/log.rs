@@ -37,7 +37,7 @@ fn init() -> Logger {
                     println!("{} {type} {url}", "info:".blue().bold());
                 }
                 Message::InstallSkipped(id) => {
-                    println!("{} Skipped {id}", "info:".blue().bold());
+                    println!("{} Skipped {}", "info:".blue().bold(), id.italic().dimmed(),);
                 }
                 Message::InstallYank { id, which: file } => {
                     println!(
