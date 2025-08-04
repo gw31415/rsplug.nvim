@@ -1,4 +1,4 @@
-use std::{collections::BinaryHeap, fmt, path::PathBuf};
+use std::{collections::BinaryHeap, path::PathBuf};
 
 use clap::Parser;
 use log::{Message, close, msg};
@@ -86,27 +86,12 @@ static DEFAULT_APP_DIR: Lazy<PathBuf> = Lazy::new(|| {
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
+    #[error("failed to parse {1:?}: {0}")]
     Parse(toml::de::Error, PathBuf),
-    Io(std::io::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use Error::*;
-        match self {
-            Io(e) => {
-                write!(f, "{e}")
-            }
-            Parse(e, file) => {
-                writeln!(f, "failed to parse {file:?}:")?;
-                write!(f, "{e}")
-            }
-            Rsplug(e) => {
-                panic!("{e}")
-            }
-        }
-    }
 }
 
 #[tokio::main]
