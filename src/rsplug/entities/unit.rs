@@ -68,7 +68,7 @@ impl Unit {
                     on_event
                         .into_iter()
                         .map(LoadEvent::Autocmd)
-                        .chain(on_cmd.into_iter().map(LoadEvent::Cmd))
+                        .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
                         .collect(),
                 )
             };

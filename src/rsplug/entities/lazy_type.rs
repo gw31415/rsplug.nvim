@@ -3,7 +3,14 @@ use std::{
     cmp::Ordering,
     collections::BTreeSet,
     ops::BitAndAssign,
+    str::FromStr,
+    sync::Arc,
 };
+
+use once_cell::sync::Lazy;
+use regex::Regex;
+use sailfish::runtime::Render;
+use serde_with::DeserializeFromStr;
 
 /// Startプラグインとするか、Optプラグインとするか
 #[derive(PartialEq, Eq, Clone, Hash)]
@@ -83,7 +90,58 @@ impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAndAssign<Rhs> for LazyType {
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum LoadEvent {
     /// Vim の自動コマンドイベント。
-    Autocmd(String),
+    Autocmd(Autocmd),
     /// Vimのユーザーコマンド
-    Cmd(String),
+    UserCmd(UserCmd),
+}
+
+/// Vimの自動コマンドの文字列を表す型。
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr)]
+pub struct Autocmd(Arc<String>);
+
+impl FromStr for Autocmd {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        static AUTOCMD_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[^\p{C}\p{Z}*]+$").unwrap());
+        if AUTOCMD_REGEX.is_match(s) {
+            Ok(Autocmd(Arc::new(s.to_string())))
+        } else {
+            Err("Autocmd must not contain control characters, spaces, or asterisks")
+        }
+    }
+}
+
+impl Render for Autocmd {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        self.0.render(b)
+    }
+}
+
+/// Vimのユーザーコマンドの文字列を表す型。
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr)]
+pub struct UserCmd(Arc<String>);
+
+impl FromStr for UserCmd {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut chars = s.chars();
+        if s.is_empty() {
+            return Err("UserCmd must not be empty");
+        }
+        if !chars.next().unwrap().is_ascii_uppercase() {
+            return Err("User command must start with an ascii uppercase letter");
+        }
+
+        if chars.all(|c| c.is_ascii_alphabetic()) {
+            Ok(UserCmd(Arc::new(s.to_string())))
+        } else {
+            Err("UserCmd must consist of ascii alphabetic letters only")
+        }
+    }
+}
+
+impl Render for UserCmd {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        self.0.render(b)
+    }
 }

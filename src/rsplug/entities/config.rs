@@ -45,10 +45,10 @@ pub(super) struct Plugin {
     pub start: bool,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
-    pub on_event: Vec<String>,
+    pub on_event: Vec<Autocmd>,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
-    pub on_cmd: Vec<String>,
+    pub on_cmd: Vec<UserCmd>,
     #[serde(flatten)]
     pub script: SetupScript,
 }

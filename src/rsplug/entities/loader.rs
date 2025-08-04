@@ -16,8 +16,8 @@ use super::*;
 #[derive(Default)]
 pub struct Loader {
     pkgid2scripts: Vec<(PackageIDStr, SetupScript)>,
-    event2pkgid: BTreeMap<String, Vec<PackageIDStr>>,
-    cmd2pkgid: BTreeMap<String, PackageIDStr>,
+    event2pkgid: BTreeMap<Autocmd, Vec<PackageIDStr>>,
+    cmd2pkgid: BTreeMap<UserCmd, PackageIDStr>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -215,8 +215,8 @@ impl Loader {
         let LazyType::Opt(events) = lazy_type else {
             return Default::default();
         };
-        let mut event2pkgid: BTreeMap<String, Vec<_>> = BTreeMap::new();
-        let mut cmd2pkgid: BTreeMap<String, PackageIDStr> = BTreeMap::new();
+        let mut event2pkgid: BTreeMap<Autocmd, Vec<_>> = BTreeMap::new();
+        let mut cmd2pkgid: BTreeMap<UserCmd, PackageIDStr> = BTreeMap::new();
 
         let id = Arc::new(id);
         let scripts = Vec::from([(id.as_str(), script)]);
@@ -226,7 +226,7 @@ impl Loader {
                 Autocmd(autocmd) => {
                     event2pkgid.entry(autocmd).or_default().push(id.as_str());
                 }
-                Cmd(cmd) => {
+                UserCmd(cmd) => {
                     cmd2pkgid.insert(cmd, id.as_str());
                 }
             }
@@ -250,26 +250,26 @@ struct CustomPackaddTemplate {
 #[template(path = "plugin/on_event.stpl")]
 #[template(escape = false)]
 struct OnEventSetupTemplate<'a> {
-    events: Keys<'a, String, Vec<PackageIDStr>>,
+    events: Keys<'a, Autocmd, Vec<PackageIDStr>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "lua/_rsplug/on_event.stpl")]
 #[template(escape = false)]
 struct OnEventTemplate<'a> {
-    event2pkgid: &'a BTreeMap<String, Vec<PackageIDStr>>,
+    event2pkgid: &'a BTreeMap<Autocmd, Vec<PackageIDStr>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "plugin/on_cmd.stpl")]
 #[template(escape = false)]
 struct OnCmdSetupTemplate<'a> {
-    cmds: Keys<'a, String, PackageIDStr>,
+    cmds: Keys<'a, UserCmd, PackageIDStr>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "lua/_rsplug/on_cmd.stpl")]
 #[template(escape = false)]
 struct OnCmdTemplate<'a> {
-    cmd2pkgid: &'a BTreeMap<String, PackageIDStr>,
+    cmd2pkgid: &'a BTreeMap<UserCmd, PackageIDStr>,
 }
