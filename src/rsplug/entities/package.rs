@@ -152,6 +152,9 @@ pub struct PackPathState {
 }
 
 impl PackPathState {
+    pub fn len(&self) -> usize {
+        self.installing.len()
+    }
     /// 空の PackPathState を生成する。
     pub fn new() -> Self {
         Default::default()

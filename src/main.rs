@@ -69,6 +69,7 @@ async fn app() -> Result<(), Error> {
 
         loader += state.insert(pkg);
     }
+    msg(Message::TotalPackagesMerged(state.len()));
 
     // Install the packages into the packpath.
     state

@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, mpsc};
 
 pub enum Message {
     TotalPackages(usize),
+    TotalPackagesMerged(usize),
     Cache(&'static str, Arc<str>),
     InstallSkipped(Arc<str>),
     InstallYank { id: Arc<str>, which: PathBuf },
@@ -27,7 +28,10 @@ fn init() -> Logger {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Message::TotalPackages(n) => {
-                    println!("{} Total Packages count {n}", "info:".blue().bold());
+                    println!("{} Raw packages count {n}", "info:".blue().bold());
+                }
+                Message::TotalPackagesMerged(n) => {
+                    println!("{} Merged packages count {n}", "info:".blue().bold());
                 }
                 Message::Cache(r#type, url) => {
                     println!("{} {type} {url}", "info:".blue().bold());
@@ -37,9 +41,9 @@ fn init() -> Logger {
                 }
                 Message::InstallYank { id, which: file } => {
                     println!(
-                        "{} [install:yank:{}] {}",
+                        "{} Copying in {}: {}",
                         "info:".blue().bold(),
-                        id,
+                        id.italic().dimmed(),
                         file.to_string_lossy()
                     );
                 }
@@ -58,7 +62,7 @@ pub fn msg(message: Message) {
     let _ = LOGGER.0.read().unwrap().as_ref().unwrap().send(message);
 }
 
-/// Output the rest of the log and exit
+/// Flush out the rest of the log and exit
 pub async fn close(code: i32) -> ! {
     loop {
         if let Ok(mut sender) = LOGGER.0.try_write() {
