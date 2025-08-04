@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::log::{self, Message};
+use crate::log::{Message, msg};
 use hashbrown::{HashMap, HashSet};
 use tokio::task::JoinSet;
 
@@ -24,9 +24,14 @@ pub struct Package {
     /// プラグインの遅延実行タイプ
     pub lazy_type: LazyType,
     /// 配置するファイル
-    pub(super) files: HashMap<PathBuf, Arc<FileSource>>,
+    pub(super) files: HashMap<PathBuf, FileItem>,
     /// セットアップスクリプト
     pub(super) script: SetupScript,
+}
+
+pub(super) struct FileItem {
+    pub source: Arc<FileSource>,
+    pub merge_type: MergeType,
 }
 
 impl PartialEq for Package {
@@ -65,7 +70,7 @@ impl Package {
                     done_items.push(tail);
                     pkgs.push(tail2);
                 }
-                (tail, _) => {
+                (tail, None) => {
                     pkgs.push(tail);
                 }
             }
@@ -89,7 +94,11 @@ impl Add for Package {
         let mergeable = {
             let (sfname, rfname): (HashSet<_>, HashSet<_>) =
                 (self.files.keys().collect(), rhs.files.keys().collect());
-            sfname.is_disjoint(&rfname)
+            sfname.intersection(&rfname).all(|path| {
+                let a = &self.files.get(*path).unwrap().merge_type;
+                let b = &rhs.files.get(*path).unwrap().merge_type;
+                !matches!((a, b), (MergeType::Conflict, _) | (_, MergeType::Conflict))
+            })
         };
         if mergeable {
             let mut pkg = self;
@@ -174,13 +183,13 @@ impl PackPathState {
         }
 
         let pkg_type_str = if lazy_type.is_start() { "start" } else { "opt" };
-        for (path, source) in files {
+        for (path, item) in files {
             let (_, files) = self
                 .files
                 .entry(id.as_str())
                 .or_insert((pkg_type_str, Vec::new()));
 
-            files.push((path, source));
+            files.push((path, item.source));
         }
 
         Loader::create(id, lazy_type, script)
@@ -199,7 +208,7 @@ impl PackPathState {
             let id: Arc<str> = id.into();
             let dir = gen_root.join(start_or_opt).join(id.as_ref());
             if dir.is_dir() {
-                log::msg(Message::InstallSkipped(id));
+                msg(Message::InstallSkipped(id));
             } else {
                 let dir = Arc::new(dir);
                 for (which, source) in files {
@@ -207,7 +216,7 @@ impl PackPathState {
                     let id = id.clone();
                     tasks.spawn(async move {
                         source.yank(&which, dir.as_path()).await?;
-                        log::msg(Message::InstallYank { id, which });
+                        msg(Message::InstallYank { id, which });
                         Ok(())
                     });
                 }

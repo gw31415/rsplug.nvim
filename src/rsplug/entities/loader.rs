@@ -24,7 +24,13 @@ pub struct Loader {
 fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Package {
     let data = data.into();
     let id = PackageID::new(&data) + PackageID::new(path);
-    let files = HashMap::from([(PathBuf::from(path), Arc::new(FileSource::File { data }))]);
+    let files = HashMap::from([(
+        PathBuf::from(path),
+        FileItem {
+            source: Arc::new(FileSource::File { data }),
+            merge_type: MergeType::Overwrite,
+        },
+    )]);
     Package {
         id,
         lazy_type: LazyType::Start,
@@ -102,13 +108,19 @@ impl From<Loader> for Vec<Package> {
                 let files = HashMap::from([
                     (
                         PathBuf::from("lua/_rsplug/on_event.lua"),
-                        Arc::new(FileSource::File { data: on_event }),
+                        FileItem {
+                            source: Arc::new(FileSource::File { data: on_event }),
+                            merge_type: MergeType::Overwrite,
+                        },
                     ),
                     (
                         PathBuf::from(format!("plugin/{}.lua", on_event_setup_id.as_str())),
-                        Arc::new(FileSource::File {
-                            data: on_event_setup,
-                        }),
+                        FileItem {
+                            source: Arc::new(FileSource::File {
+                                data: on_event_setup,
+                            }),
+                            merge_type: MergeType::Overwrite,
+                        },
                     ),
                 ]);
                 Package {
@@ -141,11 +153,17 @@ impl From<Loader> for Vec<Package> {
                 let files = HashMap::from([
                     (
                         PathBuf::from("lua/_rsplug/on_cmd.lua"),
-                        Arc::new(FileSource::File { data: on_cmd }),
+                        FileItem {
+                            source: Arc::new(FileSource::File { data: on_cmd }),
+                            merge_type: MergeType::Overwrite,
+                        },
                     ),
                     (
                         PathBuf::from(format!("plugin/{}.lua", on_cmd_setup_id.as_str())),
-                        Arc::new(FileSource::File { data: on_cmd_setup }),
+                        FileItem {
+                            source: Arc::new(FileSource::File { data: on_cmd_setup }),
+                            merge_type: MergeType::Overwrite,
+                        },
                     ),
                 ]);
                 Package {

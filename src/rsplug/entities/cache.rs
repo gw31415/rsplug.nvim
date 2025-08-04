@@ -5,9 +5,8 @@ use std::{
     sync::Arc,
 };
 
-use crate::log::{self, Message};
+use crate::log::{Message, msg};
 use hashbrown::HashMap;
-use regex::RegexSet;
 use tokio::task::JoinSet;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -36,8 +35,6 @@ impl Iterator for IntoStringSplit {
 
 /// プラグインのキャッシュ
 pub struct Cache {
-    // インストールを無視するファイル名パターン (Regexパターン)
-    pub ignore: RegexSet,
     // キャッシュディレクトリのパス
     pub cachepath: Cow<'static, Path>,
 }
@@ -46,7 +43,6 @@ impl Cache {
     pub fn new(path: impl Into<Cow<'static, Path>>) -> Self {
         Cache {
             cachepath: path.into(),
-            ..Default::default()
         }
     }
     /// キャッシュし、展開して Package のコレクションにする
@@ -66,12 +62,11 @@ impl Cache {
         update: bool,
     ) -> Pin<Box<dyn Future<Output = Result<B, Error>> + Send + Sync>> {
         let config = config.clone();
-        let ignore = Arc::new(config.ignore.clone());
         Box::pin(async move {
             let pkgs: B = unit
                 .into_iter()
                 .map(move |unit| {
-                    let (config, ignore) = (config.clone(), ignore.clone());
+                    let config = config.clone();
                     async move {
                         let unit: Arc<Unit> = unit.into();
 
@@ -80,6 +75,7 @@ impl Cache {
                             lazy_type,
                             depends,
                             script,
+                            merge,
                         } = unit.borrow();
                         let mut pkgs: Vec<_> = depends
                             .iter()
@@ -130,9 +126,9 @@ impl Cache {
                                     // リポジトリがない場合のインストール処理
                                     if !git::exists(proj_root).await {
                                         if install {
-                                            log::msg(Message::Cache("Initializing", url.clone()));
+                                            msg(Message::Cache("Initializing", url.clone()));
                                             git::init(&url, proj_root).await?;
-                                            log::msg(Message::Cache("Fetching", url.clone()));
+                                            msg(Message::Cache("Fetching", url.clone()));
                                             git::fetch(rev, proj_root).await?;
                                         } else {
                                             // インストールされていない場合はスキップ
@@ -142,7 +138,7 @@ impl Cache {
 
                                     // アップデート処理
                                     if update {
-                                        log::msg(Message::Cache("Updating", url.clone()));
+                                        msg(Message::Cache("Updating", url.clone()));
                                         git::fetch(rev, proj_root).await?;
                                     }
 
@@ -161,7 +157,7 @@ impl Cache {
                                         }
                                     });
 
-                                    let files: HashMap<PathBuf, Arc<FileSource>> = {
+                                    let files: HashMap<PathBuf, _> = {
                                         let stdout = execute(
                                             tokio::process::Command::new("git")
                                                 .current_dir(proj_root)
@@ -175,10 +171,16 @@ impl Cache {
                                         let fname = PathBuf::from(fname);
                                         let ignored = fname.iter().any(|k| {
                                             let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
-                                            ignore.is_match(k)
+                                            merge.ignore.matched(k)
                                         });
                                         if !ignored && proj_root.join(&fname).is_file() {
-                                            Some((fname, filesource.clone()))
+                                            Some((
+                                                fname,
+                                                FileItem {
+                                                    source: filesource.clone(),
+                                                    merge_type: MergeType::Conflict,
+                                                },
+                                            ))
                                         } else {
                                             None
                                         }
@@ -214,28 +216,6 @@ impl Cache {
 impl Default for Cache {
     fn default() -> Self {
         Cache {
-            ignore: RegexSet::new(vec![
-                r"^COPYING$".to_string(),
-                r"^COPYING\.txt$".to_string(),
-                r"^LICENSE$".to_string(),
-                r"^LICENSE\.md$".to_string(),
-                r"^LICENSE\.txt$".to_string(),
-                r"^Makefile$".to_string(),
-                r"^README$".to_string(),
-                r"^README\.md$".to_string(),
-                r"^README\.txt$".to_string(),
-                r"^\.gitattributes$".to_string(),
-                r"^\.github$".to_string(),
-                r"^\.gitignore$".to_string(),
-                r"^\.gitmessage$".to_string(),
-                r"^\.luacheckrc$".to_string(),
-                r"^\.tool-versions$".to_string(),
-                r"^\.vscode$".to_string(),
-                // r"^import_map\.jsonc?$".to_string(),
-                // r"^deno\.jsonc?$".to_string(),
-                // r"^deno\.lock$".to_string(),
-            ])
-            .unwrap(),
             cachepath: {
                 let homedir = std::env::home_dir().unwrap();
                 let cachedir = homedir.join(".cache");

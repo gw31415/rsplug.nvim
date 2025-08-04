@@ -16,6 +16,8 @@ pub struct Unit {
     pub depends: Vec<Arc<Unit>>,
     /// セットアップスクリプト
     pub script: SetupScript,
+    /// マージ設定
+    pub merge: MergeConfig,
 }
 
 /// プラグインの取得元
@@ -60,6 +62,7 @@ impl Unit {
                 on_event,
                 on_cmd,
                 script,
+                merge,
             } = plugin;
             let lazy_type = if start {
                 LazyType::Start
@@ -77,6 +80,7 @@ impl Unit {
                 lazy_type,
                 depends: Vec::new(),
                 script,
+                merge,
             });
             units.push(unit);
         }

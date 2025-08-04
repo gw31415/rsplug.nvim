@@ -1,0 +1,16 @@
+COPYING
+COPYING.txt
+LICENSE
+LICENSE.md
+LICENSE.txt
+Makefile
+README
+README.md
+README.txt
+.gitattributes
+.github
+.gitignore
+.gitmessage
+.luacheckrc
+.tool-versions
+.vscode
