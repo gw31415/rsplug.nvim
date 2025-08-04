@@ -231,9 +231,9 @@ impl Default for Cache {
                 r"^\.luacheckrc$".to_string(),
                 r"^\.tool-versions$".to_string(),
                 r"^\.vscode$".to_string(),
-                r"^deno\.json$".to_string(),
-                r"^deno\.jsonc$".to_string(),
-                r"^deno\.lock$".to_string(),
+                // r"^import_map\.jsonc?$".to_string(),
+                // r"^deno\.jsonc?$".to_string(),
+                // r"^deno\.lock$".to_string(),
             ])
             .unwrap(),
             cachepath: {
