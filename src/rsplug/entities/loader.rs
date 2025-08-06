@@ -90,14 +90,22 @@ impl From<Loader> for Vec<Package> {
         }
 
         // ファイルタイププラグイン
-        for (ft, pkgids) in ft2pkgid {
+        if !ft2pkgid.is_empty() {
             pkgs.push(instant_startup_pkg(
-                &format!("ftplugin/{ft}/_rsplug_on_ft.lua"),
-                FtpluginTemplate { pkgids, ft }
+                "lua/_rsplug/on_ft.lua",
+                include_bytes!("../../../templates/lua/_rsplug/on_ft.lua"),
+            ));
+            for (ft, pkgids) in ft2pkgid {
+                let mut path = format!("ftplugin/{ft}/");
+                let data = FtpluginTemplate { pkgids, ft }
                     .render_once()
                     .unwrap()
-                    .into_bytes(),
-            ));
+                    .into_bytes();
+                path.push_str(&PackageID::new(&data).as_str());
+                path.push_str(".lua");
+
+                pkgs.push(instant_startup_pkg(&path, data));
+            }
         }
 
         if !event2pkgid.is_empty() {
@@ -279,7 +287,7 @@ impl Loader {
 }
 
 #[derive(TemplateSimple)]
-#[template(path = "ftplugin.stpl")]
+#[template(path = "ftplugin/on_ft.stpl")]
 #[template(escape = false)]
 struct FtpluginTemplate {
     pkgids: Vec<PackageIDStr>,
