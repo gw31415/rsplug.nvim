@@ -89,8 +89,8 @@ impl From<Loader> for Vec<Package> {
             ));
         }
 
-        // ファイルタイププラグイン
         if !ft2pkgid.is_empty() {
+            // on_ft setup
             pkgs.push(instant_startup_pkg(
                 "lua/_rsplug/on_ft.lua",
                 include_bytes!("../../../templates/lua/_rsplug/on_ft.lua"),
