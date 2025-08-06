@@ -61,6 +61,7 @@ impl Unit {
                 repo: source,
                 on_event,
                 on_cmd,
+                on_ft,
                 script,
                 merge,
             } = plugin;
@@ -72,6 +73,7 @@ impl Unit {
                         .into_iter()
                         .map(LoadEvent::Autocmd)
                         .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
+                        .chain(on_ft.into_iter().map(LoadEvent::FileType))
                         .collect(),
                 )
             };

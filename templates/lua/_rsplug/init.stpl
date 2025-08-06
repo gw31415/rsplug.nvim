@@ -9,4 +9,40 @@ return {
 			require(setup_scripts.lua_source)
 		end
 	end,
+	---@param ft string
+	get_ft_runtime_file = function(ft)
+		local files = vim.api.nvim_get_runtime_file('ftplugin/' .. ft .. '.{vim,lua}', true)
+		files = vim.list_extend(files, vim.api.nvim_get_runtime_file('ftplugin/' .. ft .. '_*.{vim,lua}', true))
+		files = vim.list_extend(files, vim.api.nvim_get_runtime_file('ftplugin/' .. ft .. '/*.{vim,lua}', true))
+		return files
+	end,
+	---@param current vim.api.keyset.get_autocmds.ret
+	---@param old vim.api.keyset.get_autocmds.ret
+	get_new_autocmds = function(current, old)
+		---@param item vim.api.keyset.get_autocmds.ret
+		return vim.tbl_filter(function(item)
+			for _, o in ipairs(old) do
+				if item.id and item.id == o.id then
+					return false
+				end
+				if item.group and item.group == o.group then
+					return false
+				end
+				if item.callback and item.callback == o.callback then
+					return false
+				end
+				local is_same = true
+				for _, property in ipairs { 'buffer', 'buflocal', 'command', 'desc', 'once', 'pattern' } do
+					if item[property] ~= o[property] then
+						is_same = false
+						break
+					end
+				end
+				if is_same then
+					return false
+				end
+			end
+			return true
+		end, current)
+	end,
 }

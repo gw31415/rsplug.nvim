@@ -50,6 +50,9 @@ pub(super) struct Plugin {
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     pub on_cmd: Vec<UserCmd>,
+    #[serde_as(as = "OneOrMany<_>")]
+    #[serde(default)]
+    pub on_ft: Vec<FileType>,
     #[serde(flatten)]
     pub script: SetupScript,
     #[serde(flatten)]

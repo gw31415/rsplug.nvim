@@ -18,6 +18,7 @@ pub struct Loader {
     pkgid2scripts: Vec<(PackageIDStr, SetupScript)>,
     event2pkgid: BTreeMap<Autocmd, Vec<PackageIDStr>>,
     cmd2pkgid: BTreeMap<UserCmd, PackageIDStr>,
+    ft2pkgid: BTreeMap<FileType, Vec<PackageIDStr>>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -48,6 +49,7 @@ impl From<Loader> for Vec<Package> {
             pkgid2scripts,
             event2pkgid,
             cmd2pkgid,
+            ft2pkgid,
         } = value;
 
         let mut pkgs = Vec::new();
@@ -81,6 +83,17 @@ impl From<Loader> for Vec<Package> {
             pkgs.push(instant_startup_pkg(
                 "lua/_rsplug/init.lua",
                 CustomPackaddTemplate { pkgid2scripts }
+                    .render_once()
+                    .unwrap()
+                    .into_bytes(),
+            ));
+        }
+
+        // ファイルタイププラグイン
+        for (ft, pkgids) in ft2pkgid {
+            pkgs.push(instant_startup_pkg(
+                &format!("ftplugin/{ft}/_rsplug_on_ft.lua"),
+                FtpluginTemplate { pkgids, ft }
                     .render_once()
                     .unwrap()
                     .into_bytes(),
@@ -185,6 +198,7 @@ impl AddAssign for Loader {
             pkgid2scripts: scripts,
             event2pkgid,
             cmd2pkgid,
+            ft2pkgid,
         } = other;
         for (event, ids) in event2pkgid {
             self.event2pkgid
@@ -194,6 +208,7 @@ impl AddAssign for Loader {
         }
         self.pkgid2scripts.extend(scripts);
         self.cmd2pkgid.extend(cmd2pkgid);
+        self.ft2pkgid.extend(ft2pkgid);
     }
 }
 
@@ -218,8 +233,9 @@ impl Loader {
             pkgid2scripts: scripts,
             event2pkgid,
             cmd2pkgid,
+            ft2pkgid,
         } = self;
-        event2pkgid.is_empty() && scripts.is_empty() && cmd2pkgid.is_empty()
+        event2pkgid.is_empty() && scripts.is_empty() && cmd2pkgid.is_empty() && ft2pkgid.is_empty()
     }
     /// Loaderを Package のベクタに変換する。
     pub fn into_pkgs(self) -> Vec<Package> {
@@ -235,6 +251,7 @@ impl Loader {
         };
         let mut event2pkgid: BTreeMap<Autocmd, Vec<_>> = BTreeMap::new();
         let mut cmd2pkgid: BTreeMap<UserCmd, PackageIDStr> = BTreeMap::new();
+        let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
 
         let id = Arc::new(id);
         let scripts = Vec::from([(id.as_str(), script)]);
@@ -247,14 +264,26 @@ impl Loader {
                 UserCmd(cmd) => {
                     cmd2pkgid.insert(cmd, id.as_str());
                 }
+                FileType(ft) => {
+                    ft2pkgid.entry(ft).or_default().push(id.as_str());
+                }
             }
         }
         Self {
             pkgid2scripts: scripts,
             event2pkgid,
             cmd2pkgid,
+            ft2pkgid,
         }
     }
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "ftplugin.stpl")]
+#[template(escape = false)]
+struct FtpluginTemplate {
+    pkgids: Vec<PackageIDStr>,
+    ft: FileType,
 }
 
 #[derive(TemplateSimple)]

@@ -19,34 +19,7 @@ return {
 			require '_rsplug'.packadd(pkg)
 		end
 		local autocmds = vim.api.nvim_get_autocmds { event = ctx.event }
-
-		---@param autocmd vim.api.keyset.get_autocmds.ret
-		---@return boolean
-		local function filter(autocmd)
-			for _, old in ipairs(old_autocmds) do
-				if autocmd.id and autocmd.id == old.id then
-					return false
-				end
-				if autocmd.group and autocmd.group == old.group then
-					return false
-				end
-				if autocmd.callback and autocmd.callback == old.callback then
-					return false
-				end
-				local is_same = true
-				for _, property in ipairs { 'buffer', 'buflocal', 'command', 'desc', 'once', 'pattern' } do
-					if autocmd[property] ~= autocmd.callback then
-						is_same = false
-						break
-					end
-				end
-				if is_same then
-					return false
-				end
-			end
-			return true
-		end
-		local new_autocmds = vim.tbl_filter(filter, autocmds)
+		local new_autocmds = require '_rsplug'.get_new_autocmds(autocmds, old_autocmds)
 
 		if #new_autocmds == 0 then
 			return

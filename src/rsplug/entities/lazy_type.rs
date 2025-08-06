@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{
     borrow::{Borrow, Cow},
     cmp::Ordering,
@@ -93,6 +94,8 @@ pub enum LoadEvent {
     Autocmd(Autocmd),
     /// Vimのユーザーコマンド
     UserCmd(UserCmd),
+    /// 起動ファイルタイプ
+    FileType(FileType),
 }
 
 /// Vimの自動コマンドの文字列を表す型。
@@ -143,5 +146,36 @@ impl FromStr for UserCmd {
 impl Render for UserCmd {
     fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
         self.0.render(b)
+    }
+}
+
+/// Vimのユーザーコマンドの文字列を表す型。
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr)]
+pub struct FileType(Arc<String>);
+
+impl FromStr for FileType {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            Ok(FileType(Arc::new(s.to_string())))
+        } else {
+            Err(
+                "FileType must consist of ascii alphanumeric characters, underscores, hyphens, or dots",
+            )
+        }
+    }
+}
+
+impl Render for FileType {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        self.0.render(b)
+    }
+}
+
+impl fmt::Display for FileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
