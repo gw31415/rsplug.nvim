@@ -17,7 +17,7 @@ use super::*;
 pub struct Loader {
     pkgid2scripts: Vec<(PackageIDStr, SetupScript)>,
     event2pkgid: BTreeMap<Autocmd, Vec<PackageIDStr>>,
-    cmd2pkgid: BTreeMap<UserCmd, PackageIDStr>,
+    cmd2pkgid: BTreeMap<UserCmd, Vec<PackageIDStr>>,
     ft2pkgid: BTreeMap<FileType, Vec<PackageIDStr>>,
 }
 
@@ -258,7 +258,7 @@ impl Loader {
             return Default::default();
         };
         let mut event2pkgid: BTreeMap<Autocmd, Vec<_>> = BTreeMap::new();
-        let mut cmd2pkgid: BTreeMap<UserCmd, PackageIDStr> = BTreeMap::new();
+        let mut cmd2pkgid: BTreeMap<UserCmd, Vec<_>> = BTreeMap::new();
         let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
 
         let id = Arc::new(id);
@@ -270,7 +270,7 @@ impl Loader {
                     event2pkgid.entry(autocmd).or_default().push(id.as_str());
                 }
                 UserCmd(cmd) => {
-                    cmd2pkgid.insert(cmd, id.as_str());
+                    cmd2pkgid.entry(cmd).or_default().push(id.as_str());
                 }
                 FileType(ft) => {
                     ft2pkgid.entry(ft).or_default().push(id.as_str());
@@ -319,12 +319,12 @@ struct OnEventTemplate<'a> {
 #[template(path = "plugin/on_cmd.stpl")]
 #[template(escape = false)]
 struct OnCmdSetupTemplate<'a> {
-    cmds: Keys<'a, UserCmd, PackageIDStr>,
+    cmds: Keys<'a, UserCmd, Vec<PackageIDStr>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "lua/_rsplug/on_cmd.stpl")]
 #[template(escape = false)]
 struct OnCmdTemplate<'a> {
-    cmd2pkgid: &'a BTreeMap<UserCmd, PackageIDStr>,
+    cmd2pkgid: &'a BTreeMap<UserCmd, Vec<PackageIDStr>>,
 }
