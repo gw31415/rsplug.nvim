@@ -53,10 +53,24 @@ pub(super) struct Plugin {
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     pub on_ft: Vec<FileType>,
+    #[serde_as(as = "OneOrMany<_>")]
+    #[serde(default)]
+    pub depends: Vec<String>,
+    #[serde(rename = "name")]
+    pub custom_name: Option<String>,
     #[serde(flatten)]
     pub script: SetupScript,
     #[serde(flatten)]
     pub merge: MergeConfig,
+}
+
+impl Plugin {
+    /// プラグインを指定する名前
+    pub fn name(&self) -> &str {
+        self.custom_name.as_ref().unwrap_or(match &self.repo {
+            UnitSource::GitHub { repo, .. } => repo,
+        })
+    }
 }
 
 /// プラグインのセットアップに用いるスクリプト群

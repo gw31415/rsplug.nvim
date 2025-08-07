@@ -77,6 +77,9 @@ impl Cache {
                             script,
                             merge,
                         } = unit.borrow();
+                        if !depends.is_empty() {
+                            unimplemented!("依存関係の解決は未実装です");
+                        }
                         let mut pkgs: Vec<_> = depends
                             .iter()
                             .map(|dep| {

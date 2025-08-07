@@ -1,5 +1,6 @@
-use std::{str::FromStr, sync::Arc};
+use std::{cell::RefCell, str::FromStr, sync::Arc};
 
+use hashbrown::{HashMap, HashSet};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_with::DeserializeFromStr;
@@ -34,6 +35,39 @@ pub enum UnitSource {
     },
 }
 
+struct FilteredIterator<'a, T, F: Fn(&T) -> bool> {
+    index: usize,
+    vec: &'a mut Vec<T>,
+    filter: F,
+}
+
+impl<T, F: Fn(&T) -> bool> FilteredIterator<'_, T, F> {
+    fn new<'a>(vec: &'a mut Vec<T>, filter: F) -> FilteredIterator<'a, T, F> {
+        FilteredIterator {
+            index: vec.len(),
+            vec,
+            filter,
+        }
+    }
+}
+
+impl<T, F: Fn(&T) -> bool> Iterator for FilteredIterator<'_, T, F> {
+    type Item = T;
+    fn next(&mut self) -> Option<Self::Item> {
+        let Self { index, vec, filter } = self;
+        loop {
+            if *index == 0 {
+                return None;
+            }
+            *index -= 1;
+            let item = (*vec).get(*index).unwrap();
+            if filter(item) {
+                return Some(vec.swap_remove(*index));
+            }
+        }
+    }
+}
+
 impl FromStr for UnitSource {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -50,42 +84,71 @@ impl FromStr for UnitSource {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+#[error("DAG creation error")]
+pub struct DAGCreationError;
+
 impl Unit {
     /// 設定ファイルから Unit のコレクションを構築する
-    pub fn new(config: Config) -> Vec<Arc<Unit>> {
-        let Config { plugins } = config;
-        let mut units: Vec<Arc<Unit>> = Vec::new();
-        for plugin in plugins {
-            let Plugin {
-                start,
-                repo: source,
-                on_event,
-                on_cmd,
-                on_ft,
-                script,
-                merge,
-            } = plugin;
-            let lazy_type = if start {
-                LazyType::Start
-            } else {
-                LazyType::Opt(
-                    on_event
-                        .into_iter()
-                        .map(LoadEvent::Autocmd)
-                        .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
-                        .chain(on_ft.into_iter().map(LoadEvent::FileType))
-                        .collect(),
-                )
-            };
-            let unit = Arc::new(Unit {
-                source,
-                lazy_type,
-                depends: Vec::new(),
-                script,
-                merge,
+    pub fn new(config: Config) -> Result<Vec<Arc<Unit>>, DAGCreationError> {
+        let Config { mut plugins } = config;
+        let units = RefCell::new(HashMap::<String, Vec<Arc<Unit>>>::new());
+        loop {
+            let size_before = plugins.len();
+            let iterator = FilteredIterator::new(&mut plugins, |item| {
+                let units = units.borrow();
+                item.depends.iter().all(|dep| units.contains_key(dep))
             });
-            units.push(unit);
+            for plugin in iterator {
+                let name = plugin.name().to_string();
+                let Plugin {
+                    start,
+                    repo: source,
+                    on_event,
+                    on_cmd,
+                    on_ft,
+                    script,
+                    merge,
+                    depends,
+                    custom_name: _,
+                } = plugin;
+                let lazy_type = if start {
+                    LazyType::Start
+                } else {
+                    LazyType::Opt(
+                        on_event
+                            .into_iter()
+                            .map(LoadEvent::Autocmd)
+                            .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
+                            .chain(on_ft.into_iter().map(LoadEvent::FileType))
+                            .collect(),
+                    )
+                };
+                let unit = {
+                    let units = units.borrow();
+                    Arc::new(Unit {
+                        source,
+                        lazy_type,
+                        depends: depends
+                            .iter()
+                            .collect::<HashSet<_>>() // 重複削除
+                            .into_iter()
+                            .flat_map(|dep| units.get(dep).unwrap().clone())
+                            .collect(),
+                        script,
+                        merge,
+                    })
+                };
+                units.borrow_mut().entry(name).or_default().push(unit);
+            }
+            if size_before == plugins.len() {
+                if plugins.is_empty() {
+                    break;
+                }
+
+                return Err(DAGCreationError);
+            }
         }
-        units
+        Ok(units.into_inner().into_values().flatten().collect())
     }
 }

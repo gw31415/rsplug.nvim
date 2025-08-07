@@ -45,7 +45,7 @@ async fn app() -> Result<(), Error> {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?
             .into_iter();
-        rsplug::Unit::new(configs.sum())
+        rsplug::Unit::new(configs.sum())?
     };
 
     // Fetch packages through Cache based on the Units
@@ -93,6 +93,8 @@ enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
+    #[error(transparent)]
+    Dag(#[from] rsplug::unit::DAGCreationError),
 }
 
 #[tokio::main]
