@@ -4,9 +4,8 @@ local cmd2pkgid = { <% for (cmd, ids) in cmd2pkgid {%>['<%=cmd%>']={<% for id in
 return {
 	---@param args vim.api.keyset.create_user_command.command_args
 	cmd_handler = function(cmd, args)
-		local ids = cmd2pkgid[cmd] or {}
 		vim.api.nvim_del_user_command(cmd)
-		for _,id in ipairs(ids) do
+		for _,id in ipairs(cmd2pkgid[cmd] or {}) do
 			require '_rsplug'.packadd(id)
 		end
 
@@ -28,9 +27,8 @@ return {
 		end
 	end,
 	dummy_complete = function(cmd, arglead, ...)
-		local ids = cmd2pkgid[cmd] or {}
 		vim.api.nvim_del_user_command(cmd)
-		for _,id in ipairs(ids) do
+		for _,id in ipairs(cmd2pkgid[cmd] or {}) do
 			require '_rsplug'.packadd(id)
 		end
 
