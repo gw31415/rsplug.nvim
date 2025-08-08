@@ -4,9 +4,12 @@ local cmd2pkgid = { <% for (cmd, ids) in cmd2pkgid {%>['<%=cmd%>']={<% for id in
 return {
 	---@param args vim.api.keyset.create_user_command.command_args
 	cmd_handler = function(cmd, args)
-		local id = cmd2pkgid[cmd] or ''
+		local ids = cmd2pkgid[cmd] or {}
 		vim.api.nvim_del_user_command(cmd)
-		require '_rsplug'.packadd(id)
+		for _,id in ipairs(ids) do
+			require '_rsplug'.packadd(id)
+		end
+
 		local range
 		if args.line1 == args.line2 then
 			range = ''
@@ -25,7 +28,7 @@ return {
 		end
 	end,
 	dummy_complete = function(cmd, arglead, ...)
-		local ids = cmd2pkgid[cmd] or ''
+		local ids = cmd2pkgid[cmd] or {}
 		vim.api.nvim_del_user_command(cmd)
 		for _,id in ipairs(ids) do
 			require '_rsplug'.packadd(id)
