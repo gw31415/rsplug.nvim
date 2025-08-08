@@ -2,7 +2,6 @@
 name = "rsplug"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
 description = "Vim plugin manager written in Rust"
 
 [dependencies]

@@ -38,14 +38,10 @@ impl PartialOrd for LazyType {
 
 impl Ord for LazyType {
     fn cmp(&self, other: &Self) -> Ordering {
-        if let LazyType::Start = self
-            && let LazyType::Start = other
-        {
+        if let (LazyType::Start, LazyType::Start) = (self, other) {
             return Ordering::Equal;
         }
-        if let LazyType::Opt(l_opt) = self
-            && let LazyType::Opt(r_opt) = other
-        {
+        if let (LazyType::Opt(l_opt), LazyType::Opt(r_opt)) = (self, other) {
             let len_cmp = l_opt.len().cmp(&r_opt.len());
             if len_cmp != Ordering::Equal {
                 return len_cmp;
