@@ -53,14 +53,13 @@ pub mod git {
 
     /// リポジトリ同期処理
     pub async fn fetch(rev: &Option<String>, dir: &Path) -> ExecuteResult<()> {
-        let rev: &[&str] = if let Some(rev) = rev { &[rev] } else { &[] };
         execute(
             Command::new("git")
                 .current_dir(dir)
                 .arg("fetch")
                 .arg("--depth=1")
                 .arg("origin")
-                .args(rev),
+                .arg(rev.as_deref().unwrap_or("HEAD")),
         )
         .await?;
 
