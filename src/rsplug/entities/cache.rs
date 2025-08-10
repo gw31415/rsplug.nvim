@@ -1,5 +1,5 @@
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Cow,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -76,7 +76,7 @@ impl Cache {
                             depends,
                             script,
                             merge,
-                        } = unit.borrow();
+                        } = unit.as_ref();
                         if !depends.is_empty() {
                             unimplemented!("依存関係の解決は未実装です");
                         }
