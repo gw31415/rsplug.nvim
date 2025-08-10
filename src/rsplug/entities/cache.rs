@@ -132,7 +132,11 @@ impl Cache {
                                             msg(Message::Cache("Initializing", url.clone()));
                                             git::init(&url, proj_root).await?;
                                             msg(Message::Cache("Fetching", url.clone()));
-                                            git::fetch(rev, proj_root).await?;
+                                            git::fetch(
+                                                &Some(git::ls_remote(url.clone(), rev).await?),
+                                                proj_root,
+                                            )
+                                            .await?;
                                         } else {
                                             // インストールされていない場合はスキップ
                                             break 'add_pkg;
@@ -142,7 +146,11 @@ impl Cache {
                                     // アップデート処理
                                     if update {
                                         msg(Message::Cache("Updating", url.clone()));
-                                        git::fetch(rev, proj_root).await?;
+                                        git::fetch(
+                                            &Some(git::ls_remote(url.clone(), rev).await?),
+                                            proj_root,
+                                        )
+                                        .await?;
                                     }
 
                                     // ディレクトリ内容からのIDの決定
