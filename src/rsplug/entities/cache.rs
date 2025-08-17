@@ -39,6 +39,8 @@ pub struct Cache {
     pub cachepath: Cow<'static, Path>,
 }
 
+type PtrPkgMap = HashMap<usize, Package>;
+
 impl Cache {
     pub fn new(path: impl Into<Cow<'static, Path>>) -> Self {
         Cache {
@@ -46,29 +48,32 @@ impl Cache {
         }
     }
     /// キャッシュし、展開して Package のコレクションにする
-    pub fn fetch<B: FromIterator<Package>>(
+    pub async fn fetch<B: FromIterator<Package>>(
         self,
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<B, Error>> + Send + Sync>> {
+    ) -> Result<B, Error> {
         Self::fetch_inner(self.into(), unit, install, update)
+            .await
+            .map(|hashmap| hashmap.into_values().collect())
     }
 
-    fn fetch_inner<B: FromIterator<Package>>(
+    fn fetch_inner(
         config: Arc<Self>,
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<B, Error>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PtrPkgMap, Error>> + Send + Sync>> {
         let config = config.clone();
         Box::pin(async move {
-            let pkgs: B = unit
+            let pkgs: HashMap<usize, Package> = unit
                 .into_iter()
                 .map(move |unit| {
                     let config = config.clone();
                     async move {
                         let unit: Arc<Unit> = unit.into();
+                        let key = Arc::as_ptr(&unit) as usize;
 
                         let Unit {
                             source,
@@ -77,18 +82,10 @@ impl Cache {
                             script,
                             merge,
                         } = unit.as_ref();
-                        if !depends.is_empty() {
-                            unimplemented!("依存関係の解決は未実装です");
-                        }
-                        let mut pkgs: Vec<_> = depends
+                        let depends = depends
                             .iter()
                             .map(|dep| {
-                                Self::fetch_inner::<Vec<_>>(
-                                    config.clone(),
-                                    [dep.clone()],
-                                    install,
-                                    update,
-                                )
+                                Self::fetch_inner(config.clone(), [dep.clone()], install, update)
                             })
                             .collect::<JoinSet<_>>()
                             .join_all()
@@ -96,10 +93,16 @@ impl Cache {
                             .into_iter()
                             .collect::<Result<Vec<_>, _>>()?
                             .into_iter()
-                            .flatten()
-                            .collect();
-                        for pkg in pkgs.iter_mut() {
-                            pkg.lazy_type &= lazy_type;
+                            .flatten();
+
+                        let mut pkgs: HashMap<usize, Package> = HashMap::new();
+                        for (key, pkg) in depends {
+                            pkgs.entry(key).or_insert(pkg).lazy_type &= lazy_type;
+                        }
+
+                        if pkgs.contains_key(&key) {
+                            // Skip
+                            return Ok(pkgs);
                         }
 
                         'add_pkg: {
@@ -205,7 +208,7 @@ impl Cache {
                                     }
                                 }
                             };
-                            pkgs.push(pkg);
+                            pkgs.insert(key, pkg);
                         }
 
                         Ok::<_, Error>(pkgs)
@@ -218,7 +221,7 @@ impl Cache {
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .flatten()
-                .collect::<B>();
+                .collect();
             Ok(pkgs)
         })
     }

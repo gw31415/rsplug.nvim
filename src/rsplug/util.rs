@@ -142,9 +142,13 @@ pub mod git {
             .lines()
             .filter_map(|l| GitRef::try_from(l).ok())
             .max()
-            .map(|git_ref| git_ref.id.to_string()) else {
-                return Err(Error::GitRev { url, rev: rev.to_owned() });
-            };
+            .map(|git_ref| git_ref.id.to_string())
+        else {
+            return Err(Error::GitRev {
+                url,
+                rev: rev.to_owned(),
+            });
+        };
 
         Ok(latest)
     }
