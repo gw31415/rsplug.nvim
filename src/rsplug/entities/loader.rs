@@ -215,8 +215,15 @@ impl AddAssign for Loader {
                 .extend(ids.into_iter());
         }
         self.pkgid2scripts.extend(scripts);
-        self.cmd2pkgid.extend(cmd2pkgid);
-        self.ft2pkgid.extend(ft2pkgid);
+        for (cmd, ids) in cmd2pkgid {
+            self.cmd2pkgid
+                .entry(cmd)
+                .or_default()
+                .extend(ids.into_iter());
+        }
+        for (ft, ids) in ft2pkgid {
+            self.ft2pkgid.entry(ft).or_default().extend(ids.into_iter());
+        }
     }
 }
 
