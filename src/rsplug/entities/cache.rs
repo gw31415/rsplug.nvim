@@ -48,15 +48,15 @@ impl Cache {
         }
     }
     /// キャッシュし、展開して Package のコレクションにする
-    pub async fn fetch<B: FromIterator<Package>>(
+    pub async fn fetch(
         self,
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Result<B, Error> {
+    ) -> Result<impl Iterator<Item = Package>, Error> {
         Self::fetch_inner(self.into(), unit, install, update)
             .await
-            .map(|hashmap| hashmap.into_values().collect())
+            .map(|hashmap| hashmap.into_values())
     }
 
     fn fetch_inner(

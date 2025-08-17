@@ -51,7 +51,8 @@ async fn app() -> Result<(), Error> {
     // Fetch packages through Cache based on the Units
     let mut pkgs: BinaryHeap<_> = rsplug::Cache::new(DEFAULT_APP_DIR.as_path())
         .fetch(units, install, update)
-        .await?;
+        .await?
+        .collect();
     msg(Message::TotalPackages(pkgs.len()));
 
     // Create PackPathState and insert packages into it
