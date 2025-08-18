@@ -83,6 +83,14 @@ impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAndAssign<Rhs> for LazyType {
     }
 }
 
+impl BitAndAssign<LoadEvent> for LazyType {
+    fn bitand_assign(&mut self, rhs: LoadEvent) {
+        if let LazyType::Opt(events) = self {
+            events.insert(rhs);
+        }
+    }
+}
+
 /// Optプラグインの読み込みイベントを表す。
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum LoadEvent {
@@ -92,6 +100,8 @@ pub enum LoadEvent {
     UserCmd(UserCmd),
     /// 起動ファイルタイプ
     FileType(FileType),
+    /// Luaモジュールの読み込み
+    LuaModule(LuaModule),
 }
 
 /// Vimの自動コマンドの文字列を表す型。
@@ -171,6 +181,37 @@ impl Render for FileType {
 }
 
 impl fmt::Display for FileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Vimのユーザーコマンドの文字列を表す型。
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq /*DeserializeFromStr*/)]
+pub struct LuaModule(pub(super) Arc<String>);
+
+// impl FromStr for LuaModule {
+//     type Err = &'static str;
+//     fn from_str(s: &str) -> Result<Self, Self::Err> {
+//         if s.chars()
+//             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+//         {
+//             Ok(LuaModule(Arc::new(s.to_string())))
+//         } else {
+//             Err(
+//                 "LuaModulemust consist of ascii alphanumeric characters, underscores, or hyphens",
+//             )
+//         }
+//     }
+// }
+
+impl Render for LuaModule {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        self.0.render(b)
+    }
+}
+
+impl fmt::Display for LuaModule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }

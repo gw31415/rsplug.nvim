@@ -19,6 +19,7 @@ pub struct Loader {
     event2pkgid: BTreeMap<Autocmd, Vec<PackageIDStr>>,
     cmd2pkgid: BTreeMap<UserCmd, Vec<PackageIDStr>>,
     ft2pkgid: BTreeMap<FileType, Vec<PackageIDStr>>,
+    luam2pkgid: BTreeMap<LuaModule, Vec<PackageIDStr>>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -50,6 +51,7 @@ impl From<Loader> for Vec<Package> {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            luam2pkgid,
         } = value;
 
         let mut pkgs = Vec::new();
@@ -195,6 +197,42 @@ impl From<Loader> for Vec<Package> {
                 }
             });
         }
+        if !luam2pkgid.is_empty() {
+            let plugin_on_lua = include_bytes!("../../../templates/plugin/on_lua.lua");
+            let plugin_on_lua_id = PackageID::new(plugin_on_lua);
+            let on_lua = OnLuaTemplate {
+                luam2pkgid: &luam2pkgid,
+            }
+            .render_once()
+            .unwrap()
+            .into_bytes()
+            .into();
+            let on_lua_id = PackageID::new(&on_lua);
+            let files = HashMap::from([
+                (
+                    PathBuf::from("lua/_rsplug/on_lua.lua"),
+                    FileItem {
+                        source: Arc::new(FileSource::File { data: on_lua }),
+                        merge_type: MergeType::Overwrite,
+                    },
+                ),
+                (
+                    PathBuf::from(format!("plugin/{}.lua", plugin_on_lua_id.as_str())),
+                    FileItem {
+                        source: Arc::new(FileSource::File {
+                            data: plugin_on_lua.into(),
+                        }),
+                        merge_type: MergeType::Overwrite,
+                    },
+                ),
+            ]);
+            pkgs.push(Package {
+                id: plugin_on_lua_id + on_lua_id,
+                lazy_type: LazyType::Start,
+                files,
+                script: Default::default(),
+            });
+        }
 
         pkgs
     }
@@ -207,6 +245,7 @@ impl AddAssign for Loader {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            luam2pkgid,
         } = other;
         for (event, ids) in event2pkgid {
             self.event2pkgid
@@ -223,6 +262,12 @@ impl AddAssign for Loader {
         }
         for (ft, ids) in ft2pkgid {
             self.ft2pkgid.entry(ft).or_default().extend(ids.into_iter());
+        }
+        for (luam, ids) in luam2pkgid {
+            self.luam2pkgid
+                .entry(luam)
+                .or_default()
+                .extend(ids.into_iter());
         }
     }
 }
@@ -249,8 +294,13 @@ impl Loader {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            luam2pkgid,
         } = self;
-        event2pkgid.is_empty() && scripts.is_empty() && cmd2pkgid.is_empty() && ft2pkgid.is_empty()
+        event2pkgid.is_empty()
+            && scripts.is_empty()
+            && cmd2pkgid.is_empty()
+            && ft2pkgid.is_empty()
+            && luam2pkgid.is_empty()
     }
     /// Loaderを Package のベクタに変換する。
     pub fn into_pkgs(self) -> Vec<Package> {
@@ -267,6 +317,7 @@ impl Loader {
         let mut event2pkgid: BTreeMap<Autocmd, Vec<_>> = BTreeMap::new();
         let mut cmd2pkgid: BTreeMap<UserCmd, Vec<_>> = BTreeMap::new();
         let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
+        let mut luam2pkgid: BTreeMap<LuaModule, Vec<_>> = BTreeMap::new();
 
         let id = Arc::new(id);
         let pkgid2scripts = Vec::from([(id.as_str(), script)]);
@@ -282,6 +333,9 @@ impl Loader {
                 FileType(ft) => {
                     ft2pkgid.entry(ft).or_default().push(id.as_str());
                 }
+                LuaModule(luam) => {
+                    luam2pkgid.entry(luam).or_default().push(id.as_str());
+                }
             }
         }
         Self {
@@ -289,6 +343,7 @@ impl Loader {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            luam2pkgid,
         }
     }
 }
@@ -334,4 +389,11 @@ struct OnCmdSetupTemplate<'a> {
 #[template(escape = false)]
 struct OnCmdTemplate<'a> {
     cmd2pkgid: &'a BTreeMap<UserCmd, Vec<PackageIDStr>>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "lua/_rsplug/on_lua.stpl")]
+#[template(escape = false)]
+struct OnLuaTemplate<'a> {
+    luam2pkgid: &'a BTreeMap<LuaModule, Vec<PackageIDStr>>,
 }

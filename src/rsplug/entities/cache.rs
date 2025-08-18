@@ -200,10 +200,14 @@ impl Cache {
                                         }
                                     })
                                     .collect();
+                                    let mut lazy_type = lazy_type.clone();
+                                    for luam in extract_unique_lua_modules(&files) {
+                                        lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
+                                    }
                                     Package {
                                         id,
                                         files,
-                                        lazy_type: lazy_type.clone(),
+                                        lazy_type,
                                         script: script.clone(),
                                     }
                                 }
@@ -237,4 +241,34 @@ impl Default for Cache {
             },
         }
     }
+}
+
+fn extract_unique_lua_modules<'a, T>(
+    files: &'a HashMap<PathBuf, T>,
+) -> impl Iterator<Item = String> + 'a {
+    let mut seen = hashbrown::HashSet::new();
+
+    files.keys().filter_map(move |path| {
+        let mut comps = path.components();
+
+        // 先頭が "lua" でなければ対象外
+        match comps.next().and_then(|c| c.as_os_str().to_str()) {
+            Some("lua") => {}
+            _ => return None,
+        }
+
+        // lua/ の直後を取得
+        let comp = comps.next()?;
+
+        let name = Path::new(comp.as_os_str())
+            .file_stem() // hoge2.lua → hoge2
+            .and_then(|s| s.to_str())?
+            .to_string();
+
+        if !name.is_empty() && seen.insert(name.clone()) {
+            Some(name)
+        } else {
+            None
+        }
+    })
 }
