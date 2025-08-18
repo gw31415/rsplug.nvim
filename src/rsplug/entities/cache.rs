@@ -56,7 +56,7 @@ impl Cache {
     ) -> Result<impl Iterator<Item = Package>, Error> {
         Self::fetch_inner(self.into(), unit, install, update)
             .await
-            .map(|hashmap| hashmap.into_values())
+            .map(HashMap::into_values)
     }
 
     fn fetch_inner(
