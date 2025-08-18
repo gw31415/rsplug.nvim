@@ -269,7 +269,7 @@ impl Loader {
         let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
 
         let id = Arc::new(id);
-        let scripts = Vec::from([(id.as_str(), script)]);
+        let pkgid2scripts = Vec::from([(id.as_str(), script)]);
         for ev in events {
             use LoadEvent::*;
             match ev {
@@ -285,7 +285,7 @@ impl Loader {
             }
         }
         Self {
-            pkgid2scripts: scripts,
+            pkgid2scripts,
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
