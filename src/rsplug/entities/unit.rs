@@ -90,7 +90,7 @@ pub struct DAGCreationError;
 
 impl Unit {
     /// 設定ファイルから Unit のコレクションを構築する
-    pub fn new(config: Config) -> Result<Vec<Arc<Unit>>, DAGCreationError> {
+    pub fn new(config: Config) -> Result<impl Iterator<Item = Arc<Unit>>, DAGCreationError> {
         let Config { mut plugins } = config;
         let units = RefCell::new(HashMap::<String, Vec<Arc<Unit>>>::new());
         loop {
@@ -149,6 +149,6 @@ impl Unit {
                 return Err(DAGCreationError);
             }
         }
-        Ok(units.into_inner().into_values().flatten().collect())
+        Ok(units.into_inner().into_values().flatten())
     }
 }
