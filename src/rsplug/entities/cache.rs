@@ -67,7 +67,7 @@ impl Cache {
     ) -> Pin<Box<dyn Future<Output = Result<PtrPkgMap, Error>> + Send + Sync>> {
         let config = config.clone();
         Box::pin(async move {
-            let pkgs: HashMap<usize, Package> = unit
+            let pkgs: PtrPkgMap = unit
                 .into_iter()
                 .map(move |unit| {
                     let config = config.clone();
@@ -95,7 +95,7 @@ impl Cache {
                             .into_iter()
                             .flatten();
 
-                        let mut pkgs: HashMap<usize, Package> = HashMap::new();
+                        let mut pkgs: PtrPkgMap = Default::default();
                         for (key, pkg) in depends {
                             pkgs.entry(key).or_insert(pkg).lazy_type &= lazy_type;
                         }
