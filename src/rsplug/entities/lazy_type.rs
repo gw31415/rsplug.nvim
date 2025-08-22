@@ -14,7 +14,7 @@ use sailfish::runtime::Render;
 use serde_with::DeserializeFromStr;
 
 /// Startプラグインとするか、Optプラグインとするか
-#[derive(PartialEq, Eq, Clone, Hash)]
+#[derive(PartialEq, Eq, Clone, Hash, Debug)]
 pub enum LazyType {
     /// Startプラグイン。起動時に読み込まれる。
     Start,
@@ -92,7 +92,7 @@ impl BitAndAssign<LoadEvent> for LazyType {
 }
 
 /// Optプラグインの読み込みイベントを表す。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub enum LoadEvent {
     /// Vim の自動コマンドイベント。
     Autocmd(Autocmd),
@@ -105,7 +105,7 @@ pub enum LoadEvent {
 }
 
 /// Vimの自動コマンドの文字列を表す型。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct Autocmd(Arc<String>);
 
 impl FromStr for Autocmd {
@@ -127,7 +127,7 @@ impl Render for Autocmd {
 }
 
 /// Vimのユーザーコマンドの文字列を表す型。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct UserCmd(Arc<String>);
 
 impl FromStr for UserCmd {
@@ -156,7 +156,7 @@ impl Render for UserCmd {
 }
 
 /// Vimのユーザーコマンドの文字列を表す型。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct FileType(Arc<String>);
 
 impl FromStr for FileType {
@@ -187,7 +187,7 @@ impl fmt::Display for FileType {
 }
 
 /// Vimのユーザーコマンドの文字列を表す型。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq /*DeserializeFromStr*/)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq /*DeserializeFromStr*/, Debug)]
 pub struct LuaModule(pub(super) Arc<String>);
 
 // impl FromStr for LuaModule {

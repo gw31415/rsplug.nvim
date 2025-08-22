@@ -86,7 +86,7 @@ impl Cache {
                             script,
                             merge,
                         } = unit.as_ref();
-                        let depends = depends
+                        let mut depends = depends
                             .iter()
                             .map(|dep| {
                                 Self::fetch_inner(
@@ -103,9 +103,15 @@ impl Cache {
                             .into_iter()
                             .collect::<Result<Vec<_>, _>>()?
                             .into_iter()
-                            .flatten();
+                            .flatten()
+                            .collect::<HashSet<_>>();
 
-                        let mut depends = depends.collect::<HashSet<_>>();
+                        for dep in depends.iter() {
+                            while pkgmap.read().await.get(dep).unwrap().is_none() {
+                                // Wait for dependent packages to finish processing
+                            }
+                        }
+
                         for key in &depends {
                             pkgmap
                                 .write()
@@ -116,6 +122,8 @@ impl Cache {
                                 .unwrap()
                                 .lazy_type &= lazy_type;
                         }
+                        depends.insert(key);
+                        let depends = depends; // make into immutable
 
                         match pkgmap.write().await.entry(key) {
                             Entry::Occupied(_) => {
@@ -234,7 +242,6 @@ impl Cache {
                                 }
                             };
                             pkgmap.write().await.insert(key, Some(pkg));
-                            depends.insert(key);
                         }
 
                         Ok::<_, Error>(depends)
