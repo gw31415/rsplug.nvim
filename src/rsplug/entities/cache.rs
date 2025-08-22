@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::log::{Message, msg};
-use hashbrown::HashMap;
-use tokio::task::JoinSet;
+use hashbrown::{HashMap, HashSet, hash_map::Entry};
+use tokio::{sync::RwLock, task::JoinSet};
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::{
@@ -39,8 +39,6 @@ pub struct Cache {
     pub cachepath: Cow<'static, Path>,
 }
 
-type PtrPkgMap = HashMap<usize, Package>;
-
 impl Cache {
     pub fn new(path: impl Into<Cow<'static, Path>>) -> Self {
         Cache {
@@ -54,23 +52,29 @@ impl Cache {
         install: bool,
         update: bool,
     ) -> Result<impl Iterator<Item = Package>, Error> {
-        Self::fetch_inner(self.into(), unit, install, update)
-            .await
-            .map(HashMap::into_values)
+        let pkgmap: Arc<RwLock<HashMap<usize, Option<Package>>>> = Default::default();
+        Self::fetch_inner(pkgmap.clone(), self.into(), unit, install, update).await?;
+        Ok(Arc::into_inner(pkgmap)
+            .unwrap()
+            .into_inner()
+            .into_values()
+            .flatten())
     }
 
     fn fetch_inner(
+        pkgmap: Arc<RwLock<HashMap<usize, Option<Package>>>>,
         config: Arc<Self>,
         unit: impl IntoIterator<Item = impl Into<Arc<Unit>> + Send + 'static> + Send + Sync + 'static,
         install: bool,
         update: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<PtrPkgMap, Error>> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = Result<HashSet<usize>, Error>> + Send + Sync>> {
         let config = config.clone();
         Box::pin(async move {
-            let pkgs: PtrPkgMap = unit
+            let depends: HashSet<usize> = unit
                 .into_iter()
                 .map(move |unit| {
                     let config = config.clone();
+                    let pkgmap = pkgmap.clone();
                     async move {
                         let unit: Arc<Unit> = unit.into();
                         let key = Arc::as_ptr(&unit) as usize;
@@ -85,7 +89,13 @@ impl Cache {
                         let depends = depends
                             .iter()
                             .map(|dep| {
-                                Self::fetch_inner(config.clone(), [dep.clone()], install, update)
+                                Self::fetch_inner(
+                                    pkgmap.clone(),
+                                    config.clone(),
+                                    [dep.clone()],
+                                    install,
+                                    update,
+                                )
                             })
                             .collect::<JoinSet<_>>()
                             .join_all()
@@ -95,14 +105,25 @@ impl Cache {
                             .into_iter()
                             .flatten();
 
-                        let mut pkgs: PtrPkgMap = Default::default();
-                        for (key, pkg) in depends {
-                            pkgs.entry(key).or_insert(pkg).lazy_type &= lazy_type;
+                        let mut depends = depends.collect::<HashSet<_>>();
+                        for key in &depends {
+                            pkgmap
+                                .write()
+                                .await
+                                .get_mut(key)
+                                .unwrap()
+                                .as_mut()
+                                .unwrap()
+                                .lazy_type &= lazy_type;
                         }
 
-                        if pkgs.contains_key(&key) {
-                            // Skip
-                            return Ok(pkgs);
+                        match pkgmap.write().await.entry(key) {
+                            Entry::Occupied(_) => {
+                                return Ok(depends);
+                            }
+                            pkg => {
+                                pkg.insert(None);
+                            }
                         }
 
                         'add_pkg: {
@@ -212,10 +233,11 @@ impl Cache {
                                     }
                                 }
                             };
-                            pkgs.insert(key, pkg);
+                            pkgmap.write().await.insert(key, Some(pkg));
+                            depends.insert(key);
                         }
 
-                        Ok::<_, Error>(pkgs)
+                        Ok::<_, Error>(depends)
                     }
                 })
                 .collect::<JoinSet<_>>()
@@ -226,7 +248,7 @@ impl Cache {
                 .into_iter()
                 .flatten()
                 .collect();
-            Ok(pkgs)
+            Ok(depends)
         })
     }
 }
