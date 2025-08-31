@@ -7,12 +7,12 @@ return {
 		if loaded[id] then return end
 		loaded[id] = true
 		local setup_scripts = pkgid2scripts[id] or {};
-		if setup_scripts.before_lua then
-			require(setup_scripts.before_lua)
+		if setup_scripts.lua_before then
+			require(setup_scripts.lua_before)
 		end
 		vim.cmd.packadd(id)
-		if setup_scripts.after_lua then
-			require(setup_scripts.after_lua)
+		if setup_scripts.lua_after then
+			require(setup_scripts.lua_after)
 		end
 	end,
 	---@param ft string
