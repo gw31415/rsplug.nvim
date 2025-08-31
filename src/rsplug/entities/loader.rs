@@ -75,8 +75,12 @@ impl From<Loader> for Vec<Package> {
                         }
                     };
 
-                    let SetupScript { after_lua } = script;
+                    let SetupScript {
+                        after_lua,
+                        before_lua,
+                    } = script;
                     add_script("after_lua", after_lua);
+                    add_script("before_lua", before_lua);
                     if script_set.is_empty() {
                         None
                     } else {

@@ -90,6 +90,8 @@ impl Plugin {
 pub struct SetupScript {
     /// プラグイン読み込み直後に実行される Lua スクリプト
     pub after_lua: Option<String>,
+    /// プラグイン読み込み直前に実行される Lua スクリプト
+    pub before_lua: Option<String>,
 }
 
 /// プラグインのセットアップに用いるスクリプト群
