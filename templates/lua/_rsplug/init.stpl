@@ -8,8 +8,8 @@ return {
 		loaded[id] = true
 		local setup_scripts = pkgid2scripts[id] or {};
 		vim.cmd.packadd(id)
-		if setup_scripts.lua_source then
-			require(setup_scripts.lua_source)
+		if setup_scripts.after_lua then
+			require(setup_scripts.after_lua)
 		end
 	end,
 	---@param ft string

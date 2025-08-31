@@ -89,7 +89,7 @@ impl Plugin {
 #[derive(Deserialize, Clone, Default)]
 pub struct SetupScript {
     /// プラグイン読み込み直後に実行される Lua スクリプト
-    pub lua_source: Option<String>,
+    pub after_lua: Option<String>,
 }
 
 /// プラグインのセットアップに用いるスクリプト群

@@ -12,7 +12,7 @@ use sailfish::TemplateSimple;
 
 use super::*;
 
-/// プラグインの読み込み制御や、ロード後の設定 (lua_source等) にまつわる情報を保持し、Package に変換するための構造体。
+/// プラグインの読み込み制御や、ロード後の設定 (after_lua等) にまつわる情報を保持し、Package に変換するための構造体。
 #[derive(Default)]
 pub struct Loader {
     pkgid2scripts: Vec<(PackageIDStr, SetupScript)>,
@@ -75,8 +75,8 @@ impl From<Loader> for Vec<Package> {
                         }
                     };
 
-                    let SetupScript { lua_source } = script;
-                    add_script("lua_source", lua_source);
+                    let SetupScript { after_lua } = script;
+                    add_script("after_lua", after_lua);
                     if script_set.is_empty() {
                         None
                     } else {
