@@ -20,6 +20,7 @@ pub struct Loader {
     cmd2pkgid: BTreeMap<UserCmd, Vec<PackageIDStr>>,
     ft2pkgid: BTreeMap<FileType, Vec<PackageIDStr>>,
     luam2pkgid: BTreeMap<LuaModule, Vec<PackageIDStr>>,
+    keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PackageIDStr>>>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -52,6 +53,7 @@ impl From<Loader> for Vec<Package> {
             cmd2pkgid,
             ft2pkgid,
             luam2pkgid,
+            keypattern2pkgid,
         } = value;
 
         let mut pkgs = Vec::new();
@@ -233,6 +235,30 @@ impl From<Loader> for Vec<Package> {
                 script: Default::default(),
             });
         }
+        if !keypattern2pkgid.is_empty() {
+            let data = include_bytes!("../../../templates/plugin/on_map.lua");
+            pkgs.push(instant_startup_pkg(
+                &format!("plugin/{}.lua", PackageID::new(data).as_str()),
+                data,
+            ));
+            pkgs.push(instant_startup_pkg(
+                "lua/_rsplug/on_map/init.lua",
+                include_bytes!("../../../templates/lua/_rsplug/on_map/init.lua"),
+            ));
+            for mode in keypattern2pkgid.keys() {
+                let data = OnMapTemplate {
+                    mode,
+                    keypattern2pkgid: &keypattern2pkgid,
+                }
+                .render_once()
+                .unwrap()
+                .into_bytes();
+                pkgs.push(instant_startup_pkg(
+                    &format!("lua/_rsplug/on_map/mode_{mode}.lua"),
+                    data,
+                ));
+            }
+        }
 
         pkgs
     }
@@ -246,6 +272,7 @@ impl AddAssign for Loader {
             cmd2pkgid,
             ft2pkgid,
             luam2pkgid,
+            keypattern2pkgid,
         } = other;
         for (event, ids) in event2pkgid {
             self.event2pkgid
@@ -268,6 +295,16 @@ impl AddAssign for Loader {
                 .entry(luam)
                 .or_default()
                 .extend(ids.into_iter());
+        }
+        for (key, pattern) in keypattern2pkgid {
+            for (pattern, ids) in pattern {
+                self.keypattern2pkgid
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(pattern)
+                    .or_default()
+                    .extend(ids.into_iter());
+            }
         }
     }
 }
@@ -295,12 +332,14 @@ impl Loader {
             cmd2pkgid,
             ft2pkgid,
             luam2pkgid,
+            keypattern2pkgid,
         } = self;
         event2pkgid.is_empty()
             && scripts.is_empty()
             && cmd2pkgid.is_empty()
             && ft2pkgid.is_empty()
             && luam2pkgid.is_empty()
+            && keypattern2pkgid.values().all(|v| v.is_empty())
     }
     /// Loaderを Package のベクタに変換する。
     pub fn into_pkgs(self) -> Vec<Package> {
@@ -318,6 +357,8 @@ impl Loader {
         let mut cmd2pkgid: BTreeMap<UserCmd, Vec<_>> = BTreeMap::new();
         let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
         let mut luam2pkgid: BTreeMap<LuaModule, Vec<_>> = BTreeMap::new();
+        let mut keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<_>>> =
+            BTreeMap::new();
 
         let id = Arc::new(id);
         let pkgid2scripts = Vec::from([(id.as_str(), script)]);
@@ -336,6 +377,20 @@ impl Loader {
                 LuaModule(luam) => {
                     luam2pkgid.entry(luam).or_default().push(id.as_str());
                 }
+                OnMap(pattern) => {
+                    let KeyPattern(pattern) = pattern;
+                    let id = id.as_str();
+                    for (mode, pattern) in pattern {
+                        for pattern in pattern {
+                            keypattern2pkgid
+                                .entry(mode.clone())
+                                .or_default()
+                                .entry(pattern)
+                                .or_default()
+                                .push(id.clone());
+                        }
+                    }
+                }
             }
         }
         Self {
@@ -344,6 +399,7 @@ impl Loader {
             cmd2pkgid,
             ft2pkgid,
             luam2pkgid,
+            keypattern2pkgid,
         }
     }
 }
@@ -396,4 +452,12 @@ struct OnCmdTemplate<'a> {
 #[template(escape = false)]
 struct OnLuaTemplate<'a> {
     luam2pkgid: &'a BTreeMap<LuaModule, Vec<PackageIDStr>>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "lua/_rsplug/on_map/mode__.stpl")]
+#[template(escape = false)]
+struct OnMapTemplate<'a> {
+    mode: &'a ModeChar,
+    keypattern2pkgid: &'a BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PackageIDStr>>>,
 }

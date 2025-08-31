@@ -1,4 +1,4 @@
-use std::{cell::RefCell, str::FromStr, sync::Arc};
+use std::{cell::RefCell, collections::BTreeSet, str::FromStr, sync::Arc};
 
 use hashbrown::{HashMap, HashSet};
 use once_cell::sync::Lazy;
@@ -111,18 +111,21 @@ impl Unit {
                     merge,
                     depends,
                     custom_name: _,
+                    on_map,
                 } = plugin;
                 let lazy_type = if start {
                     LazyType::Start
                 } else {
-                    LazyType::Opt(
-                        on_event
+                    LazyType::Opt({
+                        let mut set: BTreeSet<_> = on_event
                             .into_iter()
                             .map(LoadEvent::Autocmd)
                             .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
                             .chain(on_ft.into_iter().map(LoadEvent::FileType))
-                            .collect(),
-                    )
+                            .collect();
+                        set.insert(LoadEvent::OnMap(on_map));
+                        set
+                    })
                 };
                 let unit = {
                     let units = units.borrow();

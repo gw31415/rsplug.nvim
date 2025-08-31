@@ -13,7 +13,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 /// 固定されたパッケージID(表示や書き込み用)。
 /// インストールが済んだ後に使用するのが望ましい。未インストールの PackageID は変更される可能性があるため。
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct PackageIDStr([u8; 32]);
 
 impl Render for PackageIDStr {

@@ -14,7 +14,7 @@ use sailfish::runtime::Render;
 use serde_with::DeserializeFromStr;
 
 /// Startプラグインとするか、Optプラグインとするか
-#[derive(PartialEq, Eq, Clone, Hash, Debug)]
+#[derive(PartialEq, Eq, Clone, Hash)]
 pub enum LazyType {
     /// Startプラグイン。起動時に読み込まれる。
     Start,
@@ -92,7 +92,7 @@ impl BitAndAssign<LoadEvent> for LazyType {
 }
 
 /// Optプラグインの読み込みイベントを表す。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, Debug)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum LoadEvent {
     /// Vim の自動コマンドイベント。
     Autocmd(Autocmd),
@@ -102,6 +102,8 @@ pub enum LoadEvent {
     FileType(FileType),
     /// Luaモジュールの読み込み
     LuaModule(LuaModule),
+    /// on_map のキーパターン
+    OnMap(super::KeyPattern),
 }
 
 /// Vimの自動コマンドの文字列を表す型。

@@ -1,6 +1,16 @@
-use std::{iter::Sum, ops::AddAssign, path::Path, str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    hash::Hash,
+    iter::Sum,
+    ops::AddAssign,
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
 
+use hashbrown::HashMap;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use sailfish::runtime::Render;
 use serde::Deserialize;
 use serde_with::{DeserializeFromStr, OneOrMany, serde_as};
 
@@ -53,6 +63,8 @@ pub(super) struct Plugin {
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     pub on_ft: Vec<FileType>,
+    #[serde(default)]
+    pub on_map: KeyPattern,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     pub depends: Vec<String>,
@@ -109,5 +121,82 @@ impl FromStr for FileSpecifier {
             builder.add_line(None, line)?;
         }
         Ok(FileSpecifier(builder.build()?.into()))
+    }
+}
+
+/// キーパターン
+#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyPattern(pub BTreeMap<ModeChar, Vec<Arc<String>>>);
+
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub struct ModeChar(Option<char>);
+
+impl std::fmt::Display for ModeChar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(c) => c.fmt(f),
+            None => "".fmt(f),
+        }
+    }
+}
+
+impl Render for ModeChar {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        match self.0 {
+            Some(c) => c.render(b),
+            None => "".render(b),
+        }
+    }
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeyPatternDeserializerInner {
+    ModeMap(#[serde_as(as = "HashMap<_, OneOrMany<_>>")] HashMap<String, Vec<String>>),
+    AllPattern(#[serde_as(as = "OneOrMany<_>")] Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for KeyPattern {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner: KeyPatternDeserializerInner =
+            KeyPatternDeserializerInner::deserialize(deserializer)?;
+        let mut out: BTreeMap<ModeChar, Vec<Arc<String>>> = BTreeMap::new();
+
+        match inner {
+            KeyPatternDeserializerInner::ModeMap(map) => {
+                for (k, vals) in map {
+                    let vals: Vec<Arc<String>> = vals.into_iter().map(Arc::new).collect();
+                    // 例: "abc" -> 'a','b','c' 全てに同じ vals を付与
+                    for ch in k.chars() {
+                        match out.entry(ModeChar(Some(ch))) {
+                            Entry::Vacant(e) => {
+                                e.insert(vals.clone());
+                            }
+                            Entry::Occupied(mut e) => {
+                                e.get_mut().extend(vals.iter().cloned());
+                            }
+                        }
+                    }
+                }
+            }
+            KeyPatternDeserializerInner::AllPattern(v) => {
+                let v: Vec<Arc<String>> = v.into_iter().map(Arc::new).collect();
+                // 例: "hogehoge" / ["hoge","fuga"] -> { None: [...] }
+                match out.entry(ModeChar(None)) {
+                    Entry::Vacant(e) => {
+                        e.insert(v);
+                    }
+                    Entry::Occupied(mut e) => {
+                        e.get_mut().extend(v.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        Ok(KeyPattern(out))
     }
 }
