@@ -79,9 +79,12 @@ pub(super) struct Plugin {
 impl Plugin {
     /// プラグインを指定する名前
     pub fn name(&self) -> &str {
-        self.custom_name.as_ref().unwrap_or(match &self.repo {
-            UnitSource::GitHub { repo, .. } => repo,
-        })
+        self.custom_name.as_ref().map_or(
+            match &self.repo {
+                UnitSource::GitHub { repo, .. } => repo.as_ref(),
+            },
+            |v| v,
+        )
     }
 }
 

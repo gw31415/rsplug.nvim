@@ -29,7 +29,7 @@ pub enum UnitSource {
         /// リポジトリの所有者
         owner: String,
         /// リポジトリ
-        repo: String,
+        repo: Arc<str>,
         /// リビジョン
         rev: Option<String>,
     },
@@ -78,7 +78,7 @@ impl FromStr for UnitSource {
             return Err("GitHub repository format must be 'owner/repo[@rev]'");
         };
         let owner = cap["owner"].to_string();
-        let repo = cap["repo"].to_string();
+        let repo = cap["repo"].into();
         let rev = cap.name("rev").map(|rev| rev.as_str().to_string());
         Ok(UnitSource::GitHub { owner, repo, rev })
     }

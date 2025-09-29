@@ -142,12 +142,12 @@ impl Cache {
                                         .join("repos")
                                         .join("github.com")
                                         .join(owner)
-                                        .join(repo);
+                                        .join(repo.as_ref());
 
                                     tokio::fs::create_dir_all(&proj_root).await?;
                                     let proj_root = proj_root.canonicalize()?;
                                     let filesource =
-                                        Arc::new(FileSource::Directory { path: proj_root });
+                                        Arc::new(FileSource::Directory { path: proj_root.into() });
                                     let FileSource::Directory { path: proj_root } =
                                         filesource.as_ref()
                                     else {
@@ -162,11 +162,11 @@ impl Cache {
                                     if !git::exists(proj_root).await {
                                         if install {
                                             msg(Message::Cache("Initializing", url.clone()));
-                                            git::init(&url, proj_root).await?;
+                                            git::init(url.clone(), proj_root.clone()).await?;
                                             msg(Message::Cache("Fetching", url.clone()));
                                             git::fetch(
-                                                &Some(git::ls_remote(url.clone(), rev).await?),
-                                                proj_root,
+                                                Some(git::ls_remote(url.clone(), rev).await?),
+                                                proj_root.clone(),
                                             )
                                             .await?;
                                         } else {
@@ -179,8 +179,8 @@ impl Cache {
                                     if update {
                                         msg(Message::Cache("Updating", url.clone()));
                                         git::fetch(
-                                            &Some(git::ls_remote(url.clone(), rev).await?),
-                                            proj_root,
+                                            Some(git::ls_remote(url.clone(), rev).await?),
+                                            proj_root.clone(),
                                         )
                                         .await?;
                                     }
@@ -188,7 +188,7 @@ impl Cache {
                                     // ディレクトリ内容からのIDの決定
                                     let id = PackageID::new({
                                         let (head, diff) = tokio::join!(
-                                            git::head(proj_root),
+                                            git::head(proj_root.clone()),
                                             git::diff(proj_root),
                                         );
                                         match (head, diff) {

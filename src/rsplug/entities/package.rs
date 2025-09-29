@@ -114,7 +114,7 @@ impl Add for Package {
 
 /// ファイルの取得(生成)元。
 pub(super) enum FileSource {
-    Directory { path: PathBuf },
+    Directory { path: Arc<Path> },
     File { data: Cow<'static, [u8]> },
 }
 

@@ -24,8 +24,10 @@ pub mod git {
     //! 各種 Git 操作を行うモジュール
     use std::{path::Path, str::FromStr, sync::Arc};
 
+    use git2::Repository;
     use once_cell::sync::Lazy;
     use regex::Regex;
+    use tokio::task::spawn_blocking;
 
     use super::*;
 
@@ -38,20 +40,20 @@ pub mod git {
     }
 
     /// リポジトリ初期化処理
-    pub async fn init(repo: &str, dir: &Path) -> ExecuteResult<()> {
-        let _ = tokio::fs::remove_dir_all(dir.join(".git")).await;
-        execute(Command::new("git").current_dir(dir).arg("init")).await?;
-
-        execute(
-            Command::new("git")
-                .current_dir(dir)
-                .arg("remote")
-                .arg("add")
-                .arg("origin")
-                .arg(repo),
-        )
-        .await?;
-        Ok(())
+    pub async fn init(
+        repo: impl AsRef<str> + Send + 'static,
+        dir: impl AsRef<Path> + Send + 'static,
+    ) -> ExecuteResult<Repository> {
+        let _ = tokio::fs::remove_dir_all(dir.as_ref().join(".git")).await;
+        let r = spawn_blocking(move || git2::Repository::init(dir))
+            .await
+            .unwrap()?;
+        spawn_blocking(move || {
+            r.remote("origin", repo.as_ref())?;
+            Ok(r)
+        })
+        .await
+        .unwrap()
     }
 
     #[derive(Eq, PartialEq, PartialOrd, Ord)]
@@ -154,10 +156,13 @@ pub mod git {
     }
 
     /// リポジトリ同期処理
-    pub async fn fetch(rev: &Option<String>, dir: &Path) -> ExecuteResult<()> {
+    pub async fn fetch(
+        rev: Option<String>,
+        dir: impl AsRef<Path> + Send + 'static,
+    ) -> ExecuteResult<()> {
         execute(
             Command::new("git")
-                .current_dir(dir)
+                .current_dir(&dir)
                 .arg("fetch")
                 .arg("--depth=1")
                 .arg("origin")
@@ -177,14 +182,17 @@ pub mod git {
     }
 
     /// HEAD のハッシュ
-    pub async fn head(dir: &Path) -> ExecuteResult {
-        execute(
-            Command::new("git")
-                .current_dir(dir)
-                .arg("rev-parse")
-                .arg("HEAD"),
-        )
+    pub async fn head(dir: impl AsRef<Path> + Send + 'static) -> ExecuteResult {
+        spawn_blocking(|| {
+            let repo = Repository::open(dir)?;
+            let oid = repo
+                .head()?
+                .target()
+                .ok_or_else(|| git2::Error::from_str("HEAD is not a direct reference"))?;
+            Ok(oid.to_string().into_bytes())
+        })
         .await
+        .unwrap()
     }
 
     /// diff の出力

@@ -15,4 +15,6 @@ pub enum Error {
     /// If paths or outputs are not valid UTF-8
     #[error(transparent)]
     Utf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    Git2(#[from] git2::Error),
 }
