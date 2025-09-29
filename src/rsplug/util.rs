@@ -24,7 +24,7 @@ pub mod git {
     //! 各種 Git 操作を行うモジュール
     use std::{path::Path, str::FromStr, sync::Arc};
 
-    use git2::{DiffFormat, DiffOptions, Repository};
+    use git2::{build::CheckoutBuilder, DiffFormat, DiffOptions, FetchOptions, Repository};
     use once_cell::sync::Lazy;
     use regex::Regex;
     use tokio::task::spawn_blocking;
@@ -161,25 +161,37 @@ pub mod git {
         rev: Option<String>,
         dir: impl AsRef<Path> + Send + 'static,
     ) -> ExecuteResult<()> {
-        execute(
-            Command::new("git")
-                .current_dir(&dir)
-                .arg("fetch")
-                .arg("--depth=1")
-                .arg("origin")
-                .arg(rev.as_deref().unwrap_or("HEAD")),
-        )
-        .await?;
+        spawn_blocking(move || {
+            let mut fo = FetchOptions::new();
+            fo.download_tags(git2::AutotagOption::All);
+            fo.depth(1);
+            let repo = git2::Repository::open(dir)?;
+            let rev: [&str; 1] = [rev.as_ref().map_or("HEAD", |v| v)];
+            repo.find_remote("origin")
+                .unwrap()
+                .fetch(&rev, Some(&mut fo), None)?;
 
-        execute(
-            Command::new("git")
-                .current_dir(dir)
-                .arg("switch")
-                .arg("--detach")
-                .arg("FETCH_HEAD"),
-        )
-        .await?;
-        Ok(())
+            let fetch_head = repo
+                .find_reference("FETCH_HEAD")?
+                .target()
+                .ok_or_else(|| git2::Error::from_str("FETCH_HEAD has no target"))?;
+
+            repo.set_head_detached(fetch_head)?;
+            let obj = repo.find_object(fetch_head, None)?;
+            repo.checkout_tree(
+                &obj,
+                Some(
+                    CheckoutBuilder::new()
+                        .force()
+                        .remove_untracked(true)
+                        .allow_conflicts(true),
+                ),
+            )?;
+
+            Ok(())
+        })
+        .await
+        .unwrap()
     }
 
     /// HEAD のハッシュ
