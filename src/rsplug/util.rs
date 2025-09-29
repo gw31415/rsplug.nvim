@@ -24,10 +24,11 @@ pub mod git {
     //! 各種 Git 操作を行うモジュール
     use std::{path::Path, str::FromStr, sync::Arc};
 
-    use git2::Repository;
+    use git2::{DiffFormat, DiffOptions, Repository};
     use once_cell::sync::Lazy;
     use regex::Regex;
     use tokio::task::spawn_blocking;
+    use xxhash_rust::xxh3::Xxh3;
 
     use super::*;
 
@@ -196,7 +197,27 @@ pub mod git {
     }
 
     /// diff の出力
-    pub async fn diff(dir: &Path) -> ExecuteResult {
-        execute(Command::new("git").current_dir(dir).arg("diff").arg("HEAD")).await
+    pub async fn diff_hash(dir: &Path) -> ExecuteResult<[u8; 16]> {
+        let repo = Repository::open(dir)?;
+
+        // HEAD ツリー
+        let head_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = head_commit.tree()?;
+
+        // diff（git diff HEAD 相当）
+        let mut diff_opts = DiffOptions::new();
+        // 未追跡も含めたいなら: diff_opts.include_untracked(true);
+        let diff = repo.diff_tree_to_workdir(Some(&head_tree), Some(&mut diff_opts))?;
+
+        // パッチ出力を逐次ハッシュ化
+        let mut hasher = Xxh3::new();
+        diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+            hasher.update(line.content());
+            true
+        })?;
+
+        // 128bit のダイジェストを hex で
+        let digest = hasher.digest128();
+        Ok(digest.to_ne_bytes())
     }
 }

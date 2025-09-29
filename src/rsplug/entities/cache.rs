@@ -189,7 +189,7 @@ impl Cache {
                                     let id = PackageID::new({
                                         let (head, diff) = tokio::join!(
                                             git::head(proj_root.clone()),
-                                            git::diff(proj_root),
+                                            git::diff_hash(proj_root),
                                         );
                                         match (head, diff) {
                                             (Ok(mut head), Ok(diff)) => {
