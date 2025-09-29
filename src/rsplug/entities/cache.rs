@@ -7,11 +7,31 @@ use std::{
 
 use crate::log::{Message, msg};
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
-use ignore::WalkBuilder;
 use tokio::{sync::RwLock, task::JoinSet};
 use xxhash_rust::xxh3::xxh3_128;
 
-use super::{util::git, *};
+use super::{
+    util::{execute, git},
+    *,
+};
+
+struct IntoStringSplit(String, char);
+
+impl Iterator for IntoStringSplit {
+    type Item = String;
+    fn next(&mut self) -> Option<Self::Item> {
+        let Self(data, c) = self;
+        if data.is_empty() {
+            return None;
+        }
+        let Some(pos) = data.rfind(|ch| &ch == c) else {
+            return Some(std::mem::take(data));
+        };
+        let item = data.split_off(pos + 1);
+        data.pop();
+        Some(item)
+    }
+}
 
 /// プラグインのキャッシュ
 pub struct Cache {
@@ -180,46 +200,35 @@ impl Cache {
                                         }
                                     });
 
-                                    let files: HashMap<PathBuf, _> = WalkBuilder::new(proj_root)
-                                        .hidden(false)
-                                        // .parents()
-                                        // .ignore()
-                                        .git_ignore(true)
-                                        .git_global(false)
-                                        // .git_exclude()
-                                        .build()
-                                        .filter_map(|res| {
-                                            match res {
-                                                Ok(entry)
-                                                    if entry
-                                                        .file_type()
-                                                        .map(|t| t.is_file())
-                                                        .unwrap_or(false) =>
-                                                {
-                                                    let path = entry.path();
-                                                    let ignored = path.iter().any(|k| {
-                                                        let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
-                                                        merge.ignore.matched(k)
-                                                    });
-                                                    if !ignored && proj_root.join(path).is_file() {
-                                                        Some((
-                                                            path.to_path_buf(),
-                                                            FileItem {
-                                                                source: filesource.clone(),
-                                                                merge_type: MergeType::Conflict,
-                                                            },
-                                                        ))
-                                                    } else {
-                                                        None
-                                                    }
-                                                }
-                                                // Err(err) => {
-                                                //     return Err(err);
-                                                // }
-                                                _ => None,
-                                            }
-                                        })
-                                        .collect();
+                                    let files: HashMap<PathBuf, _> = {
+                                        let stdout = execute(
+                                            tokio::process::Command::new("git")
+                                                .current_dir(proj_root)
+                                                .arg("ls-files")
+                                                .arg("--full-name"),
+                                        )
+                                        .await?;
+                                        IntoStringSplit(String::from_utf8(stdout)?, '\n')
+                                    }
+                                    .filter_map(|fname| {
+                                        let fname = PathBuf::from(fname);
+                                        let ignored = fname.iter().any(|k| {
+                                            let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
+                                            merge.ignore.matched(k)
+                                        });
+                                        if !ignored && proj_root.join(&fname).is_file() {
+                                            Some((
+                                                fname,
+                                                FileItem {
+                                                    source: filesource.clone(),
+                                                    merge_type: MergeType::Conflict,
+                                                },
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
                                     let mut lazy_type = lazy_type.clone();
                                     for luam in extract_unique_lua_modules(&files) {
                                         lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
