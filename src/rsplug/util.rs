@@ -24,7 +24,7 @@ pub mod git {
     //! 各種 Git 操作を行うモジュール
     use std::{path::Path, str::FromStr, sync::Arc};
 
-    use git2::{build::CheckoutBuilder, DiffFormat, DiffOptions, FetchOptions, Repository};
+    use git2::{DiffFormat, DiffOptions, Repository, build::CheckoutBuilder};
     use once_cell::sync::Lazy;
     use regex::Regex;
     use tokio::task::spawn_blocking;
@@ -161,15 +161,29 @@ pub mod git {
         rev: Option<String>,
         dir: impl AsRef<Path> + Send + 'static,
     ) -> ExecuteResult<()> {
+        execute(
+            Command::new("git")
+                .current_dir(&dir)
+                .arg("fetch")
+                .arg("--depth=1")
+                .arg("origin")
+                .arg(rev.as_deref().unwrap_or("HEAD")),
+        )
+        .await?;
+
         spawn_blocking(move || {
-            let mut fo = FetchOptions::new();
-            fo.download_tags(git2::AutotagOption::All);
-            fo.depth(1);
             let repo = git2::Repository::open(dir)?;
-            let rev: [&str; 1] = [rev.as_ref().map_or("HEAD", |v| v)];
-            repo.find_remote("origin")
-                .unwrap()
-                .fetch(&rev, Some(&mut fo), None)?;
+
+            // TODO: こちらに移行したいが、現状では下記コードでは正常に FETCH_HEAD を取得してくれない
+            // repo.find_remote("origin").unwrap().fetch(
+            //     &[rev.as_ref().map_or("HEAD", |v| v)],
+            //     Some(
+            //         FetchOptions::new()
+            //             .download_tags(git2::AutotagOption::All)
+            //             .depth(1),
+            //     ),
+            //     None,
+            // )?;
 
             let fetch_head = repo
                 .find_reference("FETCH_HEAD")?
@@ -184,6 +198,7 @@ pub mod git {
                     CheckoutBuilder::new()
                         .force()
                         .remove_untracked(true)
+                        .use_theirs(true)
                         .allow_conflicts(true),
                 ),
             )?;
