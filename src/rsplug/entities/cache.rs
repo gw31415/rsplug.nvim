@@ -146,8 +146,9 @@ impl Cache {
 
                                     tokio::fs::create_dir_all(&proj_root).await?;
                                     let proj_root = proj_root.canonicalize()?;
-                                    let filesource =
-                                        Arc::new(FileSource::Directory { path: proj_root.into() });
+                                    let filesource = Arc::new(FileSource::Directory {
+                                        path: proj_root.into(),
+                                    });
                                     let FileSource::Directory { path: proj_root } =
                                         filesource.as_ref()
                                     else {
@@ -188,8 +189,8 @@ impl Cache {
                                     // ディレクトリ内容からのIDの決定
                                     let id = PackageID::new({
                                         let (head, diff) = tokio::join!(
-                                            git::head(proj_root.clone()),
-                                            git::diff_hash(proj_root),
+                                            git::head_hash(proj_root.clone()),
+                                            git::diff_hash(proj_root.clone()),
                                         );
                                         match (head, diff) {
                                             (Ok(mut head), Ok(diff)) => {

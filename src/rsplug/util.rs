@@ -210,7 +210,7 @@ pub mod git {
     }
 
     /// HEAD のハッシュ
-    pub async fn head(dir: impl AsRef<Path> + Send + 'static) -> ExecuteResult {
+    pub async fn head_hash(dir: impl AsRef<Path> + Send + 'static) -> ExecuteResult {
         spawn_blocking(|| {
             let repo = Repository::open(dir)?;
             let oid = repo
@@ -224,27 +224,31 @@ pub mod git {
     }
 
     /// diff の出力
-    pub async fn diff_hash(dir: &Path) -> ExecuteResult<[u8; 16]> {
-        let repo = Repository::open(dir)?;
+    pub async fn diff_hash(dir: impl AsRef<Path> + Send + 'static) -> ExecuteResult<[u8; 16]> {
+        spawn_blocking(|| {
+            let repo = Repository::open(dir)?;
 
-        // HEAD ツリー
-        let head_commit = repo.head()?.peel_to_commit()?;
-        let head_tree = head_commit.tree()?;
+            // HEAD ツリー
+            let head_commit = repo.head()?.peel_to_commit()?;
+            let head_tree = head_commit.tree()?;
 
-        // diff（git diff HEAD 相当）
-        let mut diff_opts = DiffOptions::new();
-        // 未追跡も含めたいなら: diff_opts.include_untracked(true);
-        let diff = repo.diff_tree_to_workdir(Some(&head_tree), Some(&mut diff_opts))?;
+            // diff（git diff HEAD 相当）
+            let mut diff_opts = DiffOptions::new();
+            // 未追跡も含めたいなら: diff_opts.include_untracked(true);
+            let diff = repo.diff_tree_to_workdir(Some(&head_tree), Some(&mut diff_opts))?;
 
-        // パッチ出力を逐次ハッシュ化
-        let mut hasher = Xxh3::new();
-        diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-            hasher.update(line.content());
-            true
-        })?;
+            // パッチ出力を逐次ハッシュ化
+            let mut hasher = Xxh3::new();
+            diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+                hasher.update(line.content());
+                true
+            })?;
 
-        // 128bit のダイジェストを hex で
-        let digest = hasher.digest128();
-        Ok(digest.to_ne_bytes())
+            // 128bit のダイジェストを hex で
+            let digest = hasher.digest128();
+            Ok(digest.to_ne_bytes())
+        })
+        .await
+        .unwrap()
     }
 }
