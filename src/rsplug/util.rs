@@ -7,7 +7,7 @@ use super::error::Error;
 type ExecuteResult<T = Vec<u8>> = Result<T, Error>;
 
 /// 外部コマンドを実行する
-pub async fn execute(cmd: &mut Command) -> ExecuteResult {
+async fn execute(cmd: &mut Command) -> ExecuteResult {
     let Output {
         stdout,
         status,
@@ -31,6 +31,38 @@ pub mod git {
     use xxhash_rust::xxh3::Xxh3;
 
     use super::*;
+
+    struct IntoStringSplit(String, char);
+
+    impl Iterator for IntoStringSplit {
+        type Item = String;
+        fn next(&mut self) -> Option<Self::Item> {
+            let Self(data, c) = self;
+            if data.is_empty() {
+                return None;
+            }
+            let Some(pos) = data.rfind(|ch| &ch == c) else {
+                return Some(std::mem::take(data));
+            };
+            let item = data.split_off(pos + 1);
+            data.pop();
+            Some(item)
+        }
+    }
+
+    pub async fn ls_files(
+        dir: impl AsRef<Path> + Send + 'static,
+    ) -> ExecuteResult<impl Iterator<Item = PathBuf>> {
+        let stdout = execute(
+            tokio::process::Command::new("git")
+                .current_dir(dir)
+                .arg("ls-files")
+                .arg("--full-name"),
+        )
+        .await?;
+
+        Ok(IntoStringSplit(String::from_utf8(stdout)?, '\n').map(PathBuf::from))
+    }
 
     /// リポジトリが存在するかどうか
     pub async fn exists(dir: &Path) -> bool {
