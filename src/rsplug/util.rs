@@ -1,4 +1,4 @@
-use std::process::Output;
+use std::{path::PathBuf, process::Output};
 
 use tokio::process::Command;
 
@@ -7,6 +7,7 @@ use super::error::Error;
 type ExecuteResult<T = Vec<u8>> = Result<T, Error>;
 
 /// 外部コマンドを実行する
+#[inline]
 async fn execute(cmd: &mut Command) -> ExecuteResult {
     let Output {
         stdout,
@@ -20,9 +21,26 @@ async fn execute(cmd: &mut Command) -> ExecuteResult {
     }
 }
 
+#[inline]
+fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes).to_string())
+    }
+}
+
 pub mod git {
     //! 各種 Git 操作を行うモジュール
-    use std::{path::Path, str::FromStr, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        str::FromStr,
+        sync::Arc,
+    };
 
     use git2::{DiffFormat, DiffOptions, Repository, build::CheckoutBuilder};
     use once_cell::sync::Lazy;
@@ -32,36 +50,15 @@ pub mod git {
 
     use super::*;
 
-    struct IntoStringSplit(String, char);
-
-    impl Iterator for IntoStringSplit {
-        type Item = String;
-        fn next(&mut self) -> Option<Self::Item> {
-            let Self(data, c) = self;
-            if data.is_empty() {
-                return None;
-            }
-            let Some(pos) = data.rfind(|ch| &ch == c) else {
-                return Some(std::mem::take(data));
-            };
-            let item = data.split_off(pos + 1);
-            data.pop();
-            Some(item)
-        }
-    }
-
     pub async fn ls_files(
         dir: impl AsRef<Path> + Send + 'static,
     ) -> ExecuteResult<impl Iterator<Item = PathBuf>> {
-        let stdout = execute(
-            tokio::process::Command::new("git")
-                .current_dir(dir)
-                .arg("ls-files")
-                .arg("--full-name"),
-        )
-        .await?;
-
-        Ok(IntoStringSplit(String::from_utf8(stdout)?, '\n').map(PathBuf::from))
+        Ok(Repository::open(dir)?
+            .index()?
+            .iter()
+            .map(|entry| bytes_to_pathbuf(entry.path))
+            .collect::<Vec<_>>()
+            .into_iter())
     }
 
     /// リポジトリが存在するかどうか
