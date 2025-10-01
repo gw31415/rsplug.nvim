@@ -10,7 +10,10 @@ use hashbrown::{HashMap, HashSet, hash_map::Entry};
 use tokio::{sync::RwLock, task::JoinSet};
 use xxhash_rust::xxh3::xxh3_128;
 
-use super::{util::git, *};
+use super::{
+    util::{git, github},
+    *,
+};
 
 /// プラグインのキャッシュ
 pub struct Cache {
@@ -135,8 +138,7 @@ impl Cache {
                                         unsafe { std::hint::unreachable_unchecked() };
                                     };
 
-                                    let url: Arc<str> =
-                                        Arc::from(format!("https://github.com/{owner}/{repo}"));
+                                    let url: Arc<str> = Arc::from(github::url(owner, repo));
 
                                     // リポジトリがない場合のインストール処理
                                     if !git::exists(proj_root).await {

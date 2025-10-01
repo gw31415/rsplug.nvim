@@ -281,3 +281,16 @@ pub mod git {
         .unwrap()
     }
 }
+
+pub mod github {
+    /// GitHubのリポジトリURLを生成
+    pub fn url(owner: &str, repo: &str) -> String {
+        const PREFIX: &str = "https://github.com/";
+        let mut url = String::with_capacity(const { PREFIX.len() + 1 } + owner.len() + repo.len());
+        url.push_str(PREFIX);
+        url.push_str(owner);
+        url.push('/');
+        url.push_str(repo);
+        url
+    }
+}
