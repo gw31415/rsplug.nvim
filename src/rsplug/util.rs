@@ -1,24 +1,34 @@
-use std::{path::PathBuf, process::Output};
-
-use tokio::process::Command;
+use std::path::PathBuf;
 
 use super::error::Error;
 
 type ExecuteResult<T = Vec<u8>> = Result<T, Error>;
 
 /// 外部コマンドを実行する
-#[inline]
-async fn execute(cmd: &mut Command) -> ExecuteResult {
-    let Output {
-        stdout,
-        status,
-        stderr,
-    } = cmd.output().await?;
-    if status.success() {
-        Ok(stdout)
-    } else {
-        Err(Error::ProcessFailed { stderr })
-    }
+macro_rules! execute {
+    ($cmd:expr, $($arg:expr),*) => {
+        execute![cwd: ".", $cmd, $($arg),*]
+    };
+    (cwd: $cwd:expr, $cmd:expr, $($arg:expr),*) => {{
+            let mut cmd = tokio::process::Command::new($cmd);
+                cmd
+                .current_dir($cwd)
+                $(
+                    .arg($arg)
+                )*;
+            async move {
+                let std::process::Output {
+                    stdout,
+                    status,
+                    stderr,
+                } = cmd.output().await?;
+                if status.success() {
+                    Ok(stdout)
+                } else {
+                    Err(Error::ProcessFailed { stderr })
+                }
+            }
+    }}
 }
 
 #[inline]
@@ -170,13 +180,7 @@ pub mod git {
     /// リポジトリのリモートからrevに対応する最新のコミットハッシュを取得する
     pub async fn ls_remote(url: Arc<str>, rev: &Option<String>) -> ExecuteResult<String> {
         let rev = rev.as_deref().unwrap_or("HEAD");
-        let stdout = execute(
-            Command::new("git")
-                .arg("ls-remote")
-                .arg(url.as_ref())
-                .arg(rev),
-        )
-        .await?;
+        let stdout = execute!["git", "ls-remote", url.as_ref(), rev].await?;
         let Some(latest) = String::from_utf8(stdout)?
             .lines()
             .filter_map(|l| GitRef::try_from(l).ok())
@@ -194,14 +198,14 @@ pub mod git {
 
     /// リポジトリ同期処理
     pub async fn fetch(rev: Option<String>, repo: Repo) -> ExecuteResult<()> {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(repo.0.lock().unwrap().workdir().unwrap());
-        execute(
-            cmd.arg("fetch")
-                .arg("--depth=1")
-                .arg("origin")
-                .arg(rev.as_deref().unwrap_or("HEAD")),
-        )
+        execute![
+            cwd: repo.0.lock().unwrap().workdir().unwrap(),
+            "git",
+            "fetch",
+            "--depth=1",
+            "origin",
+            rev.as_deref().unwrap_or("HEAD")
+        ]
         .await?;
 
         fn inner(repo: &Repository) -> ExecuteResult<()> {
