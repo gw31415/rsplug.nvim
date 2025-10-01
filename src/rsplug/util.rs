@@ -47,7 +47,7 @@ pub mod git {
     use std::{
         path::{Path, PathBuf},
         str::FromStr,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, MutexGuard},
     };
 
     use git2::{DiffFormat, DiffOptions, Repository, build::CheckoutBuilder};
@@ -67,11 +67,16 @@ pub mod git {
         }
     }
 
+    impl Repo {
+        #[inline]
+        fn borrow<'a>(&'a self) -> MutexGuard<'a, git2::Repository> {
+            self.0.lock().unwrap()
+        }
+    }
+
     pub async fn ls_files(repo: Repo) -> Result<impl Iterator<Item = PathBuf>, Error> {
         Ok(repo
-            .0
-            .lock()
-            .unwrap()
+            .borrow()
             .index()?
             .iter()
             .map(|entry| bytes_to_pathbuf(entry.path))
@@ -239,18 +244,14 @@ pub mod git {
             Ok(())
         }
 
-        spawn_blocking(move || inner(&repo.0.lock().unwrap()))
-            .await
-            .unwrap()
+        spawn_blocking(move || inner(&repo.borrow())).await.unwrap()
     }
 
     /// HEAD のハッシュ
     pub async fn head_hash(repo: Repo) -> Result<Vec<u8>, Error> {
         spawn_blocking(move || {
             let oid = repo
-                .0
-                .lock()
-                .unwrap()
+                .borrow()
                 .head()?
                 .target()
                 .ok_or_else(|| git2::Error::from_str("HEAD is not a direct reference"))?;
@@ -283,9 +284,7 @@ pub mod git {
             let digest = hasher.digest128();
             Ok(digest.to_ne_bytes())
         }
-        spawn_blocking(move || inner(&repo.0.lock().unwrap()))
-            .await
-            .unwrap()
+        spawn_blocking(move || inner(&repo.borrow())).await.unwrap()
     }
 }
 
