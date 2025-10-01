@@ -141,28 +141,30 @@ impl Cache {
                                     let url: Arc<str> = Arc::from(github::url(owner, repo));
 
                                     // リポジトリがない場合のインストール処理
-                                    if !git::exists(proj_root).await {
-                                        if install {
-                                            msg(Message::Cache("Initializing", url.clone()));
+                                    let repo = if let Ok(repo) = git::open(proj_root).await {
+                                        repo
+                                    } else if install {
+                                        msg(Message::Cache("Initializing", url.clone()));
+                                        let repo =
                                             git::init(url.clone(), proj_root.clone()).await?;
-                                            msg(Message::Cache("Fetching", url.clone()));
-                                            git::fetch(
-                                                Some(git::ls_remote(url.clone(), rev).await?),
-                                                proj_root.clone(),
-                                            )
-                                            .await?;
-                                        } else {
-                                            // インストールされていない場合はスキップ
-                                            break 'add_pkg;
-                                        }
-                                    }
+                                        msg(Message::Cache("Fetching", url.clone()));
+                                        git::fetch(
+                                            Some(git::ls_remote(url.clone(), rev).await?),
+                                            repo.clone(),
+                                        )
+                                        .await?;
+                                        repo
+                                    } else {
+                                        // インストールされていない場合はスキップ
+                                        break 'add_pkg;
+                                    };
 
                                     // アップデート処理
                                     if update {
                                         msg(Message::Cache("Updating", url.clone()));
                                         git::fetch(
                                             Some(git::ls_remote(url.clone(), rev).await?),
-                                            proj_root.clone(),
+                                            repo.clone(),
                                         )
                                         .await?;
                                     }
@@ -170,8 +172,8 @@ impl Cache {
                                     // ディレクトリ内容からのIDの決定
                                     let id = PackageID::new({
                                         let (head, diff) = tokio::join!(
-                                            git::head_hash(proj_root.clone()),
-                                            git::diff_hash(proj_root.clone()),
+                                            git::head_hash(repo.clone()),
+                                            git::diff_hash(repo.clone()),
                                         );
                                         match (head, diff) {
                                             (Ok(mut head), Ok(diff)) => {
@@ -182,27 +184,26 @@ impl Cache {
                                         }
                                     });
 
-                                    let files: HashMap<PathBuf, _> =
-                                        git::ls_files(proj_root.clone())
-                                            .await?
-                                            .filter_map(|path| {
-                                                let ignored = path.iter().any(|k| {
-                                                    let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
-                                                    merge.ignore.matched(k)
-                                                });
-                                                if !ignored && proj_root.join(&path).is_file() {
-                                                    Some((
-                                                        path,
-                                                        FileItem {
-                                                            source: filesource.clone(),
-                                                            merge_type: MergeType::Conflict,
-                                                        },
-                                                    ))
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .collect();
+                                    let files: HashMap<PathBuf, _> = git::ls_files(repo.clone())
+                                        .await?
+                                        .filter_map(|path| {
+                                            let ignored = path.iter().any(|k| {
+                                                let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
+                                                merge.ignore.matched(k)
+                                            });
+                                            if !ignored && proj_root.join(&path).is_file() {
+                                                Some((
+                                                    path,
+                                                    FileItem {
+                                                        source: filesource.clone(),
+                                                        merge_type: MergeType::Conflict,
+                                                    },
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
                                     let mut lazy_type = lazy_type.clone();
                                     for luam in extract_unique_lua_modules(&files) {
                                         lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));

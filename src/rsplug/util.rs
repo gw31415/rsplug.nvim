@@ -39,7 +39,7 @@ pub mod git {
     use std::{
         path::{Path, PathBuf},
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
     use git2::{DiffFormat, DiffOptions, Repository, build::CheckoutBuilder};
@@ -50,10 +50,20 @@ pub mod git {
 
     use super::*;
 
-    pub async fn ls_files(
-        dir: impl AsRef<Path> + Send + 'static,
-    ) -> ExecuteResult<impl Iterator<Item = PathBuf>> {
-        Ok(Repository::open(dir)?
+    #[derive(Clone)]
+    pub struct Repo(Arc<Mutex<Repository>>);
+
+    impl From<Repository> for Repo {
+        fn from(value: Repository) -> Self {
+            Repo(Arc::new(Mutex::new(value)))
+        }
+    }
+
+    pub async fn ls_files(repo: Repo) -> ExecuteResult<impl Iterator<Item = PathBuf>> {
+        Ok(repo
+            .0
+            .lock()
+            .unwrap()
             .index()?
             .iter()
             .map(|entry| bytes_to_pathbuf(entry.path))
@@ -62,25 +72,22 @@ pub mod git {
     }
 
     /// リポジトリが存在するかどうか
-    pub async fn exists(dir: &Path) -> bool {
-        matches!(
-            tokio::fs::try_exists(dir.join(".git").join("HEAD")).await,
-            Ok(true)
-        )
+    pub async fn open(dir: &Path) -> ExecuteResult<Repo> {
+        Ok(git2::Repository::open(dir)?.into())
     }
 
     /// リポジトリ初期化処理
     pub async fn init(
         repo: impl AsRef<str> + Send + 'static,
         dir: impl AsRef<Path> + Send + 'static,
-    ) -> ExecuteResult<Repository> {
+    ) -> ExecuteResult<Repo> {
         let _ = tokio::fs::remove_dir_all(dir.as_ref().join(".git")).await;
         let r = spawn_blocking(move || git2::Repository::init(dir))
             .await
             .unwrap()?;
         spawn_blocking(move || {
             r.remote("origin", repo.as_ref())?;
-            Ok(r)
+            Ok(r.into())
         })
         .await
         .unwrap()
@@ -186,23 +193,18 @@ pub mod git {
     }
 
     /// リポジトリ同期処理
-    pub async fn fetch(
-        rev: Option<String>,
-        dir: impl AsRef<Path> + Send + 'static,
-    ) -> ExecuteResult<()> {
+    pub async fn fetch(rev: Option<String>, repo: Repo) -> ExecuteResult<()> {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(repo.0.lock().unwrap().workdir().unwrap());
         execute(
-            Command::new("git")
-                .current_dir(&dir)
-                .arg("fetch")
+            cmd.arg("fetch")
                 .arg("--depth=1")
                 .arg("origin")
                 .arg(rev.as_deref().unwrap_or("HEAD")),
         )
         .await?;
 
-        spawn_blocking(move || {
-            let repo = git2::Repository::open(dir)?;
-
+        fn inner(repo: &Repository) -> ExecuteResult<()> {
             // TODO: こちらに移行したいが、現状では下記コードでは正常に FETCH_HEAD を取得してくれない
             // repo.find_remote("origin").unwrap().fetch(
             //     &[rev.as_ref().map_or("HEAD", |v| v)],
@@ -233,16 +235,20 @@ pub mod git {
             )?;
 
             Ok(())
-        })
-        .await
-        .unwrap()
+        }
+
+        spawn_blocking(move || inner(&repo.0.lock().unwrap()))
+            .await
+            .unwrap()
     }
 
     /// HEAD のハッシュ
-    pub async fn head_hash(dir: impl AsRef<Path> + Send + 'static) -> ExecuteResult {
-        spawn_blocking(|| {
-            let repo = Repository::open(dir)?;
+    pub async fn head_hash(repo: Repo) -> ExecuteResult {
+        spawn_blocking(move || {
             let oid = repo
+                .0
+                .lock()
+                .unwrap()
                 .head()?
                 .target()
                 .ok_or_else(|| git2::Error::from_str("HEAD is not a direct reference"))?;
@@ -253,10 +259,8 @@ pub mod git {
     }
 
     /// diff の出力
-    pub async fn diff_hash(dir: impl AsRef<Path> + Send + 'static) -> ExecuteResult<[u8; 16]> {
-        spawn_blocking(|| {
-            let repo = Repository::open(dir)?;
-
+    pub async fn diff_hash(repo: Repo) -> ExecuteResult<[u8; 16]> {
+        fn inner(repo: &Repository) -> ExecuteResult<[u8; 16]> {
             // HEAD ツリー
             let head_commit = repo.head()?.peel_to_commit()?;
             let head_tree = head_commit.tree()?;
@@ -268,7 +272,7 @@ pub mod git {
 
             // パッチ出力を逐次ハッシュ化
             let mut hasher = Xxh3::new();
-            diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+            diff.print(DiffFormat::Raw, |_delta, _hunk, line| {
                 hasher.update(line.content());
                 true
             })?;
@@ -276,9 +280,10 @@ pub mod git {
             // 128bit のダイジェストを hex で
             let digest = hasher.digest128();
             Ok(digest.to_ne_bytes())
-        })
-        .await
-        .unwrap()
+        }
+        spawn_blocking(move || inner(&repo.0.lock().unwrap()))
+            .await
+            .unwrap()
     }
 }
 
