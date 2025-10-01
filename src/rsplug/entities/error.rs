@@ -6,9 +6,6 @@ pub enum Error {
     /// IO Error
     #[error(transparent)]
     Io(#[from] io::Error),
-    /// External process failed with non-zero exit code
-    #[error("Process failed: {}", String::from_utf8_lossy(stderr))]
-    ProcessFailed { stderr: Vec<u8> },
     /// Git Revision Error
     #[error("Git-rev of {:?} not found in {url}", &rev)]
     GitRev { url: Arc<str>, rev: String },

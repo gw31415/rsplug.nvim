@@ -2,33 +2,6 @@ use std::path::PathBuf;
 
 use super::error::Error;
 
-/// 外部コマンドを実行する
-macro_rules! execute {
-    ($cmd:expr, $($arg:expr),*) => {
-        execute![cwd: ".", $cmd, $($arg),*]
-    };
-    (cwd: $cwd:expr, $cmd:expr, $($arg:expr),*) => {{
-            let mut cmd = tokio::process::Command::new($cmd);
-                cmd
-                .current_dir($cwd)
-                $(
-                    .arg($arg)
-                )*;
-            async move {
-                let std::process::Output {
-                    stdout,
-                    status,
-                    stderr,
-                } = cmd.output().await?;
-                if status.success() {
-                    Ok(stdout)
-                } else {
-                    Err(Error::ProcessFailed { stderr })
-                }
-            }
-    }}
-}
-
 #[inline]
 fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
     #[cfg(unix)]
@@ -50,7 +23,7 @@ pub mod git {
         sync::{Arc, Mutex},
     };
 
-    use git2::{DiffFormat, DiffOptions, Repository, build::CheckoutBuilder};
+    use git2::{DiffFormat, DiffOptions, FetchOptions, Oid, Repository, build::CheckoutBuilder};
     use once_cell::sync::Lazy;
     use regex::Regex;
     use tokio::task::spawn_blocking;
@@ -81,38 +54,28 @@ pub mod git {
         }
 
         /// リポジトリ同期処理
-        pub async fn fetch(&mut self, rev: Option<String>) -> Result<(), Error> {
-            execute![
-                cwd: self.0.lock().unwrap().workdir().unwrap(),
-                "git",
-                "fetch",
-                "--depth=1",
-                "origin",
-                rev.as_deref().unwrap_or("HEAD")
-            ]
-            .await?;
-
+        pub async fn fetch(&mut self, rev: Oid) -> Result<(), Error> {
             let repo = self.0.clone();
             spawn_blocking(move || {
                 let repo = repo.lock().unwrap();
-                // TODO: こちらに移行したいが、現状では下記コードでは正常に FETCH_HEAD を取得してくれない
-                // repo.find_remote("origin").unwrap().fetch(
-                //     &[rev.as_ref().map_or("HEAD", |v| v)],
-                //     Some(
-                //         FetchOptions::new()
-                //             .download_tags(git2::AutotagOption::All)
-                //             .depth(1),
-                //     ),
-                //     None,
-                // )?;
+                let obj = if let Ok(obj) = repo.find_object(rev, None) {
+                    obj
+                } else {
+                    if let Ok(mut remote) = repo.find_remote("origin") {
+                        remote.fetch(
+                            &[rev.to_string()],
+                            Some(
+                                FetchOptions::new()
+                                    .download_tags(git2::AutotagOption::None)
+                                    .depth(1),
+                            ),
+                            None,
+                        )?;
+                    }
+                    repo.find_object(rev, None)?
+                };
 
-                let fetch_head = repo
-                    .find_reference("FETCH_HEAD")?
-                    .target()
-                    .ok_or_else(|| git2::Error::from_str("FETCH_HEAD has no target"))?;
-
-                repo.set_head_detached(fetch_head)?;
-                let obj = repo.find_object(fetch_head, None)?;
+                repo.set_head_detached(rev)?;
                 repo.checkout_tree(
                     &obj,
                     Some(
@@ -201,6 +164,7 @@ pub mod git {
     #[derive(Eq, PartialEq, PartialOrd, Ord)]
     enum GitRefType<'a> {
         Other(&'a str),
+        Heads(&'a str),
         Tag(&'a str),
         Pull(usize, &'a str),
         SemVer {
@@ -241,54 +205,80 @@ pub mod git {
             if let Some(inner) = value.strip_prefix("refs/tags/") {
                 return GitRefType::Tag(inner);
             }
+            if let Some(inner) = value.strip_prefix("refs/heads/") {
+                return GitRefType::Heads(inner);
+            }
             GitRefType::Other(value)
         }
     }
 
-    impl<'a> TryFrom<&'a str> for GitRef<'a> {
-        type Error = &'static str;
-        fn try_from(value: &'a str) -> Result<Self, Self::Error> {
-            static LINE_REGEX: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"^(?<id>[0-9a-f]+)\s+(?<gitref>.+)$").unwrap());
-            let Some(caps) = LINE_REGEX.captures(value) else {
-                return Err("Invalid git ref format");
+    impl<'a> From<&'a git2::RemoteHead<'a>> for GitRef<'a> {
+        fn from(value: &'a git2::RemoteHead<'a>) -> Self {
+            let ref_type = GitRefType::from(value.name());
+            let name = match ref_type {
+                GitRefType::Tag(_) | GitRefType::SemVer { .. } => {
+                    Some(value.name().strip_prefix("refs/tags/").unwrap())
+                }
+                GitRefType::Heads(_) => Some(value.name().strip_prefix("refs/heads/").unwrap()),
+                GitRefType::Head => Some("HEAD"),
+                _ => None,
             };
-            let Some(id) = caps.name("id") else {
-                return Err("Invalid git ref format: missing id");
-            };
-            let Some(gitref) = caps.name("gitref") else {
-                return Err("Invalid git ref format: missing content");
-            };
-            Ok(GitRef {
-                id: id.as_str(),
-                ref_type: GitRefType::from(gitref.as_str()),
-            })
+            GitRef {
+                ref_type,
+                id: value.oid(),
+                name,
+            }
+        }
+    }
+
+    impl From<GitRef<'_>> for Oid {
+        fn from(value: GitRef<'_>) -> Self {
+            value.id
         }
     }
 
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
     struct GitRef<'a> {
         ref_type: GitRefType<'a>,
-        id: &'a str,
+        id: Oid,
+        name: Option<&'a str>,
     }
 
     /// リポジトリのリモートからrevに対応する最新のコミットハッシュを取得する
-    pub async fn ls_remote(url: Arc<str>, rev: &Option<String>) -> Result<String, Error> {
-        let rev = rev.as_deref().unwrap_or("HEAD");
-        let stdout = execute!["git", "ls-remote", url.as_ref(), rev].await?;
-        let Some(latest) = String::from_utf8(stdout)?
-            .lines()
-            .filter_map(|l| GitRef::try_from(l).ok())
-            .max()
-            .map(|git_ref| git_ref.id.to_string())
-        else {
-            return Err(Error::GitRev {
-                url,
-                rev: rev.to_owned(),
-            });
+    pub async fn ls_remote(url: Arc<str>, rev: &Option<String>) -> Result<Oid, Error> {
+        let mut remote = git2::Remote::create_detached(url.to_string()).unwrap();
+        let connection = remote
+            .connect_auth(git2::Direction::Fetch, None, None)
+            .unwrap();
+        let references = connection.list().unwrap();
+        let latest = if let Some(rev) = rev {
+            let rev = wildmatch::WildMatch::new(rev);
+            references
+                .iter()
+                .filter_map(|val| {
+                    let gitref = GitRef::from(val);
+                    if let Some(true) = gitref.name.map(|name| rev.matches(name)) {
+                        Some(gitref)
+                    } else {
+                        None
+                    }
+                })
+                .max()
+        } else {
+            references
+                .iter()
+                .find(|r| r.name() == "HEAD")
+                .map(GitRef::from)
         };
 
-        Ok(latest)
+        if let Some(latest) = latest {
+            Ok(latest.into())
+        } else {
+            Err(Error::GitRev {
+                url,
+                rev: rev.as_deref().unwrap_or("HEAD").to_string(),
+            })
+        }
     }
 }
 

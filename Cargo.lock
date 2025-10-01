@@ -1009,6 +1009,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml 0.9.7",
+ "wildmatch",
  "xxhash-rust",
 ]
 
@@ -1576,6 +1577,12 @@ checksum = "1a05d73b933a847d6cccdda8f838a22ff101ad9bf93e33684f39c1f5f0eece3d"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "wildmatch"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39b7d07a236abaef6607536ccfaf19b396dbe3f5110ddb73d39f4562902ed382"
 
 [[package]]
 name = "winapi-util"

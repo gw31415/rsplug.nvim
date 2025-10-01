@@ -145,10 +145,8 @@ impl Cache {
                                         // アップデート処理
                                         if update {
                                             msg(Message::Cache("Updating", url.clone()));
-                                            repo.fetch(Some(
-                                                git::ls_remote(url.clone(), rev).await?,
-                                            ))
-                                            .await?;
+                                            repo.fetch(git::ls_remote(url.clone(), rev).await?)
+                                                .await?;
                                         }
                                         repo
                                     } else if install {
@@ -156,8 +154,7 @@ impl Cache {
                                         let mut repo =
                                             git::init(proj_root.clone(), url.clone()).await?;
                                         msg(Message::Cache("Fetching", url.clone()));
-                                        repo.fetch(Some(git::ls_remote(url.clone(), rev).await?))
-                                            .await?;
+                                        repo.fetch(git::ls_remote(url.clone(), rev).await?).await?;
                                         repo
                                     } else {
                                         // インストールされていない場合はスキップ
