@@ -141,40 +141,33 @@ impl Cache {
                                     let url: Arc<str> = Arc::from(github::url(owner, repo));
 
                                     // リポジトリがない場合のインストール処理
-                                    let repo = if let Ok(repo) = git::open(proj_root).await {
+                                    let repo = if let Ok(mut repo) = git::open(&proj_root).await {
+                                        // アップデート処理
+                                        if update {
+                                            msg(Message::Cache("Updating", url.clone()));
+                                            repo.fetch(Some(
+                                                git::ls_remote(url.clone(), rev).await?,
+                                            ))
+                                            .await?;
+                                        }
                                         repo
                                     } else if install {
                                         msg(Message::Cache("Initializing", url.clone()));
-                                        let repo =
-                                            git::init(url.clone(), proj_root.clone()).await?;
+                                        let mut repo =
+                                            git::init(proj_root.clone(), url.clone()).await?;
                                         msg(Message::Cache("Fetching", url.clone()));
-                                        git::fetch(
-                                            Some(git::ls_remote(url.clone(), rev).await?),
-                                            repo.clone(),
-                                        )
-                                        .await?;
+                                        repo.fetch(Some(git::ls_remote(url.clone(), rev).await?))
+                                            .await?;
                                         repo
                                     } else {
                                         // インストールされていない場合はスキップ
                                         break 'add_pkg;
                                     };
 
-                                    // アップデート処理
-                                    if update {
-                                        msg(Message::Cache("Updating", url.clone()));
-                                        git::fetch(
-                                            Some(git::ls_remote(url.clone(), rev).await?),
-                                            repo.clone(),
-                                        )
-                                        .await?;
-                                    }
-
                                     // ディレクトリ内容からのIDの決定
                                     let id = PackageID::new({
-                                        let (head, diff) = tokio::join!(
-                                            git::head_hash(repo.clone()),
-                                            git::diff_hash(repo.clone()),
-                                        );
+                                        let (head, diff) =
+                                            tokio::join!(repo.head_hash(), repo.diff_hash(),);
                                         match (head, diff) {
                                             (Ok(mut head), Ok(diff)) => {
                                                 head.extend(diff);
@@ -184,7 +177,8 @@ impl Cache {
                                         }
                                     });
 
-                                    let files: HashMap<PathBuf, _> = git::ls_files(repo.clone())
+                                    let files: HashMap<PathBuf, _> = repo
+                                        .ls_files()
                                         .await?
                                         .filter_map(|path| {
                                             let ignored = path.iter().any(|k| {

@@ -47,7 +47,7 @@ pub mod git {
     use std::{
         path::{Path, PathBuf},
         str::FromStr,
-        sync::{Arc, Mutex, MutexGuard},
+        sync::{Arc, Mutex},
     };
 
     use git2::{DiffFormat, DiffOptions, Repository, build::CheckoutBuilder};
@@ -58,7 +58,6 @@ pub mod git {
 
     use super::*;
 
-    #[derive(Clone)]
     pub struct Repo(Arc<Mutex<Repository>>);
 
     impl From<Repository> for Repo {
@@ -68,31 +67,124 @@ pub mod git {
     }
 
     impl Repo {
-        #[inline]
-        fn borrow<'a>(&'a self) -> MutexGuard<'a, git2::Repository> {
-            self.0.lock().unwrap()
+        /// リポジトリ内のファイル一覧を取得
+        pub async fn ls_files(&self) -> Result<impl Iterator<Item = PathBuf>, Error> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .index()?
+                .iter()
+                .map(|entry| bytes_to_pathbuf(entry.path))
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+
+        /// リポジトリ同期処理
+        pub async fn fetch(&mut self, rev: Option<String>) -> Result<(), Error> {
+            execute![
+                cwd: self.0.lock().unwrap().workdir().unwrap(),
+                "git",
+                "fetch",
+                "--depth=1",
+                "origin",
+                rev.as_deref().unwrap_or("HEAD")
+            ]
+            .await?;
+
+            let repo = self.0.clone();
+            spawn_blocking(move || {
+                let repo = repo.lock().unwrap();
+                // TODO: こちらに移行したいが、現状では下記コードでは正常に FETCH_HEAD を取得してくれない
+                // repo.find_remote("origin").unwrap().fetch(
+                //     &[rev.as_ref().map_or("HEAD", |v| v)],
+                //     Some(
+                //         FetchOptions::new()
+                //             .download_tags(git2::AutotagOption::All)
+                //             .depth(1),
+                //     ),
+                //     None,
+                // )?;
+
+                let fetch_head = repo
+                    .find_reference("FETCH_HEAD")?
+                    .target()
+                    .ok_or_else(|| git2::Error::from_str("FETCH_HEAD has no target"))?;
+
+                repo.set_head_detached(fetch_head)?;
+                let obj = repo.find_object(fetch_head, None)?;
+                repo.checkout_tree(
+                    &obj,
+                    Some(
+                        CheckoutBuilder::new()
+                            .force()
+                            .remove_untracked(true)
+                            .use_theirs(true)
+                            .allow_conflicts(true),
+                    ),
+                )?;
+
+                Ok(())
+            })
+            .await
+            .unwrap()
+        }
+
+        /// HEAD のハッシュ
+        pub async fn head_hash(&self) -> Result<Vec<u8>, Error> {
+            let repo = self.0.clone();
+            spawn_blocking(move || {
+                let oid = repo
+                    .lock()
+                    .unwrap()
+                    .head()?
+                    .target()
+                    .ok_or_else(|| git2::Error::from_str("HEAD is not a direct reference"))?;
+                Ok(oid.to_string().into_bytes())
+            })
+            .await
+            .unwrap()
+        }
+
+        /// diff のハッシュの出力
+        pub async fn diff_hash(&self) -> Result<[u8; 16], Error> {
+            let repo = self.0.clone();
+            spawn_blocking(move || {
+                let repo = repo.lock().unwrap();
+                // HEAD ツリー
+                let head_commit = repo.head()?.peel_to_commit()?;
+                let head_tree = head_commit.tree()?;
+
+                // diff（git diff HEAD 相当）
+                let mut diff_opts = DiffOptions::new();
+                // 未追跡も含めたいなら: diff_opts.include_untracked(true);
+                let diff = repo.diff_tree_to_workdir(Some(&head_tree), Some(&mut diff_opts))?;
+
+                // パッチ出力を逐次ハッシュ化
+                let mut hasher = Xxh3::new();
+                diff.print(DiffFormat::Raw, |_delta, _hunk, line| {
+                    hasher.update(line.content());
+                    true
+                })?;
+
+                // 128bit のダイジェストを hex で
+                let digest = hasher.digest128();
+                Ok(digest.to_ne_bytes())
+            })
+            .await
+            .unwrap()
         }
     }
 
-    pub async fn ls_files(repo: Repo) -> Result<impl Iterator<Item = PathBuf>, Error> {
-        Ok(repo
-            .borrow()
-            .index()?
-            .iter()
-            .map(|entry| bytes_to_pathbuf(entry.path))
-            .collect::<Vec<_>>()
-            .into_iter())
-    }
-
-    /// リポジトリが存在するかどうか
-    pub async fn open(dir: &Path) -> Result<Repo, Error> {
+    /// リポジトリを開く
+    pub async fn open(dir: impl AsRef<Path>) -> Result<Repo, Error> {
         Ok(git2::Repository::open(dir)?.into())
     }
 
     /// リポジトリ初期化処理
     pub async fn init(
-        repo: impl AsRef<str> + Send + 'static,
         dir: impl AsRef<Path> + Send + 'static,
+        repo: impl AsRef<str> + Send + 'static,
     ) -> Result<Repo, Error> {
         let _ = tokio::fs::remove_dir_all(dir.as_ref().join(".git")).await;
         let r = spawn_blocking(move || git2::Repository::init(dir))
@@ -197,94 +289,6 @@ pub mod git {
         };
 
         Ok(latest)
-    }
-
-    /// リポジトリ同期処理
-    pub async fn fetch(rev: Option<String>, repo: Repo) -> Result<(), Error> {
-        execute![
-            cwd: repo.0.lock().unwrap().workdir().unwrap(),
-            "git",
-            "fetch",
-            "--depth=1",
-            "origin",
-            rev.as_deref().unwrap_or("HEAD")
-        ]
-        .await?;
-
-        fn inner(repo: &Repository) -> Result<(), Error> {
-            // TODO: こちらに移行したいが、現状では下記コードでは正常に FETCH_HEAD を取得してくれない
-            // repo.find_remote("origin").unwrap().fetch(
-            //     &[rev.as_ref().map_or("HEAD", |v| v)],
-            //     Some(
-            //         FetchOptions::new()
-            //             .download_tags(git2::AutotagOption::All)
-            //             .depth(1),
-            //     ),
-            //     None,
-            // )?;
-
-            let fetch_head = repo
-                .find_reference("FETCH_HEAD")?
-                .target()
-                .ok_or_else(|| git2::Error::from_str("FETCH_HEAD has no target"))?;
-
-            repo.set_head_detached(fetch_head)?;
-            let obj = repo.find_object(fetch_head, None)?;
-            repo.checkout_tree(
-                &obj,
-                Some(
-                    CheckoutBuilder::new()
-                        .force()
-                        .remove_untracked(true)
-                        .use_theirs(true)
-                        .allow_conflicts(true),
-                ),
-            )?;
-
-            Ok(())
-        }
-
-        spawn_blocking(move || inner(&repo.borrow())).await.unwrap()
-    }
-
-    /// HEAD のハッシュ
-    pub async fn head_hash(repo: Repo) -> Result<Vec<u8>, Error> {
-        spawn_blocking(move || {
-            let oid = repo
-                .borrow()
-                .head()?
-                .target()
-                .ok_or_else(|| git2::Error::from_str("HEAD is not a direct reference"))?;
-            Ok(oid.to_string().into_bytes())
-        })
-        .await
-        .unwrap()
-    }
-
-    /// diff の出力
-    pub async fn diff_hash(repo: Repo) -> Result<[u8; 16], Error> {
-        fn inner(repo: &Repository) -> Result<[u8; 16], Error> {
-            // HEAD ツリー
-            let head_commit = repo.head()?.peel_to_commit()?;
-            let head_tree = head_commit.tree()?;
-
-            // diff（git diff HEAD 相当）
-            let mut diff_opts = DiffOptions::new();
-            // 未追跡も含めたいなら: diff_opts.include_untracked(true);
-            let diff = repo.diff_tree_to_workdir(Some(&head_tree), Some(&mut diff_opts))?;
-
-            // パッチ出力を逐次ハッシュ化
-            let mut hasher = Xxh3::new();
-            diff.print(DiffFormat::Raw, |_delta, _hunk, line| {
-                hasher.update(line.content());
-                true
-            })?;
-
-            // 128bit のダイジェストを hex で
-            let digest = hasher.digest128();
-            Ok(digest.to_ne_bytes())
-        }
-        spawn_blocking(move || inner(&repo.borrow())).await.unwrap()
     }
 }
 
