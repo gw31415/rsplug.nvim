@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use super::error::Error;
 
-type ExecuteResult<T = Vec<u8>> = Result<T, Error>;
-
 /// 外部コマンドを実行する
 macro_rules! execute {
     ($cmd:expr, $($arg:expr),*) => {
@@ -69,7 +67,7 @@ pub mod git {
         }
     }
 
-    pub async fn ls_files(repo: Repo) -> ExecuteResult<impl Iterator<Item = PathBuf>> {
+    pub async fn ls_files(repo: Repo) -> Result<impl Iterator<Item = PathBuf>, Error> {
         Ok(repo
             .0
             .lock()
@@ -82,7 +80,7 @@ pub mod git {
     }
 
     /// リポジトリが存在するかどうか
-    pub async fn open(dir: &Path) -> ExecuteResult<Repo> {
+    pub async fn open(dir: &Path) -> Result<Repo, Error> {
         Ok(git2::Repository::open(dir)?.into())
     }
 
@@ -90,7 +88,7 @@ pub mod git {
     pub async fn init(
         repo: impl AsRef<str> + Send + 'static,
         dir: impl AsRef<Path> + Send + 'static,
-    ) -> ExecuteResult<Repo> {
+    ) -> Result<Repo, Error> {
         let _ = tokio::fs::remove_dir_all(dir.as_ref().join(".git")).await;
         let r = spawn_blocking(move || git2::Repository::init(dir))
             .await
@@ -178,7 +176,7 @@ pub mod git {
     }
 
     /// リポジトリのリモートからrevに対応する最新のコミットハッシュを取得する
-    pub async fn ls_remote(url: Arc<str>, rev: &Option<String>) -> ExecuteResult<String> {
+    pub async fn ls_remote(url: Arc<str>, rev: &Option<String>) -> Result<String, Error> {
         let rev = rev.as_deref().unwrap_or("HEAD");
         let stdout = execute!["git", "ls-remote", url.as_ref(), rev].await?;
         let Some(latest) = String::from_utf8(stdout)?
@@ -197,7 +195,7 @@ pub mod git {
     }
 
     /// リポジトリ同期処理
-    pub async fn fetch(rev: Option<String>, repo: Repo) -> ExecuteResult<()> {
+    pub async fn fetch(rev: Option<String>, repo: Repo) -> Result<(), Error> {
         execute![
             cwd: repo.0.lock().unwrap().workdir().unwrap(),
             "git",
@@ -208,7 +206,7 @@ pub mod git {
         ]
         .await?;
 
-        fn inner(repo: &Repository) -> ExecuteResult<()> {
+        fn inner(repo: &Repository) -> Result<(), Error> {
             // TODO: こちらに移行したいが、現状では下記コードでは正常に FETCH_HEAD を取得してくれない
             // repo.find_remote("origin").unwrap().fetch(
             //     &[rev.as_ref().map_or("HEAD", |v| v)],
@@ -247,7 +245,7 @@ pub mod git {
     }
 
     /// HEAD のハッシュ
-    pub async fn head_hash(repo: Repo) -> ExecuteResult {
+    pub async fn head_hash(repo: Repo) -> Result<Vec<u8>, Error> {
         spawn_blocking(move || {
             let oid = repo
                 .0
@@ -263,8 +261,8 @@ pub mod git {
     }
 
     /// diff の出力
-    pub async fn diff_hash(repo: Repo) -> ExecuteResult<[u8; 16]> {
-        fn inner(repo: &Repository) -> ExecuteResult<[u8; 16]> {
+    pub async fn diff_hash(repo: Repo) -> Result<[u8; 16], Error> {
+        fn inner(repo: &Repository) -> Result<[u8; 16], Error> {
             // HEAD ツリー
             let head_commit = repo.head()?.peel_to_commit()?;
             let head_tree = head_commit.tree()?;
