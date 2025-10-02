@@ -35,15 +35,14 @@ async fn app() -> Result<(), Error> {
             .into_iter()
             .map(|path| async {
                 let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
-                let config: rsplug::Config =
-                    toml::from_slice(&content).map_err(|e| Error::Parse(e, path.into()))?;
-                Ok::<_, Error>(config)
+                toml::from_slice::<rsplug::Config>(&content)
+                    .map_err(|e| Error::Parse(e, path.into()))
             })
             .collect::<JoinSet<_>>()
             .join_all()
             .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, Error>>()?
             .into_iter();
         rsplug::Unit::new(configs.sum())?
     };
