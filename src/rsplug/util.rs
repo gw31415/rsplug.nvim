@@ -175,54 +175,47 @@ pub mod git {
         Head,
     }
 
-    impl<'a> From<&'a str> for GitRefType<'a> {
-        fn from(value: &'a str) -> Self {
+    impl<'a> GitRefType<'a> {
+        fn parse(value: &'a str) -> (GitRefType<'a>, Option<&'a str>) {
+            if value == "HEAD" {
+                return (GitRefType::Head, Some(value));
+            }
             static PULL_REGEX: Lazy<Regex> = Lazy::new(|| {
                 Regex::new(r"^refs/pull/(?<num>[0-9]+)/(?<type>head|merge)$").unwrap()
             });
-            static SEMVER_REGEX: Lazy<Regex> = Lazy::new(|| {
-                Regex::new(r"^refs/tags/v?(?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)$")
-                    .unwrap()
-            });
-            if value == "HEAD" {
-                return GitRefType::Head;
+            if let Some(inner) = value.strip_prefix("refs/tags/") {
+                static SEMVER_REGEX: Lazy<Regex> = Lazy::new(|| {
+                    Regex::new(r"^v?(?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)$").unwrap()
+                });
+                let ref_type = if let Some(caps) = SEMVER_REGEX.captures(inner) {
+                    let major = usize::from_str(caps.name("major").unwrap().as_str()).unwrap();
+                    let minor = usize::from_str(caps.name("minor").unwrap().as_str()).unwrap();
+                    let patch = usize::from_str(caps.name("patch").unwrap().as_str()).unwrap();
+                    GitRefType::SemVer {
+                        major,
+                        minor,
+                        patch,
+                    }
+                } else {
+                    GitRefType::Tag(inner)
+                };
+                return (ref_type, Some(inner));
+            }
+            if let Some(inner) = value.strip_prefix("refs/heads/") {
+                return (GitRefType::Heads(inner), Some(inner));
             }
             if let Some(caps) = PULL_REGEX.captures(value) {
                 let num = usize::from_str(caps.name("num").unwrap().as_str()).unwrap();
                 let r#type = caps.name("type").unwrap().as_str();
-                return GitRefType::Pull(num, r#type);
+                return (GitRefType::Pull(num, r#type), None);
             }
-            if let Some(caps) = SEMVER_REGEX.captures(value) {
-                let major = usize::from_str(caps.name("major").unwrap().as_str()).unwrap();
-                let minor = usize::from_str(caps.name("minor").unwrap().as_str()).unwrap();
-                let patch = usize::from_str(caps.name("patch").unwrap().as_str()).unwrap();
-                return GitRefType::SemVer {
-                    major,
-                    minor,
-                    patch,
-                };
-            }
-            if let Some(inner) = value.strip_prefix("refs/tags/") {
-                return GitRefType::Tag(inner);
-            }
-            if let Some(inner) = value.strip_prefix("refs/heads/") {
-                return GitRefType::Heads(inner);
-            }
-            GitRefType::Other(value)
+            (GitRefType::Other(value), None)
         }
     }
 
     impl<'a> From<&'a git2::RemoteHead<'a>> for GitRef<'a> {
         fn from(value: &'a git2::RemoteHead<'a>) -> Self {
-            let ref_type = GitRefType::from(value.name());
-            let name = match ref_type {
-                GitRefType::Tag(_) | GitRefType::SemVer { .. } => {
-                    Some(value.name().strip_prefix("refs/tags/").unwrap())
-                }
-                GitRefType::Heads(_) => Some(value.name().strip_prefix("refs/heads/").unwrap()),
-                GitRefType::Head => Some("HEAD"),
-                _ => None,
-            };
+            let (ref_type, name) = GitRefType::parse(value.name());
             GitRef {
                 ref_type,
                 id: value.oid(),
