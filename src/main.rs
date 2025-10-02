@@ -18,8 +18,8 @@ struct Args {
     #[arg(short, long)]
     update: bool,
     /// Config files to process
-    #[arg(required = true)]
-    config_files: Vec<PathBuf>,
+    #[arg(required = true, env = "RSPLUG_CONFIG_FILES", value_delimiter = ':')]
+    config_files: Vec<String>,
 }
 
 async fn app() -> Result<(), Error> {
@@ -36,7 +36,7 @@ async fn app() -> Result<(), Error> {
             .map(|path| async {
                 let content = tokio::fs::read_to_string(&path).await.map_err(Error::Io)?;
                 let config = toml::from_str::<rsplug::Config>(&content)
-                    .map_err(|e| Error::Parse(e, path))?;
+                    .map_err(|e| Error::Parse(e, path.into()))?;
                 Ok::<_, Error>(config)
             })
             .collect::<JoinSet<_>>()
