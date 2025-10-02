@@ -30,7 +30,7 @@ async fn app() -> Result<(), Error> {
     } = Args::parse();
 
     let units = {
-        // parse config files into Vec<Arc<Unit>>
+        // parse config files into Iterator<Item = Arc<Unit>>
         let configs = config_files
             .into_iter()
             .map(|path| async {
