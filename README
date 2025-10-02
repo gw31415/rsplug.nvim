@@ -3,7 +3,7 @@ Vim plugin manager written in Rust
 Usage: rsplug [OPTIONS] <CONFIG_FILES>...
 
 Arguments:
-  <CONFIG_FILES>...  Config files to process
+  <CONFIG_FILES>...  Config files to process [env: RSPLUG_CONFIG_FILES]
 
 Options:
   -i, --install  Install plugins
