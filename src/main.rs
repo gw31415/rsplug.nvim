@@ -34,9 +34,9 @@ async fn app() -> Result<(), Error> {
         let configs = config_files
             .into_iter()
             .map(|path| async {
-                let content = tokio::fs::read_to_string(&path).await.map_err(Error::Io)?;
+                let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
                 let config: rsplug::Config =
-                    toml::from_str(&content).map_err(|e| Error::Parse(e, path.into()))?;
+                    toml::from_slice(&content).map_err(|e| Error::Parse(e, path.into()))?;
                 Ok::<_, Error>(config)
             })
             .collect::<JoinSet<_>>()
