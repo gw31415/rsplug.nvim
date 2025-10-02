@@ -16,14 +16,15 @@ fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
 }
 
 pub mod git {
-    //! 各種 Git 操作を行うモジュール
+    //! 各種 Git 操作関連のユーティリティ
+
     use std::{
         path::{Path, PathBuf},
         str::FromStr,
         sync::{Arc, Mutex},
     };
 
-    use git2::{DiffFormat, DiffOptions, FetchOptions, Oid, Repository, build::CheckoutBuilder};
+    use git2::{DiffFormat, DiffOptions, FetchOptions, Oid, build::CheckoutBuilder};
     use once_cell::sync::Lazy;
     use regex::Regex;
     use tokio::task::spawn_blocking;
@@ -31,15 +32,15 @@ pub mod git {
 
     use super::*;
 
-    pub struct Repo(Arc<Mutex<Repository>>);
+    /// 初期化済みのローカルリポジトリ
+    pub struct Repository(Arc<Mutex<git2::Repository>>);
 
-    impl From<Repository> for Repo {
-        fn from(value: Repository) -> Self {
-            Repo(Arc::new(Mutex::new(value)))
+    impl Repository {
+        /// (INTERNAL) git2のRepositoryから生成
+        fn from(value: git2::Repository) -> Self {
+            Repository(Arc::new(Mutex::new(value)))
         }
-    }
 
-    impl Repo {
         /// リポジトリ内のファイル一覧を取得
         pub async fn ls_files(&self) -> Result<impl Iterator<Item = PathBuf>, Error> {
             Ok(self
@@ -140,27 +141,28 @@ pub mod git {
     }
 
     /// リポジトリを開く
-    pub async fn open(dir: impl AsRef<Path>) -> Result<Repo, Error> {
-        Ok(git2::Repository::open(dir)?.into())
+    pub async fn open(dir: impl AsRef<Path>) -> Result<Repository, Error> {
+        Ok(Repository::from(git2::Repository::open(dir)?))
     }
 
     /// リポジトリ初期化処理
     pub async fn init(
         dir: impl AsRef<Path> + Send + 'static,
         repo: impl AsRef<str> + Send + 'static,
-    ) -> Result<Repo, Error> {
+    ) -> Result<Repository, Error> {
         let _ = tokio::fs::remove_dir_all(dir.as_ref().join(".git")).await;
         let r = spawn_blocking(move || git2::Repository::init(dir))
             .await
             .unwrap()?;
         spawn_blocking(move || {
             r.remote("origin", repo.as_ref())?;
-            Ok(r.into())
+            Ok(Repository::from(r))
         })
         .await
         .unwrap()
     }
 
+    /// GitRefを並び替え可能・最大値を取得可能にするための型
     #[derive(Eq, PartialEq, PartialOrd, Ord)]
     enum GitRefType<'a> {
         Other(&'a str),
@@ -176,6 +178,7 @@ pub mod git {
     }
 
     impl<'a> GitRefType<'a> {
+        /// 文字列からGitRefTypeを生成しつつ、nameを抽出する
         fn parse(value: &'a str) -> (GitRefType<'a>, Option<&'a str>) {
             if value == "HEAD" {
                 return (GitRefType::Head, Some(value));
@@ -276,6 +279,8 @@ pub mod git {
 }
 
 pub mod github {
+    //! GitHub関連のユーティリティ
+
     /// GitHubのリポジトリURLを生成
     pub fn url(owner: &str, repo: &str) -> String {
         const PREFIX: &str = "https://github.com/";
