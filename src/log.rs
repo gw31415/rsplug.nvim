@@ -7,6 +7,8 @@ use std::{
 use tokio::sync::{Mutex, mpsc};
 
 pub enum Message {
+    DetectConfigFile(PathBuf),
+    CheckingLocalPlugins { install: bool, update: bool },
     TotalPackages(usize),
     TotalPackagesMerged(usize),
     Cache(&'static str, Arc<str>),
@@ -27,6 +29,25 @@ fn init() -> Logger {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             match msg {
+                Message::DetectConfigFile(path) => {
+                    println!(
+                        "{} Using config file: {}",
+                        "info:".blue().bold(),
+                        path.to_string_lossy().italic().dimmed()
+                    );
+                }
+                Message::CheckingLocalPlugins { install, update } => {
+                    let activity = if install && update {
+                        "Checking installed plugins & updates"
+                    } else if update {
+                        "Checking updates"
+                    } else if install {
+                        "Checking installed plugins"
+                    } else {
+                        "Loading local plugins"
+                    };
+                    println!("{} {}", "info:".blue().bold(), activity);
+                }
                 Message::TotalPackages(n) => {
                     println!("{} Raw packages count {n}", "info:".blue().bold());
                 }

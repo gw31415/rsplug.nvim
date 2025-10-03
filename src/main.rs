@@ -52,20 +52,25 @@ async fn app() -> Result<(), Error> {
             .map(|path| async {
                 let path = path?;
                 let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
-                Ok::<_, Error>(
-                    toml::from_slice::<rsplug::Config>(&content).map_err(|e| Error::Parse(e, path)),
-                )
+
+                match toml::from_slice::<rsplug::Config>(&content) {
+                    Ok(config) => {
+                        log::msg(Message::DetectConfigFile(path));
+                        Ok(config)
+                    }
+                    Err(e) => Err(Error::Parse(e, path)),
+                }
             })
             .collect::<JoinSet<_>>()
             .join_all()
             .await
             .into_iter()
-            .flatten()
             .collect::<Result<Vec<_>, Error>>()?
             .into_iter();
         rsplug::Unit::new(configs.sum())?
     };
 
+    msg(Message::CheckingLocalPlugins { install, update });
     // Fetch packages through Cache based on the Units
     let mut pkgs: BinaryHeap<_> = rsplug::Cache::new(DEFAULT_APP_DIR.as_path())
         .fetch(units, install, update)
