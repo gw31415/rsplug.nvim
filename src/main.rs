@@ -36,7 +36,7 @@ async fn app() -> Result<(), Error> {
 
     let units = {
         // parse config files into Iterator<Item = Arc<Unit>>
-        let configs = rsplug::util::glob::find(config_files.iter().map(|a| a as &str))?
+        let configs = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
             .filter_map(|path| match path {
                 Err(e) => Some(Err(e)),
                 Ok(path) => {
