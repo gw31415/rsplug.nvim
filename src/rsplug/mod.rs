@@ -1,5 +1,5 @@
 mod entities;
-mod util;
+pub(crate) mod util;
 
 pub use entities::error;
 // pub use entities::lazy_type;

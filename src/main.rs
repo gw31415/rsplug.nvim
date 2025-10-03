@@ -5,6 +5,8 @@ use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 
+use crate::rsplug::util;
+
 mod log;
 mod rsplug;
 
@@ -17,8 +19,13 @@ struct Args {
     /// Update plugins
     #[arg(short, long)]
     update: bool,
-    /// Config files to process
-    #[arg(required = true, env = "RSPLUG_CONFIG_FILES", value_delimiter = ':')]
+    /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
+    #[arg(
+        required = true,
+        env = "RSPLUG_CONFIG_FILES",
+        value_delimiter = ':',
+        hide_env_values = true
+    )]
     config_files: Vec<String>,
 }
 
@@ -31,17 +38,23 @@ async fn app() -> Result<(), Error> {
 
     let units = {
         // parse config files into Iterator<Item = Arc<Unit>>
-        let configs = config_files
-            .into_iter()
-            .map(|path| async {
-                let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
-                toml::from_slice::<rsplug::Config>(&content)
-                    .map_err(|e| Error::Parse(e, path.into()))
+        let configs = util::glob::find(config_files.iter().map(|a| a as &str))?
+            .map(|path| {
+                let path = path.map(PathBuf::from);
+                async {
+                    let path = path?;
+                    let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
+                    Ok::<_, Error>(
+                        toml::from_slice::<rsplug::Config>(&content)
+                            .map_err(|e| Error::Parse(e, path)),
+                    )
+                }
             })
             .collect::<JoinSet<_>>()
             .join_all()
             .await
             .into_iter()
+            .flatten()
             .collect::<Result<Vec<_>, Error>>()?
             .into_iter();
         rsplug::Unit::new(configs.sum())?
@@ -95,6 +108,8 @@ enum Error {
     Rsplug(#[from] rsplug::Error),
     #[error(transparent)]
     Dag(#[from] rsplug::unit::DAGCreationError),
+    #[error(transparent)]
+    Ignore(#[from] ignore::Error),
 }
 
 #[tokio::main]

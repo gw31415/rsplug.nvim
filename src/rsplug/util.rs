@@ -292,3 +292,81 @@ pub mod github {
         url
     }
 }
+
+pub mod glob {
+    use std::{borrow::Cow, path::Path};
+
+    use hashbrown::HashMap;
+    use ignore::{WalkBuilder, overrides::OverrideBuilder};
+
+    pub fn find<'a>(
+        pattern: impl IntoIterator<Item = &'a str>,
+    ) -> Result<impl Iterator<Item = Result<Cow<'a, Path>, ignore::Error>>, ignore::Error> {
+        let mut hashmap: HashMap<&Path, (WalkBuilder, OverrideBuilder)> = HashMap::new();
+        let mut raw_path = Vec::new();
+        for pattern in pattern {
+            let ParsedGlob { base, pattern } = ParsedGlob::new(pattern);
+            if pattern.is_empty() {
+                raw_path.push(Ok(base.into()));
+            } else {
+                hashmap
+                    .entry(base)
+                    .or_insert_with(|| {
+                        let mut builder = WalkBuilder::new(base);
+                        builder
+                            .standard_filters(false)
+                            .skip_stdout(true)
+                            .hidden(false)
+                            .max_depth(Some(128))
+                            .follow_links(true);
+                        (builder, OverrideBuilder::new(base))
+                    })
+                    .1
+                    .add(pattern)?;
+            }
+        }
+
+        let iter = hashmap
+            .into_values()
+            .map(|(mut builder, overrides)| {
+                Ok::<_, ignore::Error>(builder.overrides(overrides.build()?).build())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.map(|entry| entry.into_path().into()))
+            .chain(raw_path);
+
+        Ok(iter)
+    }
+
+    struct ParsedGlob<'a> {
+        base: &'a Path,
+        pattern: &'a str,
+    }
+    impl<'a> ParsedGlob<'a> {
+        fn new(pattern: &'a str) -> ParsedGlob<'a> {
+            let pattern_path = Path::new(pattern);
+
+            macro_rules! anyof { ($c1: literal$(, $c: literal)*) => { |ch: char| { ch == $c1 $( || ch == $c )* } }; }
+
+            let special_comp = pattern_path
+                .components()
+                .map(|comp| comp.as_os_str().to_str().unwrap())
+                .find(|comp| comp.contains(anyof!['*', '?', '[', ']']));
+            if let Some(special_comp) = special_comp {
+                let pos = pattern.find(special_comp).unwrap();
+                let (path, pattern) = pattern.split_at(pos);
+                ParsedGlob {
+                    base: Path::new(path),
+                    pattern,
+                }
+            } else {
+                ParsedGlob {
+                    base: pattern_path,
+                    pattern: "",
+                }
+            }
+        }
+    }
+}
