@@ -222,6 +222,7 @@ impl PackPathState {
                 }
             }
         }
+        msg(Message::InstallDone);
 
         let installing = Arc::new(installing);
         for start_or_opt in ["start", "opt"] {

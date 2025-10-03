@@ -74,7 +74,7 @@ async fn app() -> Result<(), Error> {
         .fetch(units, install, update)
         .await?
         .collect();
-    msg(Message::TotalPackages(pkgs.len()));
+    let total_count = pkgs.len();
 
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
@@ -91,7 +91,10 @@ async fn app() -> Result<(), Error> {
 
         loader += state.insert(pkg);
     }
-    msg(Message::TotalPackagesMerged(state.len()));
+    msg(Message::CheckingLocalPluginsFinished {
+        total: total_count,
+        merged: state.len(),
+    });
 
     // Install the packages into the packpath.
     state

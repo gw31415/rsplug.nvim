@@ -221,6 +221,7 @@ impl Cache {
                 .into_iter()
                 .flatten()
                 .collect();
+            msg(Message::CacheDone);
             Ok(depends)
         })
     }
