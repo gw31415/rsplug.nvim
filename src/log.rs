@@ -3,9 +3,7 @@ use hashbrown::HashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::{
-    path::PathBuf,
-    sync::{Arc, RwLock},
-    time::Duration,
+    io::Write, path::PathBuf, sync::{Arc, RwLock}, time::Duration
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -38,9 +36,9 @@ fn init() -> Logger {
         let multipb_installing = MultiProgress::new();
         let mut pb_checking_local_plugins = None;
         let mut pb_installskipped = None;
-        let mut installskipped_count = 0;
         let mut pb_installyank = None;
-        let mut yankfile_count = 0;
+        // let mut installskipped_count = 0;
+        // let mut yankfile_count = 0;
         let multipb_caching = MultiProgress::new();
         let mut pb_caching = HashMap::new();
         while let Some(msg) = rx.recv().await {
@@ -93,6 +91,9 @@ fn init() -> Logger {
                     pb.set_message(url.to_string());
                 }
                 Message::CacheDone => {
+                    for pb in std::mem::take(&mut pb_caching).into_values() {
+                        pb.finish_and_clear();
+                    }
                     multipb_caching.clear().unwrap();
                 }
                 Message::InstallSkipped(id) => {
@@ -122,18 +123,25 @@ fn init() -> Logger {
                     ));
                 }
                 Message::InstallDone => {
+                    // let mut skipped = false;
+                    // let mut yanked = false;
                     if let Some(pb) = pb_installskipped.take() {
                         pb.set_style(ProgressStyle::with_template("{wide_msg}").unwrap());
-                        pb.finish_with_message(format!("skipped {installskipped_count} packages"));
+                        pb.finish_and_clear();
+                        // skipped = installskipped_count != 0;
                     }
                     if let Some(pb) = pb_installyank.take() {
                         pb.set_style(ProgressStyle::with_template("{wide_msg}").unwrap());
-                        if yankfile_count != 0 {
-                            pb.finish_with_message(format!("copied {yankfile_count} files"));
-                        } else {
-                            pb.finish_and_clear();
-                        }
+                        pb.finish_and_clear();
+                        // yanked = yankfile_count != 0;
                     }
+                    multipb_installing.clear().unwrap();
+                    // if skipped {
+                    //     println!("skipped {installskipped_count} packages");
+                    // }
+                    // if yanked {
+                    //     println!("copied {yankfile_count} files");
+                    // }
                 }
                 Message::Error(e) => {
                     println!("{} {}", "error:".red().bold(), e);
@@ -160,6 +168,7 @@ pub async fn close(code: i32) -> ! {
             continue;
         }
         LOGGER.1.lock().await.recv().await;
+        std::io::stdout().flush().unwrap();
         std::process::exit(code);
     }
 }
