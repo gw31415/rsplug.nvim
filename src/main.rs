@@ -39,16 +39,22 @@ async fn app() -> Result<(), Error> {
     let units = {
         // parse config files into Iterator<Item = Arc<Unit>>
         let configs = util::glob::find(config_files.iter().map(|a| a as &str))?
-            .map(|path| {
-                let path = path.map(PathBuf::from);
-                async {
-                    let path = path?;
-                    let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
-                    Ok::<_, Error>(
-                        toml::from_slice::<rsplug::Config>(&content)
-                            .map_err(|e| Error::Parse(e, path)),
-                    )
+            .filter_map(|path| match path {
+                Err(e) => Some(Err(e)),
+                Ok(path) => {
+                    if path.is_file() {
+                        Some(Ok(path.to_path_buf()))
+                    } else {
+                        None
+                    }
                 }
+            })
+            .map(|path| async {
+                let path = path?;
+                let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
+                Ok::<_, Error>(
+                    toml::from_slice::<rsplug::Config>(&content).map_err(|e| Error::Parse(e, path)),
+                )
             })
             .collect::<JoinSet<_>>()
             .join_all()
