@@ -1,14 +1,12 @@
+mod log;
+mod rsplug;
+
 use std::{collections::BinaryHeap, path::PathBuf};
 
 use clap::Parser;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
-
-use crate::rsplug::util;
-
-mod log;
-mod rsplug;
 
 #[derive(clap::Parser, Debug)]
 #[command(about)]
@@ -38,7 +36,7 @@ async fn app() -> Result<(), Error> {
 
     let units = {
         // parse config files into Iterator<Item = Arc<Unit>>
-        let configs = util::glob::find(config_files.iter().map(|a| a as &str))?
+        let configs = rsplug::util::glob::find(config_files.iter().map(|a| a as &str))?
             .filter_map(|path| match path {
                 Err(e) => Some(Err(e)),
                 Ok(path) => {
