@@ -97,7 +97,7 @@ fn init() -> Logger {
                     multipb_caching.clear().unwrap();
                 }
                 Message::InstallSkipped(id) => {
-                    installskipped_count += 1;
+                    // installskipped_count += 1;
                     let pb = pb_installskipped.get_or_insert_with(|| {
                         multipb_installing.add(
                             ProgressBar::no_length()
@@ -108,7 +108,7 @@ fn init() -> Logger {
                     pb.set_message(format!("{}", id.italic().dimmed()));
                 }
                 Message::InstallYank { id, which: file } => {
-                    yankfile_count += 1;
+                    // yankfile_count += 1;
                     let pb = pb_installyank.get_or_insert_with(|| {
                         multipb_installing.add(
                             ProgressBar::no_length()
