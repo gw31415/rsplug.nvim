@@ -36,6 +36,7 @@ impl Cache {
     ) -> Result<impl Iterator<Item = Package>, Error> {
         let pkgmap: Arc<RwLock<HashMap<usize, Option<Package>>>> = Default::default();
         Self::fetch_inner(pkgmap.clone(), self.into(), unit, install, update).await?;
+        msg(Message::CacheDone);
         Ok(Arc::into_inner(pkgmap)
             .unwrap()
             .into_inner()
@@ -221,7 +222,6 @@ impl Cache {
                 .into_iter()
                 .flatten()
                 .collect();
-            msg(Message::CacheDone);
             Ok(depends)
         })
     }
