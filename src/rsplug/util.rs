@@ -24,11 +24,15 @@ pub mod git {
         sync::{Arc, Mutex},
     };
 
-    use git2::{DiffFormat, DiffOptions, FetchOptions, Oid, build::CheckoutBuilder};
+    use git2::{
+        DiffFormat, DiffOptions, FetchOptions, Oid, RemoteCallbacks, build::CheckoutBuilder,
+    };
     use once_cell::sync::Lazy;
     use regex::Regex;
     use tokio::task::spawn_blocking;
     use xxhash_rust::xxh3::Xxh3;
+
+    use crate::log::{self, Message};
 
     use super::*;
 
@@ -65,11 +69,24 @@ pub mod git {
                     if let Ok(mut remote) = repo.find_remote("origin") {
                         remote.fetch(
                             &[rev.to_string()],
-                            Some(
-                                FetchOptions::new()
-                                    .download_tags(git2::AutotagOption::None)
-                                    .depth(1),
-                            ),
+                            Some(&mut {
+                                let mut cbs = RemoteCallbacks::new();
+                                cbs.transfer_progress(|progress| {
+                                    let total_objs_count = progress.total_objects();
+                                    let received_objs_count = progress.received_objects();
+                                    log::msg(Message::CacheFetchObjectsProgress {
+                                        id: rev.to_string(),
+                                        total_objs_count,
+                                        received_objs_count,
+                                    });
+                                    true
+                                });
+                                let mut ops = FetchOptions::new();
+                                ops.download_tags(git2::AutotagOption::None)
+                                    .depth(1)
+                                    .remote_callbacks(cbs);
+                                ops
+                            }),
                             None,
                         )?;
                     }

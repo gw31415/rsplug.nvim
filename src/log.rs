@@ -1,5 +1,5 @@
 use console::style;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, hash_map::Entry};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::{
@@ -12,12 +12,26 @@ use tokio::sync::{Mutex, mpsc};
 
 pub enum Message {
     DetectConfigFile(PathBuf),
-    CheckingLocalPlugins { install: bool, update: bool },
-    CheckingLocalPluginsFinished { total: usize, merged: usize },
+    CheckingLocalPlugins {
+        install: bool,
+        update: bool,
+    },
+    CheckingLocalPluginsFinished {
+        total: usize,
+        merged: usize,
+    },
     Cache(&'static str, Arc<str>),
+    CacheFetchObjectsProgress {
+        id: String,
+        total_objs_count: usize,
+        received_objs_count: usize,
+    },
     CacheDone,
     InstallSkipped(Arc<str>),
-    InstallYank { id: Arc<str>, which: PathBuf },
+    InstallYank {
+        id: Arc<str>,
+        which: PathBuf,
+    },
     InstallDone,
     Error(Box<dyn std::error::Error + 'static + Send + Sync>),
 }
@@ -32,9 +46,13 @@ fn init() -> Logger {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (tx_end, rx_end) = mpsc::unbounded_channel::<()>();
     let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
-    let pb_style_spinner = ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}")
-        .unwrap()
-        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+    let pb_style_spinner =
+        ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}").unwrap();
+    let pb_style_bar = ProgressStyle::with_template(
+        "{spinner} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
+    )
+    .unwrap()
+    .progress_chars("#>-");
     tokio::spawn(async move {
         let multipb_installing = MultiProgress::new();
         let mut pb_checking_local_plugins = None;
@@ -43,6 +61,7 @@ fn init() -> Logger {
         // let mut installskipped_count = 0;
         // let mut yankfile_count = 0;
         let multipb_caching = MultiProgress::new();
+        let mut cachefetching_oids: HashMap<String, usize> = HashMap::new();
         let mut pb_caching = HashMap::new();
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -95,11 +114,27 @@ fn init() -> Logger {
                     });
                     pb.set_message(url.to_string());
                 }
+                Message::CacheFetchObjectsProgress {
+                    id,
+                    total_objs_count,
+                    received_objs_count,
+                } => {
+                    let pb = pb_caching.entry("CacheFetchObjects").or_insert_with(|| {
+                        multipb_caching.add(ProgressBar::new(0).with_style(pb_style_bar.clone()))
+                    });
+                    let entry = cachefetching_oids.entry(id);
+                    if let Entry::Vacant(_) = entry {
+                        pb.inc_length(total_objs_count as u64);
+                    }
+                    let prev = entry.or_default();
+                    let increment = received_objs_count.saturating_sub(*prev);
+                    *prev = received_objs_count;
+                    pb.inc(increment as u64);
+                }
                 Message::CacheDone => {
                     for pb in std::mem::take(&mut pb_caching).into_values() {
-                        pb.finish_and_clear();
+                        pb.finish_with_message("done");
                     }
-                    multipb_caching.clear().unwrap();
                 }
                 Message::InstallSkipped(id) => {
                     // installskipped_count += 1;
