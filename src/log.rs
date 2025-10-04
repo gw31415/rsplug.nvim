@@ -1,9 +1,12 @@
-use colored::Colorize;
+use console::style;
 use hashbrown::HashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::{
-    io::Write, path::PathBuf, sync::{Arc, RwLock}, time::Duration
+    io::Write,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -44,7 +47,7 @@ fn init() -> Logger {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Message::DetectConfigFile(path) => {
-                    eprintln!("{}", path.to_string_lossy().dimmed());
+                    eprintln!("{}", style(path.to_string_lossy()).dim());
                 }
                 Message::CheckingLocalPlugins { install, update } => {
                     let pb = ProgressBar::new_spinner();
@@ -66,14 +69,16 @@ fn init() -> Logger {
                 Message::CheckingLocalPluginsFinished { total, merged } => {
                     let message = format!(
                         "plugins {}",
-                        format!("(total:{total} merged:{merged})").green().dimmed()
+                        style(format!("(total:{total} merged:{merged})"))
+                            .green()
+                            .dim()
                     );
                     if let Some(pb) = pb_checking_local_plugins.take() {
                         pb.set_style(pb_style.clone());
                         pb.set_prefix("Loaded");
                         pb.finish_with_message(message);
                     } else {
-                        eprintln!("{} {message}", "Loaded".blue().bold());
+                        eprintln!("{} {message}", style("Loaded").blue().bold());
                     }
                 }
                 Message::Cache(r#type, url) => {
@@ -105,7 +110,7 @@ fn init() -> Logger {
                                 .with_prefix("Skipped"),
                         )
                     });
-                    pb.set_message(format!("{}", id.italic().dimmed()));
+                    pb.set_message(format!("{}", style(id).italic().dim()));
                 }
                 Message::InstallYank { id, which: file } => {
                     // yankfile_count += 1;
@@ -118,7 +123,7 @@ fn init() -> Logger {
                     });
                     pb.set_message(format!(
                         "in {}: {}",
-                        id.italic().dimmed(),
+                        style(id).italic().dim(),
                         file.to_string_lossy()
                     ));
                 }
@@ -144,7 +149,7 @@ fn init() -> Logger {
                     // }
                 }
                 Message::Error(e) => {
-                    eprintln!("{} {}", "error:".red().bold(), e);
+                    eprintln!("{} {e}", style("error:").red().bold());
                 }
             }
         }
