@@ -1,0 +1,57 @@
+# Lazy loading is enabled by default. If no load timing is specified, it will not be loaded.
+# This plugin is dependent on deepl-operator.vim, so it is loaded at the same time accordingly.
+[[plugins]]
+repo = "gw31415/deepl.vim"
+lua_after = '''
+vim.api.nvim_set_var('deepl_authkey', os.getenv 'DEEPL_API_KEY')
+vim.api.nvim_set_var('deepl_target_lang', 'EN')
+'''
+
+[[plugins]]
+repo = "gw31415/deepl-operator.vim"
+# Dependent plugins loaded **simultaneously** (note: not in advance) with the plugin
+depends = "deepl.vim"
+# Keybindings to load the plugin
+on_map = { nx = ["cl", "cL"] }
+# Script to run after loading the plugin
+lua_after = '''
+vim.keymap.set({ 'n', 'x' }, 'cl', '<Plug>(deepl-replace)', { desc = 'Replace with DeepL translation' })
+vim.keymap.set('n', 'cll', '<Plug>(deepl-replace)_', { desc = 'Replace with DeepL translation and keep cursor' })
+vim.keymap.set('n', 'cL', '<Plug>(deepl-replace)$', { desc = 'Replace with DeepL translation at end of line' })
+'''
+
+[[plugins]]
+repo = "nvim-lua/plenary.nvim"
+# If the pattern to be read is only of the form require 'hoge/fuga',
+# it will be set up automatically without specifying any dependencies.
+lua_after = "vim.notify 'plenary.nvim loaded'"
+
+[[plugins]]
+repo = "rest-nvim/rest.nvim"
+# File types to load the plugin
+on_ft = "http"
+lua_after = "require 'rest-nvim'.setup {}"
+
+[[plugins]]
+# Specify a version with a wildcard
+repo = "j-hui/fidget.nvim@v*"
+# Autocmd events to load the plugin
+on_event = "CursorHold"
+lua_after = '''
+require 'fidget'.setup {
+	notification = {
+		override_vim_notify = true,
+	}
+}
+'''
+
+[[plugins]]
+repo = "simeji/winresizer"
+on_map = "<c-w>"
+# Script to run just before loading the plugin
+lua_before = "vim.api.nvim_set_var('winresizer_start_key', '<c-w>e')"
+
+[[plugins]]
+repo = "navarasu/onedark.nvim"
+# Disable lazy loading
+start = true
