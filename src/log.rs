@@ -44,7 +44,7 @@ fn init() -> Logger {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Message::DetectConfigFile(path) => {
-                    println!("{}", path.to_string_lossy().dimmed());
+                    eprintln!("{}", path.to_string_lossy().dimmed());
                 }
                 Message::CheckingLocalPlugins { install, update } => {
                     let pb = ProgressBar::new_spinner();
@@ -73,7 +73,7 @@ fn init() -> Logger {
                         pb.set_prefix("Loaded");
                         pb.finish_with_message(message);
                     } else {
-                        println!("{} {message}", "Loaded".blue().bold());
+                        eprintln!("{} {message}", "Loaded".blue().bold());
                     }
                 }
                 Message::Cache(r#type, url) => {
@@ -137,14 +137,14 @@ fn init() -> Logger {
                     }
                     multipb_installing.clear().unwrap();
                     // if skipped {
-                    //     println!("skipped {installskipped_count} packages");
+                    //     eprintln!("skipped {installskipped_count} packages");
                     // }
                     // if yanked {
-                    //     println!("copied {yankfile_count} files");
+                    //     eprintln!("copied {yankfile_count} files");
                     // }
                 }
                 Message::Error(e) => {
-                    println!("{} {}", "error:".red().bold(), e);
+                    eprintln!("{} {}", "error:".red().bold(), e);
                 }
             }
         }
