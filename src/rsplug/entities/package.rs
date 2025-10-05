@@ -253,7 +253,6 @@ impl PackPathState {
                 }
             }
         }
-        msg(Message::InstallDone);
 
         let installing = Arc::new(installing);
         for start_or_opt in ["start", "opt"] {
@@ -274,11 +273,13 @@ impl PackPathState {
             }
         }
 
-        tasks
+        let res = tasks
             .join_all()
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
-            .and(Ok(()))
+            .and(Ok(()));
+        msg(Message::InstallDone);
+        res
     }
 }
