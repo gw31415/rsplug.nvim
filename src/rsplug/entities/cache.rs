@@ -202,7 +202,7 @@ impl Cache {
                                     }
                                     Package {
                                         id,
-                                        files,
+                                        files: HowToPlaceFiles::CopyEachFile(files),
                                         lazy_type,
                                         script: script.clone(),
                                     }

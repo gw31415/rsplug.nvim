@@ -15,6 +15,11 @@ use tokio::task::JoinSet;
 
 use super::*;
 
+/// プラグインファイルの配置方法。
+pub(super) enum HowToPlaceFiles {
+    CopyEachFile(HashMap<PathBuf, FileItem>),
+}
+
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
 /// Packageに変換する。
@@ -24,7 +29,7 @@ pub struct Package {
     /// プラグインの遅延実行タイプ
     pub lazy_type: LazyType,
     /// 配置するファイル
-    pub(super) files: HashMap<PathBuf, FileItem>,
+    pub(super) files: HowToPlaceFiles,
     /// セットアップスクリプト
     pub(super) script: SetupScript,
 }
@@ -91,39 +96,47 @@ impl Add for Package {
         } else if rhs.id.0.is_superset(&self.id.0) {
             return (rhs, None);
         }
-        let mergeable = {
-            let (sfname, rfname): (HashSet<_>, HashSet<_>) =
-                (self.files.keys().collect(), rhs.files.keys().collect());
-            sfname.intersection(&rfname).all(|path| {
-                let a = &self.files.get(*path).unwrap().merge_type;
-                let b = &rhs.files.get(*path).unwrap().merge_type;
-                !matches!((a, b), (MergeType::Conflict, _) | (_, MergeType::Conflict))
-            })
+        match (&self.files, &rhs.files) {
+            (HowToPlaceFiles::CopyEachFile(files), HowToPlaceFiles::CopyEachFile(rfiles)) => {
+                let mergeable = {
+                    let (sfname, rfname): (HashSet<_>, HashSet<_>) =
+                        (files.keys().collect(), rfiles.keys().collect());
+                    sfname.intersection(&rfname).all(|path| {
+                        let a = &files.get(*path).unwrap().merge_type;
+                        let b = &rfiles.get(*path).unwrap().merge_type;
+                        !matches!((a, b), (MergeType::Conflict, _) | (_, MergeType::Conflict))
+                    })
+                };
+                if mergeable {
+                    let Self {
+                        mut id,
+                        lazy_type,
+                        files: HowToPlaceFiles::CopyEachFile(mut files),
+                        mut script,
+                    } = self;
+                    let Self {
+                        id: rid,
+                        lazy_type: _,
+                        files: HowToPlaceFiles::CopyEachFile(rfiles),
+                        script: rscript,
+                    } = rhs;
+                    files.extend(rfiles);
+                    id += rid;
+                    script += rscript;
+
+                    return (
+                        Self {
+                            id,
+                            lazy_type,
+                            files: HowToPlaceFiles::CopyEachFile(files),
+                            script,
+                        },
+                        None,
+                    );
+                }
+            }
         };
-        if mergeable {
-            let Self {
-                mut id,
-                lazy_type,
-                mut files,
-                mut script,
-            } = self;
-
-            files.extend(rhs.files);
-            id += rhs.id;
-            script += rhs.script;
-
-            (
-                Self {
-                    id,
-                    lazy_type,
-                    files,
-                    script,
-                },
-                None,
-            )
-        } else {
-            (self, Some(rhs))
-        }
+        (self, Some(rhs))
     }
 }
 
@@ -198,13 +211,16 @@ impl PackPathState {
         }
 
         let pkg_type_str = if lazy_type.is_start() { "start" } else { "opt" };
-        for (path, item) in files {
-            let (_, files) = self
-                .files
-                .entry(id.as_str())
-                .or_insert((pkg_type_str, Vec::new()));
-
-            files.push((path, item.source));
+        match files {
+            HowToPlaceFiles::CopyEachFile(files) => {
+                for (path, item) in files {
+                    let (_, files) = self
+                        .files
+                        .entry(id.as_str())
+                        .or_insert((pkg_type_str, Vec::new()));
+                    files.push((path, item.source));
+                }
+            }
         }
 
         Loader::create(id, lazy_type, script)

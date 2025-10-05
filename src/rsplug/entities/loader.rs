@@ -37,7 +37,7 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Packa
     Package {
         id,
         lazy_type: LazyType::Start,
-        files,
+        files: HowToPlaceFiles::CopyEachFile(files),
         script: Default::default(),
     }
 }
@@ -156,7 +156,7 @@ impl From<Loader> for Vec<Package> {
                 Package {
                     id: on_event_setup_id + on_event_id,
                     lazy_type: LazyType::Start,
-                    files,
+                    files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
                 }
             });
@@ -199,7 +199,7 @@ impl From<Loader> for Vec<Package> {
                 Package {
                     id: on_cmd_id + on_cmd_setup_id,
                     lazy_type: LazyType::Start,
-                    files,
+                    files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
                 }
             });
@@ -236,7 +236,7 @@ impl From<Loader> for Vec<Package> {
             pkgs.push(Package {
                 id: plugin_on_lua_id + on_lua_id,
                 lazy_type: LazyType::Start,
-                files,
+                files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
             });
         }
