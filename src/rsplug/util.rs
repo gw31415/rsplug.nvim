@@ -167,7 +167,6 @@ pub mod git {
         dir: impl AsRef<Path> + Send + 'static,
         repo: impl AsRef<str> + Send + 'static,
     ) -> Result<Repository, Error> {
-        let _ = tokio::fs::remove_dir_all(dir.as_ref().join(".git")).await;
         let r = spawn_blocking(move || git2::Repository::init(dir))
             .await
             .unwrap()?;
