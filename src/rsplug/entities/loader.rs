@@ -63,24 +63,25 @@ impl From<Loader> for Vec<Package> {
             let pkgid2scripts = pkgid2scripts
                 .into_iter()
                 .filter_map(|(pkgid, script)| {
-                    let mut script_set = BTreeMap::new();
-                    let mut add_script = |script_type: &'static str, content: Option<String>| {
-                        if let Some(content) = content {
-                            let module_id = format!("{script_type}_{pkgid}");
-                            pkgs.push(instant_startup_pkg(
-                                &format!("lua/{module_id}.lua"),
-                                content.into_bytes(),
-                            ));
-                            script_set.insert(script_type, module_id);
-                        }
-                    };
-
                     let SetupScript {
                         lua_after,
                         lua_before,
                     } = script;
-                    add_script("lua_after", lua_after);
-                    add_script("lua_before", lua_before);
+                    let lua_after = lua_after.into_iter().map(|s| ("lua_after", s));
+                    let lua_before = lua_before.into_iter().map(|s| ("lua_before", s));
+                    let mut script_set: BTreeMap<&'static str, Vec<String>> = Default::default();
+                    for (script_type, content) in lua_after.chain(lua_before) {
+                        let module_id = format!(
+                            "{script_type}_{}",
+                            PackageID::new(content.as_bytes()).as_str()
+                        );
+                        pkgs.push(instant_startup_pkg(
+                            &format!("lua/{module_id}.lua"),
+                            content.into_bytes(),
+                        ));
+                        script_set.entry(script_type).or_default().push(module_id);
+                    }
+
                     if script_set.is_empty() {
                         None
                     } else {
@@ -420,7 +421,7 @@ struct FtpluginTemplate {
 #[template(path = "lua/_rsplug/init.stpl")]
 #[template(escape = false)]
 struct CustomPackaddTemplate {
-    pkgid2scripts: Vec<(PackageIDStr, BTreeMap<&'static str, String>)>,
+    pkgid2scripts: Vec<(PackageIDStr, BTreeMap<&'static str, Vec<String>>)>,
 }
 
 #[derive(TemplateSimple)]

@@ -138,7 +138,7 @@ impl Unit {
                             .into_iter()
                             .flat_map(|dep| units.get(dep).unwrap().clone())
                             .collect(),
-                        script,
+                        script: script.into(),
                         merge,
                     })
                 };

@@ -101,11 +101,26 @@ impl Add for Package {
             })
         };
         if mergeable {
-            let mut pkg = self;
-            pkg.files.extend(rhs.files);
-            pkg.id += rhs.id;
+            let Self {
+                mut id,
+                lazy_type,
+                mut files,
+                mut script,
+            } = self;
 
-            (pkg, None)
+            files.extend(rhs.files);
+            id += rhs.id;
+            script += rhs.script;
+
+            (
+                Self {
+                    id,
+                    lazy_type,
+                    files,
+                    script,
+                },
+                None,
+            )
         } else {
             (self, Some(rhs))
         }

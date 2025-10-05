@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     hash::Hash,
     iter::Sum,
     ops::AddAssign,
@@ -71,7 +71,7 @@ pub(super) struct Plugin {
     #[serde(rename = "name")]
     pub custom_name: Option<String>,
     #[serde(flatten)]
-    pub script: SetupScript,
+    pub script: SetupScriptOne,
     #[serde(flatten)]
     pub merge: MergeConfig,
 }
@@ -89,12 +89,41 @@ impl Plugin {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize, Clone, Default)]
-pub struct SetupScript {
+#[derive(Deserialize, Default)]
+pub(crate) struct SetupScriptOne {
     /// プラグイン読み込み直後に実行される Lua スクリプト
     pub lua_after: Option<String>,
     /// プラグイン読み込み直前に実行される Lua スクリプト
     pub lua_before: Option<String>,
+}
+
+/// プラグインのセットアップに用いるスクリプト群
+#[derive(Clone, Default)]
+pub struct SetupScript {
+    /// プラグイン読み込み直後に実行される Lua スクリプト
+    pub lua_after: BTreeSet<String>,
+    /// プラグイン読み込み直前に実行される Lua スクリプト
+    pub lua_before: BTreeSet<String>,
+}
+
+impl From<SetupScriptOne> for SetupScript {
+    fn from(value: SetupScriptOne) -> Self {
+        let SetupScriptOne {
+            lua_after,
+            lua_before,
+        } = value;
+        SetupScript {
+            lua_after: lua_after.into_iter().collect(),
+            lua_before: lua_before.into_iter().collect(),
+        }
+    }
+}
+
+impl AddAssign for SetupScript {
+    fn add_assign(&mut self, rhs: Self) {
+        self.lua_after.extend(rhs.lua_after);
+        self.lua_before.extend(rhs.lua_before);
+    }
 }
 
 /// プラグインのセットアップに用いるスクリプト群
