@@ -18,7 +18,7 @@ use super::*;
 /// プラグインファイルの配置方法。
 pub(super) enum HowToPlaceFiles {
     CopyEachFile(HashMap<PathBuf, FileItem>),
-    SymlinkDirectory(PathBuf),
+    SymlinkDirectory(Arc<Path>),
 }
 
 /// インストール単位となるプラグイン。
@@ -196,7 +196,7 @@ struct PackageFiles {
 
 enum PackageDirectory {
     Files(Vec<(PathBuf, Arc<FileSource>)>),
-    Symlink(PathBuf),
+    Symlink(Arc<Path>),
 }
 
 /// PackPath の象徴となる状態。この構造体に Package をインサートしていき、最後に実際のパスを指定して install を行う。
@@ -278,11 +278,19 @@ impl PackPathState {
         {
             let id: Arc<str> = id.into();
             let dir = gen_root.join(start_or_opt).join(id.as_ref());
-            if dir.is_dir() {
+            let installed = {
+                let dir_is_symlink = dir.is_symlink();
+                match &pkgdir {
+                    PackageDirectory::Files(_) => dir.is_dir() && !dir_is_symlink,
+                    PackageDirectory::Symlink(_) => dir_is_symlink,
+                }
+            };
+            if installed {
                 msg(Message::InstallSkipped(id));
             } else {
                 match pkgdir {
                     PackageDirectory::Files(files) => {
+                        tokio::fs::remove_file(dir.as_path()).await.ok();
                         let dir = Arc::new(dir);
                         for (which, source) in files {
                             let dir = dir.clone();
@@ -296,8 +304,9 @@ impl PackPathState {
                     }
                     PackageDirectory::Symlink(sym) => {
                         tasks.spawn(async move {
+                            tokio::fs::remove_dir_all(&dir).await.ok();
                             tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
-                            tokio::fs::symlink(sym, &dir).await?;
+                            tokio::fs::symlink(sym, dir).await?;
                             Ok(())
                         });
                     }

@@ -48,10 +48,25 @@ impl Sum for Config {
     }
 }
 
+#[derive(Deserialize)]
+pub struct PluginSource {
+    #[serde(rename = "repo")]
+    pub base: UnitSource,
+    #[serde(default, rename = "sym")]
+    to_sym: bool,
+}
+
+impl PluginSource {
+    pub fn to_sym(&self) -> bool {
+        self.to_sym
+    }
+}
+
 #[serde_as]
 #[derive(Deserialize)]
 pub(super) struct Plugin {
-    pub repo: UnitSource,
+    #[serde(flatten)]
+    pub repo: PluginSource,
     #[serde(default)]
     pub start: bool,
     #[serde_as(as = "OneOrMany<_>")]
@@ -80,7 +95,7 @@ impl Plugin {
     /// プラグインを指定する名前
     pub fn name(&self) -> &str {
         self.custom_name.as_ref().map_or(
-            match &self.repo {
+            match &self.repo.base {
                 UnitSource::GitHub { repo, .. } => repo.as_ref(),
             },
             |v| v,

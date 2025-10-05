@@ -46,7 +46,7 @@ pub mod git {
         }
 
         /// リポジトリ内のファイル一覧を取得
-        pub async fn ls_files(&self) -> Result<impl Iterator<Item = PathBuf>, Error> {
+        pub async fn ls_files(&self) -> Result<Vec<PathBuf>, Error> {
             Ok(self
                 .0
                 .lock()
@@ -54,8 +54,7 @@ pub mod git {
                 .index()?
                 .iter()
                 .map(|entry| bytes_to_pathbuf(entry.path))
-                .collect::<Vec<_>>()
-                .into_iter())
+                .collect::<Vec<_>>())
         }
 
         /// リポジトリ同期処理

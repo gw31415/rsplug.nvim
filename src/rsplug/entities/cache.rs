@@ -118,7 +118,7 @@ impl Cache {
                         }
 
                         'add_pkg: {
-                            let pkg: Package = match &source {
+                            let pkg: Package = match &source.base {
                                 UnitSource::GitHub { owner, repo, rev } => {
                                     let proj_root = config
                                         .cachepath
@@ -175,34 +175,40 @@ impl Cache {
                                         }
                                     });
 
-                                    let files: HashMap<PathBuf, _> = repo
-                                        .ls_files()
-                                        .await?
-                                        .filter_map(|path| {
-                                            let ignored = path.iter().any(|k| {
-                                                let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
-                                                merge.ignore.matched(k)
-                                            });
-                                            if !ignored && proj_root.join(&path).is_file() {
-                                                Some((
-                                                    path,
-                                                    FileItem {
-                                                        source: filesource.clone(),
-                                                        merge_type: MergeType::Conflict,
-                                                    },
-                                                ))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
+                                    let files = repo.ls_files().await?;
                                     let mut lazy_type = lazy_type.clone();
-                                    for luam in extract_unique_lua_modules(&files) {
+                                    for luam in extract_unique_lua_modules(files.iter()) {
                                         lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
                                     }
+                                    let files: HowToPlaceFiles = if source.to_sym() {
+                                        HowToPlaceFiles::SymlinkDirectory(proj_root.clone())
+                                    } else {
+                                        HowToPlaceFiles::CopyEachFile(
+                                            files
+                                                .into_iter()
+                                                .filter_map(|path| {
+                                                    let ignored = path.iter().any(|k| {
+                                                        let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
+                                                        merge.ignore.matched(k)
+                                                    });
+                                                    if !ignored && proj_root.join(&path).is_file() {
+                                                        Some((
+                                                            path,
+                                                            FileItem {
+                                                                source: filesource.clone(),
+                                                                merge_type: MergeType::Conflict,
+                                                            },
+                                                        ))
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect(),
+                                        )
+                                    };
                                     Package {
                                         id,
-                                        files: HowToPlaceFiles::CopyEachFile(files),
+                                        files,
                                         lazy_type,
                                         script: script.clone(),
                                     }
@@ -239,12 +245,12 @@ impl Default for Cache {
     }
 }
 
-fn extract_unique_lua_modules<'a, T>(
-    files: &'a HashMap<PathBuf, T>,
+fn extract_unique_lua_modules<'a>(
+    files: impl Iterator<Item = &'a PathBuf> + 'a,
 ) -> impl Iterator<Item = String> + 'a {
     let mut seen = hashbrown::HashSet::new();
 
-    files.keys().filter_map(move |path| {
+    files.filter_map(move |path| {
         let mut comps = path.components();
 
         // 先頭が "lua" でなければ対象外

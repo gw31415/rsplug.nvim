@@ -10,7 +10,7 @@ use super::*;
 /// 設定を構成する基本単位
 pub struct Unit {
     /// 取得元
-    pub source: UnitSource,
+    pub source: PluginSource,
     /// Unitに対応する読み込みタイプ
     pub lazy_type: LazyType,
     /// 依存する Unit のリスト
