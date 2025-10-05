@@ -23,8 +23,10 @@
         pkgs = import nixpkgs {
           inherit system;
         };
-        # TODO: Load specific Rust version from ./rust-toolchain.toml
-        toolchain = fenix.packages.${system}.minimal.toolchain;
+        toolchain = fenix.packages.${system}.fromToolchainFile {
+          file = ./rust-toolchain.toml;
+          sha256 = "18blq77d227zfgqwadk3zanlwlxp3i23pqpc11ck0yqf20p6dlgv";
+        };
       in
       {
         packages.default =
