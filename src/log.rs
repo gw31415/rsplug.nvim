@@ -58,8 +58,8 @@ fn init() -> Logger {
         let mut pb_checking_local_plugins = None;
         let mut pb_installskipped = None;
         let mut pb_installyank = None;
-        // let mut installskipped_count = 0;
-        // let mut yankfile_count = 0;
+        let mut installskipped_count = 0;
+        let mut yankfile_count = 0;
         let multipb_caching = MultiProgress::new();
         let mut cachefetching_oids: HashMap<String, usize> = HashMap::new();
         let mut pb_caching = HashMap::new();
@@ -137,7 +137,7 @@ fn init() -> Logger {
                     }
                 }
                 Message::InstallSkipped(id) => {
-                    // installskipped_count += 1;
+                    installskipped_count += 1;
                     let pb = pb_installskipped.get_or_insert_with(|| {
                         multipb_installing.add(
                             ProgressBar::no_length()
@@ -148,7 +148,7 @@ fn init() -> Logger {
                     pb.set_message(format!("{}", style(id).italic().dim()));
                 }
                 Message::InstallYank { id, which: file } => {
-                    // yankfile_count += 1;
+                    yankfile_count += 1;
                     let pb = pb_installyank.get_or_insert_with(|| {
                         multipb_installing.add(
                             ProgressBar::no_length()
@@ -163,25 +163,26 @@ fn init() -> Logger {
                     ));
                 }
                 Message::InstallDone => {
-                    // let mut skipped = false;
-                    // let mut yanked = false;
                     if let Some(pb) = pb_installskipped.take() {
-                        pb.set_style(ProgressStyle::with_template("{wide_msg}").unwrap());
-                        pb.finish_and_clear();
-                        // skipped = installskipped_count != 0;
+                        pb.set_style(pb_style.clone());
+                        if installskipped_count != 0 {
+                            pb.set_prefix("Skipped");
+                            pb.finish_with_message(format!("{installskipped_count} packages"));
+                        } else {
+                            pb.finish_and_clear();
+                        }
                     }
                     if let Some(pb) = pb_installyank.take() {
-                        pb.set_style(ProgressStyle::with_template("{wide_msg}").unwrap());
+                        pb.set_style(pb_style.clone());
                         pb.finish_and_clear();
-                        // yanked = yankfile_count != 0;
+                        if yankfile_count != 0 {
+                            pb.set_prefix("Copied");
+                            pb.finish_with_message(format!("{yankfile_count} files"));
+                        } else {
+                            pb.finish_and_clear();
+                        }
                     }
-                    multipb_installing.clear().unwrap();
-                    // if skipped {
-                    //     eprintln!("skipped {installskipped_count} packages");
-                    // }
-                    // if yanked {
-                    //     eprintln!("copied {yankfile_count} files");
-                    // }
+                    // multipb_installing.clear().unwrap();
                 }
                 Message::Error(e) => {
                     eprintln!("{} {e}", style("error:").red().bold());
