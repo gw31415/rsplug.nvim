@@ -18,6 +18,7 @@ use super::*;
 /// プラグインファイルの配置方法。
 pub(super) enum HowToPlaceFiles {
     CopyEachFile(HashMap<PathBuf, FileItem>),
+    SymlinkDirectory(PathBuf),
 }
 
 /// インストール単位となるプラグイン。
@@ -113,13 +114,19 @@ impl Add for Package {
                         lazy_type,
                         files: HowToPlaceFiles::CopyEachFile(mut files),
                         mut script,
-                    } = self;
+                    } = self
+                    else {
+                        unreachable!() // SAFETY: Because self.files is verified to be a CopyEachFile
+                    };
                     let Self {
                         id: rid,
                         lazy_type: _,
                         files: HowToPlaceFiles::CopyEachFile(rfiles),
                         script: rscript,
-                    } = rhs;
+                    } = rhs
+                    else {
+                        unreachable!() // SAFETY: Because rhs.files is verified to be a CopyEachFile
+                    };
                     files.extend(rfiles);
                     id += rid;
                     script += rscript;
@@ -135,6 +142,9 @@ impl Add for Package {
                     );
                 }
             }
+            (HowToPlaceFiles::CopyEachFile(_), HowToPlaceFiles::SymlinkDirectory(_))
+            | (HowToPlaceFiles::SymlinkDirectory(_), HowToPlaceFiles::CopyEachFile(_))
+            | (HowToPlaceFiles::SymlinkDirectory(_), HowToPlaceFiles::SymlinkDirectory(_)) => {}
         };
         (self, Some(rhs))
     }
@@ -179,7 +189,15 @@ impl FileSource {
     }
 }
 
-type PackageFiles = (&'static str, Vec<(PathBuf, Arc<FileSource>)>);
+struct PackageFiles {
+    start_or_opt: &'static str,
+    dir: PackageDirectory,
+}
+
+enum PackageDirectory {
+    Files(Vec<(PathBuf, Arc<FileSource>)>),
+    Symlink(PathBuf),
+}
 
 /// PackPath の象徴となる状態。この構造体に Package をインサートしていき、最後に実際のパスを指定して install を行う。
 #[derive(Default)]
@@ -214,12 +232,27 @@ impl PackPathState {
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
                 for (path, item) in files {
-                    let (_, files) = self
-                        .files
-                        .entry(id.as_str())
-                        .or_insert((pkg_type_str, Vec::new()));
-                    files.push((path, item.source));
+                    let PackageFiles {
+                        start_or_opt: _,
+                        dir: PackageDirectory::Files(tree),
+                    } = self.files.entry(id.as_str()).or_insert(PackageFiles {
+                        start_or_opt: pkg_type_str,
+                        dir: PackageDirectory::Files(Vec::new()),
+                    })
+                    else {
+                        unreachable!() // SAFETY: idは一意なので、ここに到達することはない
+                    };
+                    tree.push((path, item.source));
                 }
+            }
+            HowToPlaceFiles::SymlinkDirectory(dir) => {
+                self.files.insert(
+                    id.as_str(),
+                    PackageFiles {
+                        start_or_opt: pkg_type_str,
+                        dir: PackageDirectory::Symlink(dir),
+                    },
+                );
             }
         }
 
@@ -235,21 +268,39 @@ impl PackPathState {
         let Self { installing, files } = self;
         let mut tasks = JoinSet::new();
 
-        for (id, (start_or_opt, files)) in files {
+        for (
+            id,
+            PackageFiles {
+                start_or_opt,
+                dir: pkgdir,
+            },
+        ) in files
+        {
             let id: Arc<str> = id.into();
             let dir = gen_root.join(start_or_opt).join(id.as_ref());
             if dir.is_dir() {
                 msg(Message::InstallSkipped(id));
             } else {
-                let dir = Arc::new(dir);
-                for (which, source) in files {
-                    let dir = dir.clone();
-                    let id = id.clone();
-                    tasks.spawn(async move {
-                        source.yank(&which, dir.as_path()).await?;
-                        msg(Message::InstallYank { id, which });
-                        Ok(())
-                    });
+                match pkgdir {
+                    PackageDirectory::Files(files) => {
+                        let dir = Arc::new(dir);
+                        for (which, source) in files {
+                            let dir = dir.clone();
+                            let id = id.clone();
+                            tasks.spawn(async move {
+                                source.yank(&which, dir.as_path()).await?;
+                                msg(Message::InstallYank { id, which });
+                                Ok(())
+                            });
+                        }
+                    }
+                    PackageDirectory::Symlink(sym) => {
+                        tasks.spawn(async move {
+                            tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
+                            tokio::fs::symlink(sym, &dir).await?;
+                            Ok(())
+                        });
+                    }
                 }
             }
         }
