@@ -100,7 +100,6 @@ pub mod git {
                     Some(
                         CheckoutBuilder::new()
                             .force()
-                            .remove_untracked(true)
                             .use_theirs(true)
                             .allow_conflicts(true),
                     ),
@@ -133,6 +132,7 @@ pub mod git {
             let repo = self.0.clone();
             spawn_blocking(move || {
                 let repo = repo.lock().unwrap();
+                repo.add_ignore_rule(RSPLUG_BUILD_SUCCESS_FILE).unwrap();
                 // HEAD ツリー
                 let head_commit = repo.head()?.peel_to_commit()?;
                 let head_tree = head_commit.tree()?;
@@ -293,6 +293,8 @@ pub mod git {
             })
         }
     }
+    /// Constant representing files to be ignored by rsplug
+    pub const RSPLUG_BUILD_SUCCESS_FILE: &str = ".rsplug_build_success";
 }
 
 pub mod github {

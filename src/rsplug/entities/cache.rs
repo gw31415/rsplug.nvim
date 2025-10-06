@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     log::{Message, msg},
-    rsplug::util::{execute, truncate},
+    rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, truncate},
 };
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
 use tokio::{sync::RwLock, task::JoinSet};
@@ -96,6 +96,7 @@ impl Cache {
                         for dep in depends.iter() {
                             while pkgmap.read().await.get(dep).unwrap().is_none() {
                                 // Wait for dependent packages to finish processing
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                             }
                         }
 
@@ -149,56 +150,16 @@ impl Cache {
                                     };
 
                                     let url: Arc<str> = Arc::from(github::url(owner, repo));
-                                    let exec = if build.is_empty() {
-                                        None
-                                    } else {
-                                        Some(async move {
-                                            let logid = {
-                                                const MAX_LOGID_LEN: usize = 20;
-                                                let repo = truncate(repo, MAX_LOGID_LEN);
-
-                                                let len = MAX_LOGID_LEN
-                                                    .saturating_sub(repo.width_cjk() + 1);
-                                                if len < 2 {
-                                                    repo
-                                                } else {
-                                                    let mut owner = truncate(owner, len);
-                                                    owner.push('/');
-                                                    owner.push_str(&repo);
-                                                    owner
-                                                }
-                                            };
-                                            let code = execute(build.iter(), proj_root, {
-                                                move |(stdtype, line)| {
-                                                    msg(Message::CacheBuildProgress {
-                                                        id: logid.clone(),
-                                                        stdtype,
-                                                        line,
-                                                    });
-                                                }
-                                            })
-                                            .await?;
-                                            if code == 0 {
-                                                Ok::<_, Error>(())
-                                            } else {
-                                                Err(Error::BuildScriptFailed {
-                                                    code,
-                                                    build: build.clone(),
-                                                })
-                                            }
-                                        })
-                                    };
 
                                     // リポジトリがない場合のインストール処理
-                                    let repo = if let Ok(mut repo) = git::open(&proj_root).await {
+                                    let repository = if let Ok(mut repo) =
+                                        git::open(&proj_root).await
+                                    {
                                         // アップデート処理
                                         if update {
                                             msg(Message::Cache("Updating", url.clone()));
                                             repo.fetch(git::ls_remote(url.clone(), rev).await?)
                                                 .await?;
-                                            if let Some(exec) = exec {
-                                                exec.await?;
-                                            }
                                         }
                                         repo
                                     } else if install {
@@ -207,19 +168,18 @@ impl Cache {
                                             git::init(proj_root.clone(), url.clone()).await?;
                                         msg(Message::Cache("Fetching", url.clone()));
                                         repo.fetch(git::ls_remote(url.clone(), rev).await?).await?;
-                                        if let Some(exec) = exec {
-                                            exec.await?;
-                                        }
                                         repo
                                     } else {
-                                        // インストールされていない場合はスキップ
+                                        // 見つからない場合はスキップ
                                         break 'add_pkg;
                                     };
 
                                     // ディレクトリ内容からのIDの決定
                                     let id = PackageID::new({
-                                        let (head, diff) =
-                                            tokio::join!(repo.head_hash(), repo.diff_hash(),);
+                                        let (head, diff) = tokio::join!(
+                                            repository.head_hash(),
+                                            repository.diff_hash()
+                                        );
                                         match (head, diff) {
                                             (Ok(mut head), Ok(diff)) => {
                                                 head.extend(diff);
@@ -233,7 +193,67 @@ impl Cache {
                                         }
                                     });
 
-                                    let files = repo.ls_files().await?;
+                                    // ビルド実行
+                                    if !build.is_empty() {
+                                        let next_build_success_id = id.as_str();
+                                        let rsplug_build_success_file =
+                                            proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
+                                        if let Some(ref prev_build_success_id) =
+                                            tokio::fs::read(&rsplug_build_success_file).await.ok()
+                                            && prev_build_success_id
+                                                == next_build_success_id.as_bytes()
+                                        {
+                                            // ビルド成功の痕跡があればビルドをスキップ
+                                        } else {
+                                            let exec = async move {
+                                                let _ = tokio::fs::remove_file(
+                                                    &rsplug_build_success_file,
+                                                )
+                                                .await;
+                                                let logid = {
+                                                    const MAX_LOGID_LEN: usize = 20;
+                                                    let repo = truncate(repo, MAX_LOGID_LEN);
+
+                                                    let len = MAX_LOGID_LEN
+                                                        .saturating_sub(repo.width_cjk() + 1);
+                                                    if len < 2 {
+                                                        repo
+                                                    } else {
+                                                        let mut owner = truncate(owner, len);
+                                                        owner.push('/');
+                                                        owner.push_str(&repo);
+                                                        owner
+                                                    }
+                                                };
+                                                let code = execute(build.iter(), proj_root, {
+                                                    move |(stdtype, line)| {
+                                                        msg(Message::CacheBuildProgress {
+                                                            id: logid.clone(),
+                                                            stdtype,
+                                                            line,
+                                                        });
+                                                    }
+                                                })
+                                                .await?;
+                                                if code == 0 {
+                                                    tokio::fs::write(
+                                                        rsplug_build_success_file,
+                                                        next_build_success_id.as_bytes(),
+                                                    )
+                                                    .await?;
+                                                    Ok::<_, Error>(())
+                                                } else {
+                                                    Err(Error::BuildScriptFailed {
+                                                        code,
+                                                        build: build.clone(),
+                                                    })
+                                                }
+                                            };
+                                            exec.await?;
+                                        }
+                                    }
+
+                                    let files = repository.ls_files().await?;
                                     let mut lazy_type = lazy_type.clone();
                                     for luam in extract_unique_lua_modules(files.iter()) {
                                         lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
