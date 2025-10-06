@@ -5,9 +5,13 @@ use std::{
     sync::Arc,
 };
 
-use crate::log::{Message, msg};
+use crate::{
+    log::{Message, msg},
+    rsplug::util::{execute, truncate},
+};
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
 use tokio::{sync::RwLock, task::JoinSet};
+use unicode_width::UnicodeWidthStr;
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::{
@@ -118,7 +122,12 @@ impl Cache {
                         }
 
                         'add_pkg: {
-                            let pkg: Package = match &source.base {
+                            let PluginSource {
+                                base,
+                                manually_to_sym: _,
+                                build,
+                            } = source;
+                            let pkg: Package = match base {
                                 UnitSource::GitHub { owner, repo, rev } => {
                                     let proj_root = config
                                         .cachepath
@@ -140,6 +149,45 @@ impl Cache {
                                     };
 
                                     let url: Arc<str> = Arc::from(github::url(owner, repo));
+                                    let exec = if build.is_empty() {
+                                        None
+                                    } else {
+                                        Some(async move {
+                                            let logid = {
+                                                const MAX_LOGID_LEN: usize = 20;
+                                                let repo = truncate(repo, MAX_LOGID_LEN);
+
+                                                let len = MAX_LOGID_LEN
+                                                    .saturating_sub(repo.width_cjk() + 1);
+                                                if len < 2 {
+                                                    repo
+                                                } else {
+                                                    let mut owner = truncate(owner, len);
+                                                    owner.push('/');
+                                                    owner.push_str(&repo);
+                                                    owner
+                                                }
+                                            };
+                                            let code = execute(build.iter(), proj_root, {
+                                                move |(stdtype, line)| {
+                                                    msg(Message::CacheBuildProgress {
+                                                        id: logid.clone(),
+                                                        stdtype,
+                                                        line,
+                                                    });
+                                                }
+                                            })
+                                            .await?;
+                                            if code == 0 {
+                                                Ok::<_, Error>(())
+                                            } else {
+                                                Err(Error::BuildScriptFailed {
+                                                    code,
+                                                    build: build.clone(),
+                                                })
+                                            }
+                                        })
+                                    };
 
                                     // リポジトリがない場合のインストール処理
                                     let repo = if let Ok(mut repo) = git::open(&proj_root).await {
@@ -148,6 +196,9 @@ impl Cache {
                                             msg(Message::Cache("Updating", url.clone()));
                                             repo.fetch(git::ls_remote(url.clone(), rev).await?)
                                                 .await?;
+                                            if let Some(exec) = exec {
+                                                exec.await?;
+                                            }
                                         }
                                         repo
                                     } else if install {
@@ -156,6 +207,9 @@ impl Cache {
                                             git::init(proj_root.clone(), url.clone()).await?;
                                         msg(Message::Cache("Fetching", url.clone()));
                                         repo.fetch(git::ls_remote(url.clone(), rev).await?).await?;
+                                        if let Some(exec) = exec {
+                                            exec.await?;
+                                        }
                                         repo
                                     } else {
                                         // インストールされていない場合はスキップ
@@ -169,6 +223,10 @@ impl Cache {
                                         match (head, diff) {
                                             (Ok(mut head), Ok(diff)) => {
                                                 head.extend(diff);
+                                                for (i, comp) in build.iter().enumerate() {
+                                                    head.extend(i.to_ne_bytes());
+                                                    head.extend(comp.as_bytes());
+                                                }
                                                 u128::to_ne_bytes(xxh3_128(&head))
                                             }
                                             (Err(err), _) | (_, Err(err)) => Err(err)?,

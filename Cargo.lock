@@ -946,6 +946,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml 0.9.7",
+ "unicode-width",
  "wildmatch",
  "xxhash-rust",
 ]

@@ -3,12 +3,14 @@ use hashbrown::{HashMap, hash_map::Entry};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::{
+    borrow::Cow,
     io::Write,
     path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::sync::{Mutex, mpsc};
+use unicode_width::UnicodeWidthStr;
 
 pub enum Message {
     DetectConfigFile(PathBuf),
@@ -25,6 +27,11 @@ pub enum Message {
         id: String,
         total_objs_count: usize,
         received_objs_count: usize,
+    },
+    CacheBuildProgress {
+        id: String,
+        stdtype: usize,
+        line: String,
     },
     CacheDone,
     InstallSkipped(Arc<str>),
@@ -62,7 +69,7 @@ fn init() -> Logger {
         let mut yankfile_count = 0;
         let multipb_caching = MultiProgress::new();
         let mut cachefetching_oids: HashMap<String, usize> = HashMap::new();
-        let mut pb_caching = HashMap::new();
+        let mut pb_caching: HashMap<Cow<'static, str>, _> = HashMap::new();
         while let Some(msg) = rx.recv().await {
             match msg {
                 Message::DetectConfigFile(path) => {
@@ -105,7 +112,7 @@ fn init() -> Logger {
                         pb.finish_and_clear();
                     }
 
-                    let pb = pb_caching.entry(r#type).or_insert_with(|| {
+                    let pb = pb_caching.entry(r#type.into()).or_insert_with(|| {
                         multipb_caching.add(
                             ProgressBar::no_length()
                                 .with_style(pb_style.clone())
@@ -119,9 +126,12 @@ fn init() -> Logger {
                     total_objs_count,
                     received_objs_count,
                 } => {
-                    let pb = pb_caching.entry("CacheFetchObjects").or_insert_with(|| {
-                        multipb_caching.add(ProgressBar::new(0).with_style(pb_style_bar.clone()))
-                    });
+                    let pb = pb_caching
+                        .entry("CacheFetchObjects".into())
+                        .or_insert_with(|| {
+                            multipb_caching
+                                .add(ProgressBar::new(0).with_style(pb_style_bar.clone()))
+                        });
                     let entry = cachefetching_oids.entry(id);
                     if let Entry::Vacant(_) = entry {
                         pb.inc_length(total_objs_count as u64);
@@ -131,8 +141,38 @@ fn init() -> Logger {
                     *prev = received_objs_count;
                     pb.inc(increment as u64);
                 }
+                Message::CacheBuildProgress { id, stdtype, line } => {
+                    let pb = ProgressBar::no_length()
+                        .with_style(pb_style_spinner.clone())
+                        .with_prefix({
+                            let mut prefix = format!("Building [{id}]");
+                            // Manual width alignment so that the style template does not need to be changed.
+                            const MAX_PREFIX_WIDTH: usize = 30;
+                            prefix.push_str(
+                                &" ".repeat(MAX_PREFIX_WIDTH.saturating_sub(prefix.width())),
+                            );
+                            prefix
+                        });
+                    let pb = pb_caching
+                        .entry({
+                            let mut id = id;
+                            id.push_str(" - Build"); // IDは人間が任意に決めるので、PREFIXを含めて衝突しないようにする
+                            id.into()
+                        })
+                        .or_insert_with(|| multipb_caching.add(pb));
+                    pb.set_message(format!(
+                        "{} {line}",
+                        style({
+                            let mut prefix = stdtype.to_string();
+                            prefix.push('>');
+                            prefix
+                        })
+                        .dim()
+                    ));
+                }
                 Message::CacheDone => {
                     for pb in std::mem::take(&mut pb_caching).into_values() {
+                        pb.set_style(pb_style.clone());
                         pb.finish_with_message("done");
                     }
                 }

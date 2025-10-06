@@ -23,5 +23,6 @@ serde_with = { version = "3.15.0", features = [
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["full"] }
 toml = "0.9.7"
+unicode-width = "0.2.1"
 wildmatch = "2.5.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

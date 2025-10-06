@@ -53,12 +53,14 @@ pub struct PluginSource {
     #[serde(rename = "repo")]
     pub base: UnitSource,
     #[serde(default, rename = "sym")]
-    to_sym: bool,
+    pub manually_to_sym: bool,
+    #[serde(default)]
+    pub build: Vec<String>,
 }
 
 impl PluginSource {
     pub fn to_sym(&self) -> bool {
-        self.to_sym
+        self.manually_to_sym || !self.build.is_empty()
     }
 }
 

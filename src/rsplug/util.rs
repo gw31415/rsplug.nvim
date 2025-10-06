@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use unicode_width::UnicodeWidthStr;
+
 use super::error::Error;
 
 #[inline]
@@ -384,4 +386,87 @@ pub mod glob {
             }
         }
     }
+}
+
+pub async fn execute(
+    cmd: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    workdir: impl AsRef<std::path::Path>,
+    mut cb: impl FnMut((usize, String)) + Send + 'static, // Handle Stdout by each line
+) -> Result<i32, std::io::Error> {
+    use tokio::io::{AsyncBufReadExt, AsyncRead};
+    use tokio::process::Command;
+    let mut cmd = {
+        let mut args = cmd.into_iter();
+        let Some(cmd) = args.next() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No command provided",
+            ));
+        };
+        let mut cmd = Command::new(cmd);
+        cmd.current_dir(workdir);
+        cmd.args(args);
+        cmd
+    };
+    tokio::spawn(async move {
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<std::io::Result<(usize, String)>>();
+
+        fn create_task(
+            tx: tokio::sync::mpsc::UnboundedSender<Result<(usize, String), std::io::Error>>,
+            id: usize,
+            reader: impl AsyncRead + Unpin + Send + 'static,
+        ) -> tokio::task::JoinHandle<()> {
+            let mut reader = tokio::io::BufReader::new(reader).lines();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                'line: while let Some(line) = {
+                    match reader.next_line().await {
+                        Ok(line) => line,
+                        Err(e) => {
+                            tx.send(Err(e)).unwrap();
+                            continue 'line;
+                        }
+                    }
+                } {
+                    tx.send(Ok((id, line))).unwrap();
+                }
+            })
+        }
+
+        let stdout_task = create_task(tx.clone(), 1, stdout);
+        let stderr_task = create_task(tx, 2, stderr);
+
+        let receiving_task = tokio::spawn(async move {
+            while let Some(res) = rx.recv().await {
+                cb(res?);
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let status = child.wait().await?;
+        stdout_task.await.unwrap();
+        stderr_task.await.unwrap();
+        receiving_task.await.unwrap()?;
+
+        Ok(status.code().unwrap_or(-1))
+    })
+    .await?
+}
+
+pub fn truncate(val: &impl ToString, len: usize) -> String {
+    let mut val = val.to_string();
+    if val.width_cjk() > len {
+        const ELIPSIS: &str = "……";
+        val.truncate(len - ELIPSIS.width_cjk());
+        val.push_str(ELIPSIS);
+    }
+    val
 }
