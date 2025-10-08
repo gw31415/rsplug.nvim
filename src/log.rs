@@ -49,6 +49,8 @@ type Logger = (MessageSender, LoggerCloser);
 
 static LOGGER: Lazy<Logger> = Lazy::new(init);
 
+const CACHE_FETCH_PROGRESS_ID: &str = "KksvT9lv";
+
 fn init() -> Logger {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (tx_end, rx_end) = mpsc::unbounded_channel::<()>();
@@ -127,7 +129,7 @@ fn init() -> Logger {
                     received_objs_count,
                 } => {
                     let pb = pb_caching
-                        .entry("CacheFetchObjects".into())
+                        .entry(CACHE_FETCH_PROGRESS_ID.into())
                         .or_insert_with(|| {
                             multipb_caching
                                 .add(ProgressBar::new(0).with_style(pb_style_bar.clone()))
@@ -171,7 +173,12 @@ fn init() -> Logger {
                     ));
                 }
                 Message::CacheDone => {
-                    for pb in std::mem::take(&mut pb_caching).into_values() {
+                    let mut pb_caching = std::mem::take(&mut pb_caching);
+                    if let Some(pb) = pb_caching.remove(CACHE_FETCH_PROGRESS_ID) {
+                        pb.set_style(pb_style.clone());
+                        pb.finish_and_clear();
+                    }
+                    for pb in pb_caching.into_values() {
                         pb.set_style(pb_style.clone());
                         pb.finish_with_message("done");
                     }
