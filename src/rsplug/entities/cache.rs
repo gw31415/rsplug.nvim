@@ -14,10 +14,7 @@ use tokio::{sync::RwLock, task::JoinSet};
 use unicode_width::UnicodeWidthStr;
 use xxhash_rust::xxh3::xxh3_128;
 
-use super::{
-    util::{git, github},
-    *,
-};
+use super::{util::git, *};
 
 /// プラグインのキャッシュ
 pub struct Cache {
@@ -130,12 +127,7 @@ impl Cache {
                             } = source;
                             let pkg: Package = match base {
                                 UnitSource::GitHub { owner, repo, rev } => {
-                                    let proj_root = config
-                                        .cachepath
-                                        .join("repos")
-                                        .join("github.com")
-                                        .join(owner)
-                                        .join(repo.as_ref());
+                                    let proj_root = config.cachepath.join(base.as_cachedir());
 
                                     tokio::fs::create_dir_all(&proj_root).await?;
                                     let proj_root = proj_root.canonicalize()?;
@@ -149,7 +141,7 @@ impl Cache {
                                         unsafe { std::hint::unreachable_unchecked() };
                                     };
 
-                                    let url: Arc<str> = Arc::from(github::url(owner, repo));
+                                    let url: Arc<str> = Arc::from(base.as_url().as_ref());
 
                                     // リポジトリがない場合のインストール処理
                                     let repository = if let Ok(mut repo) =

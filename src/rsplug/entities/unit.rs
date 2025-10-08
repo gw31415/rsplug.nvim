@@ -1,4 +1,10 @@
-use std::{cell::RefCell, collections::BTreeSet, str::FromStr, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 
 use hashbrown::{HashMap, HashSet};
 use once_cell::sync::Lazy;
@@ -33,6 +39,27 @@ pub enum UnitSource {
         /// リビジョン
         rev: Option<String>,
     },
+}
+
+impl UnitSource {
+    pub fn as_url(&self) -> impl AsRef<str> {
+        match self {
+            UnitSource::GitHub { owner, repo, .. } => util::github::url(owner, repo),
+        }
+    }
+    pub fn as_cachedir(&self) -> impl AsRef<Path> {
+        // Such as [Given: ~/.cache/rsplug/]./github.com/owner/repo
+        match self {
+            UnitSource::GitHub { owner, repo, .. } => {
+                let mut path = PathBuf::new();
+                path.push("repos");
+                path.push("github.com");
+                path.push(owner);
+                path.push(repo.as_ref());
+                path
+            }
+        }
+    }
 }
 
 struct FilteredIterator<'a, T, F: Fn(&T) -> bool> {
