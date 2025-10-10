@@ -1,10 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::BTreeSet, path::PathBuf, str::FromStr, sync::Arc};
 
 use hashbrown::{HashMap, HashSet};
 use once_cell::sync::Lazy;
