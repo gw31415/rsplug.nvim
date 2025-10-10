@@ -42,12 +42,12 @@ pub enum UnitSource {
 }
 
 impl UnitSource {
-    pub fn as_url(&self) -> impl AsRef<str> {
+    pub fn url(&self) -> String {
         match self {
             UnitSource::GitHub { owner, repo, .. } => util::github::url(owner, repo),
         }
     }
-    pub fn as_cachedir(&self) -> impl AsRef<Path> {
+    pub fn cachedir(&self) -> PathBuf {
         // Such as [Given: ~/.cache/rsplug/]./github.com/owner/repo
         match self {
             UnitSource::GitHub { owner, repo, .. } => {
