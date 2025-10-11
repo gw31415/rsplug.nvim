@@ -1,0 +1,8 @@
+[package]
+name = "dag"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+hashbrown = { optional = true, workspace = true }
