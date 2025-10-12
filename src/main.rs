@@ -37,37 +37,38 @@ async fn app() -> Result<(), Error> {
     let plugins = {
         // Parse all of config files
         // NOTE: Wait for all config files to parse.
-        // TODO: Abort immediately if any of them fail.
-        let configs = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
-            .filter_map(|path| match path {
-                Err(e) => Some(Err(e)),
-                Ok(path) => {
-                    if path.is_file() {
-                        Some(Ok(path.to_path_buf()))
-                    } else {
-                        None
+        let configs = {
+            let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
+                .filter_map(|path| match path {
+                    Err(e) => Some(Err(e)),
+                    Ok(path) => {
+                        if path.is_dir() {
+                            None
+                        } else {
+                            Some(Ok(path.to_path_buf()))
+                        }
                     }
-                }
-            })
-            .map(|path| async {
-                let path = path?;
-                let content = tokio::fs::read(&path).await.map_err(Error::Io)?;
+                })
+                .map(|path| async {
+                    let path = path?;
+                    let content = tokio::fs::read(&path).await?;
 
-                match toml::from_slice::<rsplug::Config>(&content) {
-                    Ok(config) => {
-                        log::msg(Message::DetectConfigFile(path));
-                        Ok(config)
+                    match toml::from_slice::<rsplug::Config>(&content) {
+                        Ok(config) => {
+                            log::msg(Message::DetectConfigFile(path.to_path_buf()));
+                            Ok(config)
+                        }
+                        Err(e) => Err(Error::Parse(e, path.to_path_buf())),
                     }
-                    Err(e) => Err(Error::Parse(e, path)),
-                }
-            })
-            .collect::<JoinSet<_>>()
-            .join_all()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, Error>>()?
-            .into_iter();
-        rsplug::Plugin::new(configs.sum())?
+                })
+                .collect::<JoinSet<_>>();
+            let mut confs = Vec::new();
+            while let Some(config) = joinset.join_next().await {
+                confs.push(config.unwrap()?);
+            }
+            confs
+        };
+        rsplug::Plugin::new(configs.into_iter().sum())?
     };
 
     msg(Message::Loading { install, update });
