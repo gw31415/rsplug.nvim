@@ -14,12 +14,46 @@ use {
 pub mod iterator {
     use super::*;
 
+    pub struct DagDependentsIterator<'a, D: DagNode> {
+        inner: &'a Vec<DagItem<D>>,
+        seen: Vec<bool>,
+        idxes: Vec<usize>,
+    }
+
+    impl<'a, D: DagNode> Iterator for DagDependentsIterator<'a, D> {
+        type Item = Vec<&'a D>;
+        fn next(&mut self) -> Option<Self::Item> {
+            let next_idxes = self
+                .idxes
+                .iter()
+                .flat_map(|idx_before| {
+                    let idx_next = &self.inner[*idx_before].dependents_indexes;
+                    let mut res = Vec::new();
+                    for idx_next in idx_next {
+                        let seen = &mut self.seen[*idx_next];
+                        if !*seen {
+                            *seen = true;
+                            res.push(*idx_next);
+                        }
+                    }
+                    res
+                })
+                .collect();
+            let idxes = std::mem::replace(&mut self.idxes, next_idxes);
+            if idxes.is_empty() {
+                None
+            } else {
+                Some(idxes.into_iter().map(|i| &self.inner[i].inner).collect())
+            }
+        }
+    }
+
     /// Arguments of the function which is used to map DagIterator
     pub struct DagIteratorMapFuncArgs<'a, D: DagNode> {
         /// Item itself
         pub inner: D,
         /// References to dependents items
-        pub dependents: Vec<&'a D>,
+        pub dependents_iter: DagDependentsIterator<'a, D>,
     }
 
     /// Dag Iterator with mapping function
@@ -35,14 +69,14 @@ pub mod iterator {
             let Self { inner, map_func } = self;
 
             inner.pop().map(|item| {
-                let dependents = item
-                    .dependents_indexes
-                    .iter()
-                    .map(|&i| &inner[i].inner)
-                    .collect();
+                let dependents_iter = DagDependentsIterator {
+                    inner,
+                    seen: vec![false; inner.len()],
+                    idxes: item.dependents_indexes,
+                };
                 map_func(DagIteratorMapFuncArgs {
                     inner: item.inner,
-                    dependents,
+                    dependents_iter,
                 })
             })
         }

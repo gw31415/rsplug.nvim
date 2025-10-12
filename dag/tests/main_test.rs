@@ -1,4 +1,5 @@
 use dag::*;
+use std::collections::{HashMap, HashSet};
 
 struct Node {
     id: &'static str,
@@ -76,11 +77,95 @@ fn successful_resolution() {
         },
     ];
 
-    let res = nodes.try_dag();
-    assert! { res.is_ok() };
+    let res = nodes.try_dag().unwrap();
 
-    let mut resolved_nodes = res.unwrap().into_iter();
+    let mut resolved_nodes = res.into_iter();
     assert_eq!(resolved_nodes.next().unwrap().id, "C");
     assert_eq!(resolved_nodes.next().unwrap().id, "B");
     assert_eq!(resolved_nodes.next().unwrap().id, "A");
+}
+
+#[test]
+fn get_direct_dependents() {
+    let nodes = vec![
+        Node {
+            id: "A",
+            depends: &["B"],
+        },
+        Node {
+            id: "B",
+            depends: &["C"],
+        },
+        Node {
+            id: "C",
+            depends: &[],
+        },
+    ];
+    let res = nodes.try_dag().unwrap();
+    let direct_dependents_map: HashMap<_, _> = res
+        .into_map_iter(|mut d| {
+            (
+                d.inner.id().to_string(),
+                d.dependents_iter
+                    .next()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| a.id().to_string())
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect();
+
+    let dependents = direct_dependents_map.get("A").unwrap();
+    assert!(dependents.is_empty());
+
+    let dependents = direct_dependents_map.get("B").unwrap();
+    assert_eq!(dependents.len(), 1);
+    dependents.contains("A");
+
+    let dependents = direct_dependents_map.get("C").unwrap();
+    assert_eq!(dependents.len(), 1);
+    dependents.contains("B");
+}
+
+#[test]
+fn get_recursive_dependents() {
+    let nodes = vec![
+        Node {
+            id: "A",
+            depends: &["B"],
+        },
+        Node {
+            id: "B",
+            depends: &["C"],
+        },
+        Node {
+            id: "C",
+            depends: &[],
+        },
+    ];
+    let res = nodes.try_dag().unwrap();
+    let recursive_dependents_map: HashMap<_, _> = res
+        .into_map_iter(|d| {
+            (
+                d.inner.id().to_string(),
+                d.dependents_iter
+                    .flatten()
+                    .map(|a| a.id().to_string())
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect();
+
+    let dependents = recursive_dependents_map.get("A").unwrap();
+    assert!(dependents.is_empty());
+
+    let dependents = recursive_dependents_map.get("B").unwrap();
+    assert_eq!(dependents.len(), 1);
+    dependents.contains("A");
+
+    let dependents = recursive_dependents_map.get("C").unwrap();
+    assert_eq!(dependents.len(), 2);
+    dependents.contains("A");
+    dependents.contains("B");
 }
