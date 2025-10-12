@@ -10,7 +10,7 @@ use super::*;
 /// 設定を構成する基本単位
 pub struct Unit {
     /// 取得元
-    pub source: PluginSource,
+    pub cache: CacheConfig,
     /// Unitに対応する読み込みタイプ
     pub lazy_type: LazyType,
     /// セットアップスクリプト
@@ -21,7 +21,7 @@ pub struct Unit {
 
 /// プラグインの取得元
 #[derive(DeserializeFromStr)]
-pub enum UnitSource {
+pub enum RepoSource {
     /// GitHub リポジトリ
     GitHub {
         /// リポジトリの所有者
@@ -33,16 +33,16 @@ pub enum UnitSource {
     },
 }
 
-impl UnitSource {
+impl RepoSource {
     pub fn url(&self) -> String {
         match self {
-            UnitSource::GitHub { owner, repo, .. } => util::github::url(owner, repo),
+            RepoSource::GitHub { owner, repo, .. } => util::github::url(owner, repo),
         }
     }
-    pub fn cachedir(&self) -> PathBuf {
+    pub(super) fn cachedir(&self) -> PathBuf {
         // Such as [Given: ~/.cache/rsplug/]./github.com/owner/repo
         match self {
-            UnitSource::GitHub { owner, repo, .. } => {
+            RepoSource::GitHub { owner, repo, .. } => {
                 let mut path = PathBuf::new();
                 path.push("repos");
                 path.push("github.com");
@@ -54,7 +54,7 @@ impl UnitSource {
     }
 }
 
-impl FromStr for UnitSource {
+impl FromStr for RepoSource {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         static GITHUB_REPO_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -66,7 +66,7 @@ impl FromStr for UnitSource {
         let owner = cap["owner"].to_string();
         let repo = cap["repo"].into();
         let rev = cap.name("rev").map(|rev| rev.as_str().to_string());
-        Ok(UnitSource::GitHub { owner, repo, rev })
+        Ok(RepoSource::GitHub { owner, repo, rev })
     }
 }
 
@@ -80,7 +80,7 @@ impl Unit {
                  dependents_iter,
              }| {
                 let Plugin {
-                    repo,
+                    cache,
                     lazy_type,
                     depends: _,
                     custom_name: _,
@@ -92,7 +92,7 @@ impl Unit {
                     .flatten()
                     .fold(lazy_type, |dep, plug| dep & plug.lazy_type.clone());
                 Unit {
-                    source: repo,
+                    cache,
                     lazy_type,
                     script,
                     merge,

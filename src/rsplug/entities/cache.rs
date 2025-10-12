@@ -41,22 +41,22 @@ impl Cache {
                     let config = config.clone();
                     async move {
                         let Unit {
-                            source,
+                            cache,
                             lazy_type,
                             script,
                             merge,
                         } = unit;
 
-                        let to_sym = source.to_sym();
-                        let PluginSource {
-                            base,
+                        let to_sym = cache.to_sym();
+                        let CacheConfig {
+                            repo,
                             manually_to_sym: _,
                             build,
-                        } = source;
-                        let cachedir = base.cachedir();
-                        let url: Arc<str> = Arc::from(base.url());
-                        let pkg: Package = match base {
-                            UnitSource::GitHub { owner, repo, rev } => {
+                        } = cache;
+                        let cachedir = repo.cachedir();
+                        let url: Arc<str> = Arc::from(repo.url());
+                        let pkg: Package = match repo {
+                            RepoSource::GitHub { owner, repo, rev } => {
                                 let proj_root = config.cachepath.join(cachedir);
 
                                 tokio::fs::create_dir_all(&proj_root).await?;

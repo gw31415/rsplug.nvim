@@ -50,16 +50,16 @@ impl Sum for Config {
 }
 
 #[derive(Deserialize)]
-pub struct PluginSource {
+pub struct CacheConfig {
     #[serde(rename = "repo")]
-    pub base: UnitSource,
+    pub repo: RepoSource,
     #[serde(default, rename = "sym")]
     pub manually_to_sym: bool,
     #[serde(default)]
     pub build: Vec<String>,
 }
 
-impl PluginSource {
+impl CacheConfig {
     pub fn to_sym(&self) -> bool {
         self.manually_to_sym || !self.build.is_empty()
     }
@@ -112,7 +112,7 @@ impl From<LazyTypeDeserializer> for LazyType {
 #[derive(Deserialize)]
 pub(super) struct Plugin {
     #[serde(flatten)]
-    pub repo: PluginSource,
+    pub cache: CacheConfig,
     #[serde(flatten)]
     #[serde_as(as = "FromInto<LazyTypeDeserializer>")]
     pub lazy_type: LazyType,
@@ -131,8 +131,8 @@ pub(super) struct Plugin {
 impl DagNode for Plugin {
     fn id(&self) -> &str {
         self.custom_name.as_ref().map_or(
-            match &self.repo.base {
-                UnitSource::GitHub { repo, .. } => repo.as_ref(),
+            match &self.cache.repo {
+                RepoSource::GitHub { repo, .. } => repo.as_ref(),
             },
             |v| v,
         )
