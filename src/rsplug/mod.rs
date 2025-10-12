@@ -6,7 +6,6 @@ pub use entities::error;
 pub use entities::package;
 pub use entities::unit;
 
-pub use entities::cache::Cache;
 pub use entities::config::Config;
 pub use entities::error::Error;
 pub use entities::loader::Loader;

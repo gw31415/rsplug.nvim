@@ -70,10 +70,21 @@ async fn app() -> Result<(), Error> {
 
     msg(Message::CheckingLocalPlugins { install, update });
     // Fetch packages through Cache based on the Units
-    let mut pkgs: BinaryHeap<_> = rsplug::Cache::new(DEFAULT_APP_DIR.as_path())
-        .fetch(units, install, update)
-        .await?
-        .collect();
+    let mut pkgs = {
+        let res = units
+            .map(|unit| unit.fetch(install, update, DEFAULT_APP_DIR.as_path()))
+            .collect::<JoinSet<_>>()
+            .join_all()
+            .await;
+        msg(Message::CacheDone);
+        res.into_iter()
+            .try_fold(BinaryHeap::new(), |mut acc, res| {
+                if let Some(pkg) = res? {
+                    acc.push(pkg);
+                }
+                Ok::<_, Error>(acc)
+            })?
+    };
     let total_count = pkgs.len();
 
     // Create PackPathState and insert packages into it
