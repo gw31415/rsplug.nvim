@@ -36,7 +36,6 @@ async fn app() -> Result<(), Error> {
 
     let plugins = {
         // Parse all of config files
-        // NOTE: Wait for all config files to parse.
         let configs = {
             let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
                 .filter_map(|path| match path {
