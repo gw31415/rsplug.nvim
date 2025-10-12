@@ -1,345 +1,314 @@
 use std::{
-    borrow::Cow,
-    cmp::Ordering,
-    collections::BinaryHeap,
-    io,
-    ops::Add,
-    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
 };
 
-use crate::log::{Message, msg};
-use hashbrown::{HashMap, HashSet};
-use tokio::task::JoinSet;
+use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_with::DeserializeFromStr;
 
 use super::*;
 
-/// プラグインファイルの配置方法。
-pub(super) enum HowToPlaceFiles {
-    CopyEachFile(HashMap<PathBuf, FileItem>),
-    SymlinkDirectory(Arc<Path>),
-}
-
-/// インストール単位となるプラグイン。
-/// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
-/// PluginLoadedに変換する。
-pub struct PluginLoaded {
-    /// ID
-    pub(super) id: PluginID,
-    /// プラグインの遅延実行タイプ
+/// 設定を構成する基本単位
+pub struct Plugin {
+    /// 取得元
+    pub cache: CacheConfig,
+    /// Pluginに対応する読み込みタイプ
     pub lazy_type: LazyType,
-    /// 配置するファイル
-    pub(super) files: HowToPlaceFiles,
     /// セットアップスクリプト
-    pub(super) script: SetupScript,
+    pub script: SetupScript,
+    /// マージ設定
+    pub merge: MergeConfig,
 }
 
-pub(super) struct FileItem {
-    pub source: Arc<FileSource>,
-    pub merge_type: MergeType,
+/// プラグインの取得元
+#[derive(DeserializeFromStr)]
+pub enum RepoSource {
+    /// GitHub リポジトリ
+    GitHub {
+        /// リポジトリの所有者
+        owner: String,
+        /// リポジトリ
+        repo: Arc<str>,
+        /// リビジョン
+        rev: Option<String>,
+    },
 }
 
-impl PartialEq for PluginLoaded {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for PluginLoaded {}
-
-impl PartialOrd for PluginLoaded {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PluginLoaded {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let cmp = self.lazy_type.cmp(&other.lazy_type);
-        if let Ordering::Equal = cmp {
-            return self.id.cmp(&other.id);
-        }
-        cmp
-    }
-}
-
-impl PluginLoaded {
-    /// BinaryHeap に保存された PluginLoaded 群を可能な範囲でマージする
-    pub fn merge(pkgs: &mut BinaryHeap<Self>) {
-        let mut done_items = Vec::new();
-
-        while pkgs.len() > 1 {
-            let (tail, tail2) = (pkgs.pop().unwrap(), pkgs.pop().unwrap());
-            match tail + tail2 {
-                (tail, Some(tail2)) => {
-                    done_items.push(tail);
-                    pkgs.push(tail2);
-                }
-                (tail, None) => {
-                    pkgs.push(tail);
-                }
-            }
-        }
-
-        pkgs.extend(done_items);
-    }
-}
-
-impl Add for PluginLoaded {
-    type Output = (Self, Option<Self>);
-    fn add(self, rhs: Self) -> Self::Output {
-        if self.lazy_type != rhs.lazy_type {
-            return (self, Some(rhs));
-        }
-        if self.id.0.is_superset(&rhs.id.0) {
-            return (self, None);
-        } else if rhs.id.0.is_superset(&self.id.0) {
-            return (rhs, None);
-        }
-        match (&self.files, &rhs.files) {
-            (HowToPlaceFiles::CopyEachFile(files), HowToPlaceFiles::CopyEachFile(rfiles)) => {
-                let mergeable = {
-                    let (sfname, rfname): (HashSet<_>, HashSet<_>) =
-                        (files.keys().collect(), rfiles.keys().collect());
-                    sfname.intersection(&rfname).all(|path| {
-                        let a = &files.get(*path).unwrap().merge_type;
-                        let b = &rfiles.get(*path).unwrap().merge_type;
-                        !matches!((a, b), (MergeType::Conflict, _) | (_, MergeType::Conflict))
-                    })
-                };
-                if mergeable {
-                    let Self {
-                        mut id,
-                        lazy_type,
-                        files: HowToPlaceFiles::CopyEachFile(mut files),
-                        mut script,
-                    } = self
-                    else {
-                        unreachable!() // SAFETY: Because self.files is verified to be a CopyEachFile
-                    };
-                    let Self {
-                        id: rid,
-                        lazy_type: _,
-                        files: HowToPlaceFiles::CopyEachFile(rfiles),
-                        script: rscript,
-                    } = rhs
-                    else {
-                        unreachable!() // SAFETY: Because rhs.files is verified to be a CopyEachFile
-                    };
-                    files.extend(rfiles);
-                    id += rid;
-                    script += rscript;
-
-                    return (
-                        Self {
-                            id,
-                            lazy_type,
-                            files: HowToPlaceFiles::CopyEachFile(files),
-                            script,
-                        },
-                        None,
-                    );
-                }
-            }
-            (HowToPlaceFiles::CopyEachFile(_), HowToPlaceFiles::SymlinkDirectory(_))
-            | (HowToPlaceFiles::SymlinkDirectory(_), HowToPlaceFiles::CopyEachFile(_))
-            | (HowToPlaceFiles::SymlinkDirectory(_), HowToPlaceFiles::SymlinkDirectory(_)) => {}
-        };
-        (self, Some(rhs))
-    }
-}
-
-/// ファイルの取得(生成)元。
-pub(super) enum FileSource {
-    Directory { path: Arc<Path> },
-    File { data: Cow<'static, [u8]> },
-}
-
-impl FileSource {
-    /// whichfile が install_dir からの相対パスとなるようにデータを配置する。
-    async fn yank(
-        &self,
-        whichfile: impl AsRef<Path>,
-        install_dir: impl AsRef<Path>,
-    ) -> io::Result<()> {
-        async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-            tokio::fs::create_dir_all(to.as_ref().parent().unwrap()).await?;
-            #[cfg(target_os = "macos")]
-            tokio::fs::copy(from, to).await?;
-            #[cfg(not(target_os = "macos"))]
-            tokio::fs::hard_link(from, to).await?;
-            Ok(())
-        }
-
-        use FileSource::*;
+impl RepoSource {
+    /// git url
+    pub fn url(&self) -> String {
         match self {
-            Directory { path } => {
-                let from = path.join(&whichfile);
-                let to = install_dir.as_ref().join(&whichfile);
-                copy(from, to).await
-            }
-            File { data } => {
-                let path = install_dir.as_ref().join(whichfile);
-                tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-                tokio::fs::write(path, data).await?;
-                Ok(())
+            RepoSource::GitHub { owner, repo, .. } => util::github::url(owner, repo),
+        }
+    }
+
+    /// Such as [Given: ~/.cache/rsplug/]./github.com/owner/repo
+    pub(super) fn default_cachedir(&self) -> PathBuf {
+        match self {
+            RepoSource::GitHub { owner, repo, .. } => {
+                let mut path = PathBuf::new();
+                path.push("github.com");
+                path.push(owner);
+                path.push(repo.as_ref());
+                path
             }
         }
     }
 }
 
-struct Files {
-    start_or_opt: &'static str,
-    dir_type: DirectoryExtractionType,
-}
-
-enum DirectoryExtractionType {
-    Files(Vec<(PathBuf, Arc<FileSource>)>),
-    Symlink(Arc<Path>),
-}
-
-/// PackPath の象徴となる状態。この構造体に PluginLoaded をインサートしていき、最後に実際のパスを指定して install を行う。
-#[derive(Default)]
-pub struct PackPathState {
-    installing: HashSet<Box<[u8]>>,
-    files: HashMap<PluginIDStr, Files>,
-}
-
-impl PackPathState {
-    pub fn len(&self) -> usize {
-        self.installing.len()
+impl FromStr for RepoSource {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        static GITHUB_REPO_REGEX: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"^(?<owner>[a-zA-Z0-9]([a-zA-Z0-9]?|[\-]?([a-zA-Z0-9])){0,38})/(?<repo>[a-zA-Z0-9][a-zA-Z0-9_.-]{0,38})(@(?<rev>\S+))?$").unwrap()
+        });
+        let Some(cap) = GITHUB_REPO_REGEX.captures(s) else {
+            return Err("GitHub repository format must be 'owner/repo[@rev]'");
+        };
+        let owner = cap["owner"].to_string();
+        let repo = cap["repo"].into();
+        let rev = cap.name("rev").map(|rev| rev.as_str().to_string());
+        Ok(RepoSource::GitHub { owner, repo, rev })
     }
-    /// 空の PackPathState を生成する。
-    pub fn new() -> Self {
-        Default::default()
-    }
-    /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な Loader を返す。
-    pub fn insert(&mut self, pkg: PluginLoaded) -> Loader {
-        let PluginLoaded {
-            id,
-            lazy_type,
-            files,
-            script,
-        } = pkg;
+}
 
-        let already_installed = !self.installing.insert(id.as_str().into());
-        if already_installed {
-            return Default::default();
-        }
-
-        let pkg_type_str = if lazy_type.is_start() { "start" } else { "opt" };
-        match files {
-            HowToPlaceFiles::CopyEachFile(files) => {
-                for (path, item) in files {
-                    let Files {
-                        start_or_opt: _,
-                        dir_type: DirectoryExtractionType::Files(tree),
-                    } = self.files.entry(id.as_str()).or_insert(Files {
-                        start_or_opt: pkg_type_str,
-                        dir_type: DirectoryExtractionType::Files(Vec::new()),
-                    })
-                    else {
-                        unreachable!() // SAFETY: idは一意なので、ここに到達することはない
-                    };
-                    tree.push((path, item.source));
+impl Plugin {
+    /// 設定ファイルから Plugin のコレクションを構築する
+    pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, DagError> {
+        let Config { plugins } = config;
+        Ok(plugins.try_dag()?.into_map_iter(
+            |DagIteratorMapFuncArgs {
+                 inner,
+                 dependents_iter,
+             }| {
+                let PluginConfig {
+                    cache,
+                    lazy_type,
+                    depends: _,
+                    custom_name: _,
+                    script,
+                    merge,
+                } = inner;
+                // 依存元の lazy_type を集約
+                let lazy_type = dependents_iter
+                    .flatten()
+                    .fold(lazy_type, |dep, plug| dep & plug.lazy_type.clone());
+                Plugin {
+                    cache,
+                    lazy_type,
+                    script,
+                    merge,
                 }
-            }
-            HowToPlaceFiles::SymlinkDirectory(dir) => {
-                self.files.insert(
-                    id.as_str(),
-                    Files {
-                        start_or_opt: pkg_type_str,
-                        dir_type: DirectoryExtractionType::Symlink(dir),
-                    },
-                );
-            }
-        }
-
-        Loader::create(id, lazy_type, script)
-    }
-
-    /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
-    /// NOTE: インストール後のディレクトリ構成は以下のようになる。
-    /// {packpath}/pack/_gen/{start_or_opt}/{id}/
-    pub async fn install(self, packpath: &Path) -> io::Result<()> {
-        let gen_root = packpath.join("pack").join("_gen");
-        tokio::fs::create_dir_all(&gen_root).await?;
-        let Self { installing, files } = self;
-        let mut tasks = JoinSet::new();
-
-        for (
-            id,
-            Files {
-                start_or_opt,
-                dir_type,
             },
-        ) in files
-        {
-            let id: Arc<str> = id.into();
-            let dir = gen_root.join(start_or_opt).join(id.as_ref());
-            let installed = {
-                let dir_is_symlink = dir.is_symlink();
-                match &dir_type {
-                    DirectoryExtractionType::Files(_) => dir.is_dir() && !dir_is_symlink,
-                    DirectoryExtractionType::Symlink(_) => dir_is_symlink,
-                }
-            };
-            if installed {
-                msg(Message::InstallSkipped(id));
-            } else {
-                match dir_type {
-                    DirectoryExtractionType::Files(files) => {
-                        tokio::fs::remove_file(dir.as_path()).await.ok();
-                        let dir = Arc::new(dir);
-                        for (which, source) in files {
-                            let dir = dir.clone();
-                            let id = id.clone();
-                            tasks.spawn(async move {
-                                source.yank(&which, dir.as_path()).await?;
-                                msg(Message::InstallYank { id, which });
-                                Ok(())
-                            });
-                        }
-                    }
-                    DirectoryExtractionType::Symlink(sym) => {
-                        tasks.spawn(async move {
-                            tokio::fs::remove_dir_all(&dir).await.ok();
-                            tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
-                            tokio::fs::symlink(sym, dir).await?;
-                            Ok(())
-                        });
-                    }
-                }
-            }
-        }
-
-        let installing = Arc::new(installing);
-        for start_or_opt in ["start", "opt"] {
-            let path = gen_root.join(start_or_opt);
-            if let Ok(mut read_dir) = tokio::fs::read_dir(path).await {
-                while let Some(entry) = read_dir.next_entry().await? {
-                    let installing = installing.clone();
-                    tasks.spawn(async move {
-                        let not_installed_entry =
-                            !installing.contains(&entry.file_name().into_vec().into_boxed_slice());
-                        let path = entry.path();
-                        if not_installed_entry && path.is_dir() {
-                            tokio::fs::remove_dir_all(path).await?;
-                        }
-                        Ok(())
-                    });
-                }
-            }
-        }
-
-        let res = tasks
-            .join_all()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .and(Ok(()));
-        msg(Message::InstallDone);
-        res
+        ))
     }
+
+    /// キャッシュからPluginを読み込む。オプションでインストールやアップデートも行う。
+    /// インストールされていない場合は `Ok(None)` を返す。
+    pub async fn load(
+        self,
+        install: bool,
+        update: bool,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<Option<PluginLoaded>, Error> {
+        use super::{util::git, *};
+        use crate::{
+            log::{Message, msg},
+            rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, truncate},
+        };
+        use std::sync::Arc;
+        use unicode_width::UnicodeWidthStr;
+        use xxhash_rust::xxh3::xxh3_128;
+
+        let Plugin {
+            cache,
+            lazy_type,
+            script,
+            merge,
+        } = self;
+
+        let to_sym = cache.to_sym();
+        let CacheConfig {
+            repo,
+            manually_to_sym: _,
+            build,
+        } = cache;
+        let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
+        let url: Arc<str> = Arc::from(repo.url());
+        let pkg: PluginLoaded = match repo {
+            RepoSource::GitHub { owner, repo, rev } => {
+                tokio::fs::create_dir_all(&proj_root).await?;
+                let proj_root = proj_root.canonicalize()?;
+                let filesource = Arc::new(FileSource::Directory {
+                    path: proj_root.into(),
+                });
+                let FileSource::Directory { path: proj_root } = filesource.as_ref() else {
+                    // SAFETY: すぐ上の行で `sourcefile` を `Directory` として宣言している。
+                    unsafe { std::hint::unreachable_unchecked() };
+                };
+
+                // リポジトリがない場合のインストール処理
+                let repository = if let Ok(mut repo) = git::open(&proj_root).await {
+                    // アップデート処理
+                    if update {
+                        msg(Message::Cache("Updating", url.clone()));
+                        repo.fetch(git::ls_remote(url.clone(), &rev).await?).await?;
+                    }
+                    repo
+                } else if install {
+                    msg(Message::Cache("Initializing", url.clone()));
+                    let mut repo = git::init(proj_root.clone(), url.clone()).await?;
+                    msg(Message::Cache("Fetching", url.clone()));
+                    repo.fetch(git::ls_remote(url.clone(), &rev).await?).await?;
+                    repo
+                } else {
+                    // 見つからない場合はスキップ
+                    return Ok(None);
+                };
+
+                // ディレクトリ内容からのIDの決定
+                let id = PluginID::new({
+                    let (head, diff) = tokio::join!(repository.head_hash(), repository.diff_hash());
+                    match (head, diff) {
+                        (Ok(mut head), Ok(diff)) => {
+                            head.extend(diff);
+                            for (i, comp) in build.iter().enumerate() {
+                                head.extend(i.to_ne_bytes());
+                                head.extend(comp.as_bytes());
+                            }
+                            u128::to_ne_bytes(xxh3_128(&head))
+                        }
+                        (Err(err), _) | (_, Err(err)) => Err(err)?,
+                    }
+                });
+
+                // ビルド実行
+                if !build.is_empty() {
+                    let next_build_success_id = id.as_str();
+                    let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
+                    if let Some(ref prev_build_success_id) =
+                        tokio::fs::read(&rsplug_build_success_file).await.ok()
+                        && prev_build_success_id == next_build_success_id.as_bytes()
+                    {
+                        // ビルド成功の痕跡があればビルドをスキップ
+                    } else {
+                        let exec = async move {
+                            let _ = tokio::fs::remove_file(&rsplug_build_success_file).await;
+                            let logid = {
+                                const MAX_LOGID_LEN: usize = 20;
+                                let repo = truncate(&repo, MAX_LOGID_LEN);
+
+                                let len = MAX_LOGID_LEN.saturating_sub(repo.width_cjk() + 1);
+                                if len < 2 {
+                                    repo
+                                } else {
+                                    let mut owner = truncate(&owner, len);
+                                    owner.push('/');
+                                    owner.push_str(&repo);
+                                    owner
+                                }
+                            };
+                            let code = execute(build.iter(), proj_root, {
+                                move |(stdtype, line)| {
+                                    msg(Message::CacheBuildProgress {
+                                        id: logid.clone(),
+                                        stdtype,
+                                        line,
+                                    });
+                                }
+                            })
+                            .await?;
+                            if code == 0 {
+                                tokio::fs::write(
+                                    rsplug_build_success_file,
+                                    next_build_success_id.as_bytes(),
+                                )
+                                .await?;
+                                Ok::<_, Error>(())
+                            } else {
+                                Err(Error::BuildScriptFailed {
+                                    code,
+                                    build: build.clone(),
+                                })
+                            }
+                        };
+                        exec.await?;
+                    }
+                }
+
+                let files = repository.ls_files().await?;
+                let mut lazy_type = lazy_type.clone();
+                for luam in extract_unique_lua_modules(files.iter()) {
+                    lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
+                }
+                let files: HowToPlaceFiles = if to_sym {
+                    HowToPlaceFiles::SymlinkDirectory(proj_root.clone())
+                } else {
+                    HowToPlaceFiles::CopyEachFile(
+                        files
+                            .into_iter()
+                            .filter_map(|path| {
+                                let ignored = path.iter().any(|k| {
+                                    let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
+                                    merge.ignore.matched(k)
+                                });
+                                if !ignored && proj_root.join(&path).is_file() {
+                                    Some((
+                                        path,
+                                        FileItem {
+                                            source: filesource.clone(),
+                                            merge_type: MergeType::Conflict,
+                                        },
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                    )
+                };
+                PluginLoaded {
+                    id,
+                    files,
+                    lazy_type,
+                    script: script.clone(),
+                }
+            }
+        };
+
+        Ok::<_, Error>(Some(pkg))
+    }
+}
+
+fn extract_unique_lua_modules<'a>(
+    files: impl Iterator<Item = &'a PathBuf> + 'a,
+) -> impl Iterator<Item = String> + 'a {
+    let mut seen = hashbrown::HashSet::new();
+
+    files.filter_map(move |path| {
+        let mut comps = path.components();
+
+        // 先頭が "lua" でなければ対象外
+        match comps.next().and_then(|c| c.as_os_str().to_str()) {
+            Some("lua") => {}
+            _ => return None,
+        }
+
+        // lua/ の直後を取得
+        let comp = comps.next()?;
+
+        let name = Path::new(comp.as_os_str())
+            .file_stem() // hoge2.lua → hoge2
+            .and_then(|s| s.to_str())?
+            .to_string();
+
+        if !name.is_empty() && seen.insert(name.clone()) {
+            Some(name)
+        } else {
+            None
+        }
+    })
 }
