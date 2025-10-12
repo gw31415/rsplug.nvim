@@ -243,7 +243,12 @@ fn init() -> Logger {
 
 /// Output log messages
 pub fn msg(message: Message) {
-    let _ = LOGGER.0.read().unwrap().as_ref().unwrap().send(message);
+    let _ = LOGGER
+        .0
+        .read()
+        .unwrap()
+        .as_ref() // 下記closeなどで破棄された際はLOGGERが取得できなくなるので、その時はmessageを揉み消す
+        .and_then(|lgr| lgr.send(message).ok());
 }
 
 /// Flush out the rest of the log and exit
