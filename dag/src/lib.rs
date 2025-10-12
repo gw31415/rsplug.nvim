@@ -6,6 +6,49 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use thiserror::Error;
 
+use {
+    iterator::{DagIterator, DagIteratorMapFuncArgs},
+    tree::{DagItem, DagTree},
+};
+
+pub mod iterator {
+    use super::*;
+
+    /// Arguments of the function which is used to map DagIterator
+    pub struct DagIteratorMapFuncArgs<'a, D: DagNode> {
+        /// Item itself
+        pub inner: D,
+        /// References to dependents items
+        pub dependents: Vec<&'a D>,
+    }
+
+    /// Dag Iterator with mapping function
+    pub struct DagIterator<T, D: DagNode, F: FnMut(DagIteratorMapFuncArgs<D>) -> T> {
+        pub(super) inner: Vec<DagItem<D>>,
+        pub(super) map_func: F,
+    }
+
+    impl<T, D: DagNode, F: FnMut(DagIteratorMapFuncArgs<D>) -> T> Iterator for DagIterator<T, D, F> {
+        type Item = T;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let Self { inner, map_func } = self;
+
+            inner.pop().map(|item| {
+                let dependents = item
+                    .dependents_indexes
+                    .iter()
+                    .map(|&i| &inner[i].inner)
+                    .collect();
+                map_func(DagIteratorMapFuncArgs {
+                    inner: item.inner,
+                    dependents,
+                })
+            })
+        }
+    }
+}
+
 /// Dag Node Trait
 pub trait DagNode {
     fn id(&self) -> &str;
@@ -23,48 +66,18 @@ pub enum DagError {
     CycleDetected(Vec<String>),
 }
 
-struct DagItem<D: DagNode> {
-    inner: D,
-    dependents_indexes: Vec<usize>,
-}
+pub mod tree {
+    use super::*;
 
-/// Arguments of the function which is used to map DagIterator
-pub struct DagIteratorMapFuncArgs<'a, D: DagNode> {
-    /// Item itself
-    pub inner: D,
-    /// References to dependents items
-    pub dependents: Vec<&'a D>,
-}
-
-/// Dag Iterator with mapping function
-pub struct DagIterator<T, D: DagNode, F: FnMut(DagIteratorMapFuncArgs<D>) -> T> {
-    inner: Vec<DagItem<D>>,
-    map_func: F,
-}
-
-impl<T, D: DagNode, F: FnMut(DagIteratorMapFuncArgs<D>) -> T> Iterator for DagIterator<T, D, F> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Self { inner, map_func } = self;
-
-        inner.pop().map(|item| {
-            let dependents = item
-                .dependents_indexes
-                .iter()
-                .map(|&i| &inner[i].inner)
-                .collect();
-            map_func(DagIteratorMapFuncArgs {
-                inner: item.inner,
-                dependents,
-            })
-        })
+    /// Resolved DAG Tree
+    pub struct DagTree<D: DagNode> {
+        pub(super) inner: Vec<DagItem<D>>,
     }
-}
 
-/// Resolved DAG Tree
-pub struct DagTree<D: DagNode> {
-    inner: Vec<DagItem<D>>,
+    pub(super) struct DagItem<D: DagNode> {
+        pub(super) inner: D,
+        pub(super) dependents_indexes: Vec<usize>,
+    }
 }
 
 /// Extension to IntoIterator<D>: Allow DAG resolution to be called by the method
