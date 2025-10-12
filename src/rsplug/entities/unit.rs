@@ -70,13 +70,9 @@ impl FromStr for UnitSource {
     }
 }
 
-#[derive(thiserror::Error, Debug)]
-#[error("DAG creation error")]
-pub struct DAGCreationError(#[from] DagError);
-
 impl Unit {
     /// 設定ファイルから Unit のコレクションを構築する
-    pub fn new(config: Config) -> Result<impl Iterator<Item = Unit>, DAGCreationError> {
+    pub fn new(config: Config) -> Result<impl Iterator<Item = Unit>, DagError> {
         let Config { plugins } = config;
         Ok(plugins.try_dag()?.into_map_iter(
             |DagIteratorMapFuncArgs {

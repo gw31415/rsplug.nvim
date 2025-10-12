@@ -119,7 +119,7 @@ enum Error {
     #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
     #[error(transparent)]
-    Dag(#[from] rsplug::unit::DAGCreationError),
+    Dag(#[from] dag::DagError),
     #[error(transparent)]
     Ignore(#[from] ignore::Error),
 }
