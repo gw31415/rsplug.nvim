@@ -23,10 +23,10 @@ pub(super) enum HowToPlaceFiles {
 
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
-/// Packageに変換する。
-pub struct Package {
+/// PluginLoadedに変換する。
+pub struct PluginLoaded {
     /// ID
-    pub(super) id: PackageID,
+    pub(super) id: PluginID,
     /// プラグインの遅延実行タイプ
     pub lazy_type: LazyType,
     /// 配置するファイル
@@ -40,21 +40,21 @@ pub(super) struct FileItem {
     pub merge_type: MergeType,
 }
 
-impl PartialEq for Package {
+impl PartialEq for PluginLoaded {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl Eq for Package {}
+impl Eq for PluginLoaded {}
 
-impl PartialOrd for Package {
+impl PartialOrd for PluginLoaded {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Package {
+impl Ord for PluginLoaded {
     fn cmp(&self, other: &Self) -> Ordering {
         let cmp = self.lazy_type.cmp(&other.lazy_type);
         if let Ordering::Equal = cmp {
@@ -64,8 +64,8 @@ impl Ord for Package {
     }
 }
 
-impl Package {
-    /// BinaryHeap に保存された Package 群を可能な範囲でマージする
+impl PluginLoaded {
+    /// BinaryHeap に保存された PluginLoaded 群を可能な範囲でマージする
     pub fn merge(pkgs: &mut BinaryHeap<Self>) {
         let mut done_items = Vec::new();
 
@@ -86,7 +86,7 @@ impl Package {
     }
 }
 
-impl Add for Package {
+impl Add for PluginLoaded {
     type Output = (Self, Option<Self>);
     fn add(self, rhs: Self) -> Self::Output {
         if self.lazy_type != rhs.lazy_type {
@@ -189,21 +189,21 @@ impl FileSource {
     }
 }
 
-struct PackageFiles {
+struct Files {
     start_or_opt: &'static str,
-    dir: PackageDirectory,
+    dir_type: DirectoryExtractionType,
 }
 
-enum PackageDirectory {
+enum DirectoryExtractionType {
     Files(Vec<(PathBuf, Arc<FileSource>)>),
     Symlink(Arc<Path>),
 }
 
-/// PackPath の象徴となる状態。この構造体に Package をインサートしていき、最後に実際のパスを指定して install を行う。
+/// PackPath の象徴となる状態。この構造体に PluginLoaded をインサートしていき、最後に実際のパスを指定して install を行う。
 #[derive(Default)]
 pub struct PackPathState {
     installing: HashSet<Box<[u8]>>,
-    files: HashMap<PackageIDStr, PackageFiles>,
+    files: HashMap<PluginIDStr, Files>,
 }
 
 impl PackPathState {
@@ -214,9 +214,9 @@ impl PackPathState {
     pub fn new() -> Self {
         Default::default()
     }
-    /// Package をインサートする。その Package の実行制御や設定に必要な Loader を返す。
-    pub fn insert(&mut self, pkg: Package) -> Loader {
-        let Package {
+    /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な Loader を返す。
+    pub fn insert(&mut self, pkg: PluginLoaded) -> Loader {
+        let PluginLoaded {
             id,
             lazy_type,
             files,
@@ -232,12 +232,12 @@ impl PackPathState {
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
                 for (path, item) in files {
-                    let PackageFiles {
+                    let Files {
                         start_or_opt: _,
-                        dir: PackageDirectory::Files(tree),
-                    } = self.files.entry(id.as_str()).or_insert(PackageFiles {
+                        dir_type: DirectoryExtractionType::Files(tree),
+                    } = self.files.entry(id.as_str()).or_insert(Files {
                         start_or_opt: pkg_type_str,
-                        dir: PackageDirectory::Files(Vec::new()),
+                        dir_type: DirectoryExtractionType::Files(Vec::new()),
                     })
                     else {
                         unreachable!() // SAFETY: idは一意なので、ここに到達することはない
@@ -248,9 +248,9 @@ impl PackPathState {
             HowToPlaceFiles::SymlinkDirectory(dir) => {
                 self.files.insert(
                     id.as_str(),
-                    PackageFiles {
+                    Files {
                         start_or_opt: pkg_type_str,
-                        dir: PackageDirectory::Symlink(dir),
+                        dir_type: DirectoryExtractionType::Symlink(dir),
                     },
                 );
             }
@@ -270,9 +270,9 @@ impl PackPathState {
 
         for (
             id,
-            PackageFiles {
+            Files {
                 start_or_opt,
-                dir: pkgdir,
+                dir_type,
             },
         ) in files
         {
@@ -280,16 +280,16 @@ impl PackPathState {
             let dir = gen_root.join(start_or_opt).join(id.as_ref());
             let installed = {
                 let dir_is_symlink = dir.is_symlink();
-                match &pkgdir {
-                    PackageDirectory::Files(_) => dir.is_dir() && !dir_is_symlink,
-                    PackageDirectory::Symlink(_) => dir_is_symlink,
+                match &dir_type {
+                    DirectoryExtractionType::Files(_) => dir.is_dir() && !dir_is_symlink,
+                    DirectoryExtractionType::Symlink(_) => dir_is_symlink,
                 }
             };
             if installed {
                 msg(Message::InstallSkipped(id));
             } else {
-                match pkgdir {
-                    PackageDirectory::Files(files) => {
+                match dir_type {
+                    DirectoryExtractionType::Files(files) => {
                         tokio::fs::remove_file(dir.as_path()).await.ok();
                         let dir = Arc::new(dir);
                         for (which, source) in files {
@@ -302,7 +302,7 @@ impl PackPathState {
                             });
                         }
                     }
-                    PackageDirectory::Symlink(sym) => {
+                    DirectoryExtractionType::Symlink(sym) => {
                         tasks.spawn(async move {
                             tokio::fs::remove_dir_all(&dir).await.ok();
                             tokio::fs::create_dir_all(dir.parent().unwrap()).await?;

@@ -12,10 +12,10 @@ use serde_with::DeserializeFromStr;
 use super::*;
 
 /// 設定を構成する基本単位
-pub struct Unit {
+pub struct Plugin {
     /// 取得元
     pub cache: CacheConfig,
-    /// Unitに対応する読み込みタイプ
+    /// Pluginに対応する読み込みタイプ
     pub lazy_type: LazyType,
     /// セットアップスクリプト
     pub script: SetupScript,
@@ -50,7 +50,6 @@ impl RepoSource {
         match self {
             RepoSource::GitHub { owner, repo, .. } => {
                 let mut path = PathBuf::new();
-                path.push("repos");
                 path.push("github.com");
                 path.push(owner);
                 path.push(repo.as_ref());
@@ -76,16 +75,16 @@ impl FromStr for RepoSource {
     }
 }
 
-impl Unit {
-    /// 設定ファイルから Unit のコレクションを構築する
-    pub fn new(config: Config) -> Result<impl Iterator<Item = Unit>, DagError> {
+impl Plugin {
+    /// 設定ファイルから Plugin のコレクションを構築する
+    pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, DagError> {
         let Config { plugins } = config;
         Ok(plugins.try_dag()?.into_map_iter(
             |DagIteratorMapFuncArgs {
                  inner,
                  dependents_iter,
              }| {
-                let Plugin {
+                let PluginConfig {
                     cache,
                     lazy_type,
                     depends: _,
@@ -97,7 +96,7 @@ impl Unit {
                 let lazy_type = dependents_iter
                     .flatten()
                     .fold(lazy_type, |dep, plug| dep & plug.lazy_type.clone());
-                Unit {
+                Plugin {
                     cache,
                     lazy_type,
                     script,
@@ -107,14 +106,14 @@ impl Unit {
         ))
     }
 
-    /// キャッシュからUnitを読み込む。
+    /// キャッシュからPluginを読み込む。オプションでインストールやアップデートも行う。
     /// インストールされていない場合は `Ok(None)` を返す。
-    pub async fn fetch(
+    pub async fn load(
         self,
         install: bool,
         update: bool,
         cache_dir: impl AsRef<Path>,
-    ) -> Result<Option<Package>, Error> {
+    ) -> Result<Option<PluginLoaded>, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
@@ -124,7 +123,7 @@ impl Unit {
         use unicode_width::UnicodeWidthStr;
         use xxhash_rust::xxh3::xxh3_128;
 
-        let Unit {
+        let Plugin {
             cache,
             lazy_type,
             script,
@@ -139,7 +138,7 @@ impl Unit {
         } = cache;
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
-        let pkg: Package = match repo {
+        let pkg: PluginLoaded = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
@@ -171,7 +170,7 @@ impl Unit {
                 };
 
                 // ディレクトリ内容からのIDの決定
-                let id = PackageID::new({
+                let id = PluginID::new({
                     let (head, diff) = tokio::join!(repository.head_hash(), repository.diff_hash());
                     match (head, diff) {
                         (Ok(mut head), Ok(diff)) => {
@@ -271,7 +270,7 @@ impl Unit {
                             .collect(),
                     )
                 };
-                Package {
+                PluginLoaded {
                     id,
                     files,
                     lazy_type,

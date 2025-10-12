@@ -15,18 +15,18 @@ use super::*;
 /// プラグインの読み込み制御や、ロード後の設定 (after_lua等) にまつわる情報を保持し、Package に変換するための構造体。
 #[derive(Default)]
 pub struct Loader {
-    pkgid2scripts: Vec<(PackageIDStr, SetupScript)>,
-    event2pkgid: BTreeMap<Autocmd, Vec<PackageIDStr>>,
-    cmd2pkgid: BTreeMap<UserCmd, Vec<PackageIDStr>>,
-    ft2pkgid: BTreeMap<FileType, Vec<PackageIDStr>>,
-    luam2pkgid: BTreeMap<LuaModule, Vec<PackageIDStr>>,
-    keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PackageIDStr>>>,
+    pkgid2scripts: Vec<(PluginIDStr, SetupScript)>,
+    event2pkgid: BTreeMap<Autocmd, Vec<PluginIDStr>>,
+    cmd2pkgid: BTreeMap<UserCmd, Vec<PluginIDStr>>,
+    ft2pkgid: BTreeMap<FileType, Vec<PluginIDStr>>,
+    luam2pkgid: BTreeMap<LuaModule, Vec<PluginIDStr>>,
+    keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
-fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Package {
+fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> PluginLoaded {
     let data = data.into();
-    let id = PackageID::new(&data) + PackageID::new(path);
+    let id = PluginID::new(&data) + PluginID::new(path);
     let files = HashMap::from([(
         PathBuf::from(path),
         FileItem {
@@ -34,7 +34,7 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Packa
             merge_type: MergeType::Overwrite,
         },
     )]);
-    Package {
+    PluginLoaded {
         id,
         lazy_type: LazyType::Start,
         files: HowToPlaceFiles::CopyEachFile(files),
@@ -42,8 +42,8 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Packa
     }
 }
 
-impl From<Loader> for Vec<Package> {
-    fn from(value: Loader) -> Vec<Package> {
+impl From<Loader> for Vec<PluginLoaded> {
+    fn from(value: Loader) -> Vec<PluginLoaded> {
         if value.is_empty() {
             return Vec::with_capacity(0);
         }
@@ -73,7 +73,7 @@ impl From<Loader> for Vec<Package> {
                     for (script_type, content) in lua_after.chain(lua_before) {
                         let module_id = format!(
                             "{script_type}_{}",
-                            PackageID::new(content.as_bytes()).as_str()
+                            PluginID::new(content.as_bytes()).as_str()
                         );
                         pkgs.push(instant_startup_pkg(
                             &format!("lua/{module_id}.lua"),
@@ -110,7 +110,7 @@ impl From<Loader> for Vec<Package> {
                     .render_once()
                     .unwrap()
                     .into_bytes();
-                path.push_str(&PackageID::new(&data).as_str());
+                path.push_str(&PluginID::new(&data).as_str());
                 path.push_str(".lua");
 
                 pkgs.push(instant_startup_pkg(&path, data));
@@ -126,7 +126,7 @@ impl From<Loader> for Vec<Package> {
                     .unwrap()
                     .into_bytes()
                     .into();
-                let on_event_setup_id = PackageID::new(&on_event_setup);
+                let on_event_setup_id = PluginID::new(&on_event_setup);
                 let on_event = OnEventTemplate {
                     event2pkgid: &event2pkgid,
                 }
@@ -134,7 +134,7 @@ impl From<Loader> for Vec<Package> {
                 .unwrap()
                 .into_bytes()
                 .into();
-                let on_event_id = PackageID::new(&on_event);
+                let on_event_id = PluginID::new(&on_event);
                 let files = HashMap::from([
                     (
                         PathBuf::from("lua/_rsplug/on_event.lua"),
@@ -153,7 +153,7 @@ impl From<Loader> for Vec<Package> {
                         },
                     ),
                 ]);
-                Package {
+                PluginLoaded {
                     id: on_event_setup_id + on_event_id,
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
@@ -171,7 +171,7 @@ impl From<Loader> for Vec<Package> {
                     .unwrap()
                     .into_bytes()
                     .into();
-                let on_cmd_setup_id = PackageID::new(&on_cmd_setup);
+                let on_cmd_setup_id = PluginID::new(&on_cmd_setup);
                 let on_cmd = OnCmdTemplate {
                     cmd2pkgid: &cmd2pkgid,
                 }
@@ -179,7 +179,7 @@ impl From<Loader> for Vec<Package> {
                 .unwrap()
                 .into_bytes()
                 .into();
-                let on_cmd_id = PackageID::new(&on_cmd);
+                let on_cmd_id = PluginID::new(&on_cmd);
                 let files = HashMap::from([
                     (
                         PathBuf::from("lua/_rsplug/on_cmd.lua"),
@@ -196,7 +196,7 @@ impl From<Loader> for Vec<Package> {
                         },
                     ),
                 ]);
-                Package {
+                PluginLoaded {
                     id: on_cmd_id + on_cmd_setup_id,
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
@@ -206,7 +206,7 @@ impl From<Loader> for Vec<Package> {
         }
         if !luam2pkgid.is_empty() {
             let plugin_on_lua = include_bytes!("../../../templates/plugin/on_lua.lua");
-            let plugin_on_lua_id = PackageID::new(plugin_on_lua);
+            let plugin_on_lua_id = PluginID::new(plugin_on_lua);
             let on_lua = OnLuaTemplate {
                 luam2pkgid: &luam2pkgid,
             }
@@ -214,7 +214,7 @@ impl From<Loader> for Vec<Package> {
             .unwrap()
             .into_bytes()
             .into();
-            let on_lua_id = PackageID::new(&on_lua);
+            let on_lua_id = PluginID::new(&on_lua);
             let files = HashMap::from([
                 (
                     PathBuf::from("lua/_rsplug/on_lua.lua"),
@@ -233,7 +233,7 @@ impl From<Loader> for Vec<Package> {
                     },
                 ),
             ]);
-            pkgs.push(Package {
+            pkgs.push(PluginLoaded {
                 id: plugin_on_lua_id + on_lua_id,
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
@@ -243,7 +243,7 @@ impl From<Loader> for Vec<Package> {
         if !keypattern2pkgid.is_empty() {
             let data = include_bytes!("../../../templates/plugin/on_map.lua");
             pkgs.push(instant_startup_pkg(
-                &format!("plugin/{}.lua", PackageID::new(data).as_str()),
+                &format!("plugin/{}.lua", PluginID::new(data).as_str()),
                 data,
             ));
             pkgs.push(instant_startup_pkg(
@@ -347,14 +347,14 @@ impl Loader {
             && keypattern2pkgid.values().all(|v| v.is_empty())
     }
     /// Loaderを Package のベクタに変換する。
-    pub fn into_pkgs(self) -> Vec<Package> {
+    pub fn into_pkgs(self) -> Vec<PluginLoaded> {
         self.into()
     }
     /// パッケージ情報を読み込み、 Loader を作成する。
     /// 読み込む情報が要らない場合は `None` を返す。
     /// NOTE: Package はインストールされる必要があるため、変更を抑制する意図で PackageID の所有権を奪う。
     /// その他必要な情報のみ引数に取る。
-    pub(super) fn create(id: PackageID, lazy_type: LazyType, script: SetupScript) -> Self {
+    pub(super) fn create(id: PluginID, lazy_type: LazyType, script: SetupScript) -> Self {
         let LazyType::Opt(events) = lazy_type else {
             return Default::default();
         };
@@ -413,7 +413,7 @@ impl Loader {
 #[template(path = "ftplugin/on_ft.stpl")]
 #[template(escape = false)]
 struct FtpluginTemplate {
-    pkgids: Vec<PackageIDStr>,
+    pkgids: Vec<PluginIDStr>,
     ft: FileType,
 }
 
@@ -421,42 +421,42 @@ struct FtpluginTemplate {
 #[template(path = "lua/_rsplug/init.stpl")]
 #[template(escape = false)]
 struct CustomPackaddTemplate {
-    pkgid2scripts: Vec<(PackageIDStr, BTreeMap<&'static str, Vec<String>>)>,
+    pkgid2scripts: Vec<(PluginIDStr, BTreeMap<&'static str, Vec<String>>)>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "plugin/on_event.stpl")]
 #[template(escape = false)]
 struct OnEventSetupTemplate<'a> {
-    events: Keys<'a, Autocmd, Vec<PackageIDStr>>,
+    events: Keys<'a, Autocmd, Vec<PluginIDStr>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "lua/_rsplug/on_event.stpl")]
 #[template(escape = false)]
 struct OnEventTemplate<'a> {
-    event2pkgid: &'a BTreeMap<Autocmd, Vec<PackageIDStr>>,
+    event2pkgid: &'a BTreeMap<Autocmd, Vec<PluginIDStr>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "plugin/on_cmd.stpl")]
 #[template(escape = false)]
 struct OnCmdSetupTemplate<'a> {
-    cmds: Keys<'a, UserCmd, Vec<PackageIDStr>>,
+    cmds: Keys<'a, UserCmd, Vec<PluginIDStr>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "lua/_rsplug/on_cmd.stpl")]
 #[template(escape = false)]
 struct OnCmdTemplate<'a> {
-    cmd2pkgid: &'a BTreeMap<UserCmd, Vec<PackageIDStr>>,
+    cmd2pkgid: &'a BTreeMap<UserCmd, Vec<PluginIDStr>>,
 }
 
 #[derive(TemplateSimple)]
 #[template(path = "lua/_rsplug/on_lua.stpl")]
 #[template(escape = false)]
 struct OnLuaTemplate<'a> {
-    luam2pkgid: &'a BTreeMap<LuaModule, Vec<PackageIDStr>>,
+    luam2pkgid: &'a BTreeMap<LuaModule, Vec<PluginIDStr>>,
 }
 
 #[derive(TemplateSimple)]
@@ -464,5 +464,5 @@ struct OnLuaTemplate<'a> {
 #[template(escape = false)]
 struct OnMapTemplate<'a> {
     mode: &'a ModeChar,
-    keypattern2pkgid: &'a BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PackageIDStr>>>,
+    keypattern2pkgid: &'a BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
 }

@@ -34,8 +34,10 @@ async fn app() -> Result<(), Error> {
         config_files,
     } = Args::parse();
 
-    let units = {
-        // parse config files into Iterator<Item = Arc<Unit>>
+    let plugins = {
+        // Parse all of config files
+        // NOTE: Wait for all config files to parse.
+        // TODO: Abort immediately if any of them fail.
         let configs = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
             .filter_map(|path| match path {
                 Err(e) => Some(Err(e)),
@@ -65,18 +67,20 @@ async fn app() -> Result<(), Error> {
             .into_iter()
             .collect::<Result<Vec<_>, Error>>()?
             .into_iter();
-        rsplug::Unit::new(configs.sum())?
+        rsplug::Plugin::new(configs.sum())?
     };
 
-    msg(Message::CheckingLocalPlugins { install, update });
-    // Fetch packages through Cache based on the Units
-    let mut pkgs = {
-        let res = units
-            .map(|unit| unit.fetch(install, update, DEFAULT_APP_DIR.as_path()))
+    msg(Message::Loading { install, update });
+    // Load plugins through Cache based on the Units
+    let mut plugins = {
+        let res = plugins
+            .map(|plugin| plugin.load(install, update, DEFAULT_REPOCACHE_DIR.as_path()))
             .collect::<JoinSet<_>>()
             .join_all()
             .await;
-        msg(Message::CacheDone);
+        // Wait until all loading is complete.
+        // NOTE: It does not abort if an error occurs (because of the build process).
+        msg(Message::LoadDone);
         res.into_iter()
             .try_fold(BinaryHeap::new(), |mut acc, res| {
                 if let Some(pkg) = res? {
@@ -85,24 +89,24 @@ async fn app() -> Result<(), Error> {
                 Ok::<_, Error>(acc)
             })?
     };
-    let total_count = pkgs.len();
+    let total_count = plugins.len();
 
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
     let mut loader = rsplug::Loader::new();
-    rsplug::Package::merge(&mut pkgs);
-    while let Some(pkg) = pkgs.pop() {
+    rsplug::PluginLoaded::merge(&mut plugins);
+    while let Some(pkg) = plugins.pop() {
         // Merging more by accumulating Loader until all the rest of the pkgs are Start
         if pkg.lazy_type.is_start() && !loader.is_empty() {
-            pkgs.push(pkg);
-            pkgs.extend(std::mem::take(&mut loader).into_pkgs());
-            rsplug::Package::merge(&mut pkgs);
+            plugins.push(pkg);
+            plugins.extend(std::mem::take(&mut loader).into_pkgs());
+            rsplug::PluginLoaded::merge(&mut plugins);
             continue;
         }
 
         loader += state.insert(pkg);
     }
-    msg(Message::CheckingLocalPluginsFinished {
+    msg(Message::MergeFinished {
         total: total_count,
         merged: state.len(),
     });
@@ -120,6 +124,8 @@ static DEFAULT_APP_DIR: Lazy<PathBuf> = Lazy::new(|| {
     let cachedir = homedir.join(".cache");
     cachedir.join("rsplug")
 });
+
+static DEFAULT_REPOCACHE_DIR: Lazy<PathBuf> = Lazy::new(|| DEFAULT_APP_DIR.join("repos"));
 
 #[derive(Debug, thiserror::Error)]
 enum Error {

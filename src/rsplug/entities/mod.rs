@@ -3,9 +3,9 @@ pub mod error;
 pub mod lazy_type;
 pub mod loader;
 pub mod merge_type;
-pub mod package;
-pub mod package_id;
-pub mod unit;
+pub mod plugin;
+pub mod plugin_id;
+pub mod plugin_loaded;
 
 use super::util;
 
@@ -14,6 +14,6 @@ use error::*;
 use lazy_type::*;
 use loader::*;
 use merge_type::*;
-use package::*;
-use package_id::*;
-use unit::*;
+use plugin::*;
+use plugin_id::*;
+use plugin_loaded::*;

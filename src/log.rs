@@ -14,13 +14,9 @@ use unicode_width::UnicodeWidthStr;
 
 pub enum Message {
     DetectConfigFile(PathBuf),
-    CheckingLocalPlugins {
+    Loading {
         install: bool,
         update: bool,
-    },
-    CheckingLocalPluginsFinished {
-        total: usize,
-        merged: usize,
     },
     Cache(&'static str, Arc<str>),
     CacheFetchObjectsProgress {
@@ -33,7 +29,11 @@ pub enum Message {
         stdtype: usize,
         line: String,
     },
-    CacheDone,
+    LoadDone,
+    MergeFinished {
+        total: usize,
+        merged: usize,
+    },
     InstallSkipped(Arc<str>),
     InstallYank {
         id: Arc<str>,
@@ -77,10 +77,10 @@ fn init() -> Logger {
                 Message::DetectConfigFile(path) => {
                     eprintln!("{}", style(path.to_string_lossy()).dim());
                 }
-                Message::CheckingLocalPlugins { install, update } => {
+                Message::Loading { install, update } => {
                     let pb = ProgressBar::new_spinner();
                     pb.set_style(pb_style_spinner.clone());
-                    pb.set_prefix("Checking");
+                    pb.set_prefix("Loading");
                     let activity = if install && update {
                         "installed plugins & updates"
                     } else if update {
@@ -94,7 +94,7 @@ fn init() -> Logger {
                     pb.enable_steady_tick(Duration::from_millis(100));
                     pb_checking_local_plugins = Some(pb);
                 }
-                Message::CheckingLocalPluginsFinished { total, merged } => {
+                Message::MergeFinished { total, merged } => {
                     let message = format!(
                         "plugins {}",
                         style(format!("(total:{total} merged:{merged})"))
@@ -172,7 +172,7 @@ fn init() -> Logger {
                         .dim()
                     ));
                 }
-                Message::CacheDone => {
+                Message::LoadDone => {
                     let mut pb_caching = std::mem::take(&mut pb_caching);
                     if let Some(pb) = pb_caching.remove(CACHE_FETCH_PROGRESS_ID) {
                         pb.set_style(pb_style.clone());

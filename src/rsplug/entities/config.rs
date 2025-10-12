@@ -28,7 +28,7 @@ impl<T: IntoIterator<Item = Config>> From<T> for Config {
 #[derive(Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub(super) plugins: Vec<Plugin>,
+    pub(super) plugins: Vec<PluginConfig>,
 }
 
 impl AddAssign for Config {
@@ -110,7 +110,7 @@ impl From<LazyTypeDeserializer> for LazyType {
 
 #[serde_as]
 #[derive(Deserialize)]
-pub(super) struct Plugin {
+pub(super) struct PluginConfig {
     #[serde(flatten)]
     pub cache: CacheConfig,
     #[serde(flatten)]
@@ -128,7 +128,7 @@ pub(super) struct Plugin {
     pub merge: MergeConfig,
 }
 
-impl DagNode for Plugin {
+impl DagNode for PluginConfig {
     fn id(&self) -> &str {
         self.custom_name.as_ref().map_or(
             match &self.cache.repo {
