@@ -107,7 +107,8 @@ impl Unit {
         ))
     }
 
-    /// キャッシュからファイルを読み込み、Package のコレクションにする
+    /// キャッシュからUnitを読み込む。
+    /// インストールされていない場合は `Ok(None)` を返す。
     pub async fn fetch(
         self,
         install: bool,
