@@ -64,7 +64,10 @@ async fn app() -> Result<(), Error> {
                 .collect::<JoinSet<_>>();
             let mut confs = Vec::new();
             while let Some(config) = joinset.join_next().await {
-                confs.push(config.unwrap()?);
+                confs
+                    .push(config.expect(
+                        "Some tasks reading config files may be unintentionally aborted",
+                    )?);
             }
             confs
         };
@@ -121,7 +124,7 @@ async fn app() -> Result<(), Error> {
 }
 
 static DEFAULT_APP_DIR: Lazy<PathBuf> = Lazy::new(|| {
-    let homedir = std::env::home_dir().unwrap();
+    let homedir = std::env::home_dir().expect("Failed to get home directory");
     let cachedir = homedir.join(".cache");
     cachedir.join("rsplug")
 });
