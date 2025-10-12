@@ -83,26 +83,22 @@ impl Unit {
                  inner,
                  dependents_iter,
              }| {
-                // 依存元の lazy_type を集約
-                let lazy_type = dependents_iter
-                    .flatten()
-                    .fold(inner.lazy_type(), |dep, plug| dep & plug.lazy_type());
                 let Plugin {
                     repo,
-                    start: _,
-                    on_event: _,
-                    on_cmd: _,
-                    on_ft: _,
-                    on_map: _,
+                    lazy_type,
                     depends: _,
                     custom_name: _,
                     script,
                     merge,
                 } = inner;
+                // 依存元の lazy_type を集約
+                let lazy_type = dependents_iter
+                    .flatten()
+                    .fold(lazy_type, |dep, plug| dep & plug.lazy_type.clone());
                 Unit {
                     source: repo,
                     lazy_type,
-                    script: script.into(),
+                    script,
                     merge,
                 }
             },

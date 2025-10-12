@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     hash::Hash,
-    iter::Sum,
+    iter::{Sum, once},
     ops::AddAssign,
     path::Path,
     str::FromStr,
@@ -13,7 +13,7 @@ use hashbrown::HashMap;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sailfish::runtime::Render;
 use serde::Deserialize;
-use serde_with::{DeserializeFromStr, OneOrMany, serde_as};
+use serde_with::{DeserializeFromStr, FromInto, OneOrMany, serde_as};
 
 use super::*;
 
@@ -67,29 +67,63 @@ impl PluginSource {
 
 #[serde_as]
 #[derive(Deserialize)]
+struct LazyTypeDeserializer {
+    #[serde(default)]
+    start: bool,
+    #[serde_as(as = "OneOrMany<_>")]
+    #[serde(default)]
+    on_event: Vec<Autocmd>,
+    #[serde_as(as = "OneOrMany<_>")]
+    #[serde(default)]
+    on_cmd: Vec<UserCmd>,
+    #[serde_as(as = "OneOrMany<_>")]
+    #[serde(default)]
+    on_ft: Vec<FileType>,
+    #[serde(default)]
+    on_map: KeyPattern,
+}
+
+impl From<LazyTypeDeserializer> for LazyType {
+    fn from(val: LazyTypeDeserializer) -> Self {
+        let LazyTypeDeserializer {
+            start,
+            on_event,
+            on_cmd,
+            on_ft,
+            on_map,
+        } = val;
+        if start {
+            LazyType::Start
+        } else {
+            LazyType::Opt(
+                on_event
+                    .into_iter()
+                    .map(LoadEvent::Autocmd)
+                    .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
+                    .chain(on_ft.into_iter().map(LoadEvent::FileType))
+                    .chain(once(LoadEvent::OnMap(on_map)))
+                    .collect(),
+            )
+        }
+    }
+}
+
+#[serde_as]
+#[derive(Deserialize)]
 pub(super) struct Plugin {
     #[serde(flatten)]
     pub repo: PluginSource,
-    #[serde(default)]
-    pub start: bool,
-    #[serde_as(as = "OneOrMany<_>")]
-    #[serde(default)]
-    pub on_event: Vec<Autocmd>,
-    #[serde_as(as = "OneOrMany<_>")]
-    #[serde(default)]
-    pub on_cmd: Vec<UserCmd>,
-    #[serde_as(as = "OneOrMany<_>")]
-    #[serde(default)]
-    pub on_ft: Vec<FileType>,
-    #[serde(default)]
-    pub on_map: KeyPattern,
+    #[serde(flatten)]
+    #[serde_as(as = "FromInto<LazyTypeDeserializer>")]
+    pub lazy_type: LazyType,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     pub depends: Vec<String>,
     #[serde(rename = "name")]
     pub custom_name: Option<String>,
     #[serde(flatten)]
-    pub script: SetupScriptOne,
+    #[serde_as(as = "FromInto<SetupScriptOne>")]
+    pub script: SetupScript,
     #[serde(flatten)]
     pub merge: MergeConfig,
 }
@@ -108,46 +142,13 @@ impl DagNode for Plugin {
     }
 }
 
-impl Plugin {
-    /// プラグインに設定されたLazyTypeを生成する
-    pub(super) fn lazy_type(&self) -> LazyType {
-        let Self {
-            repo: _,
-            start,
-            on_event,
-            on_cmd,
-            on_ft,
-            on_map,
-            depends: _,
-            custom_name: _,
-            script: _,
-            merge: _,
-        } = self;
-
-        if *start {
-            LazyType::Start
-        } else {
-            LazyType::Opt({
-                let mut set: BTreeSet<_> = on_event
-                    .iter()
-                    .map(|a| LoadEvent::Autocmd(a.clone()))
-                    .chain(on_cmd.iter().map(|a| LoadEvent::UserCmd(a.clone())))
-                    .chain(on_ft.iter().map(|a| LoadEvent::FileType(a.clone())))
-                    .collect();
-                set.insert(LoadEvent::OnMap(on_map.clone()));
-                set
-            })
-        }
-    }
-}
-
 /// プラグインのセットアップに用いるスクリプト群
 #[derive(Deserialize, Default)]
-pub(crate) struct SetupScriptOne {
+struct SetupScriptOne {
     /// プラグイン読み込み直後に実行される Lua スクリプト
-    pub lua_after: Option<String>,
+    lua_after: Option<String>,
     /// プラグイン読み込み直前に実行される Lua スクリプト
-    pub lua_before: Option<String>,
+    lua_before: Option<String>,
 }
 
 /// プラグインのセットアップに用いるスクリプト群

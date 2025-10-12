@@ -29,7 +29,7 @@ impl Cache {
     /// キャッシュし、展開して Package のコレクションにする
     pub async fn fetch(
         self,
-        unit: impl IntoIterator<Item = Unit> + Send + Sync + 'static,
+        unit: impl IntoIterator<Item = Unit>,
         install: bool,
         update: bool,
     ) -> Result<impl Iterator<Item = Package>, Error> {
