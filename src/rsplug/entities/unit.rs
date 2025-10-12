@@ -1,6 +1,6 @@
-use std::{cell::RefCell, collections::BTreeSet, path::PathBuf, str::FromStr, sync::Arc};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
-use hashbrown::{HashMap, HashSet};
+use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_with::DeserializeFromStr;
@@ -13,8 +13,6 @@ pub struct Unit {
     pub source: PluginSource,
     /// Unitに対応する読み込みタイプ
     pub lazy_type: LazyType,
-    /// 依存する Unit のリスト
-    pub depends: Vec<Arc<Unit>>,
     /// セットアップスクリプト
     pub script: SetupScript,
     /// マージ設定
@@ -56,39 +54,6 @@ impl UnitSource {
     }
 }
 
-struct FilteredIterator<'a, T, F: Fn(&T) -> bool> {
-    index: usize,
-    vec: &'a mut Vec<T>,
-    filter: F,
-}
-
-impl<T, F: Fn(&T) -> bool> FilteredIterator<'_, T, F> {
-    fn new<'a>(vec: &'a mut Vec<T>, filter: F) -> FilteredIterator<'a, T, F> {
-        FilteredIterator {
-            index: vec.len(),
-            vec,
-            filter,
-        }
-    }
-}
-
-impl<T, F: Fn(&T) -> bool> Iterator for FilteredIterator<'_, T, F> {
-    type Item = T;
-    fn next(&mut self) -> Option<Self::Item> {
-        let Self { index, vec, filter } = self;
-        loop {
-            if *index == 0 {
-                return None;
-            }
-            *index -= 1;
-            let item = (*vec).get(*index).unwrap();
-            if filter(item) {
-                return Some(vec.swap_remove(*index));
-            }
-        }
-    }
-}
-
 impl FromStr for UnitSource {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -107,72 +72,40 @@ impl FromStr for UnitSource {
 
 #[derive(thiserror::Error, Debug)]
 #[error("DAG creation error")]
-pub struct DAGCreationError;
+pub struct DAGCreationError(#[from] DagError);
 
 impl Unit {
     /// 設定ファイルから Unit のコレクションを構築する
-    pub fn new(config: Config) -> Result<impl Iterator<Item = Arc<Unit>>, DAGCreationError> {
-        let Config { mut plugins } = config;
-        let units = RefCell::new(HashMap::<String, Vec<Arc<Unit>>>::new());
-        loop {
-            let size_before = plugins.len();
-            let iterator = FilteredIterator::new(&mut plugins, |item| {
-                let units = units.borrow();
-                item.depends.iter().all(|dep| units.contains_key(dep))
-            });
-            for plugin in iterator {
-                let name = plugin.name().to_string();
+    pub fn new(config: Config) -> Result<impl Iterator<Item = Unit>, DAGCreationError> {
+        let Config { plugins } = config;
+        Ok(plugins.try_dag()?.into_map_iter(
+            |DagIteratorMapFuncArgs {
+                 inner,
+                 dependents_iter,
+             }| {
+                // 依存元の lazy_type を集約
+                let lazy_type = dependents_iter
+                    .flatten()
+                    .fold(inner.lazy_type(), |dep, plug| dep & plug.lazy_type());
                 let Plugin {
-                    start,
-                    repo: source,
-                    on_event,
-                    on_cmd,
-                    on_ft,
+                    repo,
+                    start: _,
+                    on_event: _,
+                    on_cmd: _,
+                    on_ft: _,
+                    on_map: _,
+                    depends: _,
+                    custom_name: _,
                     script,
                     merge,
-                    depends,
-                    custom_name: _,
-                    on_map,
-                } = plugin;
-                let lazy_type = if start {
-                    LazyType::Start
-                } else {
-                    LazyType::Opt({
-                        let mut set: BTreeSet<_> = on_event
-                            .into_iter()
-                            .map(LoadEvent::Autocmd)
-                            .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
-                            .chain(on_ft.into_iter().map(LoadEvent::FileType))
-                            .collect();
-                        set.insert(LoadEvent::OnMap(on_map));
-                        set
-                    })
-                };
-                let unit = {
-                    let units = units.borrow();
-                    Arc::new(Unit {
-                        source,
-                        lazy_type,
-                        depends: depends
-                            .iter()
-                            .collect::<HashSet<_>>() // 重複削除
-                            .into_iter()
-                            .flat_map(|dep| units.get(dep).unwrap().clone())
-                            .collect(),
-                        script: script.into(),
-                        merge,
-                    })
-                };
-                units.borrow_mut().entry(name).or_default().push(unit);
-            }
-            if size_before == plugins.len() {
-                if plugins.is_empty() {
-                    break;
+                } = inner;
+                Unit {
+                    source: repo,
+                    lazy_type,
+                    script: script.into(),
+                    merge,
                 }
-
-                return Err(DAGCreationError);
-            }
-        }
-        Ok(units.into_inner().into_values().flatten())
+            },
+        ))
     }
 }

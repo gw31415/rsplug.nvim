@@ -3,7 +3,7 @@ use std::{
     borrow::{Borrow, Cow},
     cmp::Ordering,
     collections::BTreeSet,
-    ops::BitAndAssign,
+    ops::{BitAnd, BitAndAssign},
     str::FromStr,
     sync::Arc,
 };
@@ -80,6 +80,14 @@ impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAndAssign<Rhs> for LazyType {
                 *self = rhs.into_owned();
             }
         }
+    }
+}
+
+impl BitAnd for LazyType {
+    type Output = Self;
+    fn bitand(mut self, rhs: Self) -> Self::Output {
+        self &= rhs;
+        self
     }
 }
 

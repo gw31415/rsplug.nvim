@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use dag::DagNode;
 use hashbrown::HashMap;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sailfish::runtime::Render;
@@ -93,15 +94,50 @@ pub(super) struct Plugin {
     pub merge: MergeConfig,
 }
 
-impl Plugin {
-    /// プラグインを指定する名前
-    pub fn name(&self) -> &str {
+impl DagNode for Plugin {
+    fn id(&self) -> &str {
         self.custom_name.as_ref().map_or(
             match &self.repo.base {
                 UnitSource::GitHub { repo, .. } => repo.as_ref(),
             },
             |v| v,
         )
+    }
+    fn depends(&self) -> impl IntoIterator<Item = &impl AsRef<str>> {
+        &self.depends
+    }
+}
+
+impl Plugin {
+    /// プラグインに設定されたLazyTypeを生成する
+    pub(super) fn lazy_type(&self) -> LazyType {
+        let Self {
+            repo: _,
+            start,
+            on_event,
+            on_cmd,
+            on_ft,
+            on_map,
+            depends: _,
+            custom_name: _,
+            script: _,
+            merge: _,
+        } = self;
+
+        if *start {
+            LazyType::Start
+        } else {
+            LazyType::Opt({
+                let mut set: BTreeSet<_> = on_event
+                    .iter()
+                    .map(|a| LoadEvent::Autocmd(a.clone()))
+                    .chain(on_cmd.iter().map(|a| LoadEvent::UserCmd(a.clone())))
+                    .chain(on_ft.iter().map(|a| LoadEvent::FileType(a.clone())))
+                    .collect();
+                set.insert(LoadEvent::OnMap(on_map.clone()));
+                set
+            })
+        }
     }
 }
 
