@@ -113,7 +113,7 @@ impl Plugin {
         install: bool,
         update: bool,
         cache_dir: impl AsRef<Path>,
-    ) -> Result<Option<PluginLoaded>, Error> {
+    ) -> Result<Option<LoadedPlugin>, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
@@ -138,7 +138,7 @@ impl Plugin {
         } = cache;
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
-        let pkg: PluginLoaded = match repo {
+        let loaded_plugin: LoadedPlugin = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
@@ -270,7 +270,7 @@ impl Plugin {
                             .collect(),
                     )
                 };
-                PluginLoaded {
+                LoadedPlugin {
                     id,
                     files,
                     lazy_type,
@@ -279,7 +279,7 @@ impl Plugin {
             }
         };
 
-        Ok::<_, Error>(Some(pkg))
+        Ok::<_, Error>(Some(loaded_plugin))
     }
 }
 

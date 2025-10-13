@@ -24,7 +24,7 @@ pub(super) enum HowToPlaceFiles {
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
 /// PluginLoadedに変換する。
-pub struct PluginLoaded {
+pub struct LoadedPlugin {
     /// ID
     pub(super) id: PluginID,
     /// プラグインの遅延実行タイプ
@@ -40,21 +40,21 @@ pub(super) struct FileItem {
     pub merge_type: MergeType,
 }
 
-impl PartialEq for PluginLoaded {
+impl PartialEq for LoadedPlugin {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl Eq for PluginLoaded {}
+impl Eq for LoadedPlugin {}
 
-impl PartialOrd for PluginLoaded {
+impl PartialOrd for LoadedPlugin {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for PluginLoaded {
+impl Ord for LoadedPlugin {
     fn cmp(&self, other: &Self) -> Ordering {
         let cmp = self.lazy_type.cmp(&other.lazy_type);
         if let Ordering::Equal = cmp {
@@ -64,29 +64,29 @@ impl Ord for PluginLoaded {
     }
 }
 
-impl PluginLoaded {
+impl LoadedPlugin {
     /// BinaryHeap に保存された PluginLoaded 群を可能な範囲でマージする
-    pub fn merge(pkgs: &mut BinaryHeap<Self>) {
+    pub fn merge(plugs: &mut BinaryHeap<Self>) {
         let mut done_items = Vec::new();
 
-        while pkgs.len() > 1 {
-            let (tail, tail2) = (pkgs.pop().unwrap(), pkgs.pop().unwrap());
+        while plugs.len() > 1 {
+            let (tail, tail2) = (plugs.pop().unwrap(), plugs.pop().unwrap());
             match tail + tail2 {
                 (tail, Some(tail2)) => {
                     done_items.push(tail);
-                    pkgs.push(tail2);
+                    plugs.push(tail2);
                 }
                 (tail, None) => {
-                    pkgs.push(tail);
+                    plugs.push(tail);
                 }
             }
         }
 
-        pkgs.extend(done_items);
+        plugs.extend(done_items);
     }
 }
 
-impl Add for PluginLoaded {
+impl Add for LoadedPlugin {
     type Output = (Self, Option<Self>);
     fn add(self, rhs: Self) -> Self::Output {
         if self.lazy_type != rhs.lazy_type {
@@ -215,13 +215,13 @@ impl PackPathState {
         Default::default()
     }
     /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な Loader を返す。
-    pub fn insert(&mut self, pkg: PluginLoaded) -> Loader {
-        let PluginLoaded {
+    pub fn insert(&mut self, loaded_plugin: LoadedPlugin) -> Loader {
+        let LoadedPlugin {
             id,
             lazy_type,
             files,
             script,
-        } = pkg;
+        } = loaded_plugin;
 
         let already_installed = !self.installing.insert(id.as_str().into());
         if already_installed {

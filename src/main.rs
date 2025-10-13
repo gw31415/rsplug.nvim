@@ -86,8 +86,8 @@ async fn app() -> Result<(), Error> {
         msg(Message::LoadDone);
         res.into_iter()
             .try_fold(BinaryHeap::new(), |mut acc, res| {
-                if let Some(pkg) = res? {
-                    acc.push(pkg);
+                if let Some(loaded_plugin) = res? {
+                    acc.push(loaded_plugin);
                 }
                 Ok::<_, Error>(acc)
             })?
@@ -97,17 +97,17 @@ async fn app() -> Result<(), Error> {
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
     let mut loader = rsplug::Loader::new();
-    rsplug::PluginLoaded::merge(&mut plugins);
-    while let Some(pkg) = plugins.pop() {
-        // Merging more by accumulating Loader until all the rest of the pkgs are Start
-        if pkg.lazy_type.is_start() && !loader.is_empty() {
-            plugins.push(pkg);
-            plugins.extend(std::mem::take(&mut loader).into_pkgs());
-            rsplug::PluginLoaded::merge(&mut plugins);
+    rsplug::LoadedPlugin::merge(&mut plugins);
+    while let Some(loaded_plugin) = plugins.pop() {
+        // Merging more by accumulating Loader until all the rest of the LoadedPlugins are Start
+        if loaded_plugin.lazy_type.is_start() && !loader.is_empty() {
+            plugins.push(loaded_plugin);
+            plugins.extend(Into::<Vec<_>>::into(std::mem::take(&mut loader)));
+            rsplug::LoadedPlugin::merge(&mut plugins);
             continue;
         }
 
-        loader += state.insert(pkg);
+        loader += state.insert(loaded_plugin);
     }
     msg(Message::MergeFinished {
         total: total_count,
