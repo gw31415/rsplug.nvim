@@ -11,6 +11,7 @@ use hashbrown::HashMap;
 use sailfish::TemplateSimple;
 
 use super::*;
+use crate::rsplug::util::hash;
 
 /// プラグインの読み込み制御や、ロード後の設定 (after_lua等) にまつわる情報を保持し、Package に変換するための構造体。
 #[derive(Default)]
@@ -73,7 +74,7 @@ impl From<Loader> for Vec<LoadedPlugin> {
                     for (script_type, content) in lua_after.chain(lua_before) {
                         let module_id = format!(
                             "{script_type}_{}",
-                            PluginID::new(content.as_bytes()).as_str()
+                            hash::digest_hex_string(content.as_bytes())
                         );
                         plugs.push(instant_startup_pkg(
                             &format!("lua/{module_id}.lua"),
@@ -110,7 +111,7 @@ impl From<Loader> for Vec<LoadedPlugin> {
                     .render_once()
                     .unwrap()
                     .into_bytes();
-                path.push_str(&PluginID::new(&data).as_str());
+                path.push_str(&hash::digest_hex_string(&data));
                 path.push_str(".lua");
 
                 plugs.push(instant_startup_pkg(&path, data));
@@ -243,7 +244,7 @@ impl From<Loader> for Vec<LoadedPlugin> {
         if !keypattern2pkgid.is_empty() {
             let data = include_bytes!("../../../templates/plugin/on_map.lua");
             plugs.push(instant_startup_pkg(
-                &format!("plugin/{}.lua", PluginID::new(data).as_str()),
+                &format!("plugin/{}.lua", hash::digest_hex_string(data)),
                 data,
             ));
             plugs.push(instant_startup_pkg(

@@ -4,6 +4,52 @@ use unicode_width::UnicodeWidthStr;
 
 use super::error::Error;
 
+pub mod hash {
+    //! Utilities for hashing arbitrary data.
+
+    use std::mem::MaybeUninit;
+
+    use xxhash_rust::xxh3::xxh3_128;
+
+    const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
+
+    /// Calculate the 128-bit xxh3 digest for the given data.
+    #[inline]
+    pub fn digest(data: impl AsRef<[u8]>) -> [u8; 16] {
+        xxh3_128(data.as_ref()).to_ne_bytes()
+    }
+
+    /// Convert a raw digest into its hexadecimal representation.
+    #[inline]
+    pub fn to_hex_bytes(digest: [u8; 16]) -> [u8; 32] {
+        let mut res = const { [MaybeUninit::<u8>::uninit(); 32] };
+        for (i, b) in digest.iter().enumerate() {
+            let idx = i << 1;
+            unsafe {
+                res.get_mut(idx)
+                    .unwrap_unchecked()
+                    .write(HEX_TABLE[(b / 16u8) as usize]);
+                res.get_mut(idx + 1)
+                    .unwrap_unchecked()
+                    .write(HEX_TABLE[(b % 16u8) as usize]);
+            }
+        }
+        unsafe { std::mem::transmute::<[MaybeUninit<u8>; 32], [u8; 32]>(res) }
+    }
+
+    /// Calculate the hexadecimal representation of the xxh3 digest for the given data.
+    #[inline]
+    pub fn digest_hex_bytes(data: impl AsRef<[u8]>) -> [u8; 32] {
+        to_hex_bytes(digest(data))
+    }
+
+    /// Calculate the hexadecimal representation of the xxh3 digest as a [`String`].
+    #[inline]
+    pub fn digest_hex_string(data: impl AsRef<[u8]>) -> String {
+        unsafe { String::from_utf8_unchecked(digest_hex_bytes(data).to_vec()) }
+    }
+}
+
 #[inline]
 fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
     #[cfg(unix)]

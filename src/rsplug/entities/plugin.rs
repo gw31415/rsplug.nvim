@@ -117,11 +117,10 @@ impl Plugin {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
-            rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, truncate},
+            rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, hash, truncate},
         };
         use std::sync::Arc;
         use unicode_width::UnicodeWidthStr;
-        use xxhash_rust::xxh3::xxh3_128;
 
         let Plugin {
             cache,
@@ -179,7 +178,7 @@ impl Plugin {
                                 head.extend(i.to_ne_bytes());
                                 head.extend(comp.as_bytes());
                             }
-                            u128::to_ne_bytes(xxh3_128(&head))
+                            hash::digest(&head)
                         }
                         (Err(err), _) | (_, Err(err)) => Err(err)?,
                     }
