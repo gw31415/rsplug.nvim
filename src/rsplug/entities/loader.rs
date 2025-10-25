@@ -166,40 +166,40 @@ impl From<Loader> for Vec<LoadedPlugin> {
 
         if !event2pkgid.is_empty() {
             // on_event setup
-            plugs.push({
-                let events = event2pkgid.keys();
-                let on_event_setup = OnEventSetupTemplate { events }
-                    .render_once()
-                    .unwrap()
-                    .into_bytes()
-                    .into();
-                let on_event_setup_id = PluginID::new(&on_event_setup);
-                let on_event = OnEventTemplate {
-                    event2pkgid: &event2pkgid,
-                }
+            let events = event2pkgid.keys();
+            let on_event_setup = OnEventSetupTemplate { events }
                 .render_once()
                 .unwrap()
                 .into_bytes()
                 .into();
-                let on_event_id = PluginID::new(&on_event);
-                let files = HashMap::from([
-                    (
-                        PathBuf::from("lua/_rsplug/on_event.lua"),
-                        FileItem {
-                            source: Arc::new(FileSource::File { data: on_event }),
-                            merge_type: MergeType::Overwrite,
-                        },
-                    ),
-                    (
-                        PathBuf::from(format!("plugin/{}.lua", on_event_setup_id.as_str())),
-                        FileItem {
-                            source: Arc::new(FileSource::File {
-                                data: on_event_setup,
-                            }),
-                            merge_type: MergeType::Overwrite,
-                        },
-                    ),
-                ]);
+            let on_event_setup_id = PluginID::new(&on_event_setup);
+            let on_event = OnEventTemplate {
+                event2pkgid: &event2pkgid,
+            }
+            .render_once()
+            .unwrap()
+            .into_bytes()
+            .into();
+            let on_event_id = PluginID::new(&on_event);
+            let files = HashMap::from([
+                (
+                    PathBuf::from("lua/_rsplug/on_event.lua"),
+                    FileItem {
+                        source: Arc::new(FileSource::File { data: on_event }),
+                        merge_type: MergeType::Overwrite,
+                    },
+                ),
+                (
+                    PathBuf::from(format!("plugin/{}.lua", on_event_setup_id.as_str())),
+                    FileItem {
+                        source: Arc::new(FileSource::File {
+                            data: on_event_setup,
+                        }),
+                        merge_type: MergeType::Overwrite,
+                    },
+                ),
+            ]);
+            plugs.push({
                 LoadedPlugin {
                     id: on_event_setup_id + on_event_id,
                     lazy_type: LazyType::Start,
