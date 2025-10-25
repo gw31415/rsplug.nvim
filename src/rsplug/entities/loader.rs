@@ -13,10 +13,16 @@ use sailfish::TemplateSimple;
 use super::*;
 use crate::rsplug::util::hash;
 
+struct PkgId2ScriptsItem {
+    pkgid: PluginIDStr,
+    script: SetupScript,
+    start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
+}
+
 /// プラグインの読み込み制御や、ロード後の設定 (after_lua等) にまつわる情報を保持し、Package に変換するための構造体。
 #[derive(Default)]
 pub struct Loader {
-    pkgid2scripts: Vec<(PluginIDStr, SetupScript)>,
+    pkgid2scripts: Vec<PkgId2ScriptsItem>,
     event2pkgid: BTreeMap<Autocmd, Vec<PluginIDStr>>,
     cmd2pkgid: BTreeMap<UserCmd, Vec<PluginIDStr>>,
     ft2pkgid: BTreeMap<FileType, Vec<PluginIDStr>>,
@@ -61,9 +67,14 @@ impl From<Loader> for Vec<LoadedPlugin> {
 
         {
             // Add packages to place scripts that does the initial setup of the plugin
-            let pkgid2scripts = pkgid2scripts
-                .into_iter()
-                .filter_map(|(pkgid, script)| {
+            let (pkgid2scripts, start_plugins_script) = pkgid2scripts.into_iter().fold(
+                (Vec::new(), BTreeMap::new()),
+                |(mut scripts_lazy, mut scripts_start),
+                 PkgId2ScriptsItem {
+                     pkgid,
+                     script,
+                     start,
+                 }| {
                     let SetupScript {
                         lua_after,
                         lua_before,
@@ -71,25 +82,31 @@ impl From<Loader> for Vec<LoadedPlugin> {
                     let lua_after = lua_after.into_iter().map(|s| ("lua_after", s));
                     let lua_before = lua_before.into_iter().map(|s| ("lua_before", s));
                     let mut script_set: BTreeMap<&'static str, Vec<String>> = Default::default();
-                    for (script_type, content) in lua_after.chain(lua_before) {
-                        let module_id = format!(
-                            "{script_type}_{}",
-                            hash::digest_hex_string(content.as_bytes())
-                        );
-                        plugs.push(instant_startup_pkg(
-                            &format!("lua/{module_id}.lua"),
-                            content.into_bytes(),
-                        ));
-                        script_set.entry(script_type).or_default().push(module_id);
+                    {
+                        let script_set = if start {
+                            &mut scripts_start
+                        } else {
+                            &mut script_set
+                        };
+                        for (script_type, content) in lua_after.chain(lua_before) {
+                            let module_id = format!(
+                                "{script_type}_{}",
+                                hash::digest_hex_string(content.as_bytes())
+                            );
+                            plugs.push(instant_startup_pkg(
+                                &format!("lua/{module_id}.lua"),
+                                content.into_bytes(),
+                            ));
+                            script_set.entry(script_type).or_default().push(module_id);
+                        }
                     }
 
-                    if script_set.is_empty() {
-                        None
-                    } else {
-                        Some((pkgid, script_set))
+                    if !script_set.is_empty() {
+                        scripts_lazy.push((pkgid, script_set));
                     }
-                })
-                .collect();
+                    (scripts_lazy, scripts_start)
+                },
+            );
             plugs.push(instant_startup_pkg(
                 "lua/_rsplug/init.lua",
                 CustomPackaddTemplate { pkgid2scripts }
@@ -273,7 +290,7 @@ impl From<Loader> for Vec<LoadedPlugin> {
 impl AddAssign for Loader {
     fn add_assign(&mut self, other: Self) {
         let Self {
-            pkgid2scripts: scripts,
+            pkgid2scripts,
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
@@ -286,7 +303,7 @@ impl AddAssign for Loader {
                 .or_default()
                 .extend(ids.into_iter());
         }
-        self.pkgid2scripts.extend(scripts);
+        self.pkgid2scripts.extend(pkgid2scripts);
         for (cmd, ids) in cmd2pkgid {
             self.cmd2pkgid
                 .entry(cmd)
@@ -354,7 +371,14 @@ impl Loader {
     /// その他必要な情報のみ引数に取る。
     pub(super) fn create(id: PluginID, lazy_type: LazyType, script: SetupScript) -> Self {
         let LazyType::Opt(events) = lazy_type else {
-            return Default::default();
+            return Self {
+                pkgid2scripts: vec![PkgId2ScriptsItem {
+                    pkgid: id.as_str(),
+                    script,
+                    start: true,
+                }],
+                ..Default::default()
+            };
         };
         let mut event2pkgid: BTreeMap<Autocmd, Vec<_>> = BTreeMap::new();
         let mut cmd2pkgid: BTreeMap<UserCmd, Vec<_>> = BTreeMap::new();
@@ -363,8 +387,11 @@ impl Loader {
         let mut keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<_>>> =
             BTreeMap::new();
 
-        let id = Arc::new(id);
-        let pkgid2scripts = Vec::from([(id.as_str(), script)]);
+        let pkgid2scripts = vec![PkgId2ScriptsItem {
+            pkgid: id.as_str(),
+            script,
+            start: false,
+        }];
         for ev in events {
             use LoadEvent::*;
             match ev {
