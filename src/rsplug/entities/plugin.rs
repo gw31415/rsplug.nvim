@@ -87,7 +87,7 @@ impl Plugin {
                 let PluginConfig {
                     cache,
                     lazy_type,
-                    depends: _,
+                    with: _,
                     custom_name: _,
                     script,
                     merge,

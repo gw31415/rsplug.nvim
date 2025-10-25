@@ -118,7 +118,7 @@ pub(super) struct PluginConfig {
     pub lazy_type: LazyType,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
-    pub depends: Vec<String>,
+    pub with: Vec<String>,
     #[serde(rename = "name")]
     pub custom_name: Option<String>,
     #[serde(flatten)]
@@ -138,7 +138,7 @@ impl DagNode for PluginConfig {
         )
     }
     fn depends(&self) -> impl IntoIterator<Item = &impl AsRef<str>> {
-        &self.depends
+        &self.with
     }
 }
 
