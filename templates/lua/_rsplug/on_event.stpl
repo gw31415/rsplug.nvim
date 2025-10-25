@@ -11,11 +11,12 @@ return {
 				buffer = ctx.buf,
 				modeline = false,
 				data = ctx.data,
+				pattern = ctx.event == 'User' and ctx.match or nil,
 			}, opts))
 		end
 
 		local old_autocmds = vim.api.nvim_get_autocmds { event = ctx.event }
-		for _, pkg in pairs(event2pkgid[ctx.event] or {}) do
+		for _, pkg in pairs(event2pkgid[ctx.event] or event2pkgid[ctx.match]) do
 			require '_rsplug'.packadd(pkg)
 		end
 		local autocmds = vim.api.nvim_get_autocmds { event = ctx.event }
