@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, btree_map::Keys},
+    fmt::Display,
     iter::Sum,
     ops::AddAssign,
     path::PathBuf,
@@ -8,7 +9,7 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use sailfish::TemplateSimple;
+use sailfish::{TemplateSimple, runtime::Render};
 
 use super::*;
 use crate::rsplug::util::hash;
@@ -17,6 +18,34 @@ struct PkgId2ScriptsItem {
     pkgid: PluginIDStr,
     script: SetupScript,
     start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
+}
+
+#[derive(Hash, Eq, PartialEq, PartialOrd, Ord)]
+enum AfterOrBefore {
+    After,
+    Before,
+}
+
+impl AfterOrBefore {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AfterOrBefore::After => "lua_after",
+            AfterOrBefore::Before => "lua_before",
+        }
+    }
+}
+
+impl Display for AfterOrBefore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Render for AfterOrBefore {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        b.push_str(self.as_str());
+        Ok(())
+    }
 }
 
 /// プラグインの読み込み制御や、ロード後の設定 (after_lua等) にまつわる情報を保持し、Package に変換するための構造体。
@@ -79,9 +108,9 @@ impl From<Loader> for Vec<LoadedPlugin> {
                         lua_after,
                         lua_before,
                     } = script;
-                    let lua_after = lua_after.into_iter().map(|s| ("lua_after", s));
-                    let lua_before = lua_before.into_iter().map(|s| ("lua_before", s));
-                    let mut script_set: BTreeMap<&'static str, Vec<String>> = Default::default();
+                    let lua_after = lua_after.into_iter().map(|s| (AfterOrBefore::After, s));
+                    let lua_before = lua_before.into_iter().map(|s| (AfterOrBefore::Before, s));
+                    let mut script_set: BTreeMap<AfterOrBefore, Vec<String>> = Default::default();
                     {
                         let script_set = if start {
                             &mut scripts_start
@@ -446,7 +475,7 @@ struct FtpluginTemplate {
 #[template(path = "lua/_rsplug/init.stpl")]
 #[template(escape = false)]
 struct CustomPackaddTemplate {
-    pkgid2scripts: Vec<(PluginIDStr, BTreeMap<&'static str, Vec<String>>)>,
+    pkgid2scripts: Vec<(PluginIDStr, BTreeMap<AfterOrBefore, Vec<String>>)>,
 }
 
 #[derive(TemplateSimple)]
