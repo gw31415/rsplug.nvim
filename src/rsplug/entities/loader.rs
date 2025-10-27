@@ -96,7 +96,7 @@ impl From<Loader> for Vec<LoadedPlugin> {
 
         {
             // Add packages to place scripts that does the initial setup of the plugin
-            let (pkgid2scripts, start_plugins_script) = pkgid2scripts.into_iter().fold(
+            let (pkgid2scripts, startplugins_setupscripts) = pkgid2scripts.into_iter().fold(
                 (Vec::new(), BTreeMap::new()),
                 |(mut scripts_lazy, mut scripts_start),
                  PkgId2ScriptsItem {
