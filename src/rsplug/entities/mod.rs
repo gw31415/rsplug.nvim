@@ -3,9 +3,10 @@ pub mod error;
 pub mod lazy_type;
 pub mod merge_type;
 pub mod packpathstate;
-pub mod plugctl;
 pub mod plugin;
 pub mod plugin_id;
+
+mod plugctl;
 
 use super::util;
 

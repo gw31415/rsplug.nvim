@@ -204,6 +204,7 @@ enum DirectoryExtractionType {
 pub struct PackPathState {
     installing: HashSet<Box<[u8]>>,
     files: HashMap<PluginIDStr, Files>,
+    ctl: PlugCtl,
 }
 
 impl PackPathState {
@@ -215,7 +216,7 @@ impl PackPathState {
         Default::default()
     }
     /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な PlugCtl を返す。
-    pub fn insert(&mut self, loaded_plugin: LoadedPlugin) -> PlugCtl {
+    pub fn insert(&mut self, loaded_plugin: LoadedPlugin) {
         let LoadedPlugin {
             id,
             lazy_type,
@@ -256,16 +257,30 @@ impl PackPathState {
             }
         }
 
-        PlugCtl::create(id, lazy_type, script)
+        self.ctl += PlugCtl::create(id, lazy_type, script);
     }
 
     /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
     /// NOTE: インストール後のディレクトリ構成は以下のようになる。
     /// {packpath}/pack/_gen/{start_or_opt}/{id}/
-    pub async fn install(self, packpath: &Path) -> io::Result<()> {
+    pub async fn install(mut self, packpath: &Path) -> io::Result<()> {
+        {
+            // Load PlugCtl
+            let plugins: Vec<LoadedPlugin> = { std::mem::take(&mut self.ctl).into() };
+            let mut plugins: BinaryHeap<_> = plugins.into_iter().collect();
+            LoadedPlugin::merge(&mut plugins);
+
+            for plugin in plugins {
+                self.insert(plugin);
+            }
+        }
         let gen_root = packpath.join("pack").join("_gen");
         tokio::fs::create_dir_all(&gen_root).await?;
-        let Self { installing, files } = self;
+        let Self {
+            installing,
+            files,
+            ctl: _,
+        } = self;
         let mut tasks = JoinSet::new();
 
         for (

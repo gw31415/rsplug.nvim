@@ -96,18 +96,9 @@ async fn app() -> Result<(), Error> {
 
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
-    let mut plugctl = rsplug::PlugCtl::new();
     rsplug::LoadedPlugin::merge(&mut plugins);
-    while let Some(loaded_plugin) = plugins.pop() {
-        // Merging more by accumulating PlugCtl until all the rest of the LoadedPlugins are Start
-        if loaded_plugin.lazy_type.is_start() && !plugctl.is_empty() {
-            plugins.push(loaded_plugin);
-            plugins.extend(Into::<Vec<_>>::into(std::mem::take(&mut plugctl)));
-            rsplug::LoadedPlugin::merge(&mut plugins);
-            continue;
-        }
-
-        plugctl += state.insert(loaded_plugin);
+    for plugin in plugins {
+        state.insert(plugin);
     }
     msg(Message::MergeFinished {
         total: total_count,

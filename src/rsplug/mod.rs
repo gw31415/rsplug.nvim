@@ -7,6 +7,5 @@ pub use entities::plugin;
 
 pub use entities::config::Config;
 pub use entities::error::Error;
-pub use entities::plugctl::PlugCtl;
 pub use packpathstate::{LoadedPlugin, PackPathState};
 pub use plugin::Plugin;
