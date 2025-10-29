@@ -22,7 +22,7 @@ pub(super) enum HowToPlaceFiles {
 }
 
 /// インストール単位となるプラグイン。
-/// NOTE: 遅延実行されるプラグイン等は、インストール後に Loader が生成される。Loaderはまとめて
+/// NOTE: 遅延実行されるプラグイン等は、インストール後に PlugCtl が生成される。PlugCtlはまとめて
 /// PluginLoadedに変換する。
 pub struct LoadedPlugin {
     /// ID
@@ -214,8 +214,8 @@ impl PackPathState {
     pub fn new() -> Self {
         Default::default()
     }
-    /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な Loader を返す。
-    pub fn insert(&mut self, loaded_plugin: LoadedPlugin) -> Loader {
+    /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な PlugCtl を返す。
+    pub fn insert(&mut self, loaded_plugin: LoadedPlugin) -> PlugCtl {
         let LoadedPlugin {
             id,
             lazy_type,
@@ -256,7 +256,7 @@ impl PackPathState {
             }
         }
 
-        Loader::create(id, lazy_type, script)
+        PlugCtl::create(id, lazy_type, script)
     }
 
     /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。

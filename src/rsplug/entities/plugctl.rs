@@ -48,9 +48,9 @@ impl Render for AfterOrBefore {
     }
 }
 
-/// プラグインの読み込み制御や、ロード後の設定 (after_lua等) にまつわる情報を保持し、Package に変換するための構造体。
+/// プラグインの読み込み制御・▹ロード後の設定 (after_lua等)を行う構造体
 #[derive(Default)]
-pub struct Loader {
+pub struct PlugCtl {
     pkgid2scripts: Vec<PkgId2ScriptsItem>,
     event2pkgid: BTreeMap<Autocmd, Vec<PluginIDStr>>,
     cmd2pkgid: BTreeMap<UserCmd, Vec<PluginIDStr>>,
@@ -78,12 +78,12 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Loade
     }
 }
 
-impl From<Loader> for Vec<LoadedPlugin> {
-    fn from(value: Loader) -> Vec<LoadedPlugin> {
+impl From<PlugCtl> for Vec<LoadedPlugin> {
+    fn from(value: PlugCtl) -> Vec<LoadedPlugin> {
         if value.is_empty() {
             return Vec::with_capacity(0);
         }
-        let Loader {
+        let PlugCtl {
             pkgid2scripts,
             event2pkgid,
             cmd2pkgid,
@@ -316,7 +316,7 @@ impl From<Loader> for Vec<LoadedPlugin> {
     }
 }
 
-impl AddAssign for Loader {
+impl AddAssign for PlugCtl {
     fn add_assign(&mut self, other: Self) {
         let Self {
             pkgid2scripts,
@@ -361,9 +361,9 @@ impl AddAssign for Loader {
     }
 }
 
-impl Sum for Loader {
+impl Sum for PlugCtl {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        let mut res = Loader::new();
+        let mut res = PlugCtl::new();
         for l in iter {
             res += l
         }
@@ -371,12 +371,12 @@ impl Sum for Loader {
     }
 }
 
-impl Loader {
-    /// Create empty loader
+impl PlugCtl {
+    /// Create empty
     pub fn new() -> Self {
         Default::default()
     }
-    /// Loaderが空かどうか
+    /// PlugCtlが空かどうか
     pub fn is_empty(&self) -> bool {
         let Self {
             pkgid2scripts: scripts,
@@ -394,7 +394,7 @@ impl Loader {
             && keypattern2pkgid.values().all(|v| v.is_empty())
     }
 
-    /// パッケージ情報を読み込み、 Loader を作成する。
+    /// パッケージ情報を読み込み、 PlugCtl を作成する。
     /// 読み込む情報が要らない場合は `None` を返す。
     /// NOTE: Package はインストールされる必要があるため、変更を抑制する意図で PackageID の所有権を奪う。
     /// その他必要な情報のみ引数に取る。
