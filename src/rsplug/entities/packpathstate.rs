@@ -266,10 +266,12 @@ impl PackPathState {
     pub async fn install(mut self, packpath: &Path) -> io::Result<()> {
         {
             // Load PlugCtl
-            let plugins: Vec<LoadedPlugin> = { std::mem::take(&mut self.ctl).into() };
-            let mut plugins: BinaryHeap<_> = plugins.into_iter().collect();
-            LoadedPlugin::merge(&mut plugins);
-
+            let plugins = {
+                let plugins: Vec<LoadedPlugin> = std::mem::take(&mut self.ctl).into();
+                let mut plugins: BinaryHeap<_> = plugins.into();
+                LoadedPlugin::merge(&mut plugins);
+                plugins
+            };
             for plugin in plugins {
                 self.insert(plugin);
             }
