@@ -224,20 +224,22 @@ impl PackPathState {
             script,
         } = loaded_plugin;
 
-        let already_installed = !self.installing.insert(id.as_str().into());
+        let id_str = id.as_str();
+        let already_installed = !self.installing.insert(id_str.clone().into());
         if already_installed {
             return Default::default();
         }
+        let start_or_opt = if lazy_type.is_start() { "start" } else { "opt" };
 
-        let pkg_type_str = if lazy_type.is_start() { "start" } else { "opt" };
+        self.ctl += PlugCtl::create(id, lazy_type, script);
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
                 for (path, item) in files {
                     let Files {
                         start_or_opt: _,
                         dir_type: DirectoryExtractionType::Files(tree),
-                    } = self.files.entry(id.as_str()).or_insert(Files {
-                        start_or_opt: pkg_type_str,
+                    } = self.files.entry(id_str.clone()).or_insert(Files {
+                        start_or_opt,
                         dir_type: DirectoryExtractionType::Files(Vec::new()),
                     })
                     else {
@@ -248,16 +250,14 @@ impl PackPathState {
             }
             HowToPlaceFiles::SymlinkDirectory(dir) => {
                 self.files.insert(
-                    id.as_str(),
+                    id_str.clone(),
                     Files {
-                        start_or_opt: pkg_type_str,
+                        start_or_opt,
                         dir_type: DirectoryExtractionType::Symlink(dir),
                     },
                 );
             }
         }
-
-        self.ctl += PlugCtl::create(id, lazy_type, script);
     }
 
     /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
