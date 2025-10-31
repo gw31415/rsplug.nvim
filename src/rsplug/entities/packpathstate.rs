@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 use super::*;
 
 /// プラグインファイルの配置方法。
+#[derive(Debug)]
 pub(super) enum HowToPlaceFiles {
     CopyEachFile(HashMap<PathBuf, FileItem>),
     SymlinkDirectory(Arc<Path>),
@@ -24,6 +25,7 @@ pub(super) enum HowToPlaceFiles {
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に PlugCtl が生成される。PlugCtlはまとめて
 /// PluginLoadedに変換する。
+#[derive(Debug)]
 pub struct LoadedPlugin {
     /// ID
     pub(super) id: PluginID,
@@ -35,6 +37,7 @@ pub struct LoadedPlugin {
     pub(super) script: SetupScript,
 }
 
+#[derive(Debug)]
 pub(super) struct FileItem {
     pub source: Arc<FileSource>,
     pub merge_type: MergeType,

@@ -152,7 +152,7 @@ struct SetupScriptOne {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct SetupScript {
     /// プラグイン読み込み直後に実行される Lua スクリプト
     pub lua_after: BTreeSet<String>,
@@ -213,10 +213,10 @@ impl FromStr for FileSpecifier {
 }
 
 /// キーパターン
-#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct KeyPattern(pub BTreeMap<ModeChar, Vec<Arc<String>>>);
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct ModeChar(Option<char>);
 
 impl std::fmt::Display for ModeChar {

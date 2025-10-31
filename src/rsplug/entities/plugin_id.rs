@@ -62,7 +62,7 @@ impl std::fmt::Display for PluginIDStr {
 }
 
 /// パッケージID。ディレクトリ名として使用される。
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq, Debug)]
 pub struct PluginID(pub(super) BTreeSet<[u8; 16]>);
 
 impl Ord for PluginID {

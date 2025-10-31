@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub enum MergeType {
     /// 競合したらマージしない
     Conflict,
