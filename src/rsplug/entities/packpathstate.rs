@@ -321,21 +321,32 @@ impl PackPathState {
                     // NOTE: make helptags closure FnOnce forcely.
                     // Because multiple asynchronous starts do not work properly
                     let nvim = tokio::process::Command::new("nvim");
-                    move |dir: &Path| -> io::Result<()> {
+                    async move |dir: &Path| -> io::Result<()> {
                         if start_or_opt == "start" {
                             let mut nvim = nvim;
                             let help_dir = dir.join("doc/");
                             if help_dir.is_dir() {
+                                let cmd = format!("helptags {}", help_dir.to_string_lossy());
                                 nvim.arg("--headless")
                                     .arg("-u")
                                     .arg("NONE")
                                     .arg("-c")
                                     // TODO: escape help_dir properly
-                                    .arg(format!("helptags {}", help_dir.to_string_lossy()))
+                                    .arg(&cmd)
                                     .arg("-c")
                                     .arg("q")
-                                    .spawn()
-                                    .map(|_| ())?;
+                                    .status()
+                                    .await
+                                    .and_then(|code| {
+                                        if code.success() {
+                                            Ok(())
+                                        } else {
+                                            Err(io::Error::new(
+                                                io::ErrorKind::Other,
+                                                format!("Failed to run nvim command: {}", cmd),
+                                            ))
+                                        }
+                                    })?;
                             }
                         }
                         Ok(())
@@ -362,7 +373,7 @@ impl PackPathState {
                             while let Some(res) = copies.join_next().await {
                                 res??;
                             }
-                            helptags(dir.as_path())
+                            helptags(dir.as_path()).await
                         })
                         .await??;
                     }
@@ -371,7 +382,7 @@ impl PackPathState {
                             tokio::fs::remove_dir_all(&dir).await.ok();
                             tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
                             tokio::fs::symlink(sym, dir.as_path()).await?;
-                            helptags(dir.as_path())
+                            helptags(dir.as_path()).await
                         });
                     }
                 }
