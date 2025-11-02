@@ -35,6 +35,8 @@ pub struct LoadedPlugin {
     pub(super) files: HowToPlaceFiles,
     /// セットアップスクリプト
     pub(super) script: SetupScript,
+    /// PlugCtlを元に作成されたかどうか
+    pub(super) is_plugctl: bool,
 }
 
 #[derive(Debug)]
@@ -117,6 +119,7 @@ impl Add for LoadedPlugin {
                         lazy_type,
                         files: HowToPlaceFiles::CopyEachFile(mut files),
                         mut script,
+                        is_plugctl,
                     } = self
                     else {
                         unreachable!() // SAFETY: Because self.files is verified to be a CopyEachFile
@@ -126,6 +129,7 @@ impl Add for LoadedPlugin {
                         lazy_type: _,
                         files: HowToPlaceFiles::CopyEachFile(rfiles),
                         script: rscript,
+                        is_plugctl: r_is_plugctl,
                     } = rhs
                     else {
                         unreachable!() // SAFETY: Because rhs.files is verified to be a CopyEachFile
@@ -140,6 +144,7 @@ impl Add for LoadedPlugin {
                             lazy_type,
                             files: HowToPlaceFiles::CopyEachFile(files),
                             script,
+                            is_plugctl: is_plugctl || r_is_plugctl,
                         },
                         None,
                     );
@@ -154,6 +159,7 @@ impl Add for LoadedPlugin {
 }
 
 /// ファイルの取得(生成)元。
+#[derive(Debug)]
 pub(super) enum FileSource {
     Directory { path: Arc<Path> },
     File { data: Cow<'static, [u8]> },
@@ -223,8 +229,9 @@ impl PackPathState {
         let LoadedPlugin {
             id,
             lazy_type,
-            files,
+            mut files,
             script,
+            is_plugctl,
         } = loaded_plugin;
 
         let id_str = id.as_str();
@@ -234,7 +241,9 @@ impl PackPathState {
         }
         let start_or_opt = if lazy_type.is_start() { "start" } else { "opt" };
 
-        self.ctl += PlugCtl::create(id, lazy_type, script);
+        if !is_plugctl {
+            self.ctl += PlugCtl::create(id, lazy_type, script, &mut files);
+        }
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
                 for (path, item) in files {
@@ -308,26 +317,61 @@ impl PackPathState {
             if installed {
                 msg(Message::InstallSkipped(id));
             } else {
+                let helptags = {
+                    // NOTE: make helptags closure FnOnce forcely.
+                    // Because multiple asynchronous starts do not work properly
+                    let nvim = tokio::process::Command::new("nvim");
+                    move |dir: &Path| -> io::Result<()> {
+                        if start_or_opt == "start" {
+                            let mut nvim = nvim;
+                            let help_dir = dir.join("doc/");
+                            if help_dir.is_dir() {
+                                nvim.arg("--headless")
+                                    .arg("-u")
+                                    .arg("NONE")
+                                    .arg("-c")
+                                    // TODO: escape help_dir properly
+                                    .arg(format!("helptags {}", help_dir.to_string_lossy()))
+                                    .arg("-c")
+                                    .arg("q")
+                                    .spawn()
+                                    .map(|_| ())?;
+                            }
+                        }
+                        Ok(())
+                    }
+                };
                 match dir_type {
                     DirectoryExtractionType::Files(files) => {
                         tokio::fs::remove_file(dir.as_path()).await.ok();
                         let dir = Arc::new(dir);
-                        for (which, source) in files {
-                            let dir = dir.clone();
-                            let id = id.clone();
-                            tasks.spawn(async move {
-                                source.yank(&which, dir.as_path()).await?;
-                                msg(Message::InstallYank { id, which });
-                                Ok(())
-                            });
-                        }
+                        let copies = files
+                            .into_iter()
+                            .map(|(which, source)| {
+                                let dir = dir.clone();
+                                let id = id.clone();
+                                async move {
+                                    source.yank(&which, dir.as_path()).await?;
+                                    msg(Message::InstallYank { id, which });
+                                    Ok::<_, io::Error>(())
+                                }
+                            })
+                            .collect::<JoinSet<_>>();
+                        tokio::spawn(async move {
+                            let mut copies = copies;
+                            while let Some(res) = copies.join_next().await {
+                                res??;
+                            }
+                            helptags(dir.as_path())
+                        })
+                        .await??;
                     }
                     DirectoryExtractionType::Symlink(sym) => {
                         tasks.spawn(async move {
                             tokio::fs::remove_dir_all(&dir).await.ok();
                             tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
-                            tokio::fs::symlink(sym, dir).await?;
-                            Ok(())
+                            tokio::fs::symlink(sym, dir.as_path()).await?;
+                            helptags(dir.as_path())
                         });
                     }
                 }

@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::BTreeSet,
+    iter::Sum,
     ops::{Add, AddAssign, Deref},
     path::Path,
     sync::Arc,
@@ -104,6 +105,18 @@ impl Add for PluginID {
     fn add(mut self, rhs: Self) -> Self::Output {
         self += rhs;
         self
+    }
+}
+
+impl Sum for PluginID {
+    fn sum<I: Iterator<Item = Self>>(mut iter: I) -> Self {
+        let mut id0 = iter
+            .next()
+            .expect("PluginID's Sum Implementation requires at least one element");
+        for id in iter {
+            id0 += id;
+        }
+        id0
     }
 }
 

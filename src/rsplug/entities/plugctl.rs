@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, btree_map::Keys},
+    collections::{BTreeMap, BinaryHeap, btree_map::Keys},
     fmt::Display,
     iter::Sum,
     ops::AddAssign,
@@ -48,7 +48,7 @@ impl Render for AfterOrBefore {
     }
 }
 
-/// プラグインの読み込み制御・▹ロード後の設定 (after_lua等)を行う構造体
+/// プラグインの読み込み制御・ロード後の設定 (after_lua等)を行う構造体
 #[derive(Default)]
 pub struct PlugCtl {
     pkgid2scripts: Vec<PkgId2ScriptsItem>,
@@ -57,6 +57,7 @@ pub struct PlugCtl {
     ft2pkgid: BTreeMap<FileType, Vec<PluginIDStr>>,
     luam2pkgid: BTreeMap<LuaModule, Vec<PluginIDStr>>,
     keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
+    overwrite_files: (HashMap<PathBuf, FileItem>, BinaryHeap<PluginID>),
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -75,6 +76,7 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Loade
         lazy_type: LazyType::Start,
         files: HowToPlaceFiles::CopyEachFile(files),
         script: Default::default(),
+        is_plugctl: true,
     }
 }
 
@@ -90,6 +92,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             ft2pkgid,
             luam2pkgid,
             keypattern2pkgid,
+            overwrite_files,
         } = value;
 
         let mut plugs = Vec::new();
@@ -205,6 +208,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
+                    is_plugctl: true,
                 }
             });
         }
@@ -248,6 +252,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
+                    is_plugctl: true,
                 }
             });
         }
@@ -285,6 +290,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
+                is_plugctl: true,
             });
         }
         if !keypattern2pkgid.is_empty() {
@@ -311,6 +317,17 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 ));
             }
         }
+        if !overwrite_files.0.is_empty() {
+            let (overwrite_files, ids) = overwrite_files;
+
+            plugs.push(LoadedPlugin {
+                id: ids.into_iter().sum(),
+                lazy_type: LazyType::Start,
+                files: HowToPlaceFiles::CopyEachFile(overwrite_files),
+                script: Default::default(),
+                is_plugctl: true,
+            });
+        }
 
         plugs
     }
@@ -325,6 +342,7 @@ impl AddAssign for PlugCtl {
             ft2pkgid,
             luam2pkgid,
             keypattern2pkgid,
+            overwrite_files,
         } = other;
         for (event, ids) in event2pkgid {
             self.event2pkgid
@@ -358,6 +376,8 @@ impl AddAssign for PlugCtl {
                     .extend(ids.into_iter());
             }
         }
+        self.overwrite_files.0.extend(overwrite_files.0);
+        self.overwrite_files.1.extend(overwrite_files.1);
     }
 }
 
@@ -385,6 +405,7 @@ impl PlugCtl {
             ft2pkgid,
             luam2pkgid,
             keypattern2pkgid,
+            overwrite_files,
         } = self;
         event2pkgid.is_empty()
             && scripts.is_empty()
@@ -392,13 +413,39 @@ impl PlugCtl {
             && ft2pkgid.is_empty()
             && luam2pkgid.is_empty()
             && keypattern2pkgid.values().all(|v| v.is_empty())
+            && overwrite_files.0.is_empty()
     }
 
     /// パッケージ情報を読み込み、 PlugCtl を作成する。
     /// 読み込む情報が要らない場合は `None` を返す。
     /// NOTE: Package はインストールされる必要があるため、変更を抑制する意図で PackageID の所有権を奪う。
     /// その他必要な情報のみ引数に取る。
-    pub(super) fn create(id: PluginID, lazy_type: LazyType, script: SetupScript) -> Self {
+    pub(super) fn create(
+        id: PluginID,
+        lazy_type: LazyType,
+        script: SetupScript,
+        files: &mut HowToPlaceFiles,
+    ) -> Self {
+        // Steal `doc/**` files
+        let mut overwrite_files = move |id: PluginID| {
+            (
+                match files {
+                    HowToPlaceFiles::CopyEachFile(map) => map
+                        .extract_if(|path, file| {
+                            if path.starts_with("doc/") {
+                                file.merge_type = MergeType::Overwrite;
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .collect(),
+                    HowToPlaceFiles::SymlinkDirectory(_) => HashMap::new(), // TODO: Copy doc files from symlinked directory
+                },
+                [id].into(),
+            )
+        };
+
         let LazyType::Opt(events) = lazy_type else {
             return Self {
                 pkgid2scripts: vec![PkgId2ScriptsItem {
@@ -406,6 +453,7 @@ impl PlugCtl {
                     script,
                     start: true,
                 }],
+                overwrite_files: overwrite_files(id),
                 ..Default::default()
             };
         };
@@ -459,6 +507,7 @@ impl PlugCtl {
             ft2pkgid,
             luam2pkgid,
             keypattern2pkgid,
+            overwrite_files: overwrite_files(id),
         }
     }
 }

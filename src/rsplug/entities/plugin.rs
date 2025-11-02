@@ -274,6 +274,7 @@ impl Plugin {
                     files,
                     lazy_type,
                     script: script.clone(),
+                    is_plugctl: false,
                 }
             }
         };
