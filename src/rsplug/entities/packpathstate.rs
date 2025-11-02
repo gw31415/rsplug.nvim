@@ -327,6 +327,7 @@ impl PackPathState {
                             let help_dir = dir.join("doc/");
                             if help_dir.is_dir() {
                                 let cmd = format!("helptags {}", help_dir.to_string_lossy());
+                                msg(Message::InstallHelp { help_dir });
                                 nvim.arg("--headless")
                                     .arg("-u")
                                     .arg("NONE")
@@ -341,10 +342,10 @@ impl PackPathState {
                                         if code.success() {
                                             Ok(())
                                         } else {
-                                            Err(io::Error::new(
-                                                io::ErrorKind::Other,
-                                                format!("Failed to run nvim command: {}", cmd),
-                                            ))
+                                            Err(io::Error::other(format!(
+                                                "Failed to run nvim command: {}",
+                                                cmd
+                                            )))
                                         }
                                     })?;
                             }

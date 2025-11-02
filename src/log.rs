@@ -39,6 +39,9 @@ pub enum Message {
         id: Arc<str>,
         which: PathBuf,
     },
+    InstallHelp {
+        help_dir: PathBuf,
+    },
     InstallDone,
     Error(Box<dyn std::error::Error + 'static + Send + Sync>),
 }
@@ -208,6 +211,16 @@ fn init() -> Logger {
                         style(id).italic().dim(),
                         file.to_string_lossy()
                     ));
+                }
+                Message::InstallHelp { help_dir } => {
+                    let pb = pb_installyank.get_or_insert_with(|| {
+                        multipb_installing.add(
+                            ProgressBar::no_length()
+                                .with_style(pb_style.clone())
+                                .with_prefix(":helptags"),
+                        )
+                    });
+                    pb.set_message(help_dir.to_string_lossy().into_owned());
                 }
                 Message::InstallDone => {
                     if let Some(pb) = pb_installskipped.take() {
