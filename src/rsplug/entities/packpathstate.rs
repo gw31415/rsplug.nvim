@@ -16,6 +16,8 @@ use tokio::task::JoinSet;
 use super::*;
 
 /// プラグインファイルの配置方法。
+// TODO: HowToPlaceFilesをenum { Root, Tree(HashMap<PathBuf, FileItem>) }にする。SymlinkDirectoryはFileItemに含める
+// その方がマージもでき、SymlinkなPluginのdocにも対応できるため。
 #[derive(Debug)]
 pub(super) enum HowToPlaceFiles {
     CopyEachFile(HashMap<PathBuf, FileItem>),
