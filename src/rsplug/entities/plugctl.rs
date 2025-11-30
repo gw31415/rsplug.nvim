@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BinaryHeap, btree_map::Keys},
+    collections::{BTreeMap, btree_map::Keys},
     fmt::Display,
     iter::Sum,
     ops::AddAssign,
@@ -57,7 +57,7 @@ pub struct PlugCtl {
     ft2pkgid: BTreeMap<FileType, Vec<PluginIDStr>>,
     luam2pkgid: BTreeMap<LuaModule, Vec<PluginIDStr>>,
     keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
-    overwrite_files: (HashMap<PathBuf, FileItem>, BinaryHeap<PluginID>),
+    overwrite_files: BTreeMap<PluginID, HowToPlaceFiles>,
 }
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
@@ -317,16 +317,32 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 ));
             }
         }
-        if !overwrite_files.0.is_empty() {
-            let (overwrite_files, ids) = overwrite_files;
 
-            plugs.push(LoadedPlugin {
-                id: ids.into_iter().sum(),
-                lazy_type: LazyType::Start,
-                files: HowToPlaceFiles::CopyEachFile(overwrite_files),
-                script: Default::default(),
-                is_plugctl: true,
-            });
+        // Processing overwrite_files
+        {
+            let mut overwrite_copies_id: PluginID = PluginID::new(b"doc");
+            let mut overwrite_copies = HashMap::new();
+            for (id, files) in overwrite_files {
+                match files {
+                    HowToPlaceFiles::CopyEachFile(files) => {
+                        // If CopyEachFile then merge
+                        overwrite_copies_id += id;
+                        overwrite_copies.extend(files);
+                    }
+                    HowToPlaceFiles::SymlinkDirectory(_) => {
+                        panic!("SymlinkDirectory is not supported for overwrite_files in PlugCtl");
+                    }
+                }
+            }
+            if !overwrite_copies.is_empty() {
+                plugs.push(LoadedPlugin {
+                    id: overwrite_copies_id,
+                    lazy_type: LazyType::Start,
+                    files: HowToPlaceFiles::CopyEachFile(overwrite_copies),
+                    script: Default::default(),
+                    is_plugctl: true,
+                });
+            }
         }
 
         plugs
@@ -376,8 +392,7 @@ impl AddAssign for PlugCtl {
                     .extend(ids.into_iter());
             }
         }
-        self.overwrite_files.0.extend(overwrite_files.0);
-        self.overwrite_files.1.extend(overwrite_files.1);
+        self.overwrite_files.extend(overwrite_files);
     }
 }
 
@@ -413,7 +428,7 @@ impl PlugCtl {
             && ft2pkgid.is_empty()
             && luam2pkgid.is_empty()
             && keypattern2pkgid.values().all(|v| v.is_empty())
-            && overwrite_files.0.is_empty()
+            && overwrite_files.is_empty()
     }
 
     /// パッケージ情報を読み込み、 PlugCtl を作成する。
@@ -428,10 +443,11 @@ impl PlugCtl {
     ) -> Self {
         // Steal `doc/**` files
         let mut overwrite_files = move |id: PluginID| {
-            (
+            [(
+                id,
                 match files {
-                    HowToPlaceFiles::CopyEachFile(map) => map
-                        .extract_if(|path, file| {
+                    HowToPlaceFiles::CopyEachFile(map) => HowToPlaceFiles::CopyEachFile(
+                        map.extract_if(|path, file| {
                             if path.starts_with("doc/") {
                                 file.merge_type = MergeType::Overwrite;
                                 true
@@ -440,10 +456,15 @@ impl PlugCtl {
                             }
                         })
                         .collect(),
-                    HowToPlaceFiles::SymlinkDirectory(_) => HashMap::new(), // TODO: Copy doc files from symlinked directory
+                    ),
+                    HowToPlaceFiles::SymlinkDirectory(_path) => {
+                        // TODO: Copy doc files from symlinked directory
+                        // Copy each _path.join("doc/*") file/dirs
+                        HowToPlaceFiles::CopyEachFile(HashMap::new())
+                    }
                 },
-                [id].into(),
-            )
+            )]
+            .into()
         };
 
         let LazyType::Opt(events) = lazy_type else {

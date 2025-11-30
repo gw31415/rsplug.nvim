@@ -22,6 +22,12 @@ pub(super) enum HowToPlaceFiles {
     SymlinkDirectory(Arc<Path>),
 }
 
+impl Default for HowToPlaceFiles {
+    fn default() -> Self {
+        HowToPlaceFiles::CopyEachFile(HashMap::new())
+    }
+}
+
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に PlugCtl が生成される。PlugCtlはまとめて
 /// PluginLoadedに変換する。
