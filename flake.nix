@@ -50,9 +50,8 @@
               OPENSSL_DIR = "${pkgs.openssl.dev}";
               OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
             });
-        apps.default = {
-          type = "app";
-          program = "${self.packages.${system}.default}/bin/rsplug";
+        apps.default = flake-utils.lib.mkApp {
+          drv = self.packages.${system}.default;
         };
       }
     );
