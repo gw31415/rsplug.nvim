@@ -134,8 +134,9 @@ fn init() -> Logger {
                     let pb = pb_caching
                         .entry(CACHE_FETCH_PROGRESS_ID.into())
                         .or_insert_with(|| {
-                            multipb_caching
-                                .add(ProgressBar::new(0).with_style(pb_style_bar.clone()))
+                            let pb = ProgressBar::new(0).with_style(pb_style_bar.clone());
+                            pb.enable_steady_tick(Duration::from_millis(100));
+                            multipb_caching.add(pb)
                         });
                     let entry = cachefetching_oids.entry(id);
                     if let Entry::Vacant(_) = entry {
@@ -147,9 +148,10 @@ fn init() -> Logger {
                     pb.inc(increment as u64);
                 }
                 Message::CacheBuildProgress { id, stdtype, line } => {
-                    let pb = ProgressBar::no_length()
-                        .with_style(pb_style_spinner.clone())
-                        .with_prefix({
+                    let pb = {
+                        let pb = ProgressBar::new_spinner().with_style(pb_style_spinner.clone());
+                        pb.enable_steady_tick(Duration::from_millis(100));
+                        pb.with_prefix({
                             let mut prefix = format!("Building [{id}]");
                             // Manual width alignment so that the style template does not need to be changed.
                             const MAX_PREFIX_WIDTH: usize = 30;
@@ -157,7 +159,8 @@ fn init() -> Logger {
                                 &" ".repeat(MAX_PREFIX_WIDTH.saturating_sub(prefix.width())),
                             );
                             prefix
-                        });
+                        })
+                    };
                     let pb = pb_caching
                         .entry({
                             let mut id = id;
