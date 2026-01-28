@@ -304,35 +304,6 @@ impl PackPathState {
             ctl: _,
         } = self;
         let mut tasks = JoinSet::new();
-        let helptags_sem = Arc::new(tokio::sync::Semaphore::new(1));
-
-        async fn helptags_for(start_or_opt: &'static str, dir: &Path) -> io::Result<()> {
-            if start_or_opt == "start" {
-                let help_dir = dir.join("doc/");
-                if help_dir.is_dir() {
-                    let cmd = format!("helptags {}", help_dir.to_string_lossy());
-                    msg(Message::InstallHelp { help_dir });
-                    let status = tokio::process::Command::new("nvim")
-                        .arg("--headless")
-                        .arg("-u")
-                        .arg("NONE")
-                        .arg("-c")
-                        // TODO: escape help_dir properly
-                        .arg(&cmd)
-                        .arg("-c")
-                        .arg("q")
-                        .status()
-                        .await?;
-                    if !status.success() {
-                        return Err(io::Error::other(format!(
-                            "Failed to run nvim command: {}",
-                            cmd
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        }
 
         for (
             id,
@@ -354,41 +325,73 @@ impl PackPathState {
             if installed {
                 msg(Message::InstallSkipped(id));
             } else {
+                let helptags = {
+                    // NOTE: make helptags closure FnOnce forcely.
+                    // Because multiple asynchronous starts do not work properly
+                    let nvim = tokio::process::Command::new("nvim");
+                    async move |dir: &Path| -> io::Result<()> {
+                        if start_or_opt == "start" {
+                            let mut nvim = nvim;
+                            let help_dir = dir.join("doc/");
+                            if help_dir.is_dir() {
+                                let cmd = format!("helptags {}", help_dir.to_string_lossy());
+                                msg(Message::InstallHelp { help_dir });
+                                nvim.arg("--headless")
+                                    .arg("-u")
+                                    .arg("NONE")
+                                    .arg("-c")
+                                    // TODO: escape help_dir properly
+                                    .arg(&cmd)
+                                    .arg("-c")
+                                    .arg("q")
+                                    .status()
+                                    .await
+                                    .and_then(|code| {
+                                        if code.success() {
+                                            Ok(())
+                                        } else {
+                                            Err(io::Error::other(format!(
+                                                "Failed to run nvim command: {}",
+                                                cmd
+                                            )))
+                                        }
+                                    })?;
+                            }
+                        }
+                        Ok(())
+                    }
+                };
                 match dir_type {
                     DirectoryExtractionType::Files(files) => {
+                        tokio::fs::remove_file(dir.as_path()).await.ok();
                         let dir = Arc::new(dir);
-                        let id = id.clone();
-                        let helptags_sem = helptags_sem.clone();
-                        tasks.spawn(async move {
-                            tokio::fs::remove_file(dir.as_path()).await.ok();
-                            let copies = files
-                                .into_iter()
-                                .map(|(which, source)| {
-                                    let dir = dir.clone();
-                                    let id = id.clone();
-                                    async move {
-                                        source.yank(&which, dir.as_path()).await?;
-                                        msg(Message::InstallYank { id, which });
-                                        Ok::<_, io::Error>(())
-                                    }
-                                })
-                                .collect::<JoinSet<_>>();
+                        let copies = files
+                            .into_iter()
+                            .map(|(which, source)| {
+                                let dir = dir.clone();
+                                let id = id.clone();
+                                async move {
+                                    source.yank(&which, dir.as_path()).await?;
+                                    msg(Message::InstallYank { id, which });
+                                    Ok::<_, io::Error>(())
+                                }
+                            })
+                            .collect::<JoinSet<_>>();
+                        tokio::spawn(async move {
                             let mut copies = copies;
                             while let Some(res) = copies.join_next().await {
                                 res??;
                             }
-                            let _permit = helptags_sem.acquire().await.unwrap();
-                            helptags_for(start_or_opt, dir.as_path()).await
-                        });
+                            helptags(dir.as_path()).await
+                        })
+                        .await??;
                     }
                     DirectoryExtractionType::Symlink(sym) => {
-                        let helptags_sem = helptags_sem.clone();
                         tasks.spawn(async move {
                             tokio::fs::remove_dir_all(&dir).await.ok();
                             tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
                             tokio::fs::symlink(sym, dir.as_path()).await?;
-                            let _permit = helptags_sem.acquire().await.unwrap();
-                            helptags_for(start_or_opt, dir.as_path()).await
+                            helptags(dir.as_path()).await
                         });
                     }
                 }
