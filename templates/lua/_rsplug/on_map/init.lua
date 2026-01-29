@@ -41,6 +41,8 @@ local pattern_ids = {}
 -- Track which patterns are associated with each plugin ID
 -- id_patterns[id] = { pattern1, pattern2, ... }
 local id_patterns = {}
+-- Track which plugin IDs have been loaded
+local loaded_plugins = {}
 
 return {
 	---@param mode string
@@ -50,6 +52,19 @@ return {
 				setup_done[mode_char] = true
 				local exists, mod = pcall(require, '_rsplug/on_map/mode_' .. mode_char)
 				for pattern, ids in pairs(exists and mod or {}) do
+					-- Check if all plugins for this pattern are already loaded
+					local all_loaded = true
+					for _, id in ipairs(ids) do
+						if not loaded_plugins[id] then
+							all_loaded = false
+							break
+						end
+					end
+					-- Skip setup if plugin is already loaded (real mappings exist)
+					if all_loaded then
+						goto continue
+					end
+
 					-- Track that this pattern is set up in this mode
 					if not pattern_modes[pattern] then
 						pattern_modes[pattern] = {}
@@ -88,6 +103,26 @@ return {
 						-- Get all plugin IDs for this pattern
 						local all_ids = pattern_ids[pattern] or ids
 
+						-- Check if all plugins are already loaded
+						local all_already_loaded = true
+						for _, id in ipairs(all_ids) do
+							if not loaded_plugins[id] then
+								all_already_loaded = false
+								break
+							end
+						end
+
+						-- If plugin is already loaded, delete only this mapping and feed keys
+						if all_already_loaded then
+							pcall(vim.keymap.del, mode_char, pattern, {})
+							vim.api.nvim_feedkeys(
+								vim.api.nvim_replace_termcodes(pattern, true, false, true),
+								'imt',
+								true
+							)
+							return ''
+						end
+
 						-- Collect all patterns that need to be deleted
 						-- (all patterns associated with the plugins being loaded)
 						local patterns_to_delete = {}
@@ -112,6 +147,8 @@ return {
 						-- Load all plugins that registered this pattern
 						for _, id in ipairs(all_ids) do
 							require '_rsplug'.packadd(id)
+							-- Mark plugin as loaded
+							loaded_plugins[id] = true
 							-- Clear tracking for this plugin ID
 							id_patterns[id] = nil
 						end
@@ -123,6 +160,8 @@ return {
 						)
 						return ''
 					end, { expr = true, silent = true })
+
+					::continue::
 				end
 			end
 		end
