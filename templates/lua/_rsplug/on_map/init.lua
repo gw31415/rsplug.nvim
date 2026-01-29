@@ -32,6 +32,23 @@ local function parse_mode(mode)
 end
 
 local setup_done = {}
+local function add_unique(list, value)
+	for _, existing in ipairs(list) do
+		if existing == value then
+			return
+		end
+	end
+	table.insert(list, value)
+end
+
+local function all_loaded(ids)
+	for _, id in ipairs(ids) do
+		if not require '_rsplug'.loaded[id] then
+			return false
+		end
+	end
+	return true
+end
 -- Track which modes have which patterns set up
 -- pattern_modes[pattern] = { mode1, mode2, ... }
 local pattern_modes = {}
@@ -41,8 +58,6 @@ local pattern_ids = {}
 -- Track which patterns are associated with each plugin ID
 -- id_patterns[id] = { pattern1, pattern2, ... }
 local id_patterns = {}
--- Track which plugin IDs have been loaded
-local loaded_plugins = {}
 
 return {
 	---@param mode string
@@ -52,16 +67,8 @@ return {
 				setup_done[mode_char] = true
 				local exists, mod = pcall(require, '_rsplug/on_map/mode_' .. mode_char)
 				for pattern, ids in pairs(exists and mod or {}) do
-					-- Check if all plugins for this pattern are already loaded
-					local all_loaded = true
-					for _, id in ipairs(ids) do
-						if not loaded_plugins[id] then
-							all_loaded = false
-							break
-						end
-					end
 					-- Skip setup if plugin is already loaded (real mappings exist)
-					if all_loaded then
+					if all_loaded(ids) then
 						goto continue
 					end
 
@@ -73,47 +80,20 @@ return {
 					table.insert(pattern_modes[pattern], mode_char)
 					-- Collect all unique plugin IDs for this pattern
 					for _, id in ipairs(ids) do
-						local found = false
-						for _, existing_id in ipairs(pattern_ids[pattern]) do
-							if existing_id == id then
-								found = true
-								break
-							end
-						end
-						if not found then
-							table.insert(pattern_ids[pattern], id)
-						end
+						add_unique(pattern_ids[pattern], id)
 						-- Track reverse mapping: plugin ID to patterns
 						if not id_patterns[id] then
 							id_patterns[id] = {}
 						end
-						local pattern_found = false
-						for _, existing_pattern in ipairs(id_patterns[id]) do
-							if existing_pattern == pattern then
-								pattern_found = true
-								break
-							end
-						end
-						if not pattern_found then
-							table.insert(id_patterns[id], pattern)
-						end
+						add_unique(id_patterns[id], pattern)
 					end
 
 					vim.keymap.set(mode_char, pattern, function()
 						-- Get all plugin IDs for this pattern
 						local all_ids = pattern_ids[pattern] or ids
 
-						-- Check if all plugins are already loaded
-						local all_already_loaded = true
-						for _, id in ipairs(all_ids) do
-							if not loaded_plugins[id] then
-								all_already_loaded = false
-								break
-							end
-						end
-
 						-- If plugin is already loaded, delete only this mapping and feed keys
-						if all_already_loaded then
+						if all_loaded(all_ids) then
 							pcall(vim.keymap.del, mode_char, pattern, {})
 							vim.api.nvim_feedkeys(
 								vim.api.nvim_replace_termcodes(pattern, true, false, true),
@@ -147,8 +127,6 @@ return {
 						-- Load all plugins that registered this pattern
 						for _, id in ipairs(all_ids) do
 							require '_rsplug'.packadd(id)
-							-- Mark plugin as loaded
-							loaded_plugins[id] = true
 							-- Clear tracking for this plugin ID
 							id_patterns[id] = nil
 						end
@@ -165,5 +143,5 @@ return {
 				end
 			end
 		end
-	end,
+	end
 }
