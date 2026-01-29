@@ -391,7 +391,9 @@ impl PackPathState {
                             tokio::fs::remove_dir_all(&dir).await.ok();
                             tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
                             tokio::fs::symlink(sym, dir.as_path()).await?;
-                            helptags(dir.as_path()).await
+                            // Avoid mutating symlink source; helptags are generated
+                            // from PlugCtl's copied doc files instead.
+                            Ok(())
                         });
                     }
                 }
