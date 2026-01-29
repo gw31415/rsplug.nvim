@@ -67,9 +67,12 @@ pub mod git {
     //! 各種 Git 操作関連のユーティリティ
 
     use std::{
+        cell::Cell,
+        ops::Deref,
         path::{Path, PathBuf},
         str::FromStr,
         sync::{Arc, Mutex},
+        time::{Duration, Instant},
     };
 
     use git2::{
@@ -118,14 +121,33 @@ pub mod git {
                             &[rev.to_string()],
                             Some(&mut {
                                 let mut cbs = RemoteCallbacks::new();
-                                cbs.transfer_progress(|progress| {
+                                let last_reported = Cell::new(0usize);
+                                let last_tick = Cell::new(Instant::now());
+                                cbs.transfer_progress(move |progress| {
                                     let total_objs_count = progress.total_objects();
                                     let received_objs_count = progress.received_objects();
-                                    log::msg(Message::CacheFetchObjectsProgress {
-                                        id: rev.to_string(),
-                                        total_objs_count,
-                                        received_objs_count,
-                                    });
+                                    if received_objs_count == 0
+                                        || received_objs_count == last_reported.get()
+                                    {
+                                        return true;
+                                    }
+                                    let now = Instant::now();
+                                    let enough_increment = received_objs_count
+                                        .saturating_sub(last_reported.get())
+                                        >= 32;
+                                    let enough_time = now.duration_since(last_tick.get())
+                                        >= Duration::from_millis(120);
+                                    let is_done = received_objs_count >= total_objs_count
+                                        && total_objs_count != 0;
+                                    if enough_increment || enough_time || is_done {
+                                        last_reported.set(received_objs_count);
+                                        last_tick.set(now);
+                                        log::msg(Message::CacheFetchObjectsProgress {
+                                            id: rev.to_string(),
+                                            total_objs_count,
+                                            received_objs_count,
+                                        });
+                                    }
                                     true
                                 });
                                 let mut ops = FetchOptions::new();
@@ -205,8 +227,11 @@ pub mod git {
     }
 
     /// リポジトリを開く
-    pub async fn open(dir: impl AsRef<Path>) -> Result<Repository, Error> {
-        Ok(Repository::from(git2::Repository::open(dir)?))
+    pub async fn open(dir: impl AsRef<Path> + Send + 'static) -> Result<Repository, Error> {
+        let repo = spawn_blocking(move || git2::Repository::open(dir))
+            .await
+            .unwrap()?;
+        Ok(Repository::from(repo))
     }
 
     /// リポジトリ初期化処理
@@ -304,40 +329,47 @@ pub mod git {
     }
 
     /// リポジトリのリモートからrevに対応する最新のコミットハッシュを取得する
-    pub async fn ls_remote(url: Arc<str>, rev: &Option<String>) -> Result<Oid, Error> {
-        let mut remote = git2::Remote::create_detached(url.to_string()).unwrap();
-        let connection = remote
-            .connect_auth(git2::Direction::Fetch, None, None)
-            .unwrap();
-        let references = connection.list().unwrap();
-        let latest = if let Some(rev) = rev {
-            let rev = wildmatch::WildMatch::new(rev);
-            references
-                .iter()
-                .filter_map(|val| {
-                    let gitref = GitRef::from(val);
-                    if let Some(true) = gitref.name.map(|name| rev.matches(name)) {
-                        Some(gitref)
-                    } else {
-                        None
-                    }
-                })
-                .max()
-        } else {
-            references
-                .iter()
-                .find(|r| r.name() == "HEAD")
-                .map(GitRef::from)
-        };
+    pub async fn ls_remote(
+        url: Arc<str>,
+        rev: Option<impl Deref<Target = str> + Send + 'static>,
+    ) -> Result<Oid, Error> {
+        spawn_blocking(move || {
+            let mut remote = git2::Remote::create_detached(url.to_string()).unwrap();
+            let connection = remote
+                .connect_auth(git2::Direction::Fetch, None, None)
+                .unwrap();
+            let references = connection.list().unwrap();
+            let latest = if let Some(rev) = rev.as_deref() {
+                let rev = wildmatch::WildMatch::new(rev);
+                references
+                    .iter()
+                    .filter_map(|val| {
+                        let gitref = GitRef::from(val);
+                        if let Some(true) = gitref.name.map(|name| rev.matches(name)) {
+                            Some(gitref)
+                        } else {
+                            None
+                        }
+                    })
+                    .max()
+            } else {
+                references
+                    .iter()
+                    .find(|r| r.name() == "HEAD")
+                    .map(GitRef::from)
+            };
 
-        if let Some(latest) = latest {
-            Ok(latest.into())
-        } else {
-            Err(Error::GitRev {
-                url,
-                rev: rev.as_deref().unwrap_or("HEAD").to_string(),
-            })
-        }
+            if let Some(latest) = latest {
+                Ok(latest.into())
+            } else {
+                Err(Error::GitRev {
+                    url,
+                    rev: rev.as_deref().unwrap_or("HEAD").to_string(),
+                })
+            }
+        })
+        .await
+        .unwrap()
     }
     /// Constant representing files to be ignored by rsplug
     pub const RSPLUG_BUILD_SUCCESS_FILE: &str = ".rsplug_build_success";

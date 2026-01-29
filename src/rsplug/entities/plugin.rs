@@ -33,7 +33,7 @@ pub enum RepoSource {
         /// リポジトリ
         repo: Arc<str>,
         /// リビジョン
-        rev: Option<String>,
+        rev: Option<Arc<str>>,
     },
 }
 
@@ -70,7 +70,7 @@ impl FromStr for RepoSource {
         };
         let owner = cap["owner"].to_string();
         let repo = cap["repo"].into();
-        let rev = cap.name("rev").map(|rev| rev.as_str().to_string());
+        let rev = cap.name("rev").map(|rev| rev.as_str().into());
         Ok(RepoSource::GitHub { owner, repo, rev })
     }
 }
@@ -150,18 +150,20 @@ impl Plugin {
                 };
 
                 // リポジトリがない場合のインストール処理
-                let repository = if let Ok(mut repo) = git::open(&proj_root).await {
+                let repository = if let Ok(mut repo) = git::open(proj_root.clone()).await {
                     // アップデート処理
                     if update {
                         msg(Message::Cache("Updating", url.clone()));
-                        repo.fetch(git::ls_remote(url.clone(), &rev).await?).await?;
+                        repo.fetch(git::ls_remote(url.clone(), rev.clone()).await?)
+                            .await?;
                     }
                     repo
                 } else if install {
                     msg(Message::Cache("Initializing", url.clone()));
                     let mut repo = git::init(proj_root.clone(), url.clone()).await?;
                     msg(Message::Cache("Fetching", url.clone()));
-                    repo.fetch(git::ls_remote(url.clone(), &rev).await?).await?;
+                    repo.fetch(git::ls_remote(url.clone(), rev.clone()).await?)
+                        .await?;
                     repo
                 } else {
                     // 見つからない場合はスキップ
