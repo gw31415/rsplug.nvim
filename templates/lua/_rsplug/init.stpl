@@ -2,6 +2,7 @@
 local pkgid2scripts = {<% for (id, script_set) in pkgid2scripts {%>['<%=id%>']={<% for (script_type, module_ids) in script_set {%>['<%=script_type%>']={<% for module_id in module_ids {%>'<%=module_id%>',<%}%>},<%}%>},<%}%>}
 local loaded = {}
 return {
+	loaded = loaded,
 	---@param id string
 	packadd = function(id)
 		if loaded[id] then return end

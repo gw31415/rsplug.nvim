@@ -32,6 +32,32 @@ local function parse_mode(mode)
 end
 
 local setup_done = {}
+local function add_unique(list, value)
+	for _, existing in ipairs(list) do
+		if existing == value then
+			return
+		end
+	end
+	table.insert(list, value)
+end
+
+local function all_loaded(ids)
+	for _, id in ipairs(ids) do
+		if not require '_rsplug'.loaded[id] then
+			return false
+		end
+	end
+	return true
+end
+-- Track which modes have which patterns set up
+-- pattern_modes[pattern] = { mode1, mode2, ... }
+local pattern_modes = {}
+-- Track all plugin IDs for each pattern across all modes
+-- pattern_ids[pattern] = { id1, id2, ... }
+local pattern_ids = {}
+-- Track which patterns are associated with each plugin ID
+-- id_patterns[id] = { pattern1, pattern2, ... }
+local id_patterns = {}
 
 return {
 	---@param mode string
@@ -41,11 +67,70 @@ return {
 				setup_done[mode_char] = true
 				local exists, mod = pcall(require, '_rsplug/on_map/mode_' .. mode_char)
 				for pattern, ids in pairs(exists and mod or {}) do
-					vim.keymap.set(mode_char, pattern, function()
-						vim.keymap.del(mode_char, pattern, {})
-						for _, id in ipairs(ids) do
-							require '_rsplug'.packadd(id)
+					-- Skip setup if plugin is already loaded (real mappings exist)
+					if all_loaded(ids) then
+						goto continue
+					end
+
+					-- Track that this pattern is set up in this mode
+					if not pattern_modes[pattern] then
+						pattern_modes[pattern] = {}
+						pattern_ids[pattern] = {}
+					end
+					table.insert(pattern_modes[pattern], mode_char)
+					-- Collect all unique plugin IDs for this pattern
+					for _, id in ipairs(ids) do
+						add_unique(pattern_ids[pattern], id)
+						-- Track reverse mapping: plugin ID to patterns
+						if not id_patterns[id] then
+							id_patterns[id] = {}
 						end
+						add_unique(id_patterns[id], pattern)
+					end
+
+					vim.keymap.set(mode_char, pattern, function()
+						-- Get all plugin IDs for this pattern
+						local all_ids = pattern_ids[pattern] or ids
+
+						-- If plugin is already loaded, delete only this mapping and feed keys
+						if all_loaded(all_ids) then
+							pcall(vim.keymap.del, mode_char, pattern, {})
+							vim.api.nvim_feedkeys(
+								vim.api.nvim_replace_termcodes(pattern, true, false, true),
+								'imt',
+								true
+							)
+							return ''
+						end
+
+						-- Collect all patterns that need to be deleted
+						-- (all patterns associated with the plugins being loaded)
+						local patterns_to_delete = {}
+						for _, id in ipairs(all_ids) do
+							local related_patterns = id_patterns[id] or {}
+							for _, related_pattern in ipairs(related_patterns) do
+								patterns_to_delete[related_pattern] = true
+							end
+						end
+
+						-- Delete all related pattern mappings in all their modes
+						for pattern_to_delete, _ in pairs(patterns_to_delete) do
+							local modes = pattern_modes[pattern_to_delete] or {}
+							for _, m in ipairs(modes) do
+								pcall(vim.keymap.del, m, pattern_to_delete, {})
+							end
+							-- Clear tracking for this pattern
+							pattern_modes[pattern_to_delete] = nil
+							pattern_ids[pattern_to_delete] = nil
+						end
+
+						-- Load all plugins that registered this pattern
+						for _, id in ipairs(all_ids) do
+							require '_rsplug'.packadd(id)
+							-- Clear tracking for this plugin ID
+							id_patterns[id] = nil
+						end
+
 						vim.api.nvim_feedkeys(
 							vim.api.nvim_replace_termcodes(pattern, true, false, true),
 							'imt',
@@ -53,8 +138,10 @@ return {
 						)
 						return ''
 					end, { expr = true, silent = true })
+
+					::continue::
 				end
 			end
 		end
-	end,
+	end
 }
