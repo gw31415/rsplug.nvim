@@ -48,8 +48,11 @@ return {
 						end
 						vim.api.nvim_feedkeys(
 							vim.api.nvim_replace_termcodes(pattern, true, false, true),
-							'm', true)
-					end, { remap = true, silent = true, nowait = true })
+							'imt',
+							true
+						)
+						return ''
+					end, { expr = true, silent = true })
 				end
 			end
 		end
