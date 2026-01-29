@@ -38,6 +38,9 @@ local pattern_modes = {}
 -- Track all plugin IDs for each pattern across all modes
 -- pattern_ids[pattern] = { id1, id2, ... }
 local pattern_ids = {}
+-- Track which patterns are associated with each plugin ID
+-- id_patterns[id] = { pattern1, pattern2, ... }
+local id_patterns = {}
 
 return {
 	---@param mode string
@@ -65,24 +68,53 @@ return {
 						if not found then
 							table.insert(pattern_ids[pattern], id)
 						end
+						-- Track reverse mapping: plugin ID to patterns
+						if not id_patterns[id] then
+							id_patterns[id] = {}
+						end
+						local pattern_found = false
+						for _, existing_pattern in ipairs(id_patterns[id]) do
+							if existing_pattern == pattern then
+								pattern_found = true
+								break
+							end
+						end
+						if not pattern_found then
+							table.insert(id_patterns[id], pattern)
+						end
 					end
 
 					vim.keymap.set(mode_char, pattern, function()
-						-- Delete the mapping in ALL modes where it was set up
-						local modes = pattern_modes[pattern] or { mode_char }
-						for _, m in ipairs(modes) do
-							pcall(vim.keymap.del, m, pattern, {})
+						-- Get all plugin IDs for this pattern
+						local all_ids = pattern_ids[pattern] or ids
+
+						-- Collect all patterns that need to be deleted
+						-- (all patterns associated with the plugins being loaded)
+						local patterns_to_delete = {}
+						for _, id in ipairs(all_ids) do
+							local related_patterns = id_patterns[id] or {}
+							for _, related_pattern in ipairs(related_patterns) do
+								patterns_to_delete[related_pattern] = true
+							end
 						end
 
-						-- Load all plugins that registered this pattern in any mode
-						local all_ids = pattern_ids[pattern] or ids
+						-- Delete all related pattern mappings in all their modes
+						for pattern_to_delete, _ in pairs(patterns_to_delete) do
+							local modes = pattern_modes[pattern_to_delete] or {}
+							for _, m in ipairs(modes) do
+								pcall(vim.keymap.del, m, pattern_to_delete, {})
+							end
+							-- Clear tracking for this pattern
+							pattern_modes[pattern_to_delete] = nil
+							pattern_ids[pattern_to_delete] = nil
+						end
+
+						-- Load all plugins that registered this pattern
 						for _, id in ipairs(all_ids) do
 							require '_rsplug'.packadd(id)
+							-- Clear tracking for this plugin ID
+							id_patterns[id] = nil
 						end
-
-						-- Clear the tracking for this pattern
-						pattern_modes[pattern] = nil
-						pattern_ids[pattern] = nil
 
 						vim.api.nvim_feedkeys(
 							vim.api.nvim_replace_termcodes(pattern, true, false, true),
