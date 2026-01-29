@@ -5,10 +5,11 @@ use std::{
     iter::Sum,
     ops::AddAssign,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use hashbrown::HashMap;
+use ignore::{WalkBuilder, WalkState};
 use sailfish::{TemplateSimple, runtime::Render};
 
 use super::*;
@@ -18,6 +19,63 @@ struct PkgId2ScriptsItem {
     pkgid: PluginIDStr,
     script: SetupScript,
     start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
+}
+
+fn collect_doc_files_from_root(root: &std::path::Path) -> HashMap<PathBuf, FileItem> {
+    let doc_root = root.join("doc");
+    if !doc_root.is_dir() {
+        return HashMap::new();
+    }
+
+    let source = Arc::new(FileSource::Directory {
+        path: Arc::from(root.to_path_buf()),
+    });
+    let root = Arc::new(root.to_path_buf());
+    let files = Arc::new(Mutex::new(HashMap::new()));
+
+    WalkBuilder::new(&doc_root)
+        .standard_filters(false)
+        .hidden(false)
+        .max_depth(Some(128))
+        .follow_links(true)
+        .build_parallel()
+        .run(|| {
+            let root = root.clone();
+            let source = source.clone();
+            let files = files.clone();
+            Box::new(move |entry| {
+                let Ok(entry) = entry else {
+                    return WalkState::Continue;
+                };
+                if !entry
+                    .file_type()
+                    .map(|meta| meta.is_file())
+                    .unwrap_or(false)
+                {
+                    return WalkState::Continue;
+                }
+                let path = entry.into_path();
+                let Ok(rel_path) = path.strip_prefix(root.as_path()) else {
+                    return WalkState::Continue;
+                };
+                files.lock().unwrap().insert(
+                    rel_path.to_path_buf(),
+                    FileItem {
+                        source: source.clone(),
+                        merge_type: MergeType::Overwrite,
+                    },
+                );
+                WalkState::Continue
+            })
+        });
+
+    match Arc::try_unwrap(files) {
+        Ok(files) => files.into_inner().unwrap_or_default(),
+        Err(files) => {
+            let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        }
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, PartialOrd, Ord)]
@@ -457,10 +515,8 @@ impl PlugCtl {
                         })
                         .collect(),
                     ),
-                    HowToPlaceFiles::SymlinkDirectory(_path) => {
-                        // TODO: Copy doc files from symlinked directory
-                        // Copy each _path.join("doc/*") file/dirs
-                        HowToPlaceFiles::CopyEachFile(HashMap::new())
+                    HowToPlaceFiles::SymlinkDirectory(path) => {
+                        HowToPlaceFiles::CopyEachFile(collect_doc_files_from_root(path))
                     }
                 },
             )]
