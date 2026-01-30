@@ -25,7 +25,7 @@ impl<T: IntoIterator<Item = Config>> From<T> for Config {
 
 /// 設定ファイルの構造体
 #[serde_as]
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
@@ -49,7 +49,7 @@ impl Sum for Config {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct CacheConfig {
     #[serde(rename = "repo")]
     pub repo: RepoSource,
@@ -149,7 +149,7 @@ impl From<LazyType> for LazyTypeDeserializer {
 }
 
 #[serde_as]
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PluginConfig {
     #[serde(flatten)]
     pub cache: CacheConfig,
@@ -235,7 +235,7 @@ impl AddAssign for SetupScript {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct MergeConfig {
     #[serde(default = "default_ignore")]
     pub ignore: FileSpecifier,
@@ -246,7 +246,7 @@ fn default_ignore() -> FileSpecifier {
 }
 
 /// Gitignore形式のファイル指定子
-#[derive(DeserializeFromStr, Clone)]
+#[derive(Clone, DeserializeFromStr)]
 pub struct FileSpecifier(Arc<Gitignore>, String);
 
 impl std::fmt::Debug for FileSpecifier {

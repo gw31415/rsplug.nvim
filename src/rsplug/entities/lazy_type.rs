@@ -196,7 +196,6 @@ impl Serialize for FileType {
         serializer.serialize_str(&self.0)
     }
 }
-
 impl FromStr for FileType {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {

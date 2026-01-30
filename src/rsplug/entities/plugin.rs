@@ -5,6 +5,7 @@ use std::{
 };
 
 use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
+use git2::Oid;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Serialize, Serializer};
@@ -41,7 +42,7 @@ pub struct Plugin {
 }
 
 /// プラグインの取得元
-#[derive(DeserializeFromStr, Clone, Debug)]
+#[derive(Clone, DeserializeFromStr, Debug)]
 pub enum RepoSource {
     /// GitHub リポジトリ
     GitHub {
@@ -148,6 +149,7 @@ impl Plugin {
         install: bool,
         update: bool,
         cache_dir: impl AsRef<Path>,
+        locked_rev: Option<Arc<str>>,
     ) -> Result<PluginLoadResult, Error> {
         use super::{util::git, *};
         use crate::{
@@ -171,15 +173,41 @@ impl Plugin {
             build,
         } = cache;
 
-        // Clone values needed for lock info before they're moved
-        let build_clone = build.clone();
-
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
-                // Clone URL for lock info (will be moved into async blocks)
-                let url_for_lock = url.clone();
+                let resolved_rev = if install || update {
+                    let locked_rev = if let Some(locked_rev) = locked_rev.as_deref() {
+                        locked_rev.to_string()
+                    } else if let Some(rev) = rev.as_deref() {
+                        if is_full_hex_hash(rev) {
+                            rev.to_string()
+                        } else {
+                            git::ls_remote(Arc::clone(&url), Some(rev.to_string()))
+                                .await?
+                                .to_string()
+                        }
+                    } else {
+                        git::ls_remote(Arc::clone(&url), None::<String>)
+                            .await?
+                            .to_string()
+                    };
+                    Some(locked_rev)
+                } else {
+                    None
+                };
+                let fetch_oid = if install || update {
+                    let rev = resolved_rev.as_deref().ok_or_else(|| {
+                        Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Missing locked revision for {}", url),
+                        ))
+                    })?;
+                    Some(Oid::from_str(rev).map_err(Error::Git2)?)
+                } else {
+                    None
+                };
 
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
@@ -196,16 +224,26 @@ impl Plugin {
                     // アップデート処理
                     if update {
                         msg(Message::Cache("Updating", url.clone()));
-                        repo.fetch(git::ls_remote(url.clone(), rev.clone()).await?)
-                            .await?;
+                        let fetch_oid = fetch_oid.ok_or_else(|| {
+                            Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Missing locked revision for {}", url),
+                            ))
+                        })?;
+                        repo.fetch(fetch_oid).await?;
                     }
                     repo
                 } else if install {
                     msg(Message::Cache("Initializing", url.clone()));
                     let mut repo = git::init(proj_root.clone(), url.clone()).await?;
                     msg(Message::Cache("Fetching", url.clone()));
-                    repo.fetch(git::ls_remote(url.clone(), rev.clone()).await?)
-                        .await?;
+                    let fetch_oid = fetch_oid.ok_or_else(|| {
+                        Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Missing locked revision for {}", url),
+                        ))
+                    })?;
+                    repo.fetch(fetch_oid).await?;
                     repo
                 } else {
                     // 見つからない場合はスキップ
@@ -215,27 +253,16 @@ impl Plugin {
                     });
                 };
 
-                // Get the resolved commit SHA for lock file
-                let resolved_rev = {
-                    let head = repository.head_hash().await?;
-                    // Git commit hashes are always valid hex strings (40 chars)
-                    String::from_utf8(head).map_err(|e| {
-                        Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Invalid UTF-8 in git commit hash: {}", e),
-                        ))
-                    })?
-                };
-
                 // ディレクトリ内容からのIDの決定
-                // Reuse the head hash we already retrieved to avoid redundant I/O
                 let id = PluginID::new({
-                    let (head_bytes, diff) = (
-                        resolved_rev.as_bytes().to_vec(),
-                        repository.diff_hash().await?,
-                    );
-                    let mut head = head_bytes;
-                    head.extend(diff);
+                    let (head, diff) = tokio::join!(repository.head_hash(), repository.diff_hash());
+                    let mut head = match (head, diff) {
+                        (Ok(mut head), Ok(diff)) => {
+                            head.extend(diff);
+                            head
+                        }
+                        (Err(err), _) | (_, Err(err)) => Err(err)?,
+                    };
                     for (i, comp) in build.iter().enumerate() {
                         head.extend(i.to_ne_bytes());
                         head.extend(comp.as_bytes());
@@ -336,19 +363,18 @@ impl Plugin {
                     script: script.clone(),
                     is_plugctl: false,
                 };
-
-                let lock = PluginLockInfo {
-                    url: url_for_lock.to_string(),
+                let lock_info = resolved_rev.map(|resolved_rev| PluginLockInfo {
+                    url: url.to_string(),
                     resolved_rev,
-                };
+                });
 
-                (loaded, lock)
+                (loaded, lock_info)
             }
         };
 
         Ok(PluginLoadResult {
             loaded: Some(loaded_plugin),
-            lock_info: Some(lock_info),
+            lock_info,
         })
     }
 }
@@ -381,4 +407,8 @@ fn extract_unique_lua_modules<'a>(
             None
         }
     })
+}
+
+fn is_full_hex_hash(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }

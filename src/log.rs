@@ -34,6 +34,7 @@ pub enum Message {
         total: usize,
         merged: usize,
     },
+    DetectLockFile(Arc<PathBuf>),
     InstallSkipped(Arc<str>),
     InstallYank {
         id: Arc<str>,
@@ -188,6 +189,13 @@ fn init() -> Logger {
                         pb.set_style(pb_style.clone());
                         pb.finish_with_message("done");
                     }
+                }
+                Message::DetectLockFile(path) => {
+                    eprintln!(
+                        "{} {}",
+                        style("LockFile:").blue().dim(),
+                        style(path.to_string_lossy()).dim()
+                    );
                 }
                 Message::InstallSkipped(id) => {
                     installskipped_count += 1;

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{borrow::Cow, collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,35 +6,34 @@ use super::config::PluginConfig;
 
 /// Lock file structure that contains all necessary information to build the pack directory.
 /// This is serialized to JSON format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct LockFile {
     /// Version of the lock file format
-    pub version: String,
+    pub version: Cow<'static, str>,
     /// Plugin configurations (collection of PluginConfigs as described in TOML)
     pub plugins: Vec<PluginConfig>,
-    /// Locked information for resources requiring network connection
-    pub locked: Vec<LockedResource>,
+    /// Locked resources by repository URL
+    pub locked: BTreeMap<String, LockedResource>,
 }
 
 /// Locked resource information for network-dependent resources
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LockedResource {
-    /// Repository URL
-    pub url: String,
+    /// Resource type (e.g. git)
+    #[serde(rename = "type")]
+    pub kind: LockedResourceType,
     /// Git commit hash
     pub rev: String,
 }
 
-impl LockFile {
-    /// Create a new lock file with the current version
-    pub fn new() -> Self {
-        Self {
-            version: "1".to_string(),
-            plugins: Vec::new(),
-            locked: Vec::new(),
-        }
-    }
+/// Resource type discriminator for lock entries
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LockedResourceType {
+    Git,
+}
 
+impl LockFile {
     /// Read a lock file from disk
     pub async fn read(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         let path = path.as_ref();
@@ -57,11 +56,5 @@ impl LockFile {
             )
         })?;
         tokio::fs::write(path, content).await
-    }
-}
-
-impl Default for LockFile {
-    fn default() -> Self {
-        Self::new()
     }
 }

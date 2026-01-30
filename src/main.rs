@@ -1,12 +1,18 @@
 mod log;
 mod rsplug;
 
-use std::{collections::BinaryHeap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BinaryHeap},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use clap::Parser;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
+
+use crate::rsplug::{LockFile, plugin::PluginLockInfo};
 
 #[derive(clap::Parser, Debug)]
 #[command(about)]
@@ -17,12 +23,15 @@ struct Args {
     /// Update plugins
     #[arg(short, long)]
     update: bool,
-    /// Path to lock file. When provided, build from lock file instead of TOML configs
+    /// Frozen lockfile mode: only use the lockfile and do not update it
+    #[arg(long)]
+    frozen_lockfile: bool,
+    /// Specify the lockfile path
     #[arg(short, long)]
-    lock_file: Option<PathBuf>,
+    lockfile: Option<PathBuf>,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
     #[arg(
-        required_unless_present = "lock_file",
+        required_unless_present = "frozen_lockfile",
         env = "RSPLUG_CONFIG_FILES",
         value_delimiter = ':',
         hide_env_values = true
@@ -34,30 +43,25 @@ async fn app() -> Result<(), Error> {
     let Args {
         install,
         update,
-        lock_file,
+        lockfile,
+        frozen_lockfile,
         config_files,
     } = Args::parse();
+    let lockfile = Arc::new(lockfile.unwrap_or(DEFAULT_APP_DIR.join("rsplug.lock.json")));
 
-    let (plugins, plugin_configs, is_from_lock_file) = if let Some(lock_path) = lock_file {
+    let (plugins, locked, config) = if frozen_lockfile {
         // Build from lock file
-        let lock = rsplug::LockFile::read(&lock_path).await?;
-        msg(Message::DetectConfigFile(lock_path));
+        let rsplug::LockFile {
+            plugins, locked, ..
+        } = rsplug::LockFile::read(lockfile.as_path()).await?;
+        msg(Message::DetectLockFile(lockfile.clone()));
 
-        // TODO: Use lock.locked to enforce exact commits when loading
-        // Currently, we load plugins using the repo info from PluginConfig
-        // For true deterministic builds, we should match each plugin with its locked
-        // revision and pass that to the load function.
-
-        // Use plugins from lock file directly
-        let config = rsplug::Config {
-            plugins: lock.plugins.clone(),
-        };
-
-        (rsplug::Plugin::new(config)?, lock.plugins, true)
+        let config = rsplug::Config { plugins };
+        (rsplug::Plugin::new(config.clone())?, locked, config)
     } else {
         // Build from TOML files (existing behavior)
         // Parse all of config files
-        let (configs, plugin_configs) = {
+        let config = {
             let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
                 .filter_map(|path| match path {
                     Err(e) => Some(Err(e)),
@@ -89,18 +93,50 @@ async fn app() -> Result<(), Error> {
                 confs.push(config);
             }
             // Aggregate all configs and extract plugin configs
-            let aggregated_config: rsplug::Config = confs.into_iter().sum();
-            let plugin_configs = aggregated_config.plugins.clone();
-            (aggregated_config, plugin_configs)
+            confs.into_iter().sum::<rsplug::Config>()
         };
-        (rsplug::Plugin::new(configs)?, plugin_configs, false)
+
+        (
+            rsplug::Plugin::new(config.clone())?,
+            BTreeMap::new(),
+            config,
+        )
     };
 
     msg(Message::Loading { install, update });
     // Load plugins through Cache based on the Units
     let (mut plugins, lock_infos) = {
+        let locked = Arc::new(locked);
         let res = plugins
-            .map(|plugin| plugin.load(install, update, DEFAULT_REPOCACHE_DIR.as_path()))
+            .map(|plugin| {
+                let locked = Arc::clone(&locked);
+                async move {
+                    let url = plugin.cache.repo.url();
+                    let locked_rev = if let Some(entry) = locked.get(&url) {
+                        if entry.kind != rsplug::LockedResourceType::Git {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Unsupported lock type for {}: {:?}", url, entry.kind),
+                            )));
+                        }
+                        Some(Arc::<str>::from(entry.rev.as_str()))
+                    } else if install || update {
+                        if frozen_lockfile {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Missing locked revision for {}", url),
+                            )));
+                        }
+                        None
+                    } else {
+                        None
+                    };
+                    let loaded = plugin
+                        .load(install, update, DEFAULT_REPOCACHE_DIR.as_path(), locked_rev)
+                        .await?;
+                    Ok(loaded)
+                }
+            })
             .collect::<JoinSet<_>>()
             .join_all()
             .await;
@@ -123,6 +159,27 @@ async fn app() -> Result<(), Error> {
     };
     let total_count = plugins.len();
 
+    if install || update {
+        LockFile {
+            version: "1".into(),
+            locked: lock_infos
+                .into_iter()
+                .map(|PluginLockInfo { url, resolved_rev }| {
+                    (
+                        url,
+                        rsplug::LockedResource {
+                            kind: rsplug::LockedResourceType::Git,
+                            rev: resolved_rev,
+                        },
+                    )
+                })
+                .collect(),
+            plugins: config.plugins,
+        }
+        .write(lockfile.as_path())
+        .await?;
+    }
+
     // Create PackPathState and insert packages into it
     let mut state = rsplug::PackPathState::new();
     rsplug::LoadedPlugin::merge(&mut plugins);
@@ -139,26 +196,6 @@ async fn app() -> Result<(), Error> {
         .install(DEFAULT_APP_DIR.as_path())
         .await
         .map_err(rsplug::Error::Io)?;
-
-    // Write lock file only when building from TOML configs (not when using existing lock file)
-    if !is_from_lock_file && (install || update) {
-        let lock_file = rsplug::LockFile {
-            version: "1".to_string(),
-            plugins: plugin_configs,
-            locked: lock_infos
-                .into_iter()
-                .map(|info| rsplug::LockedResource {
-                    url: info.url,
-                    rev: info.resolved_rev,
-                })
-                .collect(),
-        };
-
-        let lock_path = DEFAULT_APP_DIR.join("rsplug.lock.json");
-        lock_file.write(&lock_path).await?;
-        // TODO: Add proper log message for lock file write
-        msg(Message::DetectConfigFile(lock_path));
-    }
 
     Ok(())
 }

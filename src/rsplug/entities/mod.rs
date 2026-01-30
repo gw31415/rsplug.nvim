@@ -14,7 +14,6 @@ use super::util;
 use config::*;
 use error::*;
 use lazy_type::*;
-use lockfile::*;
 use merge_type::*;
 use packpathstate::*;
 use plugctl::*;
