@@ -17,9 +17,12 @@ struct Args {
     /// Update plugins
     #[arg(short, long)]
     update: bool,
+    /// Path to lock file. When provided, build from lock file instead of TOML configs
+    #[arg(short, long)]
+    lock_file: Option<PathBuf>,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
     #[arg(
-        required = true,
+        required_unless_present = "lock_file",
         env = "RSPLUG_CONFIG_FILES",
         value_delimiter = ':',
         hide_env_values = true
@@ -31,10 +34,29 @@ async fn app() -> Result<(), Error> {
     let Args {
         install,
         update,
+        lock_file,
         config_files,
     } = Args::parse();
 
-    let (plugins, toml_configs) = {
+    let (plugins, toml_configs) = if let Some(lock_path) = lock_file {
+        // Build from lock file
+        let lock = rsplug::LockFile::read(&lock_path).await?;
+        msg(Message::DetectConfigFile(lock_path));
+        
+        // Parse TOML configs from lock file
+        let mut configs = Vec::new();
+        for toml_config in &lock.toml_configs {
+            match toml::from_str::<rsplug::Config>(&toml_config.content) {
+                Ok(config) => {
+                    configs.push(config);
+                }
+                Err(e) => return Err(Error::Parse(e, toml_config.path.clone())),
+            }
+        }
+        
+        (rsplug::Plugin::new(configs.into_iter().sum())?, lock.toml_configs)
+    } else {
+        // Build from TOML files (existing behavior)
         // Parse all of config files
         let (configs, toml_configs) = {
             let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
