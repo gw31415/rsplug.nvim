@@ -165,11 +165,11 @@ impl Plugin {
         let url: Arc<str> = Arc::from(repo.url());
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
-                // Clone values needed for lock info
-                let owner_clone = owner.clone();
-                let repo_clone = repo.clone();
-                let rev_clone = rev.clone();
-                let url_clone = url.clone();
+                // Clone values that will be moved into async blocks but needed later
+                let owner_for_lock = owner.clone();
+                let repo_for_lock = repo.clone();
+                let url_for_lock = url.clone();
+                let rev_for_lock = rev.clone();
                 
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
@@ -208,23 +208,26 @@ impl Plugin {
                 // Get the resolved commit SHA for lock file
                 let resolved_rev = {
                     let head = repository.head_hash().await?;
-                    String::from_utf8_lossy(&head).to_string()
+                    // Git commit hashes are always valid hex strings (40 chars)
+                    String::from_utf8(head).map_err(|e| {
+                        Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Invalid UTF-8 in git commit hash: {}", e),
+                        ))
+                    })?
                 };
 
                 // ディレクトリ内容からのIDの決定
+                // Reuse the head hash we already retrieved to avoid redundant I/O
                 let id = PluginID::new({
-                    let (head, diff) = tokio::join!(repository.head_hash(), repository.diff_hash());
-                    match (head, diff) {
-                        (Ok(mut head), Ok(diff)) => {
-                            head.extend(diff);
-                            for (i, comp) in build.iter().enumerate() {
-                                head.extend(i.to_ne_bytes());
-                                head.extend(comp.as_bytes());
-                            }
-                            hash::digest(&head)
-                        }
-                        (Err(err), _) | (_, Err(err)) => Err(err)?,
+                    let (head_bytes, diff) = (resolved_rev.as_bytes().to_vec(), repository.diff_hash().await?);
+                    let mut head = head_bytes;
+                    head.extend(diff);
+                    for (i, comp) in build.iter().enumerate() {
+                        head.extend(i.to_ne_bytes());
+                        head.extend(comp.as_bytes());
                     }
+                    hash::digest(&head)
                 });
 
                 // ビルド実行
@@ -322,12 +325,12 @@ impl Plugin {
                 };
                 
                 let lock = PluginLockInfo {
-                    id: format!("{}/{}", owner_clone, repo_clone),
+                    id: format!("{}/{}", owner_for_lock, repo_for_lock),
                     repo: RepoSourceLock::GitHub {
-                        owner: owner_clone.clone(),
-                        repo: repo_clone.to_string(),
-                        requested_rev: rev_clone.as_ref().map(|r| r.to_string()),
-                        url: url_clone.to_string(),
+                        owner: owner_for_lock.to_string(),
+                        repo: repo_for_lock.to_string(),
+                        requested_rev: rev_for_lock.as_ref().map(|r| r.to_string()),
+                        url: url_for_lock.to_string(),
                     },
                     resolved_rev,
                     to_sym,

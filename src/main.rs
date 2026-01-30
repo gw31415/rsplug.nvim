@@ -38,10 +38,15 @@ async fn app() -> Result<(), Error> {
         config_files,
     } = Args::parse();
 
-    let (plugins, toml_configs) = if let Some(lock_path) = lock_file {
+    let (plugins, toml_configs, is_from_lock_file) = if let Some(lock_path) = lock_file {
         // Build from lock file
         let lock = rsplug::LockFile::read(&lock_path).await?;
         msg(Message::DetectConfigFile(lock_path));
+        
+        // TODO: Use lock.plugins[].resolved_rev to enforce exact commits when loading
+        // Currently, we parse TOML and load as normal, which may fetch different commits
+        // For true deterministic builds, we should match each plugin with its locked
+        // revision and pass that to the load function.
         
         // Parse TOML configs from lock file
         let mut configs = Vec::new();
@@ -54,7 +59,7 @@ async fn app() -> Result<(), Error> {
             }
         }
         
-        (rsplug::Plugin::new(configs.into_iter().sum())?, lock.toml_configs)
+        (rsplug::Plugin::new(configs.into_iter().sum())?, lock.toml_configs, true)
     } else {
         // Build from TOML files (existing behavior)
         // Parse all of config files
@@ -99,7 +104,7 @@ async fn app() -> Result<(), Error> {
             }
             (confs, toml_confs)
         };
-        (rsplug::Plugin::new(configs.into_iter().sum())?, toml_configs)
+        (rsplug::Plugin::new(configs.into_iter().sum())?, toml_configs, false)
     };
 
     msg(Message::Loading { install, update });
@@ -144,8 +149,8 @@ async fn app() -> Result<(), Error> {
         .await
         .map_err(rsplug::Error::Io)?;
     
-    // Write lock file
-    if install || update {
+    // Write lock file only when building from TOML configs (not when using existing lock file)
+    if !is_from_lock_file && (install || update) {
         let lock_file = rsplug::LockFile {
             version: "1".to_string(),
             toml_configs,
@@ -160,7 +165,8 @@ async fn app() -> Result<(), Error> {
         
         let lock_path = DEFAULT_APP_DIR.join("rsplug.lock.json");
         lock_file.write(&lock_path).await?;
-        msg(Message::DetectConfigFile(lock_path)); // Reuse message for notification
+        // TODO: Add proper log message for lock file write
+        msg(Message::DetectConfigFile(lock_path));
     }
     
     Ok(())

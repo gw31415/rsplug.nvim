@@ -65,21 +65,23 @@ impl LockFile {
 
     /// Read a lock file from disk
     pub async fn read(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let path = path.as_ref();
         let content = tokio::fs::read(path).await?;
         serde_json::from_slice(&content).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Failed to parse lock file: {}", e),
+                format!("Failed to parse lock file {:?}: {}", path, e),
             )
         })
     }
 
     /// Write the lock file to disk
     pub async fn write(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        let path = path.as_ref();
         let content = serde_json::to_string_pretty(self).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize lock file: {}", e),
+                format!("Failed to serialize lock file {:?}: {}", path, e),
             )
         })?;
         tokio::fs::write(path, content).await
