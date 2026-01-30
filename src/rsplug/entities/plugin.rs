@@ -7,8 +7,8 @@ use std::{
 use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde_with::DeserializeFromStr;
 use serde::{Serialize, Serializer};
+use serde_with::DeserializeFromStr;
 
 use super::*;
 
@@ -170,17 +170,17 @@ impl Plugin {
             manually_to_sym: _,
             build,
         } = cache;
-        
+
         // Clone values needed for lock info before they're moved
         let build_clone = build.clone();
-        
+
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
                 // Clone URL for lock info (will be moved into async blocks)
                 let url_for_lock = url.clone();
-                
+
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
                 let filesource = Arc::new(FileSource::Directory {
@@ -230,7 +230,10 @@ impl Plugin {
                 // ディレクトリ内容からのIDの決定
                 // Reuse the head hash we already retrieved to avoid redundant I/O
                 let id = PluginID::new({
-                    let (head_bytes, diff) = (resolved_rev.as_bytes().to_vec(), repository.diff_hash().await?);
+                    let (head_bytes, diff) = (
+                        resolved_rev.as_bytes().to_vec(),
+                        repository.diff_hash().await?,
+                    );
                     let mut head = head_bytes;
                     head.extend(diff);
                     for (i, comp) in build.iter().enumerate() {
@@ -325,7 +328,7 @@ impl Plugin {
                             .collect(),
                     )
                 };
-                
+
                 let loaded = LoadedPlugin {
                     id,
                     files,
@@ -333,12 +336,12 @@ impl Plugin {
                     script: script.clone(),
                     is_plugctl: false,
                 };
-                
+
                 let lock = PluginLockInfo {
                     url: url_for_lock.to_string(),
                     resolved_rev,
                 };
-                
+
                 (loaded, lock)
             }
         };

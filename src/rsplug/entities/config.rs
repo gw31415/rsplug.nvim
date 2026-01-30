@@ -123,7 +123,7 @@ impl From<LazyType> for LazyTypeDeserializer {
                 let mut on_cmd = Vec::new();
                 let mut on_ft = Vec::new();
                 let mut on_map = KeyPattern::default();
-                
+
                 for event in events {
                     match event {
                         LoadEvent::Autocmd(a) => on_event.push(a),
@@ -135,7 +135,7 @@ impl From<LazyType> for LazyTypeDeserializer {
                         }
                     }
                 }
-                
+
                 LazyTypeDeserializer {
                     start: false,
                     on_event,

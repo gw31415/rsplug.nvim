@@ -42,17 +42,17 @@ async fn app() -> Result<(), Error> {
         // Build from lock file
         let lock = rsplug::LockFile::read(&lock_path).await?;
         msg(Message::DetectConfigFile(lock_path));
-        
+
         // TODO: Use lock.locked to enforce exact commits when loading
         // Currently, we load plugins using the repo info from PluginConfig
         // For true deterministic builds, we should match each plugin with its locked
         // revision and pass that to the load function.
-        
+
         // Use plugins from lock file directly
         let config = rsplug::Config {
             plugins: lock.plugins.clone(),
         };
-        
+
         (rsplug::Plugin::new(config)?, lock.plugins, true)
     } else {
         // Build from TOML files (existing behavior)
@@ -84,9 +84,8 @@ async fn app() -> Result<(), Error> {
                 .collect::<JoinSet<_>>();
             let mut confs = Vec::new();
             while let Some(result) = joinset.join_next().await {
-                let config = result.expect(
-                    "Some tasks reading config files may be unintentionally aborted",
-                )?;
+                let config = result
+                    .expect("Some tasks reading config files may be unintentionally aborted")?;
                 confs.push(config);
             }
             // Aggregate all configs and extract plugin configs
@@ -108,8 +107,9 @@ async fn app() -> Result<(), Error> {
         // Wait until all loading is complete.
         // NOTE: It does not abort if an error occurs (because of the build process).
         msg(Message::LoadDone);
-        res.into_iter()
-            .try_fold((BinaryHeap::new(), Vec::new()), |(mut plugins, mut locks), res| {
+        res.into_iter().try_fold(
+            (BinaryHeap::new(), Vec::new()),
+            |(mut plugins, mut locks), res| {
                 let result = res?;
                 if let Some(loaded_plugin) = result.loaded {
                     plugins.push(loaded_plugin);
@@ -118,7 +118,8 @@ async fn app() -> Result<(), Error> {
                     locks.push(lock_info);
                 }
                 Ok::<_, Error>((plugins, locks))
-            })?
+            },
+        )?
     };
     let total_count = plugins.len();
 
@@ -138,24 +139,27 @@ async fn app() -> Result<(), Error> {
         .install(DEFAULT_APP_DIR.as_path())
         .await
         .map_err(rsplug::Error::Io)?;
-    
+
     // Write lock file only when building from TOML configs (not when using existing lock file)
     if !is_from_lock_file && (install || update) {
         let lock_file = rsplug::LockFile {
             version: "1".to_string(),
             plugins: plugin_configs,
-            locked: lock_infos.into_iter().map(|info| rsplug::LockedResource {
-                url: info.url,
-                rev: info.resolved_rev,
-            }).collect(),
+            locked: lock_infos
+                .into_iter()
+                .map(|info| rsplug::LockedResource {
+                    url: info.url,
+                    rev: info.resolved_rev,
+                })
+                .collect(),
         };
-        
+
         let lock_path = DEFAULT_APP_DIR.join("rsplug.lock.json");
         lock_file.write(&lock_path).await?;
         // TODO: Add proper log message for lock file write
         msg(Message::DetectConfigFile(lock_path));
     }
-    
+
     Ok(())
 }
 
