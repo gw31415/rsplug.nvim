@@ -11,6 +11,28 @@ use serde_with::DeserializeFromStr;
 
 use super::*;
 
+/// Result of loading a plugin with lock information
+pub struct PluginLoadResult {
+    /// The loaded plugin (if successfully loaded)
+    pub loaded: Option<LoadedPlugin>,
+    /// Lock information for the lock file
+    pub lock_info: Option<PluginLockInfo>,
+}
+
+/// Information needed for the lock file
+pub struct PluginLockInfo {
+    /// Plugin identifier
+    pub id: String,
+    /// Repository source
+    pub repo: RepoSourceLock,
+    /// Resolved commit SHA
+    pub resolved_rev: String,
+    /// Whether symlinked
+    pub to_sym: bool,
+    /// Build commands
+    pub build: Vec<String>,
+}
+
 /// 設定を構成する基本単位
 pub struct Plugin {
     /// 取得元
@@ -113,7 +135,7 @@ impl Plugin {
         install: bool,
         update: bool,
         cache_dir: impl AsRef<Path>,
-    ) -> Result<Option<LoadedPlugin>, Error> {
+    ) -> Result<PluginLoadResult, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
@@ -135,10 +157,20 @@ impl Plugin {
             manually_to_sym: _,
             build,
         } = cache;
+        
+        // Clone values needed for lock info before they're moved
+        let build_clone = build.clone();
+        
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
-        let loaded_plugin: LoadedPlugin = match repo {
+        let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
+                // Clone values needed for lock info
+                let owner_clone = owner.clone();
+                let repo_clone = repo.clone();
+                let rev_clone = rev.clone();
+                let url_clone = url.clone();
+                
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
                 let filesource = Arc::new(FileSource::Directory {
@@ -167,7 +199,16 @@ impl Plugin {
                     repo
                 } else {
                     // 見つからない場合はスキップ
-                    return Ok(None);
+                    return Ok(PluginLoadResult {
+                        loaded: None,
+                        lock_info: None,
+                    });
+                };
+
+                // Get the resolved commit SHA for lock file
+                let resolved_rev = {
+                    let head = repository.head_hash().await?;
+                    String::from_utf8_lossy(&head).to_string()
                 };
 
                 // ディレクトリ内容からのIDの決定
@@ -271,17 +312,36 @@ impl Plugin {
                             .collect(),
                     )
                 };
-                LoadedPlugin {
+                
+                let loaded = LoadedPlugin {
                     id,
                     files,
                     lazy_type,
                     script: script.clone(),
                     is_plugctl: false,
-                }
+                };
+                
+                let lock = PluginLockInfo {
+                    id: format!("{}/{}", owner_clone, repo_clone),
+                    repo: RepoSourceLock::GitHub {
+                        owner: owner_clone.clone(),
+                        repo: repo_clone.to_string(),
+                        requested_rev: rev_clone.as_ref().map(|r| r.to_string()),
+                        url: url_clone.to_string(),
+                    },
+                    resolved_rev,
+                    to_sym,
+                    build: build_clone,
+                };
+                
+                (loaded, lock)
             }
         };
 
-        Ok::<_, Error>(Some(loaded_plugin))
+        Ok(PluginLoadResult {
+            loaded: Some(loaded_plugin),
+            lock_info: Some(lock_info),
+        })
     }
 }
 

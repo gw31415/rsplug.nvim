@@ -34,9 +34,9 @@ async fn app() -> Result<(), Error> {
         config_files,
     } = Args::parse();
 
-    let plugins = {
+    let (plugins, toml_configs) = {
         // Parse all of config files
-        let configs = {
+        let (configs, toml_configs) = {
             let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
                 .filter_map(|path| match path {
                     Err(e) => Some(Err(e)),
@@ -55,27 +55,34 @@ async fn app() -> Result<(), Error> {
                     match toml::from_slice::<rsplug::Config>(&content) {
                         Ok(config) => {
                             log::msg(Message::DetectConfigFile(path.to_path_buf()));
-                            Ok(config)
+                            // Also save TOML content for lock file
+                            let toml_content = String::from_utf8_lossy(&content).to_string();
+                            Ok((config, rsplug::TomlConfig {
+                                path: path.clone(),
+                                content: toml_content,
+                            }))
                         }
                         Err(e) => Err(Error::Parse(e, path.to_path_buf())),
                     }
                 })
                 .collect::<JoinSet<_>>();
             let mut confs = Vec::new();
-            while let Some(config) = joinset.join_next().await {
-                confs
-                    .push(config.expect(
-                        "Some tasks reading config files may be unintentionally aborted",
-                    )?);
+            let mut toml_confs = Vec::new();
+            while let Some(result) = joinset.join_next().await {
+                let (config, toml_config) = result.expect(
+                    "Some tasks reading config files may be unintentionally aborted",
+                )?;
+                confs.push(config);
+                toml_confs.push(toml_config);
             }
-            confs
+            (confs, toml_confs)
         };
-        rsplug::Plugin::new(configs.into_iter().sum())?
+        (rsplug::Plugin::new(configs.into_iter().sum())?, toml_configs)
     };
 
     msg(Message::Loading { install, update });
     // Load plugins through Cache based on the Units
-    let mut plugins = {
+    let (mut plugins, lock_infos) = {
         let res = plugins
             .map(|plugin| plugin.load(install, update, DEFAULT_REPOCACHE_DIR.as_path()))
             .collect::<JoinSet<_>>()
@@ -85,11 +92,15 @@ async fn app() -> Result<(), Error> {
         // NOTE: It does not abort if an error occurs (because of the build process).
         msg(Message::LoadDone);
         res.into_iter()
-            .try_fold(BinaryHeap::new(), |mut acc, res| {
-                if let Some(loaded_plugin) = res? {
-                    acc.push(loaded_plugin);
+            .try_fold((BinaryHeap::new(), Vec::new()), |(mut plugins, mut locks), res| {
+                let result = res?;
+                if let Some(loaded_plugin) = result.loaded {
+                    plugins.push(loaded_plugin);
                 }
-                Ok::<_, Error>(acc)
+                if let Some(lock_info) = result.lock_info {
+                    locks.push(lock_info);
+                }
+                Ok::<_, Error>((plugins, locks))
             })?
     };
     let total_count = plugins.len();
@@ -110,6 +121,26 @@ async fn app() -> Result<(), Error> {
         .install(DEFAULT_APP_DIR.as_path())
         .await
         .map_err(rsplug::Error::Io)?;
+    
+    // Write lock file
+    if install || update {
+        let lock_file = rsplug::LockFile {
+            version: "1".to_string(),
+            toml_configs,
+            plugins: lock_infos.into_iter().map(|info| rsplug::LockedPlugin {
+                id: info.id,
+                repo: info.repo,
+                resolved_rev: info.resolved_rev,
+                to_sym: info.to_sym,
+                build: info.build,
+            }).collect(),
+        };
+        
+        let lock_path = DEFAULT_APP_DIR.join("rsplug.lock.json");
+        lock_file.write(&lock_path).await?;
+        msg(Message::DetectConfigFile(lock_path)); // Reuse message for notification
+    }
+    
     Ok(())
 }
 
