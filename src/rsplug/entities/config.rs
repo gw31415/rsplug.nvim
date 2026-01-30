@@ -12,7 +12,7 @@ use dag::DagNode;
 use hashbrown::HashMap;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sailfish::runtime::Render;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_with::{DeserializeFromStr, FromInto, OneOrMany, serde_as};
 
 use super::*;
@@ -25,10 +25,10 @@ impl<T: IntoIterator<Item = Config>> From<T> for Config {
 
 /// 設定ファイルの構造体
 #[serde_as]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
     #[serde(default)]
-    pub(super) plugins: Vec<PluginConfig>,
+    pub plugins: Vec<PluginConfig>,
 }
 
 impl AddAssign for Config {
@@ -49,7 +49,7 @@ impl Sum for Config {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct CacheConfig {
     #[serde(rename = "repo")]
     pub repo: RepoSource,
@@ -66,7 +66,7 @@ impl CacheConfig {
 }
 
 #[serde_as]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct LazyTypeDeserializer {
     #[serde(default)]
     start: bool,
@@ -108,9 +108,49 @@ impl From<LazyTypeDeserializer> for LazyType {
     }
 }
 
+impl From<LazyType> for LazyTypeDeserializer {
+    fn from(val: LazyType) -> Self {
+        match val {
+            LazyType::Start => LazyTypeDeserializer {
+                start: true,
+                on_event: Vec::new(),
+                on_cmd: Vec::new(),
+                on_ft: Vec::new(),
+                on_map: KeyPattern::default(),
+            },
+            LazyType::Opt(events) => {
+                let mut on_event = Vec::new();
+                let mut on_cmd = Vec::new();
+                let mut on_ft = Vec::new();
+                let mut on_map = KeyPattern::default();
+                
+                for event in events {
+                    match event {
+                        LoadEvent::Autocmd(a) => on_event.push(a),
+                        LoadEvent::UserCmd(u) => on_cmd.push(u),
+                        LoadEvent::FileType(f) => on_ft.push(f),
+                        LoadEvent::OnMap(m) => on_map = m,
+                        LoadEvent::LuaModule(_) => {
+                            // LuaModule is auto-detected, not from config
+                        }
+                    }
+                }
+                
+                LazyTypeDeserializer {
+                    start: false,
+                    on_event,
+                    on_cmd,
+                    on_ft,
+                    on_map,
+                }
+            }
+        }
+    }
+}
+
 #[serde_as]
-#[derive(Deserialize)]
-pub(super) struct PluginConfig {
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct PluginConfig {
     #[serde(flatten)]
     pub cache: CacheConfig,
     #[serde(flatten)]
@@ -143,7 +183,7 @@ impl DagNode for PluginConfig {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Serialize)]
 struct SetupScriptOne {
     /// プラグイン読み込み直後に実行される Lua スクリプト
     lua_after: Option<String>,
@@ -173,6 +213,20 @@ impl From<SetupScriptOne> for SetupScript {
     }
 }
 
+impl From<SetupScript> for SetupScriptOne {
+    fn from(value: SetupScript) -> Self {
+        let SetupScript {
+            lua_after,
+            lua_before,
+        } = value;
+        // Take the first element from each BTreeSet (if any)
+        SetupScriptOne {
+            lua_after: lua_after.into_iter().next(),
+            lua_before: lua_before.into_iter().next(),
+        }
+    }
+}
+
 impl AddAssign for SetupScript {
     fn add_assign(&mut self, rhs: Self) {
         self.lua_after.extend(rhs.lua_after);
@@ -181,7 +235,7 @@ impl AddAssign for SetupScript {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct MergeConfig {
     #[serde(default = "default_ignore")]
     pub ignore: FileSpecifier,
@@ -192,12 +246,27 @@ fn default_ignore() -> FileSpecifier {
 }
 
 /// Gitignore形式のファイル指定子
-#[derive(DeserializeFromStr)]
-pub struct FileSpecifier(Arc<Gitignore>);
+#[derive(DeserializeFromStr, Clone)]
+pub struct FileSpecifier(Arc<Gitignore>, String);
+
+impl std::fmt::Debug for FileSpecifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("FileSpecifier").field(&self.1).finish()
+    }
+}
 
 impl FileSpecifier {
     pub fn matched(&self, filepath: impl AsRef<Path>) -> bool {
         self.0.matched(filepath.as_ref(), false).is_ignore()
+    }
+}
+
+impl Serialize for FileSpecifier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.1)
     }
 }
 
@@ -208,7 +277,7 @@ impl FromStr for FileSpecifier {
         for line in s.lines() {
             builder.add_line(None, line)?;
         }
-        Ok(FileSpecifier(builder.build()?.into()))
+        Ok(FileSpecifier(builder.build()?.into(), s.to_string()))
     }
 }
 
@@ -216,8 +285,35 @@ impl FromStr for FileSpecifier {
 #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct KeyPattern(pub BTreeMap<ModeChar, Vec<Arc<String>>>);
 
+impl Serialize for KeyPattern {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            let v_strings: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+            map.serialize_entry(&k.to_string(), &v_strings)?;
+        }
+        map.end()
+    }
+}
+
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct ModeChar(Option<char>);
+
+impl Serialize for ModeChar {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0 {
+            Some(c) => serializer.serialize_char(c),
+            None => serializer.serialize_str(""),
+        }
+    }
+}
 
 impl std::fmt::Display for ModeChar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

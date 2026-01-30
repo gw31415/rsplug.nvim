@@ -8,6 +8,7 @@ use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_with::DeserializeFromStr;
+use serde::{Serialize, Serializer};
 
 use super::*;
 
@@ -21,16 +22,10 @@ pub struct PluginLoadResult {
 
 /// Information needed for the lock file
 pub struct PluginLockInfo {
-    /// Plugin identifier
-    pub id: String,
-    /// Repository source
-    pub repo: RepoSourceLock,
+    /// Repository URL
+    pub url: String,
     /// Resolved commit SHA
     pub resolved_rev: String,
-    /// Whether symlinked
-    pub to_sym: bool,
-    /// Build commands
-    pub build: Vec<String>,
 }
 
 /// 設定を構成する基本単位
@@ -46,7 +41,7 @@ pub struct Plugin {
 }
 
 /// プラグインの取得元
-#[derive(DeserializeFromStr)]
+#[derive(DeserializeFromStr, Clone, Debug)]
 pub enum RepoSource {
     /// GitHub リポジトリ
     GitHub {
@@ -57,6 +52,24 @@ pub enum RepoSource {
         /// リビジョン
         rev: Option<Arc<str>>,
     },
+}
+
+impl Serialize for RepoSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s = match self {
+            RepoSource::GitHub { owner, repo, rev } => {
+                if let Some(r) = rev {
+                    format!("{}/{}@{}", owner, repo, r)
+                } else {
+                    format!("{}/{}", owner, repo)
+                }
+            }
+        };
+        serializer.serialize_str(&s)
+    }
 }
 
 impl RepoSource {
@@ -325,16 +338,8 @@ impl Plugin {
                 };
                 
                 let lock = PluginLockInfo {
-                    id: format!("{}/{}", owner_for_lock, repo_for_lock),
-                    repo: RepoSourceLock::GitHub {
-                        owner: owner_for_lock.to_string(),
-                        repo: repo_for_lock.to_string(),
-                        requested_rev: rev_for_lock.as_ref().map(|r| r.to_string()),
-                        url: url_for_lock.to_string(),
-                    },
+                    url: url_for_lock.to_string(),
                     resolved_rev,
-                    to_sym,
-                    build: build_clone,
                 };
                 
                 (loaded, lock)

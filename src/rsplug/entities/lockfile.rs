@@ -1,6 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use super::config::PluginConfig;
 
 /// Lock file structure that contains all necessary information to build the pack directory.
 /// This is serialized to JSON format.
@@ -8,49 +10,19 @@ use serde::{Deserialize, Serialize};
 pub struct LockFile {
     /// Version of the lock file format
     pub version: String,
-    /// Embedded TOML configuration content
-    /// This allows building from lock file alone without requiring separate TOML files
-    pub toml_configs: Vec<TomlConfig>,
-    /// Locked plugin information
-    pub plugins: Vec<LockedPlugin>,
+    /// Plugin configurations (collection of PluginConfigs as described in TOML)
+    pub plugins: Vec<PluginConfig>,
+    /// Locked information for resources requiring network connection
+    pub locked: Vec<LockedResource>,
 }
 
-/// TOML configuration embedded in the lock file
+/// Locked resource information for network-dependent resources
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TomlConfig {
-    /// Path to the original TOML file (for reference)
-    pub path: PathBuf,
-    /// Content of the TOML file
-    pub content: String,
-}
-
-/// Information about a locked plugin
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LockedPlugin {
-    /// Plugin identifier (e.g., "owner/repo" or custom name)
-    pub id: String,
-    /// Repository source information
-    pub repo: RepoSourceLock,
-    /// Git commit hash that was resolved
-    pub resolved_rev: String,
-    /// Whether this plugin should be symlinked
-    pub to_sym: bool,
-    /// Build commands
-    pub build: Vec<String>,
-}
-
-/// Locked repository source information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum RepoSourceLock {
-    GitHub {
-        owner: String,
-        repo: String,
-        /// Requested revision (can be a wildcard or specific tag/branch/commit)
-        requested_rev: Option<String>,
-        /// URL of the repository
-        url: String,
-    },
+pub struct LockedResource {
+    /// Repository URL
+    pub url: String,
+    /// Git commit hash
+    pub rev: String,
 }
 
 impl LockFile {
@@ -58,8 +30,8 @@ impl LockFile {
     pub fn new() -> Self {
         Self {
             version: "1".to_string(),
-            toml_configs: Vec::new(),
             plugins: Vec::new(),
+            locked: Vec::new(),
         }
     }
 

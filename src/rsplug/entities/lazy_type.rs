@@ -12,6 +12,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sailfish::runtime::Render;
 use serde_with::DeserializeFromStr;
+use serde::Serialize;
 
 /// Startプラグインとするか、Optプラグインとするか
 #[derive(PartialEq, Eq, Clone, Hash, Debug)]
@@ -118,6 +119,15 @@ pub enum LoadEvent {
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct Autocmd(Arc<String>);
 
+impl Serialize for Autocmd {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
 impl FromStr for Autocmd {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -139,6 +149,15 @@ impl Render for Autocmd {
 /// Vimのユーザーコマンドの文字列を表す型。
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct UserCmd(Arc<String>);
+
+impl Serialize for UserCmd {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
 
 impl FromStr for UserCmd {
     type Err = &'static str;
@@ -165,9 +184,18 @@ impl Render for UserCmd {
     }
 }
 
-/// Vimのユーザーコマンドの文字列を表す型。
+/// Vimのファイルタイプの文字列を表す型。
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct FileType(Arc<String>);
+
+impl Serialize for FileType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
 
 impl FromStr for FileType {
     type Err = &'static str;

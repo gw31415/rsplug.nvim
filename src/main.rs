@@ -38,32 +38,26 @@ async fn app() -> Result<(), Error> {
         config_files,
     } = Args::parse();
 
-    let (plugins, toml_configs, is_from_lock_file) = if let Some(lock_path) = lock_file {
+    let (plugins, plugin_configs, is_from_lock_file) = if let Some(lock_path) = lock_file {
         // Build from lock file
         let lock = rsplug::LockFile::read(&lock_path).await?;
         msg(Message::DetectConfigFile(lock_path));
         
-        // TODO: Use lock.plugins[].resolved_rev to enforce exact commits when loading
-        // Currently, we parse TOML and load as normal, which may fetch different commits
+        // TODO: Use lock.locked to enforce exact commits when loading
+        // Currently, we load plugins using the repo info from PluginConfig
         // For true deterministic builds, we should match each plugin with its locked
         // revision and pass that to the load function.
         
-        // Parse TOML configs from lock file
-        let mut configs = Vec::new();
-        for toml_config in &lock.toml_configs {
-            match toml::from_str::<rsplug::Config>(&toml_config.content) {
-                Ok(config) => {
-                    configs.push(config);
-                }
-                Err(e) => return Err(Error::Parse(e, toml_config.path.clone())),
-            }
-        }
+        // Use plugins from lock file directly
+        let config = rsplug::Config {
+            plugins: lock.plugins.clone(),
+        };
         
-        (rsplug::Plugin::new(configs.into_iter().sum())?, lock.toml_configs, true)
+        (rsplug::Plugin::new(config)?, lock.plugins, true)
     } else {
         // Build from TOML files (existing behavior)
         // Parse all of config files
-        let (configs, toml_configs) = {
+        let (configs, plugin_configs) = {
             let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
                 .filter_map(|path| match path {
                     Err(e) => Some(Err(e)),
@@ -82,29 +76,25 @@ async fn app() -> Result<(), Error> {
                     match toml::from_slice::<rsplug::Config>(&content) {
                         Ok(config) => {
                             log::msg(Message::DetectConfigFile(path.to_path_buf()));
-                            // Also save TOML content for lock file
-                            let toml_content = String::from_utf8_lossy(&content).to_string();
-                            Ok((config, rsplug::TomlConfig {
-                                path: path.clone(),
-                                content: toml_content,
-                            }))
+                            Ok(config)
                         }
                         Err(e) => Err(Error::Parse(e, path.to_path_buf())),
                     }
                 })
                 .collect::<JoinSet<_>>();
             let mut confs = Vec::new();
-            let mut toml_confs = Vec::new();
             while let Some(result) = joinset.join_next().await {
-                let (config, toml_config) = result.expect(
+                let config = result.expect(
                     "Some tasks reading config files may be unintentionally aborted",
                 )?;
                 confs.push(config);
-                toml_confs.push(toml_config);
             }
-            (confs, toml_confs)
+            // Aggregate all configs and extract plugin configs
+            let aggregated_config: rsplug::Config = confs.into_iter().sum();
+            let plugin_configs = aggregated_config.plugins.clone();
+            (aggregated_config, plugin_configs)
         };
-        (rsplug::Plugin::new(configs.into_iter().sum())?, toml_configs, false)
+        (rsplug::Plugin::new(configs)?, plugin_configs, false)
     };
 
     msg(Message::Loading { install, update });
@@ -153,13 +143,10 @@ async fn app() -> Result<(), Error> {
     if !is_from_lock_file && (install || update) {
         let lock_file = rsplug::LockFile {
             version: "1".to_string(),
-            toml_configs,
-            plugins: lock_infos.into_iter().map(|info| rsplug::LockedPlugin {
-                id: info.id,
-                repo: info.repo,
-                resolved_rev: info.resolved_rev,
-                to_sym: info.to_sym,
-                build: info.build,
+            plugins: plugin_configs,
+            locked: lock_infos.into_iter().map(|info| rsplug::LockedResource {
+                url: info.url,
+                rev: info.resolved_rev,
             }).collect(),
         };
         
