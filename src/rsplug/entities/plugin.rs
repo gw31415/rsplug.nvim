@@ -178,11 +178,8 @@ impl Plugin {
         let url: Arc<str> = Arc::from(repo.url());
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
-                // Clone values that will be moved into async blocks but needed later
-                let owner_for_lock = owner.clone();
-                let repo_for_lock = repo.clone();
+                // Clone URL for lock info (will be moved into async blocks)
                 let url_for_lock = url.clone();
-                let rev_for_lock = rev.clone();
                 
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
