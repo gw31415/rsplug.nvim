@@ -189,13 +189,13 @@ impl Plugin {
                             }
                             Oid::from_str(locked_rev).map_err(Error::Git2)?
                         } else if update {
+                            msg(Message::Cache("Updating", url.clone()));
                             git::ls_remote(url.clone(), rev).await?
                         } else {
                             break 'repo repo;
                         };
-
-                        msg(Message::Cache("Updating", url.clone()));
                         repo.fetch(oid).await?;
+                        msg(Message::Cache("Updating:done", url.clone()));
                         repo
                     } else if install {
                         // リポジトリがない場合のインストール処理
