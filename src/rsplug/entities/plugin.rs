@@ -26,7 +26,7 @@ pub struct Plugin {
 }
 
 /// プラグインの取得元
-#[derive(DeserializeFromStr, Debug)]
+#[derive(DeserializeFromStr)]
 pub enum RepoSource {
     /// GitHub リポジトリ
     GitHub {

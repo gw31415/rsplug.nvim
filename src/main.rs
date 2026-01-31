@@ -12,8 +12,6 @@ use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 
-use crate::rsplug::LockFile;
-
 #[derive(clap::Parser, Debug)]
 #[command(about)]
 struct Args {
@@ -154,7 +152,7 @@ async fn app() -> Result<(), Error> {
                 },
             );
         }
-        LockFile {
+        rsplug::LockFile {
             version: "1".into(),
             locked: merged_locked,
         }
@@ -178,7 +176,6 @@ async fn app() -> Result<(), Error> {
         .install(DEFAULT_APP_DIR.as_path())
         .await
         .map_err(rsplug::Error::Io)?;
-
     Ok(())
 }
 

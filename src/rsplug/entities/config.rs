@@ -12,7 +12,7 @@ use dag::DagNode;
 use hashbrown::HashMap;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sailfish::runtime::Render;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_with::{DeserializeFromStr, FromInto, OneOrMany, serde_as};
 
 use super::*;
@@ -25,10 +25,10 @@ impl<T: IntoIterator<Item = Config>> From<T> for Config {
 
 /// 設定ファイルの構造体
 #[serde_as]
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub plugins: Vec<PluginConfig>,
+    pub(super) plugins: Vec<PluginConfig>,
 }
 
 impl AddAssign for Config {
@@ -49,7 +49,7 @@ impl Sum for Config {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 pub struct CacheConfig {
     #[serde(rename = "repo")]
     pub repo: RepoSource,
@@ -66,7 +66,7 @@ impl CacheConfig {
 }
 
 #[serde_as]
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct LazyTypeDeserializer {
     #[serde(default)]
     start: bool,
@@ -149,8 +149,8 @@ impl From<LazyType> for LazyTypeDeserializer {
 }
 
 #[serde_as]
-#[derive(Deserialize, Serialize)]
-pub struct PluginConfig {
+#[derive(Deserialize)]
+pub(super) struct PluginConfig {
     #[serde(flatten)]
     pub cache: CacheConfig,
     #[serde(flatten)]
@@ -183,7 +183,7 @@ impl DagNode for PluginConfig {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize, Default, Serialize)]
+#[derive(Deserialize, Default)]
 struct SetupScriptOne {
     /// プラグイン読み込み直後に実行される Lua スクリプト
     lua_after: Option<String>,
@@ -213,20 +213,6 @@ impl From<SetupScriptOne> for SetupScript {
     }
 }
 
-impl From<SetupScript> for SetupScriptOne {
-    fn from(value: SetupScript) -> Self {
-        let SetupScript {
-            lua_after,
-            lua_before,
-        } = value;
-        // Take the first element from each BTreeSet (if any)
-        SetupScriptOne {
-            lua_after: lua_after.into_iter().next(),
-            lua_before: lua_before.into_iter().next(),
-        }
-    }
-}
-
 impl AddAssign for SetupScript {
     fn add_assign(&mut self, rhs: Self) {
         self.lua_after.extend(rhs.lua_after);
@@ -235,7 +221,7 @@ impl AddAssign for SetupScript {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 pub struct MergeConfig {
     #[serde(default = "default_ignore")]
     pub ignore: FileSpecifier,
@@ -261,15 +247,6 @@ impl FileSpecifier {
     }
 }
 
-impl Serialize for FileSpecifier {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.1)
-    }
-}
-
 impl FromStr for FileSpecifier {
     type Err = ignore::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -282,23 +259,11 @@ impl FromStr for FileSpecifier {
 }
 
 /// キーパターン
-#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
+#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct KeyPattern(pub BTreeMap<ModeChar, Vec<Arc<String>>>);
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct ModeChar(Option<char>);
-
-impl Serialize for ModeChar {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self.0 {
-            Some(c) => serializer.serialize_char(c),
-            None => serializer.serialize_str(""),
-        }
-    }
-}
 
 impl std::fmt::Display for ModeChar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

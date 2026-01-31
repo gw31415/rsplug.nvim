@@ -11,7 +11,6 @@ use std::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 use sailfish::runtime::Render;
-use serde::Serialize;
 use serde_with::DeserializeFromStr;
 
 /// Startプラグインとするか、Optプラグインとするか
@@ -116,7 +115,7 @@ pub enum LoadEvent {
 }
 
 /// Vimの自動コマンドの文字列を表す型。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug, Serialize)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct Autocmd(Arc<String>);
 
 impl FromStr for Autocmd {
@@ -138,7 +137,7 @@ impl Render for Autocmd {
 }
 
 /// Vimのユーザーコマンドの文字列を表す型。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug, Serialize)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct UserCmd(Arc<String>);
 
 impl FromStr for UserCmd {
@@ -167,8 +166,9 @@ impl Render for UserCmd {
 }
 
 /// Vimのファイルタイプの文字列を表す型。
-#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug, Serialize)]
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct FileType(Arc<String>);
+
 impl FromStr for FileType {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
