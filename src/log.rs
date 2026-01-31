@@ -1,3 +1,4 @@
+use crate::config_display::ConfigDisplay;
 use console::style;
 use hashbrown::{HashMap, hash_map::Entry};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -12,7 +13,9 @@ use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthStr;
 
 pub enum Message {
-    DetectConfigFile(PathBuf),
+    ConfigFiles {
+        files: Vec<PathBuf>,
+    },
     Loading {
         install: bool,
         update: bool,
@@ -171,9 +174,9 @@ impl ProgressManager {
 
     fn process(&mut self, msg: Message) {
         match msg {
-            Message::DetectConfigFile(path) => {
+            Message::ConfigFiles { files } => {
                 self.multipb
-                    .println(style(path.to_string_lossy()).dim().to_string())
+                    .println(ConfigDisplay::new(files).to_string())
                     .unwrap();
             }
             Message::Loading { install, update } => {

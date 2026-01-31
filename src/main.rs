@@ -1,3 +1,4 @@
+mod config_display;
 mod log;
 mod rsplug;
 
@@ -48,6 +49,7 @@ async fn app() -> Result<(), Error> {
     let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));
 
     // Parse all of config files
+    let mut loaded_config_paths = Vec::new();
     let config = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
         .filter_map(|path| match path {
             Err(e) => Some(Err(e)),
@@ -57,10 +59,7 @@ async fn app() -> Result<(), Error> {
             let path = path?;
             let content = tokio::fs::read(&path).await?;
             match toml::from_slice::<rsplug::Config>(&content) {
-                Ok(config) => {
-                    log::msg(Message::DetectConfigFile(path.to_path_buf()));
-                    Ok(config)
-                }
+                Ok(config) => Ok((config, path.to_path_buf())),
                 Err(e) => Err(Error::Parse(e, path.to_path_buf())),
             }
         })
@@ -71,7 +70,15 @@ async fn app() -> Result<(), Error> {
         .collect::<Result<Vec<_>, _>>()
         .expect("Some tasks reading config files may be unintentionally aborted")
         .into_iter()
+        .map(|(config, path)| {
+            loaded_config_paths.push(path);
+            config
+        })
         .sum::<rsplug::Config>();
+
+    log::msg(Message::ConfigFiles {
+        files: loaded_config_paths,
+    });
 
     let locked_map = if locked {
         match rsplug::LockFile::read(lockfile.as_path()).await {
