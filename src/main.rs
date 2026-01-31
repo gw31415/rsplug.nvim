@@ -81,7 +81,6 @@ async fn app() -> Result<(), Error> {
                 msg(Message::DetectLockFile(lockfile.clone()));
                 locked
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !locked => BTreeMap::new(),
             Err(e) => return Err(e.into()),
         }
     } else {
