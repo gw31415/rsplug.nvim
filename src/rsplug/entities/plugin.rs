@@ -279,16 +279,33 @@ impl Plugin {
                                     owner
                                 }
                             };
-                            let code = execute(build.iter(), proj_root, {
+                            let logid_progress = logid.clone();
+                            let code = match execute(build.iter(), proj_root, {
                                 move |(stdtype, line)| {
                                     msg(Message::CacheBuildProgress {
-                                        id: logid.clone(),
+                                        id: logid_progress.clone(),
                                         stdtype,
                                         line,
                                     });
                                 }
                             })
-                            .await?;
+                            .await
+                            {
+                                Ok(code) => {
+                                    msg(Message::CacheBuildFinished {
+                                        id: logid.clone(),
+                                        success: code == 0,
+                                    });
+                                    code
+                                }
+                                Err(err) => {
+                                    msg(Message::CacheBuildFinished {
+                                        id: logid.clone(),
+                                        success: false,
+                                    });
+                                    return Err(err.into());
+                                }
+                            };
                             if code == 0 {
                                 tokio::fs::write(
                                     rsplug_build_success_file,

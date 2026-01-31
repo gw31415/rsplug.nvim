@@ -1,9 +1,8 @@
 use console::style;
 use hashbrown::{HashMap, hash_map::Entry};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::{
-    borrow::Cow,
     io::Write,
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -29,6 +28,10 @@ pub enum Message {
         stdtype: usize,
         line: String,
     },
+    CacheBuildFinished {
+        id: String,
+        success: bool,
+    },
     LoadDone,
     MergeFinished {
         total: usize,
@@ -53,255 +56,401 @@ type Logger = (MessageSender, LoggerCloser);
 
 static LOGGER: Lazy<Logger> = Lazy::new(init);
 
-const CACHE_FETCH_PROGRESS_ID: &str = "KksvT9lv";
+const CACHE_FETCH_PROGRESS_ID: &str = "cache_fetch_progress";
+const CACHE_FETCH_STAGE_ID: &str = "cache_fetch_stage";
 
-fn init() -> Logger {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let (tx_end, rx_end) = mpsc::unbounded_channel::<()>();
-    let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
-    let pb_style_spinner =
-        ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}").unwrap();
-    let pb_style_bar = ProgressStyle::with_template(
-        "{spinner} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
-    )
-    .unwrap()
-    .progress_chars("#>-");
-    tokio::spawn(async move {
-        let multipb_installing = MultiProgress::new();
-        let mut pb_checking_local_plugins = None;
-        let mut pb_installskipped = None;
-        let mut pb_installyank = None;
-        let mut installskipped_count = 0;
-        let mut yankfile_count = 0;
-        let multipb_caching = MultiProgress::new();
-        let mut cachefetching_oids: HashMap<String, usize> = HashMap::new();
-        let mut pb_caching: HashMap<Cow<'static, str>, _> = HashMap::new();
-        let mut cache_updating_fetching: HashMap<String, ()> = HashMap::new();
-        let mut cache_updating_current: Option<String> = None;
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                Message::DetectConfigFile(path) => {
-                    eprintln!("{}", style(path.to_string_lossy()).dim());
-                }
-                Message::Loading { install, update } => {
-                    let pb = ProgressBar::new_spinner();
-                    pb.set_style(pb_style_spinner.clone());
-                    pb.set_prefix("Loading");
-                    let activity = if install && update {
-                        "installed plugins & updates"
-                    } else if update {
-                        "updates"
-                    } else if install {
-                        "installed plugins"
-                    } else {
-                        "local plugins"
-                    };
-                    pb.set_message(activity);
-                    pb.enable_steady_tick(Duration::from_millis(100));
-                    pb_checking_local_plugins = Some(pb);
-                }
-                Message::MergeFinished { total, merged } => {
-                    let message = format!(
-                        "plugins {}",
-                        style(format!("(total:{total} merged:{merged})"))
-                            .green()
-                            .dim()
-                    );
-                    if let Some(pb) = pb_checking_local_plugins.take() {
-                        pb.set_style(pb_style.clone());
-                        pb.set_prefix("Loaded");
-                        pb.finish_with_message(message);
-                    } else {
-                        eprintln!("{} {message}", style("Loaded").blue().bold());
-                    }
-                }
-                Message::Cache(r#type, url) => {
-                    if let Some(pb) = pb_checking_local_plugins.take() {
-                        pb.finish_and_clear();
-                    }
+struct ProgressManager {
+    multipb: MultiProgress,
+    pb_style: ProgressStyle,
+    pb_style_spinner: ProgressStyle,
+    pb_style_bar: ProgressStyle,
 
-                    let pb = {
-                        let r#type = if "Updating:done" == r#type {
-                            "Updating"
-                        } else {
-                            r#type
-                        };
-                        pb_caching.entry(r#type.into()).or_insert_with(|| {
-                            multipb_caching.add(
-                                ProgressBar::no_length()
-                                    .with_style(pb_style.clone())
-                                    .with_prefix(r#type),
-                            )
-                        })
-                    };
-                    match r#type {
-                        "Updating" | "Updating:done" => {
-                            let url = url.to_string();
-                            match r#type {
-                                "Updating" => {
-                                    cache_updating_fetching.insert(url.clone(), ());
-                                    if cache_updating_current.is_none() {
-                                        cache_updating_current = Some(url.clone());
-                                        pb.set_message(url);
-                                    }
-                                }
-                                "Updating:done" => {
-                                    cache_updating_fetching.remove(&url);
-                                    if cache_updating_fetching.is_empty() {
-                                        if let Some(pb) = pb_caching.remove("Updating") {
-                                            pb.set_style(pb_style.clone());
-                                            pb.finish_with_message("done");
-                                        }
-                                        cache_updating_current = None;
-                                    } else if cache_updating_current
-                                        .as_deref()
-                                        .is_none_or(|c| c == url)
-                                    {
-                                        let next = cache_updating_fetching.keys().next().cloned();
-                                        cache_updating_current = next.clone();
-                                        pb.set_message(next.unwrap_or_default());
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {
-                            pb.set_message(url.to_string());
-                        }
-                    }
+    // State
+    progress_bars: HashMap<String, BarState>,
+    installskipped_count: usize,
+    yankfile_count: usize,
+    cachefetching_oids: HashMap<String, usize>,
+    cache_updating_fetching: HashMap<String, ()>,
+    cache_updating_current: Option<String>,
+    cache_fetch_stage: Option<&'static str>,
+}
+
+struct BarState {
+    bar: ProgressBar,
+    last_message: Option<String>,
+}
+
+impl BarState {
+    fn new(bar: ProgressBar) -> Self {
+        Self {
+            bar,
+            last_message: None,
+        }
+    }
+
+    fn set_message_if_changed(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.last_message.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        self.bar.set_message(message.clone());
+        self.last_message = Some(message);
+    }
+}
+
+fn sanitize_build_line(line: &str) -> Option<String> {
+    // Some build tools redraw a single line using '\r' without '\n'.
+    // Keep only the last non-empty segment to reduce flicker.
+    let mut last = "";
+    for part in line.split('\r') {
+        if !part.trim().is_empty() {
+            last = part;
+        }
+    }
+    let trimmed = last.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.replace('\n', " "))
+}
+
+impl ProgressManager {
+    fn new() -> Self {
+        let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
+        let pb_style_spinner =
+            ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}").unwrap();
+        let pb_style_bar = ProgressStyle::with_template(
+            "{spinner} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
+        )
+        .unwrap()
+        .progress_chars("#>-");
+
+        Self {
+            multipb: {
+                let multipb = MultiProgress::new();
+                multipb.set_draw_target(ProgressDrawTarget::stderr_with_hz(20));
+                multipb
+            },
+            pb_style,
+            pb_style_spinner,
+            pb_style_bar,
+            progress_bars: HashMap::new(),
+            installskipped_count: 0,
+            yankfile_count: 0,
+            cachefetching_oids: HashMap::new(),
+            cache_updating_fetching: HashMap::new(),
+            cache_updating_current: None,
+            cache_fetch_stage: None,
+        }
+    }
+
+    fn ensure_fetch_stage(&mut self, stage: &'static str, url: &str) {
+        let bar_state = self
+            .progress_bars
+            .entry(CACHE_FETCH_STAGE_ID.to_string())
+            .or_insert_with(|| {
+                let pb = ProgressBar::new_spinner().with_style(self.pb_style_spinner.clone());
+                pb.enable_steady_tick(Duration::from_millis(100));
+                BarState::new(self.multipb.add(pb))
+            });
+        bar_state.bar.set_prefix(stage);
+        bar_state.set_message_if_changed(url.to_string());
+        self.cache_fetch_stage = Some(stage);
+    }
+
+    fn finish_fetch_stage(&mut self) {
+        if let Some(pb) = self.progress_bars.remove(CACHE_FETCH_STAGE_ID) {
+            self.cache_fetch_stage = None;
+            self.multipb
+                .println(format!("{} all packages", style("Fetched").blue().bold()))
+                .unwrap();
+            pb.bar.set_style(self.pb_style.clone());
+            pb.bar.finish_and_clear();
+        }
+    }
+
+    fn process(&mut self, msg: Message) {
+        match msg {
+            Message::DetectConfigFile(path) => {
+                self.multipb
+                    .println(style(path.to_string_lossy()).dim().to_string())
+                    .unwrap();
+            }
+            Message::Loading { install, update } => {
+                let pb = self.multipb.add(ProgressBar::new_spinner());
+                pb.set_style(self.pb_style_spinner.clone());
+                pb.set_prefix("Loading");
+                let activity = if install && update {
+                    "installed plugins & updates"
+                } else if update {
+                    "updates"
+                } else if install {
+                    "installed plugins"
+                } else {
+                    "local plugins"
+                };
+                pb.set_message(activity);
+                pb.enable_steady_tick(Duration::from_millis(100));
+                self.progress_bars
+                    .insert("loading".to_string(), BarState::new(pb));
+            }
+            Message::MergeFinished { total, merged } => {
+                let message = format!(
+                    "plugins {}",
+                    style(format!("(total:{total} merged:{merged})"))
+                        .green()
+                        .dim()
+                );
+                if let Some(pb) = self.progress_bars.remove("loading") {
+                    pb.bar.set_style(self.pb_style.clone());
+                    pb.bar.set_prefix("Loaded");
+                    pb.bar.finish_with_message(message);
+                } else {
+                    self.multipb
+                        .println(format!("{} {message}", style("Loaded").blue().bold()))
+                        .unwrap();
                 }
-                Message::CacheFetchObjectsProgress {
-                    id,
-                    total_objs_count,
-                    received_objs_count,
-                } => {
-                    let pb = pb_caching
-                        .entry(CACHE_FETCH_PROGRESS_ID.into())
+            }
+            Message::Cache(r#type, url) => {
+                if r#type == "Fetching" || r#type == "Initializing" {
+                    self.ensure_fetch_stage(r#type, url.as_ref());
+                    return;
+                }
+                self.finish_fetch_stage();
+
+                let pb = {
+                    let r#type_key = if "Updating:done" == r#type {
+                        "Updating"
+                    } else {
+                        r#type
+                    };
+                    let style = self.pb_style.clone();
+                    let prefix = r#type_key.to_string();
+                    self.progress_bars
+                        .entry(r#type_key.to_string())
                         .or_insert_with(|| {
-                            let pb = ProgressBar::new(0).with_style(pb_style_bar.clone());
-                            pb.enable_steady_tick(Duration::from_millis(100));
-                            multipb_caching.add(pb)
-                        });
-                    let entry = cachefetching_oids.entry(id);
-                    if let Entry::Vacant(_) = entry {
-                        pb.inc_length(total_objs_count as u64);
-                    }
-                    let prev = entry.or_default();
-                    let increment = received_objs_count.saturating_sub(*prev);
-                    *prev = received_objs_count;
-                    pb.inc(increment as u64);
-                }
-                Message::CacheBuildProgress { id, stdtype, line } => {
-                    let pb = {
-                        let pb = ProgressBar::new_spinner().with_style(pb_style_spinner.clone());
-                        pb.enable_steady_tick(Duration::from_millis(100));
-                        pb.with_prefix({
-                            let mut prefix = format!("Building [{id}]");
-                            // Manual width alignment so that the style template does not need to be changed.
-                            const MAX_PREFIX_WIDTH: usize = 30;
-                            prefix.push_str(
-                                &" ".repeat(MAX_PREFIX_WIDTH.saturating_sub(prefix.width())),
+                            let bar = self.multipb.add(
+                                ProgressBar::no_length()
+                                    .with_style(style)
+                                    .with_prefix(prefix),
                             );
-                            prefix
+                            BarState::new(bar)
                         })
+                };
+                match r#type {
+                    "Updating" | "Updating:done" => {
+                        let url = url.to_string();
+                        match r#type {
+                            "Updating" => {
+                                self.cache_updating_fetching.insert(url.clone(), ());
+                                if self.cache_updating_current.is_none() {
+                                    self.cache_updating_current = Some(url.clone());
+                                    pb.set_message_if_changed(url);
+                                }
+                            }
+                            "Updating:done" => {
+                                self.cache_updating_fetching.remove(&url);
+                                if self.cache_updating_fetching.is_empty() {
+                                    if let Some(pb) = self.progress_bars.remove("Updating") {
+                                        pb.bar.set_style(self.pb_style.clone());
+                                        pb.bar.finish_with_message("done");
+                                    }
+                                    self.cache_updating_current = None;
+                                } else if self
+                                    .cache_updating_current
+                                    .as_deref()
+                                    .is_none_or(|c| c == url)
+                                {
+                                    let next = self.cache_updating_fetching.keys().next().cloned();
+                                    self.cache_updating_current = next.clone();
+                                    pb.set_message_if_changed(next.unwrap_or_default());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {
+                        pb.set_message_if_changed(url.to_string());
+                    }
+                }
+            }
+            Message::CacheFetchObjectsProgress {
+                id,
+                total_objs_count,
+                received_objs_count,
+            } => {
+                let style = self.pb_style_bar.clone();
+                let pb = self
+                    .progress_bars
+                    .entry(CACHE_FETCH_PROGRESS_ID.to_string())
+                    .or_insert_with(|| {
+                        let pb = ProgressBar::new(0).with_style(style);
+                        pb.enable_steady_tick(Duration::from_millis(100));
+                        BarState::new(self.multipb.add(pb))
+                    });
+                let entry = self.cachefetching_oids.entry(id);
+                if let Entry::Vacant(_) = entry {
+                    pb.bar.inc_length(total_objs_count as u64);
+                }
+                let prev = entry.or_default();
+                let increment = received_objs_count.saturating_sub(*prev);
+                *prev = received_objs_count;
+                pb.bar.inc(increment as u64);
+            }
+            Message::CacheBuildProgress { id, stdtype, line } => {
+                self.finish_fetch_stage();
+                if let Some(sanitized) = sanitize_build_line(&line) {
+                    let entry = format!("build-{id}");
+                    let prefix = {
+                        let mut prefix = format!("Building [{id}]");
+                        const MAX_PREFIX_WIDTH: usize = 30;
+                        prefix
+                            .push_str(&" ".repeat(MAX_PREFIX_WIDTH.saturating_sub(prefix.width())));
+                        prefix
                     };
-                    let pb = pb_caching
-                        .entry({
-                            let mut id = id;
-                            id.push_str(" - Build"); // IDは人間が任意に決めるので、PREFIXを含めて衝突しないようにする
-                            id.into()
-                        })
-                        .or_insert_with(|| multipb_caching.add(pb));
-                    pb.set_message(format!(
-                        "{} {line}",
+                    let bar = self.progress_bars.entry(entry).or_insert_with(|| {
+                        let style = self.pb_style_spinner.clone();
+                        let pb = ProgressBar::new_spinner().with_style(style);
+                        pb.enable_steady_tick(Duration::from_millis(100));
+                        BarState::new(self.multipb.add(pb.with_prefix(prefix.clone())))
+                    });
+                    let message = format!(
+                        "{} {}",
                         style({
                             let mut prefix = stdtype.to_string();
                             prefix.push('>');
                             prefix
                         })
-                        .dim()
-                    ));
+                        .dim(),
+                        sanitized
+                    );
+                    bar.set_message_if_changed(message);
+                    bar.bar.set_prefix(prefix);
                 }
-                Message::LoadDone => {
-                    let mut pb_caching = std::mem::take(&mut pb_caching);
-                    if let Some(pb) = pb_caching.remove(CACHE_FETCH_PROGRESS_ID) {
-                        pb.set_style(pb_style.clone());
-                        pb.finish_and_clear();
-                    }
-                    for pb in pb_caching.into_values() {
-                        pb.set_style(pb_style.clone());
-                        pb.finish_with_message("done");
+            }
+            Message::CacheBuildFinished { id, success } => {
+                let entry = format!("build-{id}");
+                if let Some(pb_state) = self.progress_bars.remove(&entry) {
+                    pb_state.bar.set_style(self.pb_style.clone());
+                    pb_state.bar.set_prefix("Build");
+                    if success {
+                        pb_state.bar.finish_with_message(format!("success [{id}]"));
+                    } else {
+                        pb_state.bar.finish_with_message(format!("failed [{id}]"));
                     }
                 }
-                Message::DetectLockFile(path) => {
-                    eprintln!(
+            }
+            Message::LoadDone => {
+                self.finish_fetch_stage();
+                let mut pbs = std::mem::take(&mut self.progress_bars);
+                if let Some(pb) = pbs.remove(CACHE_FETCH_PROGRESS_ID) {
+                    pb.bar.set_style(self.pb_style.clone());
+                    pb.bar.finish_and_clear();
+                }
+                for (_, pb) in pbs {
+                    pb.bar.set_style(self.pb_style.clone());
+                    pb.bar.finish_with_message("done");
+                }
+            }
+            Message::DetectLockFile(path) => {
+                self.multipb
+                    .println(format!(
                         "{} {}",
                         style("LockFile:").blue().dim(),
                         style(path.to_string_lossy()).dim()
-                    );
-                }
-                Message::InstallSkipped(id) => {
-                    installskipped_count += 1;
-                    let pb = pb_installskipped.get_or_insert_with(|| {
-                        multipb_installing.add(
+                    ))
+                    .unwrap();
+            }
+            Message::InstallSkipped(id) => {
+                self.installskipped_count += 1;
+                let progress_style = self.pb_style.clone();
+                let pb = self
+                    .progress_bars
+                    .entry("install_skipped".to_string())
+                    .or_insert_with(|| {
+                        let bar = self.multipb.add(
                             ProgressBar::no_length()
-                                .with_style(pb_style.clone())
+                                .with_style(progress_style)
                                 .with_prefix("Skipped"),
-                        )
+                        );
+                        BarState::new(bar)
                     });
-                    pb.set_message(format!("{}", style(id).italic().dim()));
-                }
-                Message::InstallYank { id, which: file } => {
-                    yankfile_count += 1;
-                    let pb = pb_installyank.get_or_insert_with(|| {
-                        multipb_installing.add(
+                pb.set_message_if_changed(format!("{}", style(id).italic().dim()));
+            }
+            Message::InstallYank { id, which: file } => {
+                self.yankfile_count += 1;
+                let progress_style = self.pb_style.clone();
+                let pb = self
+                    .progress_bars
+                    .entry("install_yank".to_string())
+                    .or_insert_with(|| {
+                        let bar = self.multipb.add(
                             ProgressBar::no_length()
-                                .with_style(pb_style.clone())
+                                .with_style(progress_style)
                                 .with_prefix("Copying"),
-                        )
+                        );
+                        BarState::new(bar)
                     });
-                    pb.set_message(format!(
-                        "in {}: {}",
-                        style(id).italic().dim(),
-                        file.to_string_lossy()
-                    ));
-                }
-                Message::InstallHelp { help_dir } => {
-                    let pb = pb_installyank.get_or_insert_with(|| {
-                        multipb_installing.add(
+                pb.set_message_if_changed(format!(
+                    "in {}: {}",
+                    style(id).italic().dim(),
+                    file.to_string_lossy()
+                ));
+            }
+            Message::InstallHelp { help_dir } => {
+                let progress_style = self.pb_style.clone();
+                let pb = self
+                    .progress_bars
+                    .entry("install_yank".to_string())
+                    .or_insert_with(|| {
+                        let bar = self.multipb.add(
                             ProgressBar::no_length()
-                                .with_style(pb_style.clone())
+                                .with_style(progress_style)
                                 .with_prefix(":helptags"),
-                        )
+                        );
+                        BarState::new(bar)
                     });
-                    pb.set_message(help_dir.to_string_lossy().into_owned());
-                }
-                Message::InstallDone => {
-                    if let Some(pb) = pb_installskipped.take() {
-                        pb.set_style(pb_style.clone());
-                        if installskipped_count != 0 {
-                            pb.set_prefix("Skipped");
-                            pb.finish_with_message(format!("{installskipped_count} packages"));
-                        } else {
-                            pb.finish_and_clear();
-                        }
+                pb.set_message_if_changed(help_dir.to_string_lossy().into_owned());
+            }
+            Message::InstallDone => {
+                if let Some(pb) = self.progress_bars.remove("install_skipped") {
+                    pb.bar.set_style(self.pb_style.clone());
+                    if self.installskipped_count != 0 {
+                        pb.bar.set_prefix("Skipped");
+                        pb.bar
+                            .finish_with_message(format!("{} packages", self.installskipped_count));
+                    } else {
+                        pb.bar.finish_and_clear();
                     }
-                    if let Some(pb) = pb_installyank.take() {
-                        pb.set_style(pb_style.clone());
-                        pb.finish_and_clear();
-                        if yankfile_count != 0 {
-                            pb.set_prefix("Copied");
-                            pb.finish_with_message(format!("{yankfile_count} files"));
-                        } else {
-                            pb.finish_and_clear();
-                        }
-                    }
-                    // multipb_installing.clear().unwrap();
                 }
-                Message::Error(e) => {
-                    eprintln!("{} {e}", style("error:").red().bold());
+                if let Some(pb) = self.progress_bars.remove("install_yank") {
+                    pb.bar.set_style(self.pb_style.clone());
+                    if self.yankfile_count != 0 {
+                        pb.bar.set_prefix("Copied");
+                        pb.bar
+                            .finish_with_message(format!("{} files", self.yankfile_count));
+                    } else {
+                        pb.bar.finish_and_clear();
+                    }
                 }
             }
+            Message::Error(e) => {
+                // To prevent flicker with other progress bars, suspend drawing.
+                self.multipb.suspend(|| {
+                    eprintln!("{} {e}", style("error:").red().bold());
+                });
+            }
+        }
+    }
+}
+
+fn init() -> Logger {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx_end, rx_end) = mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        let mut manager = ProgressManager::new();
+        while let Some(msg) = rx.recv().await {
+            manager.process(msg);
         }
         let _ = tx_end.send(());
     });
