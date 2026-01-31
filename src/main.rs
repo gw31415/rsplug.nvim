@@ -12,7 +12,7 @@ use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 
-use crate::rsplug::{LockFile, plugin::PluginLockInfo};
+use crate::rsplug::LockFile;
 
 #[derive(clap::Parser, Debug)]
 #[command(about)]
@@ -51,43 +51,33 @@ async fn app() -> Result<(), Error> {
         offline,
         config_files,
     } = Args::parse();
-    let lockfile = Arc::new(lockfile.unwrap_or(DEFAULT_APP_DIR.join("rsplug.lock.json")));
+    let lockfile = lockfile.unwrap_or(DEFAULT_APP_DIR.join("rsplug.lock.json"));
 
     // Parse all of config files
-    let config = {
-        let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
-            .filter_map(|path| match path {
-                Err(e) => Some(Err(e)),
-                Ok(path) => {
-                    if path.is_dir() {
-                        None
-                    } else {
-                        Some(Ok(path.to_path_buf()))
-                    }
+    let config = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
+        .filter_map(|path| match path {
+            Err(e) => Some(Err(e)),
+            Ok(path) => (!path.is_dir()).then_some(Ok(path.to_path_buf())),
+        })
+        .map(|path| async {
+            let path = path?;
+            let content = tokio::fs::read(&path).await?;
+            match toml::from_slice::<rsplug::Config>(&content) {
+                Ok(config) => {
+                    log::msg(Message::DetectConfigFile(path.to_path_buf()));
+                    Ok(config)
                 }
-            })
-            .map(|path| async {
-                let path = path?;
-                let content = tokio::fs::read(&path).await?;
-
-                match toml::from_slice::<rsplug::Config>(&content) {
-                    Ok(config) => {
-                        log::msg(Message::DetectConfigFile(path.to_path_buf()));
-                        Ok(config)
-                    }
-                    Err(e) => Err(Error::Parse(e, path.to_path_buf())),
-                }
-            })
-            .collect::<JoinSet<_>>();
-        let mut confs = Vec::new();
-        while let Some(result) = joinset.join_next().await {
-            let config =
-                result.expect("Some tasks reading config files may be unintentionally aborted")?;
-            confs.push(config);
-        }
-        // Aggregate all configs and extract plugin configs
-        confs.into_iter().sum::<rsplug::Config>()
-    };
+                Err(e) => Err(Error::Parse(e, path.to_path_buf())),
+            }
+        })
+        .collect::<JoinSet<_>>()
+        .join_all()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Some tasks reading config files may be unintentionally aborted")
+        .into_iter()
+        .sum::<rsplug::Config>();
 
     let locked_map = if locked || !update {
         match rsplug::LockFile::read(lockfile.as_path()).await {
@@ -106,8 +96,8 @@ async fn app() -> Result<(), Error> {
 
     msg(Message::Loading { install, update });
     // Load plugins through Cache based on the Units
-    let (mut plugins, lock_infos, locked_map) = {
-        let locked_map = Arc::new(locked_map);
+    let locked_map = Arc::new(locked_map);
+    let (mut plugins, lock_infos) = {
         let res = plugins
             .map(|plugin| {
                 let locked_map = Arc::clone(&locked_map);
@@ -152,21 +142,21 @@ async fn app() -> Result<(), Error> {
         let (plugins, locks) = res.into_iter().try_fold(
             (BinaryHeap::new(), Vec::new()),
             |(mut plugins, mut locks), res| {
-                if let Some(result) = res? {
-                    plugins.push(result.loaded);
-                    locks.push(result.lock_info);
+                if let Some((loaded, lock_info)) = res? {
+                    plugins.push(loaded);
+                    locks.push(lock_info);
                 }
                 Ok::<_, Error>((plugins, locks))
             },
         )?;
-        (plugins, locks, locked_map)
+        (plugins, locks)
     };
     let total_count = plugins.len();
 
     if !locked {
         let mut merged_locked =
             Arc::try_unwrap(locked_map).expect("No other references to locked_map");
-        for PluginLockInfo { url, resolved_rev } in lock_infos {
+        for (url, resolved_rev) in lock_infos {
             merged_locked.insert(
                 url,
                 rsplug::LockedResource {

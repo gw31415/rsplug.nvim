@@ -13,22 +13,6 @@ use serde_with::DeserializeFromStr;
 
 use super::*;
 
-/// Result of loading a plugin with lock information
-pub struct PluginLoadResult {
-    /// The loaded plugin (if successfully loaded)
-    pub loaded: LoadedPlugin,
-    /// Lock information for the lock file
-    pub lock_info: PluginLockInfo,
-}
-
-/// Information needed for the lock file
-pub struct PluginLockInfo {
-    /// Repository URL
-    pub url: String,
-    /// Resolved commit SHA
-    pub resolved_rev: String,
-}
-
 /// 設定を構成する基本単位
 pub struct Plugin {
     /// 取得元
@@ -151,7 +135,7 @@ impl Plugin {
         offline: bool,
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
-    ) -> Result<Option<PluginLoadResult>, Error> {
+    ) -> Result<Option<(LoadedPlugin, (String, String))>, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
@@ -159,6 +143,9 @@ impl Plugin {
         };
         use std::sync::Arc;
         use unicode_width::UnicodeWidthStr;
+
+        let invalid_data =
+            |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
 
         let Plugin {
             cache,
@@ -178,7 +165,8 @@ impl Plugin {
         let url: Arc<str> = Arc::from(repo.url());
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
-                let resolved_rev = if install || update {
+                let needs_revision = install || update;
+                let resolved_rev = if needs_revision {
                     let locked_rev = if let Some(locked_rev) = locked_rev.as_deref() {
                         locked_rev.to_string()
                     } else if let Some(rev) = rev.as_deref() {
@@ -186,9 +174,9 @@ impl Plugin {
                             rev.to_string()
                         } else {
                             if offline {
-                                return Err(Error::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Offline mode requires full revision for {}", url),
+                                return Err(invalid_data(format!(
+                                    "Offline mode requires full revision for {}",
+                                    url
                                 )));
                             }
                             git::ls_remote(Arc::clone(&url), Some(rev.to_string()))
@@ -197,9 +185,9 @@ impl Plugin {
                         }
                     } else {
                         if offline {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Offline mode requires locked revision for {}", url),
+                            return Err(invalid_data(format!(
+                                "Offline mode requires locked revision for {}",
+                                url
                             )));
                         }
                         git::ls_remote(Arc::clone(&url), None::<String>)
@@ -210,17 +198,10 @@ impl Plugin {
                 } else {
                     None
                 };
-                let fetch_oid = if install || update {
-                    let rev = resolved_rev.as_deref().ok_or_else(|| {
-                        Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Missing locked revision for {}", url),
-                        ))
-                    })?;
-                    Some(Oid::from_str(rev).map_err(Error::Git2)?)
-                } else {
-                    None
-                };
+                let fetch_oid = resolved_rev
+                    .as_deref()
+                    .map(|rev| Oid::from_str(rev).map_err(Error::Git2))
+                    .transpose()?;
 
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
@@ -238,37 +219,31 @@ impl Plugin {
                     if update {
                         msg(Message::Cache("Updating", url.clone()));
                         let fetch_oid = fetch_oid.ok_or_else(|| {
-                            Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Missing locked revision for {}", url),
-                            ))
+                            invalid_data(format!("Missing locked revision for {}", url))
                         })?;
                         repo.fetch(fetch_oid, offline).await?;
                     }
                     repo
                 } else if install {
                     if offline {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Offline mode requires cached repository for {}", url),
+                        return Err(invalid_data(format!(
+                            "Offline mode requires cached repository for {}",
+                            url
                         )));
                     }
                     msg(Message::Cache("Initializing", url.clone()));
                     let mut repo = git::init(proj_root.clone(), url.clone()).await?;
                     msg(Message::Cache("Fetching", url.clone()));
                     let fetch_oid = fetch_oid.ok_or_else(|| {
-                        Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Missing locked revision for {}", url),
-                        ))
+                        invalid_data(format!("Missing locked revision for {}", url))
                     })?;
                     repo.fetch(fetch_oid, offline).await?;
                     repo
                 } else {
                     if locked_rev.is_some() {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Missing cached repository for locked revision: {}", url),
+                        return Err(invalid_data(format!(
+                            "Missing cached repository for locked revision: {}",
+                            url
                         )));
                     }
                     // 見つからない場合はスキップ
@@ -276,30 +251,21 @@ impl Plugin {
                 };
 
                 let head_rev = repository.head_hash().await?;
-                let head_rev = String::from_utf8_lossy(&head_rev).to_string();
+                let head_rev_str = String::from_utf8_lossy(&head_rev).to_string();
 
                 if let Some(locked_rev) = locked_rev.as_deref()
-                    && head_rev != locked_rev
+                    && head_rev_str != locked_rev
                 {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Locked revision mismatch for {}: expected {}, got {}",
-                            url, locked_rev, head_rev
-                        ),
+                    return Err(invalid_data(format!(
+                        "Locked revision mismatch for {}: expected {}, got {}",
+                        url, locked_rev, head_rev_str
                     )));
                 }
 
                 // ディレクトリ内容からのIDの決定
                 let id = PluginID::new({
-                    let (head, diff) = tokio::join!(repository.head_hash(), repository.diff_hash());
-                    let mut head = match (head, diff) {
-                        (Ok(mut head), Ok(diff)) => {
-                            head.extend(diff);
-                            head
-                        }
-                        (Err(err), _) | (_, Err(err)) => Err(err)?,
-                    };
+                    let mut head = head_rev.clone();
+                    head.extend(repository.diff_hash().await?);
                     for (i, comp) in build.iter().enumerate() {
                         head.extend(i.to_ne_bytes());
                         head.extend(comp.as_bytes());
@@ -400,21 +366,13 @@ impl Plugin {
                     script: script.clone(),
                     is_plugctl: false,
                 };
-                // TODO: 実際にUpdateやInstallが行われたかどうかを判定してLockFileの更新の要不要を決定する
-                // Always write the actual checked-out HEAD to the lockfile.
-                let lock_info = PluginLockInfo {
-                    url: url.to_string(),
-                    resolved_rev: head_rev,
-                };
+                let lock_info = (url.to_string(), head_rev_str);
 
                 (loaded, lock_info)
             }
         };
 
-        Ok(Some(PluginLoadResult {
-            loaded: loaded_plugin,
-            lock_info,
-        }))
+        Ok(Some((loaded_plugin, lock_info)))
     }
 }
 

@@ -282,23 +282,8 @@ impl FromStr for FileSpecifier {
 }
 
 /// キーパターン
-#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
 pub struct KeyPattern(pub BTreeMap<ModeChar, Vec<Arc<String>>>);
-
-impl Serialize for KeyPattern {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (k, v) in &self.0 {
-            let v_strings: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
-            map.serialize_entry(&k.to_string(), &v_strings)?;
-        }
-        map.end()
-    }
-}
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct ModeChar(Option<char>);

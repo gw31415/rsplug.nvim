@@ -34,7 +34,7 @@ pub enum Message {
         total: usize,
         merged: usize,
     },
-    DetectLockFile(Arc<PathBuf>),
+    DetectLockFile(PathBuf),
     InstallSkipped(Arc<str>),
     InstallYank {
         id: Arc<str>,
