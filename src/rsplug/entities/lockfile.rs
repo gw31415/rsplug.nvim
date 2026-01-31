@@ -2,16 +2,12 @@ use std::{borrow::Cow, collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use super::config::PluginConfig;
-
 /// Lock file structure that contains all necessary information to build the pack directory.
 /// This is serialized to JSON format.
 #[derive(Serialize, Deserialize)]
 pub struct LockFile {
     /// Version of the lock file format
     pub version: Cow<'static, str>,
-    /// Plugin configurations (collection of PluginConfigs as described in TOML)
-    pub plugins: Vec<PluginConfig>,
     /// Locked resources by repository URL
     pub locked: BTreeMap<String, LockedResource>,
 }

@@ -23,15 +23,18 @@ struct Args {
     /// Update plugins
     #[arg(short, long)]
     update: bool,
-    /// Frozen lockfile mode: only use the lockfile and do not update it
+    /// Fix the repo version with rev in the lockfile
     #[arg(long)]
-    frozen_lockfile: bool,
+    locked: bool,
+    /// Do not access remote
+    #[arg(long)]
+    offline: bool,
     /// Specify the lockfile path
     #[arg(short, long)]
     lockfile: Option<PathBuf>,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
     #[arg(
-        required_unless_present = "frozen_lockfile",
+        required = true,
         env = "RSPLUG_CONFIG_FILES",
         value_delimiter = ':',
         hide_env_values = true
@@ -44,95 +47,98 @@ async fn app() -> Result<(), Error> {
         install,
         update,
         lockfile,
-        frozen_lockfile,
+        locked,
+        offline,
         config_files,
     } = Args::parse();
     let lockfile = Arc::new(lockfile.unwrap_or(DEFAULT_APP_DIR.join("rsplug.lock.json")));
 
-    let (plugins, locked, config) = if frozen_lockfile {
-        // Build from lock file
-        let rsplug::LockFile {
-            plugins, locked, ..
-        } = rsplug::LockFile::read(lockfile.as_path()).await?;
-        msg(Message::DetectLockFile(lockfile.clone()));
-
-        let config = rsplug::Config { plugins };
-        (rsplug::Plugin::new(config.clone())?, locked, config)
-    } else {
-        // Build from TOML files (existing behavior)
-        // Parse all of config files
-        let config = {
-            let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
-                .filter_map(|path| match path {
-                    Err(e) => Some(Err(e)),
-                    Ok(path) => {
-                        if path.is_dir() {
-                            None
-                        } else {
-                            Some(Ok(path.to_path_buf()))
-                        }
+    // Parse all of config files
+    let config = {
+        let mut joinset = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
+            .filter_map(|path| match path {
+                Err(e) => Some(Err(e)),
+                Ok(path) => {
+                    if path.is_dir() {
+                        None
+                    } else {
+                        Some(Ok(path.to_path_buf()))
                     }
-                })
-                .map(|path| async {
-                    let path = path?;
-                    let content = tokio::fs::read(&path).await?;
+                }
+            })
+            .map(|path| async {
+                let path = path?;
+                let content = tokio::fs::read(&path).await?;
 
-                    match toml::from_slice::<rsplug::Config>(&content) {
-                        Ok(config) => {
-                            log::msg(Message::DetectConfigFile(path.to_path_buf()));
-                            Ok(config)
-                        }
-                        Err(e) => Err(Error::Parse(e, path.to_path_buf())),
+                match toml::from_slice::<rsplug::Config>(&content) {
+                    Ok(config) => {
+                        log::msg(Message::DetectConfigFile(path.to_path_buf()));
+                        Ok(config)
                     }
-                })
-                .collect::<JoinSet<_>>();
-            let mut confs = Vec::new();
-            while let Some(result) = joinset.join_next().await {
-                let config = result
-                    .expect("Some tasks reading config files may be unintentionally aborted")?;
-                confs.push(config);
-            }
-            // Aggregate all configs and extract plugin configs
-            confs.into_iter().sum::<rsplug::Config>()
-        };
-
-        (
-            rsplug::Plugin::new(config.clone())?,
-            BTreeMap::new(),
-            config,
-        )
+                    Err(e) => Err(Error::Parse(e, path.to_path_buf())),
+                }
+            })
+            .collect::<JoinSet<_>>();
+        let mut confs = Vec::new();
+        while let Some(result) = joinset.join_next().await {
+            let config =
+                result.expect("Some tasks reading config files may be unintentionally aborted")?;
+            confs.push(config);
+        }
+        // Aggregate all configs and extract plugin configs
+        confs.into_iter().sum::<rsplug::Config>()
     };
+
+    let locked_map = if locked || !update {
+        match rsplug::LockFile::read(lockfile.as_path()).await {
+            Ok(rsplug::LockFile { locked, .. }) => {
+                msg(Message::DetectLockFile(lockfile.clone()));
+                locked
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !locked => BTreeMap::new(),
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        BTreeMap::new()
+    };
+
+    let plugins = rsplug::Plugin::new(config)?;
 
     msg(Message::Loading { install, update });
     // Load plugins through Cache based on the Units
-    let (mut plugins, lock_infos) = {
-        let locked = Arc::new(locked);
+    let (mut plugins, lock_infos, locked_map) = {
+        let locked_map = Arc::new(locked_map);
         let res = plugins
             .map(|plugin| {
-                let locked = Arc::clone(&locked);
+                let locked_map = Arc::clone(&locked_map);
                 async move {
                     let url = plugin.cache.repo.url();
-                    let locked_rev = if let Some(entry) = locked.get(&url) {
-                        if entry.kind != rsplug::LockedResourceType::Git {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Unsupported lock type for {}: {:?}", url, entry.kind),
-                            )));
-                        }
-                        Some(Arc::<str>::from(entry.rev.as_str()))
-                    } else if install || update {
-                        if frozen_lockfile {
+                    let locked_rev = if locked {
+                        if let Some(entry) = locked_map.get(&url) {
+                            if entry.kind != rsplug::LockedResourceType::Git {
+                                return Err(Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("Unsupported lock type for {}: {:?}", url, entry.kind),
+                                )));
+                            }
+                            Some(Arc::<str>::from(entry.rev.as_str()))
+                        } else {
                             return Err(Error::Io(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 format!("Missing locked revision for {}", url),
                             )));
                         }
-                        None
                     } else {
                         None
                     };
                     let loaded = plugin
-                        .load(install, update, DEFAULT_REPOCACHE_DIR.as_path(), locked_rev)
+                        .load(
+                            install,
+                            update,
+                            offline,
+                            DEFAULT_REPOCACHE_DIR.as_path(),
+                            locked_rev,
+                        )
                         .await?;
                     Ok(loaded)
                 }
@@ -143,38 +149,35 @@ async fn app() -> Result<(), Error> {
         // Wait until all loading is complete.
         // NOTE: It does not abort if an error occurs (because of the build process).
         msg(Message::LoadDone);
-        res.into_iter().try_fold(
+        let (plugins, locks) = res.into_iter().try_fold(
             (BinaryHeap::new(), Vec::new()),
             |(mut plugins, mut locks), res| {
-                let result = res?;
-                if let Some(loaded_plugin) = result.loaded {
-                    plugins.push(loaded_plugin);
-                }
-                if let Some(lock_info) = result.lock_info {
-                    locks.push(lock_info);
+                if let Some(result) = res? {
+                    plugins.push(result.loaded);
+                    locks.push(result.lock_info);
                 }
                 Ok::<_, Error>((plugins, locks))
             },
-        )?
+        )?;
+        (plugins, locks, locked_map)
     };
     let total_count = plugins.len();
 
-    if install || update {
+    if !locked {
+        let mut merged_locked =
+            Arc::try_unwrap(locked_map).expect("No other references to locked_map");
+        for PluginLockInfo { url, resolved_rev } in lock_infos {
+            merged_locked.insert(
+                url,
+                rsplug::LockedResource {
+                    kind: rsplug::LockedResourceType::Git,
+                    rev: resolved_rev,
+                },
+            );
+        }
         LockFile {
             version: "1".into(),
-            locked: lock_infos
-                .into_iter()
-                .map(|PluginLockInfo { url, resolved_rev }| {
-                    (
-                        url,
-                        rsplug::LockedResource {
-                            kind: rsplug::LockedResourceType::Git,
-                            rev: resolved_rev,
-                        },
-                    )
-                })
-                .collect(),
-            plugins: config.plugins,
+            locked: merged_locked,
         }
         .write(lockfile.as_path())
         .await?;

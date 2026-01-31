@@ -16,9 +16,9 @@ use super::*;
 /// Result of loading a plugin with lock information
 pub struct PluginLoadResult {
     /// The loaded plugin (if successfully loaded)
-    pub loaded: Option<LoadedPlugin>,
+    pub loaded: LoadedPlugin,
     /// Lock information for the lock file
-    pub lock_info: Option<PluginLockInfo>,
+    pub lock_info: PluginLockInfo,
 }
 
 /// Information needed for the lock file
@@ -42,7 +42,7 @@ pub struct Plugin {
 }
 
 /// プラグインの取得元
-#[derive(Clone, DeserializeFromStr, Debug)]
+#[derive(DeserializeFromStr, Debug)]
 pub enum RepoSource {
     /// GitHub リポジトリ
     GitHub {
@@ -148,9 +148,10 @@ impl Plugin {
         self,
         install: bool,
         update: bool,
+        offline: bool,
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
-    ) -> Result<PluginLoadResult, Error> {
+    ) -> Result<Option<PluginLoadResult>, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
@@ -184,11 +185,23 @@ impl Plugin {
                         if is_full_hex_hash(rev) {
                             rev.to_string()
                         } else {
+                            if offline {
+                                return Err(Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("Offline mode requires full revision for {}", url),
+                                )));
+                            }
                             git::ls_remote(Arc::clone(&url), Some(rev.to_string()))
                                 .await?
                                 .to_string()
                         }
                     } else {
+                        if offline {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Offline mode requires locked revision for {}", url),
+                            )));
+                        }
                         git::ls_remote(Arc::clone(&url), None::<String>)
                             .await?
                             .to_string()
@@ -230,10 +243,16 @@ impl Plugin {
                                 format!("Missing locked revision for {}", url),
                             ))
                         })?;
-                        repo.fetch(fetch_oid).await?;
+                        repo.fetch(fetch_oid, offline).await?;
                     }
                     repo
                 } else if install {
+                    if offline {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Offline mode requires cached repository for {}", url),
+                        )));
+                    }
                     msg(Message::Cache("Initializing", url.clone()));
                     let mut repo = git::init(proj_root.clone(), url.clone()).await?;
                     msg(Message::Cache("Fetching", url.clone()));
@@ -243,15 +262,33 @@ impl Plugin {
                             format!("Missing locked revision for {}", url),
                         ))
                     })?;
-                    repo.fetch(fetch_oid).await?;
+                    repo.fetch(fetch_oid, offline).await?;
                     repo
                 } else {
+                    if locked_rev.is_some() {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Missing cached repository for locked revision: {}", url),
+                        )));
+                    }
                     // 見つからない場合はスキップ
-                    return Ok(PluginLoadResult {
-                        loaded: None,
-                        lock_info: None,
-                    });
+                    return Ok(None);
                 };
+
+                let head_rev = repository.head_hash().await?;
+                let head_rev = String::from_utf8_lossy(&head_rev).to_string();
+
+                if let Some(locked_rev) = locked_rev.as_deref()
+                    && head_rev != locked_rev
+                {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Locked revision mismatch for {}: expected {}, got {}",
+                            url, locked_rev, head_rev
+                        ),
+                    )));
+                }
 
                 // ディレクトリ内容からのIDの決定
                 let id = PluginID::new({
@@ -363,19 +400,21 @@ impl Plugin {
                     script: script.clone(),
                     is_plugctl: false,
                 };
-                let lock_info = resolved_rev.map(|resolved_rev| PluginLockInfo {
+                // TODO: 実際にUpdateやInstallが行われたかどうかを判定してLockFileの更新の要不要を決定する
+                // Always write the actual checked-out HEAD to the lockfile.
+                let lock_info = PluginLockInfo {
                     url: url.to_string(),
-                    resolved_rev,
-                });
+                    resolved_rev: head_rev,
+                };
 
                 (loaded, lock_info)
             }
         };
 
-        Ok(PluginLoadResult {
-            loaded: Some(loaded_plugin),
+        Ok(Some(PluginLoadResult {
+            loaded: loaded_plugin,
             lock_info,
-        })
+        }))
     }
 }
 
