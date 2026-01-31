@@ -26,9 +26,6 @@ struct Args {
     /// Fix the repo version with rev in the lockfile
     #[arg(long)]
     locked: bool,
-    /// Do not access remote
-    #[arg(long)]
-    offline: bool,
     /// Specify the lockfile path
     #[arg(short, long)]
     lockfile: Option<PathBuf>,
@@ -48,10 +45,9 @@ async fn app() -> Result<(), Error> {
         update,
         lockfile,
         locked,
-        offline,
         config_files,
     } = Args::parse();
-    let lockfile = lockfile.unwrap_or(DEFAULT_APP_DIR.join("rsplug.lock.json"));
+    let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));
 
     // Parse all of config files
     let config = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
@@ -79,7 +75,7 @@ async fn app() -> Result<(), Error> {
         .into_iter()
         .sum::<rsplug::Config>();
 
-    let locked_map = if locked || !update {
+    let locked_map = if locked {
         match rsplug::LockFile::read(lockfile.as_path()).await {
             Ok(rsplug::LockFile { locked, .. }) => {
                 msg(Message::DetectLockFile(lockfile.clone()));
@@ -122,13 +118,7 @@ async fn app() -> Result<(), Error> {
                         None
                     };
                     let loaded = plugin
-                        .load(
-                            install,
-                            update,
-                            offline,
-                            DEFAULT_REPOCACHE_DIR.as_path(),
-                            locked_rev,
-                        )
+                        .load(install, update, DEFAULT_REPOCACHE_DIR.as_path(), locked_rev)
                         .await?;
                     Ok(loaded)
                 }

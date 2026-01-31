@@ -132,7 +132,6 @@ impl Plugin {
         self,
         install: bool,
         update: bool,
-        offline: bool,
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
     ) -> Result<Option<(LoadedPlugin, (String, String))>, Error> {
@@ -165,44 +164,6 @@ impl Plugin {
         let url: Arc<str> = Arc::from(repo.url());
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
-                let needs_revision = install || update;
-                let resolved_rev = if needs_revision {
-                    let locked_rev = if let Some(locked_rev) = locked_rev.as_deref() {
-                        locked_rev.to_string()
-                    } else if let Some(rev) = rev.as_deref() {
-                        if is_full_hex_hash(rev) {
-                            rev.to_string()
-                        } else {
-                            if offline {
-                                return Err(invalid_data(format!(
-                                    "Offline mode requires full revision for {}",
-                                    url
-                                )));
-                            }
-                            git::ls_remote(Arc::clone(&url), Some(rev.to_string()))
-                                .await?
-                                .to_string()
-                        }
-                    } else {
-                        if offline {
-                            return Err(invalid_data(format!(
-                                "Offline mode requires locked revision for {}",
-                                url
-                            )));
-                        }
-                        git::ls_remote(Arc::clone(&url), None::<String>)
-                            .await?
-                            .to_string()
-                    };
-                    Some(locked_rev)
-                } else {
-                    None
-                };
-                let fetch_oid = resolved_rev
-                    .as_deref()
-                    .map(|rev| Oid::from_str(rev).map_err(Error::Git2))
-                    .transpose()?;
-
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
                 let filesource = Arc::new(FileSource::Directory {
@@ -213,41 +174,59 @@ impl Plugin {
                     unsafe { std::hint::unreachable_unchecked() };
                 };
 
-                // リポジトリがない場合のインストール処理
-                let repository = if let Ok(mut repo) = git::open(proj_root.clone()).await {
-                    // アップデート処理
-                    if update {
+                let repository = 'repo: {
+                    if let Ok(mut repo) = git::open(proj_root.clone()).await {
+                        // リポジトリが存在する場合
+
+                        // アップデート処理
+                        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+                            // locked モード
+                            if !is_full_hex_hash(locked_rev) {
+                                return Err(invalid_data(format!(
+                                    "Locked revision must be full hash for {}: got {}",
+                                    url, locked_rev
+                                )));
+                            }
+                            Oid::from_str(locked_rev).map_err(Error::Git2)?
+                        } else if update {
+                            git::ls_remote(url.clone(), rev).await?
+                        } else {
+                            break 'repo repo;
+                        };
+
                         msg(Message::Cache("Updating", url.clone()));
-                        let fetch_oid = fetch_oid.ok_or_else(|| {
-                            invalid_data(format!("Missing locked revision for {}", url))
-                        })?;
-                        repo.fetch(fetch_oid, offline).await?;
+                        repo.fetch(oid, update).await?;
+                        repo
+                    } else if install {
+                        // リポジトリがない場合のインストール処理
+                        // Installの際は暗黙的にonlineモード
+                        msg(Message::Cache("Initializing", url.clone()));
+                        let mut repo = git::init(proj_root.clone(), url.clone()).await?;
+                        msg(Message::Cache("Fetching", url.clone()));
+                        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+                            // locked モード
+                            if !is_full_hex_hash(locked_rev) {
+                                return Err(invalid_data(format!(
+                                    "Locked revision must be full hash for {}: got {}",
+                                    url, locked_rev
+                                )));
+                            }
+                            Oid::from_str(locked_rev).map_err(Error::Git2)?
+                        } else {
+                            git::ls_remote(url.clone(), rev).await?
+                        };
+                        repo.fetch(oid, true).await?;
+                        repo
+                    } else {
+                        if locked_rev.is_some() {
+                            return Err(invalid_data(format!(
+                                "Missing cached repository for locked revision: {}",
+                                url
+                            )));
+                        }
+                        // 見つからない場合はスキップ
+                        return Ok(None);
                     }
-                    repo
-                } else if install {
-                    if offline {
-                        return Err(invalid_data(format!(
-                            "Offline mode requires cached repository for {}",
-                            url
-                        )));
-                    }
-                    msg(Message::Cache("Initializing", url.clone()));
-                    let mut repo = git::init(proj_root.clone(), url.clone()).await?;
-                    msg(Message::Cache("Fetching", url.clone()));
-                    let fetch_oid = fetch_oid.ok_or_else(|| {
-                        invalid_data(format!("Missing locked revision for {}", url))
-                    })?;
-                    repo.fetch(fetch_oid, offline).await?;
-                    repo
-                } else {
-                    if locked_rev.is_some() {
-                        return Err(invalid_data(format!(
-                            "Missing cached repository for locked revision: {}",
-                            url
-                        )));
-                    }
-                    // 見つからない場合はスキップ
-                    return Ok(None);
                 };
 
                 let head_rev = repository.head_hash().await?;
@@ -264,13 +243,13 @@ impl Plugin {
 
                 // ディレクトリ内容からのIDの決定
                 let id = PluginID::new({
-                    let mut head = head_rev.clone();
-                    head.extend(repository.diff_hash().await?);
+                    let mut head_rev = head_rev;
+                    head_rev.extend(repository.diff_hash().await?);
                     for (i, comp) in build.iter().enumerate() {
-                        head.extend(i.to_ne_bytes());
-                        head.extend(comp.as_bytes());
+                        head_rev.extend(i.to_ne_bytes());
+                        head_rev.extend(comp.as_bytes());
                     }
-                    hash::digest(&head)
+                    hash::digest(&head_rev)
                 });
 
                 // ビルド実行
