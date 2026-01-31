@@ -109,19 +109,13 @@ pub mod git {
         }
 
         /// リポジトリ同期処理
-        pub async fn fetch(&mut self, rev: Oid, remote: bool) -> Result<(), Error> {
+        pub async fn fetch(&mut self, rev: Oid) -> Result<(), Error> {
             let repo = self.0.clone();
             spawn_blocking(move || {
                 let repo = repo.lock().unwrap();
                 let obj = if let Ok(obj) = repo.find_object(rev, None) {
                     obj
                 } else {
-                    if !remote {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Missing object for offline fetch: {}", rev),
-                        )));
-                    }
                     if let Ok(mut remote) = repo.find_remote("origin") {
                         remote.fetch(
                             &[rev.to_string()],

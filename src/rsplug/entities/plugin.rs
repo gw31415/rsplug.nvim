@@ -195,11 +195,10 @@ impl Plugin {
                         };
 
                         msg(Message::Cache("Updating", url.clone()));
-                        repo.fetch(oid, update).await?;
+                        repo.fetch(oid).await?;
                         repo
                     } else if install {
                         // リポジトリがない場合のインストール処理
-                        // Installの際は暗黙的にonlineモード
                         msg(Message::Cache("Initializing", url.clone()));
                         let mut repo = git::init(proj_root.clone(), url.clone()).await?;
                         msg(Message::Cache("Fetching", url.clone()));
@@ -215,7 +214,7 @@ impl Plugin {
                         } else {
                             git::ls_remote(url.clone(), rev).await?
                         };
-                        repo.fetch(oid, true).await?;
+                        repo.fetch(oid).await?;
                         repo
                     } else {
                         if locked_rev.is_some() {

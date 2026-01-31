@@ -20,7 +20,7 @@ struct Args {
     /// Install plugins
     #[arg(short, long)]
     install: bool,
-    /// Update plugins
+    /// Fetch remote revisions
     #[arg(short, long)]
     update: bool,
     /// Fix the repo version with rev in the lockfile
