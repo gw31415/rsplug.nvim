@@ -98,14 +98,18 @@ pub mod git {
 
         /// リポジトリ内のファイル一覧を取得
         pub async fn ls_files(&self) -> Result<Vec<PathBuf>, Error> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap()
-                .index()?
-                .iter()
-                .map(|entry| bytes_to_pathbuf(entry.path))
-                .collect::<Vec<_>>())
+            let repo = self.0.clone();
+            spawn_blocking(move || {
+                Ok(repo
+                    .lock()
+                    .unwrap()
+                    .index()?
+                    .iter()
+                    .map(|entry| bytes_to_pathbuf(entry.path))
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .unwrap()
         }
 
         /// リポジトリ同期処理
@@ -220,6 +224,22 @@ pub mod git {
                 // 128bit のダイジェストを hex で
                 let digest = hasher.digest128();
                 Ok(digest.to_ne_bytes())
+            })
+            .await
+            .unwrap()
+        }
+
+        /// ワークツリーに変更があるかどうか
+        pub async fn is_dirty(&self) -> Result<bool, Error> {
+            let repo = self.0.clone();
+            spawn_blocking(move || {
+                let repo = repo.lock().unwrap();
+                let mut opts = git2::StatusOptions::new();
+                opts.include_untracked(true)
+                    .recurse_untracked_dirs(true)
+                    .include_unmodified(false);
+                let statuses = repo.statuses(Some(&mut opts))?;
+                Ok(!statuses.is_empty())
             })
             .await
             .unwrap()

@@ -165,7 +165,7 @@ impl Plugin {
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
                 tokio::fs::create_dir_all(&proj_root).await?;
-                let proj_root = proj_root.canonicalize()?;
+                let proj_root = tokio::fs::canonicalize(&proj_root).await?;
                 let filesource = Arc::new(FileSource::Directory {
                     path: proj_root.into(),
                 });
@@ -243,7 +243,9 @@ impl Plugin {
                 // ディレクトリ内容からのIDの決定
                 let id = PluginID::new({
                     let mut head_rev = head_rev;
-                    head_rev.extend(repository.diff_hash().await?);
+                    if repository.is_dirty().await? {
+                        head_rev.extend(repository.diff_hash().await?);
+                    }
                     for (i, comp) in build.iter().enumerate() {
                         head_rev.extend(i.to_ne_bytes());
                         head_rev.extend(comp.as_bytes());
