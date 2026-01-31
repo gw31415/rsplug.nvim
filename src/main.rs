@@ -15,17 +15,17 @@ use tokio::task::JoinSet;
 #[derive(clap::Parser, Debug)]
 #[command(about)]
 struct Args {
-    /// Install plugins
+    /// Install plugins which are not installed yet
     #[arg(short, long)]
     install: bool,
-    /// Fetch remote revisions
-    #[arg(short, long)]
+    /// Access remote and update repositories
+    #[arg(conflicts_with = "locked", short, long)]
     update: bool,
     /// Fix the repo version with rev in the lockfile
     #[arg(long)]
     locked: bool,
     /// Specify the lockfile path
-    #[arg(short, long)]
+    #[arg(long)]
     lockfile: Option<PathBuf>,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
     #[arg(
