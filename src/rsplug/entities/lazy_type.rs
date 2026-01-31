@@ -165,7 +165,7 @@ impl Render for UserCmd {
     }
 }
 
-/// Vimのユーザーコマンドの文字列を表す型。
+/// Vimのファイルタイプの文字列を表す型。
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct FileType(Arc<String>);
 

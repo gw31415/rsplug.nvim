@@ -108,6 +108,46 @@ impl From<LazyTypeDeserializer> for LazyType {
     }
 }
 
+impl From<LazyType> for LazyTypeDeserializer {
+    fn from(val: LazyType) -> Self {
+        match val {
+            LazyType::Start => LazyTypeDeserializer {
+                start: true,
+                on_event: Vec::new(),
+                on_cmd: Vec::new(),
+                on_ft: Vec::new(),
+                on_map: KeyPattern::default(),
+            },
+            LazyType::Opt(events) => {
+                let mut on_event = Vec::new();
+                let mut on_cmd = Vec::new();
+                let mut on_ft = Vec::new();
+                let mut on_map = KeyPattern::default();
+
+                for event in events {
+                    match event {
+                        LoadEvent::Autocmd(a) => on_event.push(a),
+                        LoadEvent::UserCmd(u) => on_cmd.push(u),
+                        LoadEvent::FileType(f) => on_ft.push(f),
+                        LoadEvent::OnMap(m) => on_map = m,
+                        LoadEvent::LuaModule(_) => {
+                            // LuaModule is auto-detected, not from config
+                        }
+                    }
+                }
+
+                LazyTypeDeserializer {
+                    start: false,
+                    on_event,
+                    on_cmd,
+                    on_ft,
+                    on_map,
+                }
+            }
+        }
+    }
+}
+
 #[serde_as]
 #[derive(Deserialize)]
 pub(super) struct PluginConfig {
@@ -193,7 +233,13 @@ fn default_ignore() -> FileSpecifier {
 
 /// Gitignore形式のファイル指定子
 #[derive(DeserializeFromStr)]
-pub struct FileSpecifier(Arc<Gitignore>);
+pub struct FileSpecifier(Arc<Gitignore>, String);
+
+impl std::fmt::Debug for FileSpecifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("FileSpecifier").field(&self.1).finish()
+    }
+}
 
 impl FileSpecifier {
     pub fn matched(&self, filepath: impl AsRef<Path>) -> bool {
@@ -208,7 +254,7 @@ impl FromStr for FileSpecifier {
         for line in s.lines() {
             builder.add_line(None, line)?;
         }
-        Ok(FileSpecifier(builder.build()?.into()))
+        Ok(FileSpecifier(builder.build()?.into(), s.to_string()))
     }
 }
 

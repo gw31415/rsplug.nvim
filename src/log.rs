@@ -34,6 +34,7 @@ pub enum Message {
         total: usize,
         merged: usize,
     },
+    DetectLockFile(PathBuf),
     InstallSkipped(Arc<str>),
     InstallYank {
         id: Arc<str>,
@@ -75,6 +76,8 @@ fn init() -> Logger {
         let multipb_caching = MultiProgress::new();
         let mut cachefetching_oids: HashMap<String, usize> = HashMap::new();
         let mut pb_caching: HashMap<Cow<'static, str>, _> = HashMap::new();
+        let mut cache_updating_fetching: HashMap<String, ()> = HashMap::new();
+        let mut cache_updating_current: Option<String> = None;
         while let Some(msg) = rx.recv().await {
             match msg {
                 Message::DetectConfigFile(path) => {
@@ -117,14 +120,55 @@ fn init() -> Logger {
                         pb.finish_and_clear();
                     }
 
-                    let pb = pb_caching.entry(r#type.into()).or_insert_with(|| {
-                        multipb_caching.add(
-                            ProgressBar::no_length()
-                                .with_style(pb_style.clone())
-                                .with_prefix(r#type),
-                        )
-                    });
-                    pb.set_message(url.to_string());
+                    let pb = {
+                        let r#type = if "Updating:done" == r#type {
+                            "Updating"
+                        } else {
+                            r#type
+                        };
+                        pb_caching.entry(r#type.into()).or_insert_with(|| {
+                            multipb_caching.add(
+                                ProgressBar::no_length()
+                                    .with_style(pb_style.clone())
+                                    .with_prefix(r#type),
+                            )
+                        })
+                    };
+                    match r#type {
+                        "Updating" | "Updating:done" => {
+                            let url = url.to_string();
+                            match r#type {
+                                "Updating" => {
+                                    cache_updating_fetching.insert(url.clone(), ());
+                                    if cache_updating_current.is_none() {
+                                        cache_updating_current = Some(url.clone());
+                                        pb.set_message(url);
+                                    }
+                                }
+                                "Updating:done" => {
+                                    cache_updating_fetching.remove(&url);
+                                    if cache_updating_fetching.is_empty() {
+                                        if let Some(pb) = pb_caching.remove("Updating") {
+                                            pb.set_style(pb_style.clone());
+                                            pb.finish_with_message("done");
+                                        }
+                                        cache_updating_current = None;
+                                    } else if cache_updating_current
+                                        .as_deref()
+                                        .is_none_or(|c| c == url)
+                                    {
+                                        let next = cache_updating_fetching.keys().next().cloned();
+                                        cache_updating_current = next.clone();
+                                        pb.set_message(next.unwrap_or_default());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            pb.set_message(url.to_string());
+                        }
+                    }
                 }
                 Message::CacheFetchObjectsProgress {
                     id,
@@ -188,6 +232,13 @@ fn init() -> Logger {
                         pb.set_style(pb_style.clone());
                         pb.finish_with_message("done");
                     }
+                }
+                Message::DetectLockFile(path) => {
+                    eprintln!(
+                        "{} {}",
+                        style("LockFile:").blue().dim(),
+                        style(path.to_string_lossy()).dim()
+                    );
                 }
                 Message::InstallSkipped(id) => {
                     installskipped_count += 1;

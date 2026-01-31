@@ -5,8 +5,10 @@ use std::{
 };
 
 use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
+use git2::Oid;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::{Serialize, Serializer};
 use serde_with::DeserializeFromStr;
 
 use super::*;
@@ -35,6 +37,24 @@ pub enum RepoSource {
         /// リビジョン
         rev: Option<Arc<str>>,
     },
+}
+
+impl Serialize for RepoSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s = match self {
+            RepoSource::GitHub { owner, repo, rev } => {
+                if let Some(r) = rev {
+                    format!("{}/{}@{}", owner, repo, r)
+                } else {
+                    format!("{}/{}", owner, repo)
+                }
+            }
+        };
+        serializer.serialize_str(&s)
+    }
 }
 
 impl RepoSource {
@@ -113,7 +133,8 @@ impl Plugin {
         install: bool,
         update: bool,
         cache_dir: impl AsRef<Path>,
-    ) -> Result<Option<LoadedPlugin>, Error> {
+        locked_rev: Option<Arc<str>>,
+    ) -> Result<Option<(LoadedPlugin, (String, String))>, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
@@ -121,6 +142,9 @@ impl Plugin {
         };
         use std::sync::Arc;
         use unicode_width::UnicodeWidthStr;
+
+        let invalid_data =
+            |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
 
         let Plugin {
             cache,
@@ -135,9 +159,10 @@ impl Plugin {
             manually_to_sym: _,
             build,
         } = cache;
+
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
-        let loaded_plugin: LoadedPlugin = match repo {
+        let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
                 tokio::fs::create_dir_all(&proj_root).await?;
                 let proj_root = proj_root.canonicalize()?;
@@ -149,41 +174,81 @@ impl Plugin {
                     unsafe { std::hint::unreachable_unchecked() };
                 };
 
-                // リポジトリがない場合のインストール処理
-                let repository = if let Ok(mut repo) = git::open(proj_root.clone()).await {
-                    // アップデート処理
-                    if update {
-                        msg(Message::Cache("Updating", url.clone()));
-                        repo.fetch(git::ls_remote(url.clone(), rev.clone()).await?)
-                            .await?;
+                let repository = 'repo: {
+                    if let Ok(mut repo) = git::open(proj_root.clone()).await {
+                        // リポジトリが存在する場合
+
+                        // アップデート処理
+                        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+                            // locked モード
+                            if !is_full_hex_hash(locked_rev) {
+                                return Err(invalid_data(format!(
+                                    "Locked revision must be full hash for {}: got {}",
+                                    url, locked_rev
+                                )));
+                            }
+                            Oid::from_str(locked_rev).map_err(Error::Git2)?
+                        } else if update {
+                            msg(Message::Cache("Updating", url.clone()));
+                            git::ls_remote(url.clone(), rev).await?
+                        } else {
+                            break 'repo repo;
+                        };
+                        repo.fetch(oid).await?;
+                        msg(Message::Cache("Updating:done", url.clone()));
+                        repo
+                    } else if install {
+                        // リポジトリがない場合のインストール処理
+                        msg(Message::Cache("Initializing", url.clone()));
+                        let mut repo = git::init(proj_root.clone(), url.clone()).await?;
+                        msg(Message::Cache("Fetching", url.clone()));
+                        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+                            // locked モード
+                            if !is_full_hex_hash(locked_rev) {
+                                return Err(invalid_data(format!(
+                                    "Locked revision must be full hash for {}: got {}",
+                                    url, locked_rev
+                                )));
+                            }
+                            Oid::from_str(locked_rev).map_err(Error::Git2)?
+                        } else {
+                            git::ls_remote(url.clone(), rev).await?
+                        };
+                        repo.fetch(oid).await?;
+                        repo
+                    } else {
+                        if locked_rev.is_some() {
+                            return Err(invalid_data(format!(
+                                "Missing cached repository for locked revision: {}",
+                                url
+                            )));
+                        }
+                        // 見つからない場合はスキップ
+                        return Ok(None);
                     }
-                    repo
-                } else if install {
-                    msg(Message::Cache("Initializing", url.clone()));
-                    let mut repo = git::init(proj_root.clone(), url.clone()).await?;
-                    msg(Message::Cache("Fetching", url.clone()));
-                    repo.fetch(git::ls_remote(url.clone(), rev.clone()).await?)
-                        .await?;
-                    repo
-                } else {
-                    // 見つからない場合はスキップ
-                    return Ok(None);
                 };
+
+                let head_rev = repository.head_hash().await?;
+                let head_rev_str = String::from_utf8_lossy(&head_rev).to_string();
+
+                if let Some(locked_rev) = locked_rev.as_deref()
+                    && head_rev_str != locked_rev
+                {
+                    return Err(invalid_data(format!(
+                        "Locked revision mismatch for {}: expected {}, got {}",
+                        url, locked_rev, head_rev_str
+                    )));
+                }
 
                 // ディレクトリ内容からのIDの決定
                 let id = PluginID::new({
-                    let (head, diff) = tokio::join!(repository.head_hash(), repository.diff_hash());
-                    match (head, diff) {
-                        (Ok(mut head), Ok(diff)) => {
-                            head.extend(diff);
-                            for (i, comp) in build.iter().enumerate() {
-                                head.extend(i.to_ne_bytes());
-                                head.extend(comp.as_bytes());
-                            }
-                            hash::digest(&head)
-                        }
-                        (Err(err), _) | (_, Err(err)) => Err(err)?,
+                    let mut head_rev = head_rev;
+                    head_rev.extend(repository.diff_hash().await?);
+                    for (i, comp) in build.iter().enumerate() {
+                        head_rev.extend(i.to_ne_bytes());
+                        head_rev.extend(comp.as_bytes());
                     }
+                    hash::digest(&head_rev)
                 });
 
                 // ビルド実行
@@ -271,17 +336,21 @@ impl Plugin {
                             .collect(),
                     )
                 };
-                LoadedPlugin {
+
+                let loaded = LoadedPlugin {
                     id,
                     files,
                     lazy_type,
                     script: script.clone(),
                     is_plugctl: false,
-                }
+                };
+                let lock_info = (url.to_string(), head_rev_str);
+
+                (loaded, lock_info)
             }
         };
 
-        Ok::<_, Error>(Some(loaded_plugin))
+        Ok(Some((loaded_plugin, lock_info)))
     }
 }
 
@@ -313,4 +382,8 @@ fn extract_unique_lua_modules<'a>(
             None
         }
     })
+}
+
+fn is_full_hex_hash(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }

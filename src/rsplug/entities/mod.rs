@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod lazy_type;
+pub mod lockfile;
 pub mod merge_type;
 pub mod packpathstate;
 pub mod plugin;
