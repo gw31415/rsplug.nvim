@@ -6,6 +6,8 @@ Arguments:
   <CONFIG_FILES>...  Glob-patterns of the config files. Split by ':' to specify multiple patterns [env: RSPLUG_CONFIG_FILES]
 
 Options:
-  -i, --install  Install plugins
-  -u, --update   Update plugins
-  -h, --help     Print help
+  -i, --install              Install plugins which are not installed yet
+  -u, --update               Access remote and update repositories
+      --locked               Fix the repo version with rev in the lockfile
+      --lockfile <LOCKFILE>  Specify the lockfile path
+  -h, --help                 Print help
