@@ -16,10 +16,6 @@ pub enum Message {
     ConfigFiles {
         files: Vec<PathBuf>,
     },
-    Loading {
-        install: bool,
-        update: bool,
-    },
     Cache(&'static str, Arc<str>),
     CacheFetchObjectsProgress {
         id: String,
@@ -75,6 +71,7 @@ struct ProgressManager {
     cachefetching_oids: HashMap<String, usize>,
     cache_updating_fetching: HashMap<String, ()>,
     cache_updating_current: Option<String>,
+    updating_bar: Option<BarState>,
     cache_fetch_stage: Option<&'static str>,
 }
 
@@ -143,6 +140,7 @@ impl ProgressManager {
             cachefetching_oids: HashMap::new(),
             cache_updating_fetching: HashMap::new(),
             cache_updating_current: None,
+            updating_bar: None,
             cache_fetch_stage: None,
         }
     }
@@ -179,24 +177,6 @@ impl ProgressManager {
                     .println(ConfigDisplay::new(files).to_string())
                     .unwrap();
             }
-            Message::Loading { install, update } => {
-                let pb = self.multipb.add(ProgressBar::new_spinner());
-                pb.set_style(self.pb_style_spinner.clone());
-                pb.set_prefix("Loading");
-                let activity = if install && update {
-                    "installed plugins & updates"
-                } else if update {
-                    "updates"
-                } else if install {
-                    "installed plugins"
-                } else {
-                    "local plugins"
-                };
-                pb.set_message(activity);
-                pb.enable_steady_tick(Duration::from_millis(100));
-                self.progress_bars
-                    .insert("loading".to_string(), BarState::new(pb));
-            }
             Message::MergeFinished { total, merged } => {
                 let message = format!(
                     "plugins {}",
@@ -221,28 +201,17 @@ impl ProgressManager {
                 }
                 self.finish_fetch_stage();
 
-                let pb = {
-                    let r#type_key = if "Updating:done" == r#type {
-                        "Updating"
-                    } else {
-                        r#type
-                    };
-                    let style = self.pb_style.clone();
-                    let prefix = r#type_key.to_string();
-                    self.progress_bars
-                        .entry(r#type_key.to_string())
-                        .or_insert_with(|| {
-                            let bar = self.multipb.add(
-                                ProgressBar::no_length()
-                                    .with_style(style)
-                                    .with_prefix(prefix),
-                            );
-                            BarState::new(bar)
-                        })
-                };
                 match r#type {
                     "Updating" | "Updating:done" => {
                         let url = url.to_string();
+                        let pb = self.updating_bar.get_or_insert_with(|| {
+                            let bar = ProgressBar::new_spinner()
+                                .with_style(self.pb_style_spinner.clone())
+                                .with_prefix("Updating");
+                            bar.enable_steady_tick(Duration::from_millis(100));
+                            bar.set_draw_target(ProgressDrawTarget::stderr());
+                            BarState::new(bar)
+                        });
                         match r#type {
                             "Updating" => {
                                 self.cache_updating_fetching.insert(url.clone(), ());
@@ -254,10 +223,7 @@ impl ProgressManager {
                             "Updating:done" => {
                                 self.cache_updating_fetching.remove(&url);
                                 if self.cache_updating_fetching.is_empty() {
-                                    if let Some(pb) = self.progress_bars.remove("Updating") {
-                                        pb.bar.set_style(self.pb_style.clone());
-                                        pb.bar.finish_with_message("done");
-                                    }
+                                    pb.set_message_if_changed(url);
                                     self.cache_updating_current = None;
                                 } else if self
                                     .cache_updating_current
@@ -273,6 +239,20 @@ impl ProgressManager {
                         }
                     }
                     _ => {
+                        let pb = {
+                            let style = self.pb_style.clone();
+                            let prefix = r#type.to_string();
+                            self.progress_bars
+                                .entry(r#type.to_string())
+                                .or_insert_with(|| {
+                                    let bar = self.multipb.add(
+                                        ProgressBar::no_length()
+                                            .with_style(style)
+                                            .with_prefix(prefix),
+                                    );
+                                    BarState::new(bar)
+                                })
+                        };
                         pb.set_message_if_changed(url.to_string());
                     }
                 }
@@ -348,6 +328,9 @@ impl ProgressManager {
                 let mut pbs = std::mem::take(&mut self.progress_bars);
                 if let Some(pb) = pbs.remove(CACHE_FETCH_PROGRESS_ID) {
                     pb.bar.set_style(self.pb_style.clone());
+                    pb.bar.finish_and_clear();
+                }
+                if let Some(pb) = self.updating_bar.take() {
                     pb.bar.finish_and_clear();
                 }
                 for (_, pb) in pbs {

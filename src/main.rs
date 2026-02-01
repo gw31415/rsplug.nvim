@@ -94,7 +94,6 @@ async fn app() -> Result<(), Error> {
 
     let plugins = rsplug::Plugin::new(config)?;
 
-    msg(Message::Loading { install, update });
     // Load plugins through Cache based on the Units
     let locked_map = Arc::new(locked_map);
     let (mut plugins, lock_infos) = {
