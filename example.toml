@@ -10,7 +10,7 @@ vim.api.nvim_set_var('deepl_target_lang', 'EN')
 [[plugins]]
 repo = "gw31415/deepl-operator.vim"
 # Dependent plugins loaded **simultaneously** (note: not in advance) with the plugin
-depends = "deepl.vim"
+with = ["deepl.vim"]
 # Keybindings to load the plugin
 on_map = { nx = ["cl", "cL"] }
 # Script to run after loading the plugin
