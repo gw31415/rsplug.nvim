@@ -6,7 +6,7 @@
 
 ## Overview
 
-**rsplug.nvim** is a modern Neovim plugin manager that takes a different approach: it's implemented as an external Rust binary rather than a Vimscript/Lua plugin. This architectural decision enables fast, parallel Git operations, deterministic builds, and seamless integration with Nix-based workflows.
+**rsplug.nvim** is a modern Neovim plugin manager that takes a different approach: it's implemented as an external Rust binary rather than a Vimscript/Lua plugin. Instead of installing plugins directly, rsplug **synchronizes Vim pack packages from TOML configuration files**, enabling fast, parallel Git operations, deterministic builds, and seamless integration with Nix-based workflows.
 
 ### Why rsplug.nvim?
 
@@ -70,17 +70,32 @@ on_event = ["InsertEnter", "CmdlineEnter"]
 lua_after = "require('cmp').setup{}"
 ```
 
-2. **Install plugins**:
+2. **Synchronize plugins from the TOML file**:
 
 ```bash
 rsplug --install ~/.config/nvim/rsplug.toml
+```
+
+**💡 Tip: Use environment variable for convenience!** Instead of specifying the config file every time, set:
+
+```bash
+export RSPLUG_CONFIG_FILES="~/.config/nvim/rsplug.toml"
+# Or use glob patterns:
+export RSPLUG_CONFIG_FILES="~/.config/nvim/plugins/*.toml"
+```
+
+Then simply run:
+
+```bash
+rsplug --install
+rsplug --update
 ```
 
 3. **Add to your Neovim init.lua**:
 
 ```lua
 -- Set packpath to rsplug's output directory
-vim.opt.packpath:prepend(vim.fn.expand("~/.cache/rsplug/_gen"))
+vim.opt.packpath:prepend(vim.fn.expand("~/.cache/rsplug"))
 
 -- Load lazy-loading infrastructure
 require("_rsplug")
@@ -89,8 +104,10 @@ require("_rsplug")
 4. **Update plugins**:
 
 ```bash
-rsplug --update ~/.config/nvim/rsplug.toml
+rsplug --update
 ```
+
+> **⚠️ Important:** rsplug synchronizes pack packages based on the configuration file(s) you provide. If you change which configuration file you specify as an argument, plugins defined in other files will no longer be loaded. Always use the same configuration file pattern or use the `RSPLUG_CONFIG_FILES` environment variable to ensure consistency.
 
 ## Key Features
 
@@ -161,11 +178,14 @@ repo = "j-hui/fidget.nvim@main"        # Specific branch
 Generate a lock file to ensure consistent plugin versions:
 
 ```bash
-# Create/update lock file
+# Create/update lock file (with RSPLUG_CONFIG_FILES set)
+rsplug --update
+
+# Or specify config file directly
 rsplug --update ~/.config/nvim/rsplug.toml
 
 # Use exact versions from lock file
-rsplug --locked --install ~/.config/nvim/rsplug.toml
+rsplug --locked --install
 ```
 
 ### Multiple Configuration Files
@@ -246,17 +266,21 @@ rsplug.nvim operates in two phases:
 
 ### 1. Build Phase (CLI)
 
+```bash
+rsplug --install  # with RSPLUG_CONFIG_FILES set
 ```
-rsplug --install config.toml
-```
+
+rsplug **synchronizes the pack packages** from your TOML configuration:
 
 1. Parses TOML configuration file(s)
 2. Resolves plugin dependencies using DAG (Directed Acyclic Graph)
 3. Clones/updates Git repositories to `~/.cache/rsplug/repos/`
 4. Runs build commands if specified
-5. Generates plugin structure in `~/.cache/rsplug/_gen/pack/_gen/`
-6. Creates lazy-loading infrastructure in `~/.cache/rsplug/_gen/_rsplug/`
+5. Generates plugin structure in `~/.cache/rsplug/pack/_gen/`
+6. Creates lazy-loading infrastructure in `~/.cache/rsplug/_rsplug/`
 7. Writes lock file with exact commit hashes
+
+**Important:** The pack directory reflects exactly what's in your current configuration file(s). If you change which configuration file you pass as an argument, the pack directory will be re-synchronized to match only those plugins.
 
 ### 2. Runtime Phase (Neovim)
 

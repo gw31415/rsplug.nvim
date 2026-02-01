@@ -31,8 +31,9 @@ CONTENTS                                                      *rsplug-contents*
 1. Introduction                                           *rsplug-introduction*
 
 rsplug.nvim is a Neovim plugin manager implemented as an external Rust binary
-rather than a traditional Vimscript or Lua plugin. This architectural decision
-provides several advantages:
+rather than a traditional Vimscript or Lua plugin. Instead of installing
+plugins directly, rsplug synchronizes Vim pack packages from TOML
+configuration files. This architectural decision provides several advantages:
 
 - No Neovim restart required to update the plugin manager itself
 - Fast, parallel Git operations using shallow clones
@@ -44,8 +45,9 @@ Key Concepts:~
 
 External Binary Model~
     Unlike traditional plugin managers that run inside Neovim, rsplug operates
-    as a standalone CLI tool. You run it from your shell to install and update
-    plugins, then Neovim loads the generated plugin structure.
+    as a standalone CLI tool. You run it from your shell to synchronize your
+    pack packages from TOML configuration, then Neovim loads the generated
+    plugin structure.
 
 Pack System Integration~
     rsplug generates a standard Neovim |packages| directory structure. Plugins
@@ -55,6 +57,12 @@ Pack System Integration~
 Configuration-Driven~
     All plugin definitions live in TOML configuration files. Changes to your
     plugin setup require editing TOML and re-running the rsplug CLI tool.
+    
+    IMPORTANT: rsplug synchronizes the pack directory to match the
+    configuration file(s) you provide. If you change which configuration file
+    you specify as an argument, plugins defined in other files will no longer
+    be loaded. Use the RSPLUG_CONFIG_FILES environment variable with glob
+    patterns for consistency.
 
 ==============================================================================
 2. Installation                                           *rsplug-installation*
@@ -107,7 +115,18 @@ Create `~/.config/nvim/rsplug.toml`:
     lua_after = "require('lspconfig').rust_analyzer.setup{}"
 <
 
-Step 2: Install plugins~
+Step 2: Synchronize plugins~
+
+Recommended: Set environment variable for convenience
+>bash
+    export RSPLUG_CONFIG_FILES="~/.config/nvim/rsplug.toml"
+    # Or use glob patterns:
+    # export RSPLUG_CONFIG_FILES="~/.config/nvim/plugins/*.toml"
+    
+    rsplug --install
+<
+
+Or specify config file directly:
 >bash
     rsplug --install ~/.config/nvim/rsplug.toml
 <
@@ -117,7 +136,7 @@ Step 3: Configure Neovim~
 Add to your `init.lua`:
 >lua
     -- Add rsplug's output to packpath
-    vim.opt.packpath:prepend(vim.fn.expand("~/.cache/rsplug/_gen"))
+    vim.opt.packpath:prepend(vim.fn.expand("~/.cache/rsplug"))
     
     -- Load lazy-loading infrastructure
     require("_rsplug")
@@ -125,8 +144,14 @@ Add to your `init.lua`:
 
 Step 4: Update plugins~
 >bash
-    rsplug --update ~/.config/nvim/rsplug.toml
+    rsplug --update
 <
+
+Important Notes:~
+    - rsplug synchronizes pack packages from your configuration file(s)
+    - If you change which config file you specify, other plugins will no
+      longer be loaded
+    - Using RSPLUG_CONFIG_FILES environment variable ensures consistency
 
 ==============================================================================
 4. Command-Line Usage                                            *rsplug-cli*
@@ -178,17 +203,21 @@ Environment Variables:~
     RSPLUG_CONFIG_FILES
         Default config file pattern(s). Overridden by command-line arguments.
         
+        RECOMMENDED: Set this environment variable to avoid specifying config
+        files every time you run rsplug. Supports glob patterns.
+        
         Example:
 >bash
             export RSPLUG_CONFIG_FILES="~/.config/nvim/plugins/*.toml"
             rsplug --install
+            rsplug --update
 <
 
 Default Paths:~
 
     App directory:     `~/.cache/rsplug/`
     Repository cache:  `~/.cache/rsplug/repos/`
-    Generated output:  `~/.cache/rsplug/_gen/`
+    Pack output:       `~/.cache/rsplug/pack/_gen/`
     Lock file:         `~/.cache/rsplug/rsplug.lock.json`
 
 ==============================================================================
@@ -706,7 +735,7 @@ into Neovim.
 Basic setup in init.lua:~
 >lua
     -- Add rsplug output directory to packpath
-    vim.opt.packpath:prepend(vim.fn.expand("~/.cache/rsplug/_gen"))
+    vim.opt.packpath:prepend(vim.fn.expand("~/.cache/rsplug"))
     
     -- Load lazy-loading infrastructure
     require("_rsplug")
