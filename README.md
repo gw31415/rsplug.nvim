@@ -208,7 +208,7 @@ rsplug --install
 ### Key Mapping Syntax
 
 ```toml
-# Simple (all modes)
+# Simple (`nxo` modes)
 on_map = "<leader>f"
 
 # Single mode
@@ -270,24 +270,6 @@ require("_rsplug")
 
 ## Advanced Topics
 
-### Nix Integration
-
-rsplug.nvim is designed to work seamlessly with Nix:
-
-```nix
-# Example flake usage
-{
-  packages.neovim-with-plugins = pkgs.wrapNeovim pkgs.neovim-unwrapped {
-    configure = {
-      customRC = ''
-        set packpath+=${rsplugOutput}/_gen
-        lua require('_rsplug')
-      '';
-    };
-  };
-}
-```
-
 The deterministic output (config + lock file → plugin directory) makes it ideal for Nix-based Neovim configurations.
 
 ### Plugin Merging
@@ -322,8 +304,6 @@ rsplug.nvim is ideal for:
 
 ## Known Limitations
 
-- Key mapping (`on_map`) lazy-loading is currently broken and being fixed
-- Help generation doesn't run for non-`start` plugins with `sym` or `build` settings
 - Plugin merging may occur between sibling dependencies without clear ordering control
 
 ## Contributing
