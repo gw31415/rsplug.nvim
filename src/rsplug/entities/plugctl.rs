@@ -153,7 +153,10 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             overwrite_files,
         } = value;
 
-        let mut plugs = Vec::new();
+        let mut plugs = vec![instant_startup_pkg(
+            "./doc/rsplug.txt",
+            include_bytes!("../../../templates/doc/rsplug.txt"),
+        )];
 
         {
             // Add packages to place scripts that does the initial setup of the plugin
