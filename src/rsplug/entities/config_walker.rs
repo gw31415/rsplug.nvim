@@ -38,6 +38,9 @@ impl ConfigWalker {
                 }
             }
         });
-        ConfigWalker { rx, _handle: handle }
+        ConfigWalker {
+            rx,
+            _handle: handle,
+        }
     }
 }

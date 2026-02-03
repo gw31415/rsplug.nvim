@@ -291,16 +291,22 @@ impl ProgressManager {
         .unwrap()
         .progress_chars("#>-");
 
+        let multipb = MultiProgress::new();
+        multipb.set_draw_target(ProgressDrawTarget::stderr_with_hz(20));
+        let mut barstate = BarState::new(
+            multipb.add(
+                ProgressBar::no_length()
+                    .with_style(pb_style.clone())
+                    .with_prefix("Config"),
+            ),
+        );
+        barstate.set_message_if_changed("0 files");
         Self {
-            multipb: {
-                let multipb = MultiProgress::new();
-                multipb.set_draw_target(ProgressDrawTarget::stderr_with_hz(20));
-                multipb
-            },
+            multipb,
             pb_style,
             pb_style_spinner,
             pb_style_bar,
-            progress_bars: HashMap::new(),
+            progress_bars: HashMap::from([("config_files".to_string(), barstate)]),
             installskipped_count: 0,
             yankfile_count: 0,
             cachefetching_oids: HashMap::new(),
@@ -340,9 +346,17 @@ impl ProgressManager {
     fn process(&mut self, msg: Message) {
         match msg {
             Message::ConfigFound(path) => {
+                let pb = self.progress_bars.get_mut("config_files").unwrap();
+                pb.set_message_if_changed(format!(
+                    "{} files: {path:?}",
+                    self.config_files.len() + 1
+                ));
                 self.config_files.push(path);
             }
             Message::ConfigWalkFinish => {
+                let mut pb = self.progress_bars.remove("config_files").unwrap();
+                pb.set_message_if_changed(format!("{} files", self.config_files.len()));
+                pb.bar.finish_and_clear();
                 let display = ConfigList::from_files(std::mem::take(&mut self.config_files));
                 self.multipb.println(display.to_string()).unwrap();
             }
@@ -518,14 +532,13 @@ impl ProgressManager {
             }
             Message::InstallSkipped(id) => {
                 self.installskipped_count += 1;
-                let progress_style = self.pb_style.clone();
                 let pb = self
                     .progress_bars
                     .entry("install_skipped".to_string())
                     .or_insert_with(|| {
                         let bar = self.multipb.add(
                             ProgressBar::no_length()
-                                .with_style(progress_style)
+                                .with_style(self.pb_style.clone())
                                 .with_prefix("Skipped"),
                         );
                         BarState::new(bar)
@@ -534,14 +547,13 @@ impl ProgressManager {
             }
             Message::InstallYank { id, which: file } => {
                 self.yankfile_count += 1;
-                let progress_style = self.pb_style.clone();
                 let pb = self
                     .progress_bars
                     .entry("install_yank".to_string())
                     .or_insert_with(|| {
                         let bar = self.multipb.add(
                             ProgressBar::no_length()
-                                .with_style(progress_style)
+                                .with_style(self.pb_style.clone())
                                 .with_prefix("Copying"),
                         );
                         BarState::new(bar)
@@ -553,14 +565,13 @@ impl ProgressManager {
                 ));
             }
             Message::InstallHelp { help_dir } => {
-                let progress_style = self.pb_style.clone();
                 let pb = self
                     .progress_bars
                     .entry("install_yank".to_string())
                     .or_insert_with(|| {
                         let bar = self.multipb.add(
                             ProgressBar::no_length()
-                                .with_style(progress_style)
+                                .with_style(self.pb_style.clone())
                                 .with_prefix(":helptags"),
                         );
                         BarState::new(bar)
