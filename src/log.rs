@@ -1,11 +1,11 @@
-use crate::config_display::ConfigDisplay;
 use console::style;
 use hashbrown::{HashMap, hash_map::Entry};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::{
+    fmt::{Display, Formatter, Result as FmtResult},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -13,9 +13,8 @@ use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthStr;
 
 pub enum Message {
-    ConfigFiles {
-        files: Vec<PathBuf>,
-    },
+    ConfigFound(Arc<Path>),
+    ConfigWalkFinish,
     Cache(&'static str, Arc<str>),
     CacheFetchObjectsProgress {
         id: String,
@@ -58,6 +57,172 @@ static LOGGER: Lazy<Logger> = Lazy::new(init);
 const CACHE_FETCH_PROGRESS_ID: &str = "cache_fetch_progress";
 const CACHE_FETCH_STAGE_ID: &str = "cache_fetch_stage";
 
+#[derive(Clone)]
+struct ConfigGroup {
+    location: Arc<Path>,
+    files: Vec<Arc<Path>>,
+}
+
+impl ConfigGroup {
+    fn new(location: Arc<Path>, mut files: Vec<Arc<Path>>) -> Self {
+        files.sort();
+        Self { location, files }
+    }
+
+    fn location_label(&self) -> String {
+        let name = self
+            .location
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.is_empty() {
+            self.location.to_string_lossy().to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn join_names(&self) -> String {
+        let mut names: Vec<String> = self
+            .files
+            .iter()
+            .map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names.join(" ")
+    }
+}
+
+fn config_n_files_string(n: usize) -> String {
+    format!(
+        "{} {} file{}",
+        style("Config").blue().bold(),
+        n,
+        if n == 1 { "" } else { "s" }
+    )
+}
+
+struct ConfigList {
+    files: Vec<Arc<Path>>,
+}
+
+impl ConfigList {
+    fn from_files(mut files: Vec<Arc<Path>>) -> Self {
+        files.sort();
+        Self { files }
+    }
+
+    fn render_lines(&self) -> Vec<String> {
+        let total = self.files.len();
+        let groups = self.build_groups();
+
+        if groups.len() == total {
+            let mut lines = Vec::with_capacity(total + 2);
+            lines.push(format!(
+                "{} ({} locations)",
+                config_n_files_string(total),
+                total
+            ));
+            for path in self.files.iter() {
+                lines.push(format!("  {}", path.to_string_lossy()));
+            }
+            return lines;
+        }
+
+        if let Some((dominant_idx, dominant_count)) = self.dominant_group(&groups) {
+            let main_ratio = if total == 0 {
+                0.0
+            } else {
+                dominant_count as f32 / total as f32
+            };
+            let external_count = total.saturating_sub(dominant_count);
+            if main_ratio >= 0.75 && external_count <= 5 {
+                let main = &groups[dominant_idx];
+                let mut lines = Vec::new();
+                lines.push(config_n_files_string(total));
+                lines.push(format!(
+                    "    {} ({})",
+                    main.location.to_string_lossy(),
+                    main.files.len()
+                ));
+                lines.push(format!("        {}", main.join_names()));
+                let suffix = if external_count == 1 { "file" } else { "files" };
+                lines.push(format!("    +{} external {}", external_count, suffix));
+                return lines;
+            }
+        }
+
+        if groups.len() == 1 {
+            let group = &groups[0];
+            return vec![
+                config_n_files_string(total),
+                format!("    {}", group.location.to_string_lossy()),
+                format!("        {}", group.join_names()),
+            ];
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{} in {} locations",
+            config_n_files_string(total),
+            groups.len()
+        ));
+        for group in groups {
+            lines.push(format!(
+                "    {} ({})",
+                group.location_label(),
+                group.files.len()
+            ));
+            lines.push(format!("    {}", group.location.to_string_lossy()));
+            lines.push(format!("        {}", group.join_names()));
+        }
+        while lines.last().map(|line| line.is_empty()).unwrap_or(false) {
+            lines.pop();
+        }
+        lines
+    }
+
+    fn build_groups(&self) -> Vec<ConfigGroup> {
+        let mut groups_map: HashMap<Arc<Path>, Vec<Arc<Path>>> = HashMap::new();
+        for path in self.files.iter() {
+            let key = path.parent().unwrap_or(Path::new("/")).into();
+            groups_map.entry(key).or_default().push(path.clone());
+        }
+        let mut groups: Vec<ConfigGroup> = groups_map
+            .into_iter()
+            .map(|(location, files)| ConfigGroup::new(location, files))
+            .collect();
+        groups.sort_by(|a, b| a.location.cmp(&b.location));
+        groups
+    }
+
+    fn dominant_group(&self, groups: &[ConfigGroup]) -> Option<(usize, usize)> {
+        let mut dominant_idx = None;
+        let mut dominant_count = 0;
+        for (idx, group) in groups.iter().enumerate() {
+            if group.files.len() > dominant_count {
+                dominant_count = group.files.len();
+                dominant_idx = Some(idx);
+            }
+        }
+        dominant_idx.map(|idx| (idx, dominant_count))
+    }
+}
+
+impl Display for ConfigList {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        for line in self.render_lines() {
+            writeln!(f, "{}", style(line).dim())?;
+        }
+        Ok(())
+    }
+}
+
 struct ProgressManager {
     multipb: MultiProgress,
     pb_style: ProgressStyle,
@@ -73,6 +238,7 @@ struct ProgressManager {
     cache_updating_current: Option<String>,
     updating_bar: Option<BarState>,
     cache_fetch_stage: Option<&'static str>,
+    config_files: Vec<Arc<Path>>,
 }
 
 struct BarState {
@@ -142,6 +308,7 @@ impl ProgressManager {
             cache_updating_current: None,
             updating_bar: None,
             cache_fetch_stage: None,
+            config_files: Vec::new(),
         }
     }
 
@@ -172,10 +339,12 @@ impl ProgressManager {
 
     fn process(&mut self, msg: Message) {
         match msg {
-            Message::ConfigFiles { files } => {
-                self.multipb
-                    .println(ConfigDisplay::new(files).to_string())
-                    .unwrap();
+            Message::ConfigFound(path) => {
+                self.config_files.push(path);
+            }
+            Message::ConfigWalkFinish => {
+                let display = ConfigList::from_files(std::mem::take(&mut self.config_files));
+                self.multipb.println(display.to_string()).unwrap();
             }
             Message::MergeFinished { total, merged } => {
                 let message = format!(

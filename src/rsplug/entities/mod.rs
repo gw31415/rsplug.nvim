@@ -1,4 +1,5 @@
 pub mod config;
+pub mod config_walker;
 pub mod error;
 pub mod lazy_type;
 pub mod lockfile;

@@ -1,6 +1,7 @@
 mod entities;
 pub(crate) mod util;
 
+pub use entities::config_walker;
 pub use entities::error;
 pub use entities::packpathstate;
 pub use entities::plugin;

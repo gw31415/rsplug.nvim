@@ -1,4 +1,3 @@
-mod config_display;
 mod log;
 mod rsplug;
 
@@ -12,6 +11,8 @@ use clap::Parser;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
+
+use rsplug::config_walker::ConfigWalker;
 
 #[derive(clap::Parser, Debug)]
 #[command(about)]
@@ -48,37 +49,35 @@ async fn app() -> Result<(), Error> {
     } = Args::parse();
     let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));
 
-    // Parse all of config files
-    let mut loaded_config_paths = Vec::new();
-    let config = rsplug::util::glob::find(config_files.iter().map(String::as_str))?
-        .filter_map(|path| match path {
-            Err(e) => Some(Err(e)),
-            Ok(path) => (!path.is_dir()).then_some(Ok(path.to_path_buf())),
-        })
-        .map(|path| async {
-            let path = path?;
-            let content = tokio::fs::read(&path).await?;
-            match toml::from_slice::<rsplug::Config>(&content) {
-                Ok(config) => Ok((config, path.to_path_buf())),
-                Err(e) => Err(Error::Parse(e, path.to_path_buf())),
+    // Parse all of config files while walking patterns in background.
+    let mut config_tasks = JoinSet::new();
+    {
+        let mut walker = ConfigWalker::new(config_files);
+        while let Some(item) = walker.recv().await {
+            match item {
+                Ok(path) => {
+                    msg(Message::ConfigFound(path.clone()));
+                    config_tasks.spawn(async move {
+                        let content = tokio::fs::read(&path).await?;
+                        toml::from_slice::<rsplug::Config>(&content)
+                            .map_err(|e| Error::Parse(e, path.to_path_buf()))
+                    });
+                }
+                Err(e) => return Err(Error::Ignore(e)),
             }
-        })
-        .collect::<JoinSet<_>>()
+        }
+        // All tasks in ConfigWalker::rx are done here.
+        log::msg(Message::ConfigWalkFinish);
+    }
+
+    let config = config_tasks
         .join_all()
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .expect("Some tasks reading config files may be unintentionally aborted")
         .into_iter()
-        .map(|(config, path)| {
-            loaded_config_paths.push(path);
-            config
-        })
         .sum::<rsplug::Config>();
-
-    log::msg(Message::ConfigFiles {
-        files: loaded_config_paths,
-    });
 
     let locked_map = if locked {
         match rsplug::LockFile::read(lockfile.as_path()).await {
