@@ -35,7 +35,7 @@ Instead of installing plugins directly, rsplug synchronizes Vim pack packages
 from TOML configuration files. This architectural decision provides several
 advantages:
 
-- No Neovim restart required to update the plugin manager itself
+- Say goodbye to launching Neovim just to manage plugins
 - Fast, parallel Git operations using shallow clones
 - Deterministic, reproducible builds via lock files
 - Minimal runtime overhead through plugin merging

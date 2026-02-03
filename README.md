@@ -10,7 +10,7 @@
 
 ### Why rsplug.nvim?
 
-- **External binary architecture**: No Neovim restart required to update the plugin manager itself
+- **External binary architecture**: Say goodbye to launching Neovim just to manage plugins
 - **Blazingly fast**: Parallel shallow Git clones with depth=1 for rapid installation and updates
 - **Deterministic and reproducible**: Lock file support ensures consistent plugin versions across machines
 - **Lazy-loading first**: Sophisticated lazy-loading system with autocmds, filetypes, commands, and keymaps
