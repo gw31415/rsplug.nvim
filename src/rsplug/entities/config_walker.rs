@@ -3,6 +3,17 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::util;
 
+fn is_ignorable_walk_error(e: &ignore::Error) -> bool {
+    e.io_error()
+        .map(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub struct ConfigWalker {
     rx: mpsc::UnboundedReceiver<Result<Arc<Path>, ignore::Error>>,
     _handle: JoinHandle<()>,
@@ -25,16 +36,14 @@ impl ConfigWalker {
             };
             for entry in iter {
                 match entry {
-                    Ok(path) => {
-                        if path.is_dir() {
-                            continue;
-                        }
-                        let path: Arc<Path> = path.into();
-                        let _ = tx.send(Ok(path));
+                    Ok(path) if !path.is_dir() => {
+                        let _ = tx.send(Ok(path.into()));
                     }
-                    Err(e) => {
+                    Err(e) if !is_ignorable_walk_error(&e) => {
                         let _ = tx.send(Err(e));
+                        return;
                     }
+                    _ => (),
                 }
             }
         });
