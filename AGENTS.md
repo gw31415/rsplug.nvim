@@ -27,14 +27,28 @@ fit into Nix-based workflows.
 - Inputs: one or more TOML files plus a lock file.
 - Output: a single Neovim `pack` directory (single package).
 - Lock file management (read/write) is part of the workflow.
+- Lock file format is **JSON** (`rsplug.lock.json`) with a `version` field and
+  per-repository locked resources (`type`, `rev`).
 
-## Current implemented status
+## Implemented status (synced with resolved GitHub issues + current log implementation)
 
 - TOML parsing.
 - Parallel install/update.
 - Lock file read/write.
 - Support for config-only scripts (no plugin).
 - Loading related scripts for plugins.
+- `on_cmd`, `on_map`, `on_ft`, `on_event`, and Lua `require` lazy-loading.
+- `build` hooks executed after install/update with build-success caching.
+- Dependency co-loading via `with`.
+- Helptags generation during install.
+- Merge behavior for simultaneously loaded plugins to reduce `runtimepath`.
+- Fixes for historical issues in lazy map loading and duplicate mapping behavior.
+- Fixes for edge-case deadlocks (including zero-plugin install paths).
+- Rich installer/log UX:
+  - grouped config discovery summaries,
+  - fetch stage/progress reporting,
+  - build output progress lines,
+  - improved install/yank/help log cleanup and formatting.
 
 ## Lazy-loading model
 
@@ -57,21 +71,16 @@ Supported lazy-loading triggers and scripts:
 - `lua_start`: run at Neovim startup
 - `build`: run subprocess after install
 
-## Known issues / incomplete areas
+## Resolved design direction
 
-- `on_map` is currently broken.
-- Help generation does not run for plugins that are not `start` (e.g. `sym` or
-  `build` settings).
-- TUI output feels heavy.
-- Sibling dependency plugins can be merged without a clear ordering/avoid-merge
-  mechanism.
+- The lock file is not TOML-embedded config. Current direction is:
+  TOML config as source of intent + JSON lock file for reproducible revisions.
 
-## Open design question
+## Deferred / non-goals (current)
 
-- Lock file format: store TOML content inside the lock file (lock-only build)
-  vs. store only hashes and use TOML+lock together.
+- Dedicated `ftplugin` configuration field support is intentionally deferred
+  for now (workaround: put files under `after/ftplugin` directly).
 
-## Contribution notes
+## Notes
 
-- Issues and PRs are welcome; see the issue tracker for current tasks.
-
+- Don't run `cargo check -q`
