@@ -4,8 +4,8 @@ resolver = "3"
 package = { version = "0.1.0", edition = "2024" }
 
 [workspace.dependencies]
-hashbrown = "0.16.0"
-thiserror = "2.0.17"
+hashbrown = "0.16"
+thiserror = "2.0"
 
 [package]
 name = "rsplug"
@@ -17,24 +17,24 @@ description = "Vim plugin manager written in Rust"
 hashbrown.workspace = true
 thiserror.workspace = true
 
-clap = { version = "4.5.51", features = ["derive", "env"] }
-console = "0.16.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+console = "0.16.2"
 dag = { path = "dag", features = ["hashbrown"] }
-git2 = "0.20.2"
-ignore = "0.4.25"
-indicatif = { version = "0.18.2", features = ["tokio"] }
-itertools = "0.14.0"
-once_cell = "1.21.3"
-regex = "1.12.2"
-sailfish = "0.10.0"
-serde = { version = "1.0.228", features = ["derive", "rc"] }
+git2 = "0.20"
+ignore = "0.4"
+indicatif = { version = "0.18", features = ["tokio"] }
+itertools = "0.14"
+once_cell = "1.21"
+regex = "1.12"
+sailfish = "0.10"
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-serde_with = { version = "3.15.1", features = [
+serde_with = { version = "3.16", features = [
 	"macros",
 	"hashbrown_0_16",
 ], default-features = false }
-tokio = { version = "1.48.0", features = ["full"] }
-toml = "0.9.8"
-unicode-width = "0.2.2"
-wildmatch = "2.5.0"
+tokio = { version = "1.49", features = ["full"] }
+toml = "0.9"
+unicode-width = "0.2"
+wildmatch = "2.6"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
