@@ -294,7 +294,7 @@ impl ProgressManager {
         .progress_chars("#>-");
 
         let multipb = MultiProgress::new();
-        multipb.set_draw_target(ProgressDrawTarget::stderr_with_hz(20));
+        multipb.set_draw_target(ProgressDrawTarget::stderr());
         let mut barstate = BarState::new(
             multipb.add(
                 ProgressBar::no_length()
@@ -397,8 +397,7 @@ impl ProgressManager {
                                 .with_style(self.pb_style_spinner.clone())
                                 .with_prefix("Updating");
                             bar.enable_steady_tick(Duration::from_millis(100));
-                            bar.set_draw_target(ProgressDrawTarget::stderr());
-                            BarState::new(bar)
+                            BarState::new(self.multipb.add(bar))
                         });
                         match r#type {
                             "Updating" => {
