@@ -347,10 +347,13 @@ impl ProgressManager {
         match msg {
             Message::ConfigFound(path) => {
                 let pb = self.progress_bars.get_mut("config_files").unwrap();
-                pb.set_message_if_changed(format!(
-                    "{} files: {path:?}",
-                    self.config_files.len() + 1
-                ));
+                if let Some(path) = path.to_str() {
+                    pb.set_message_if_changed(format!(
+                        "{} files: {}",
+                        self.config_files.len() + 1,
+                        style(path).dim(),
+                    ));
+                }
                 self.config_files.push(path);
             }
             Message::ConfigWalkFinish => {
