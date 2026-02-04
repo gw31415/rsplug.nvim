@@ -279,10 +279,9 @@ rsplug **synchronizes the pack packages** from your TOML configuration:
   - Clone new plugins if it provided the option `--install`
   - Update repos if it provided the option `--update`
   - Synchronizes to specific commit from lock file if `--locked` is provided
-4. Runs build commands if specified
-5. Generates plugin structure in `~/.cache/rsplug/pack/_gen/`
-6. Creates lazy-loading infrastructure in `~/.cache/rsplug/_rsplug/`
-7. Writes lock file with exact commit hashes
+4. Writes lock file with exact commit hashes
+5. Runs build commands if specified
+6. Generates plugin structure in `~/.cache/rsplug/pack/_gen/`
 
 **Important:** The pack directory reflects exactly what's in your current configuration file(s). If you change which configuration file you pass as an argument, the pack directory will be re-synchronized to match only those plugins.
 
