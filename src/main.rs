@@ -74,8 +74,7 @@ async fn app() -> Result<(), Error> {
         .join_all()
         .await
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("Some tasks reading config files may be unintentionally aborted")
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .sum::<rsplug::Config>();
 
