@@ -78,7 +78,7 @@ Binary Installation:~
 Requirements:~
     - Neovim 0.9+ (for lazy-loading features)
     - Git 2.0+
-    - Rust 1.80+ (for building from source)
+    - Rust 1.89+ (for building from source)
 
 From Source:~
 >bash

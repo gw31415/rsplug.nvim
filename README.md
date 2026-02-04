@@ -31,7 +31,7 @@ Then, install the `rsplug` binary:
 
 #### From Source
 
-Requires Rust 1.80+ and Git:
+Requires Rust 1.89+ and Git:
 
 ```bash
 git clone https://github.com/gw31415/rsplug.nvim.git
