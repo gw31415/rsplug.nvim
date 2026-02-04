@@ -355,9 +355,7 @@ pub mod git {
     ) -> Result<Oid, Error> {
         spawn_blocking(move || {
             let mut remote = git2::Remote::create_detached(url.to_string()).unwrap();
-            let connection = remote
-                .connect_auth(git2::Direction::Fetch, None, None)
-                .unwrap();
+            let connection = remote.connect_auth(git2::Direction::Fetch, None, None)?;
             let references = connection.list().unwrap();
             let latest = if let Some(rev) = rev.as_deref() {
                 let rev = wildmatch::WildMatch::new(rev);
