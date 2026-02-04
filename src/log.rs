@@ -151,8 +151,10 @@ impl ConfigList {
                     main.files.len()
                 ));
                 lines.push(format!("        {}", main.join_names()));
-                let suffix = if external_count == 1 { "file" } else { "files" };
-                lines.push(format!("    +{} external {}", external_count, suffix));
+                if external_count != 0 {
+                    let suffix = if external_count == 1 { "file" } else { "files" };
+                    lines.push(format!("    +{} external {}", external_count, suffix));
+                }
                 return lines;
             }
         }
