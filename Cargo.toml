@@ -1,7 +1,11 @@
 [workspace]
 members = [".", "dag"]
 resolver = "3"
-package = { version = "0.1.0", edition = "2024" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/gw31415/rsplug.nvim"
 
 [workspace.dependencies]
 hashbrown = "0.16"
@@ -11,7 +15,9 @@ thiserror = "2.0"
 name = "rsplug"
 version.workspace = true
 edition.workspace = true
-description = "Vim plugin manager written in Rust"
+repository.workspace = true
+description = "A blazingly fast Neovim plugin manager written in Rust"
+license = "Apache-2.0"
 
 [dependencies]
 hashbrown.workspace = true
