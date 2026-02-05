@@ -52,7 +52,7 @@ async fn app() -> Result<(), Error> {
     // Parse all of config files while walking patterns in background.
     let mut config_tasks = JoinSet::new();
     {
-        let mut walker = ConfigWalker::new(config_files)?;
+        let mut walker = ConfigWalker::new(config_files).await?;
         while let Some(item) = walker.recv().await {
             match item {
                 Ok(path) => {

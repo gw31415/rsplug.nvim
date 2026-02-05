@@ -19,9 +19,9 @@ impl ConfigWalker {
         self.rx.recv()
     }
 
-    pub fn new(patterns: Vec<String>) -> Result<ConfigWalker, io::Error> {
+    pub async fn new(patterns: Vec<String>) -> Result<ConfigWalker, io::Error> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut walker = globwalker::GlobWalker::new(patterns, &current_dir()?)?;
+        let mut walker = globwalker::GlobWalker::new(patterns, &current_dir()?).await?;
         let handle = tokio::spawn(async move {
             loop {
                 let _ = tx.send(match walker.next().await {

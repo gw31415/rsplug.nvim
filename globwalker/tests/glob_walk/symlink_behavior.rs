@@ -19,7 +19,7 @@ async fn deduplicates_by_canonical_path_and_ignores_broken_symlink() -> io::Resu
             test_dir.path.join("broken.txt"),
         )?;
 
-        let walker = GlobWalker::new(vec!["**/*.txt".to_string()], &test_dir.path)?;
+        let walker = GlobWalker::new(vec!["**/*.txt".to_string()], &test_dir.path).await?;
         let result = collect_paths(walker).await?;
         assert_eq!(result.len(), 1);
         return Ok(());
@@ -43,7 +43,7 @@ async fn follows_symlinked_directories_outside_root() -> io::Result<()> {
     create_file(&outside.path.join("secret/hidden.txt"))?;
     super::support::symlink(&outside.path, root.path.join("escape"))?;
 
-    let walker = GlobWalker::new(vec!["**/*.txt".to_string()], &root.path)?;
+    let walker = GlobWalker::new(vec!["**/*.txt".to_string()], &root.path).await?;
     let result = collect_paths(walker).await?;
 
     let paths = collect_set(&result);

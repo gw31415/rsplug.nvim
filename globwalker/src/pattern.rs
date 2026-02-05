@@ -1,26 +1,26 @@
 use std::io;
-use std::path::{Component, Path};
+use std::path::Path;
 
-use globset::{GlobBuilder, GlobMatcher};
+use wildmatch::WildMatch;
 
 #[derive(Debug, Clone)]
 pub struct PatternRule {
     pub is_exclude: bool,
-    matcher: RuleMatcher,
+    segments: Vec<SegmentMatcher>,
 }
 
 #[derive(Debug, Clone)]
-enum RuleMatcher {
-    Never,
-    AnyPath,
-    PrefixAndSuffix { prefix: String, suffix: String },
-    Glob(GlobMatcher),
+enum SegmentMatcher {
+    AnyPath(String),
+    Glob(WildMatch),
+    Descends,
 }
 
 #[derive(Debug, Clone)]
 pub struct CompiledRules {
     pub ordered_rules: Vec<PatternRule>,
     pub include_prefixes: Vec<String>,
+    pub include_patterns: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -28,6 +28,7 @@ pub struct InitializedPattern {
     index: usize,
     rule: PatternRule,
     include_prefix: Option<String>,
+    include_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,9 +47,10 @@ pub fn initialize_pattern(
             index,
             rule: PatternRule {
                 is_exclude: raw_pattern.starts_with('!'),
-                matcher: RuleMatcher::Never,
+                segments: Vec::new(),
             },
             include_prefix: None,
+            include_pattern: None,
         });
     };
 
@@ -57,14 +59,20 @@ pub fn initialize_pattern(
     } else {
         Some(extract_static_prefix(&normalized.pattern))
     };
+    let include_pattern = if normalized.is_exclude {
+        None
+    } else {
+        Some(normalized.pattern.clone())
+    };
 
     Ok(InitializedPattern {
         index,
         rule: PatternRule {
             is_exclude: normalized.is_exclude,
-            matcher: compile_matcher(&normalized.pattern)?,
+            segments: compile_matcher(&normalized.pattern)?,
         },
         include_prefix,
+        include_pattern,
     })
 }
 
@@ -107,17 +115,22 @@ pub fn compile_rules(mut initialized_patterns: Vec<InitializedPattern>) -> Compi
 
     let mut ordered_rules = Vec::with_capacity(initialized_patterns.len());
     let mut include_prefixes = Vec::new();
+    let mut include_patterns = Vec::new();
 
     for entry in initialized_patterns {
         ordered_rules.push(entry.rule);
         if let Some(prefix) = entry.include_prefix {
             include_prefixes.push(prefix);
         }
+        if let Some(pattern) = entry.include_pattern {
+            include_patterns.push(pattern);
+        }
     }
 
     CompiledRules {
         ordered_rules,
         include_prefixes,
+        include_patterns,
     }
 }
 
@@ -156,6 +169,7 @@ pub fn could_match_subtree(directory_relative_path: &str, include_prefixes: &[St
 fn normalize_pattern(input: &str) -> String {
     let mut normalized = input.replace('\\', "/");
     normalized = normalized.trim_start_matches("./").to_string();
+    normalized = normalized.trim_start_matches('/').to_string();
     normalized = normalized.replace("/**.", "/**/*.");
     if normalized.starts_with("**.") {
         normalized = format!("**/*{}", &normalized[2..]);
@@ -163,107 +177,43 @@ fn normalize_pattern(input: &str) -> String {
     normalized
 }
 
-fn compile_matcher(pattern: &str) -> io::Result<RuleMatcher> {
-    if pattern == "**" {
-        return Ok(RuleMatcher::AnyPath);
-    }
-    if let Some(matcher) = try_build_prefix_suffix_matcher(pattern) {
-        return Ok(matcher);
+fn compile_matcher(pattern: &str) -> io::Result<Vec<SegmentMatcher>> {
+    let mut segments = Vec::new();
+    if pattern.is_empty() {
+        return Ok(segments);
     }
 
-    GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .build()
-        .map(|glob| RuleMatcher::Glob(glob.compile_matcher()))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
-}
+    for segment in pattern.split('/') {
+        if segment.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Pattern contains empty path segment: {pattern}"),
+            ));
+        }
+        if segment == "**" {
+            if !matches!(segments.last(), Some(SegmentMatcher::Descends)) {
+                segments.push(SegmentMatcher::Descends);
+            }
+            continue;
+        }
 
-fn try_build_prefix_suffix_matcher(pattern: &str) -> Option<RuleMatcher> {
-    if let Some(extension) = pattern.strip_prefix("**/*.")
-        && is_literal_fragment(extension)
-    {
-        return Some(RuleMatcher::PrefixAndSuffix {
-            prefix: String::new(),
-            suffix: format!(".{extension}"),
-        });
+        if segment_contains_wildcard(segment) {
+            segments.push(SegmentMatcher::Glob(WildMatch::new(segment)));
+        } else {
+            segments.push(SegmentMatcher::AnyPath(segment.to_string()));
+        }
     }
 
-    let (prefix, extension) = pattern.split_once("/**/*.")?;
-    if !is_literal_fragment(prefix) || !is_literal_fragment(extension) {
-        return None;
-    }
-    Some(RuleMatcher::PrefixAndSuffix {
-        prefix: prefix.to_string(),
-        suffix: format!(".{extension}"),
-    })
-}
-
-fn is_literal_fragment(value: &str) -> bool {
-    !value.is_empty() && !segment_contains_wildcard(value)
+    Ok(segments)
 }
 
 fn resolve_pattern_for_cwd(pattern: &str, cwd_prefixes: &[String]) -> Option<String> {
     if !Path::new(pattern).is_absolute() {
-        return Some(pattern.to_string());
+        let cwd = cwd_prefixes.first()?;
+        let cwd = cwd.trim_end_matches('/');
+        return Some(format!("{cwd}/{pattern}"));
     }
-
-    let normalized_pattern = pattern.replace('\\', "/");
-    for normalized_cwd in cwd_prefixes {
-        if normalized_pattern == *normalized_cwd {
-            return Some(String::new());
-        }
-        let with_separator = format!("{normalized_cwd}/");
-        if let Some(relative) = normalized_pattern.strip_prefix(&with_separator) {
-            return Some(relative.to_string());
-        }
-        if let Some(relative) =
-            resolve_absolute_pattern_relative_to_cwd(normalized_cwd, &normalized_pattern)
-        {
-            return Some(relative);
-        }
-    }
-    None
-}
-
-fn resolve_absolute_pattern_relative_to_cwd(cwd: &str, absolute_pattern: &str) -> Option<String> {
-    let cwd_path = Path::new(cwd);
-    let pattern_path = Path::new(absolute_pattern);
-    if !cwd_path.is_absolute() || !pattern_path.is_absolute() {
-        return None;
-    }
-
-    let cwd_components = cwd_path
-        .components()
-        .filter(|component| !matches!(component, Component::CurDir))
-        .collect::<Vec<_>>();
-    let pattern_components = pattern_path
-        .components()
-        .filter(|component| !matches!(component, Component::CurDir))
-        .collect::<Vec<_>>();
-
-    let mut common_length = 0usize;
-    while common_length < cwd_components.len()
-        && common_length < pattern_components.len()
-        && cwd_components[common_length] == pattern_components[common_length]
-    {
-        common_length += 1;
-    }
-
-    let mut relative_parts = Vec::new();
-    for component in &cwd_components[common_length..] {
-        if matches!(component, Component::Normal(_) | Component::ParentDir) {
-            relative_parts.push("..".to_string());
-        }
-    }
-    for component in &pattern_components[common_length..] {
-        match component {
-            Component::Normal(value) => relative_parts.push(value.to_string_lossy().into_owned()),
-            Component::ParentDir => relative_parts.push("..".to_string()),
-            _ => {}
-        }
-    }
-
-    Some(relative_parts.join("/"))
+    Some(pattern.to_string())
 }
 
 fn extract_static_prefix(pattern: &str) -> String {
@@ -294,18 +244,85 @@ fn is_path_prefix(prefix: &str, path: &str) -> bool {
 
 impl PatternRule {
     fn is_match(&self, path: &str) -> bool {
-        match &self.matcher {
-            RuleMatcher::Never => false,
-            RuleMatcher::AnyPath => true,
-            RuleMatcher::PrefixAndSuffix { prefix, suffix } => {
-                path.ends_with(suffix)
-                    && (prefix.is_empty()
-                        || path == prefix
-                        || path
-                            .strip_prefix(prefix)
-                            .is_some_and(|rest| rest.starts_with('/')))
+        if self.segments.is_empty() {
+            return false;
+        }
+        let path_segments = if path.is_empty() {
+            Vec::new()
+        } else {
+            path.split('/').collect::<Vec<_>>()
+        };
+        let mut failed_states = hashbrown::HashSet::new();
+        segments_match_from(&self.segments, 0, 0, &path_segments, &mut failed_states)
+    }
+}
+
+fn segments_match_from(
+    segments: &[SegmentMatcher],
+    pattern_index: usize,
+    path_index: usize,
+    path_segments: &[&str],
+    failed_states: &mut hashbrown::HashSet<(usize, usize)>,
+) -> bool {
+    if !failed_states.insert((pattern_index, path_index)) {
+        return false;
+    }
+
+    let Some(segment) = segments.get(pattern_index) else {
+        return path_index == path_segments.len();
+    };
+
+    match segment {
+        SegmentMatcher::AnyPath(expected) => {
+            if path_segments
+                .get(path_index)
+                .is_some_and(|actual| actual == expected)
+            {
+                return segments_match_from(
+                    segments,
+                    pattern_index + 1,
+                    path_index + 1,
+                    path_segments,
+                    failed_states,
+                );
             }
-            RuleMatcher::Glob(matcher) => matcher.is_match(path),
+            false
+        }
+        SegmentMatcher::Glob(matcher) => {
+            if path_segments
+                .get(path_index)
+                .is_some_and(|actual| matcher.matches(actual))
+            {
+                return segments_match_from(
+                    segments,
+                    pattern_index + 1,
+                    path_index + 1,
+                    path_segments,
+                    failed_states,
+                );
+            }
+            false
+        }
+        SegmentMatcher::Descends => {
+            if segments_match_from(
+                segments,
+                pattern_index + 1,
+                path_index,
+                path_segments,
+                failed_states,
+            ) {
+                return true;
+            }
+            if path_index < path_segments.len() {
+                return segments_match_from(
+                    segments,
+                    pattern_index,
+                    path_index + 1,
+                    path_segments,
+                    failed_states,
+                );
+            }
+            false
         }
     }
 }

@@ -23,14 +23,6 @@ pub(crate) fn matches_compiled_rules(path: &str, rules: &[PatternRule]) -> bool 
     matches_last_rule(path, rules)
 }
 
-pub(crate) fn to_relative_unix_path(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    let normalized = relative.to_string_lossy().replace('\\', "/");
-    let normalized = normalized.trim_start_matches("./");
-    let normalized = normalized.trim_start_matches('/');
-    Some(normalized.to_string())
-}
-
 fn build_cwd_prefixes(cwd: &Path) -> Vec<String> {
     vec![cwd.to_string_lossy().replace('\\', "/")]
 }

@@ -7,11 +7,13 @@ use std::time::Instant;
 
 use hashbrown::HashSet;
 use tokio::fs;
+use tokio::task::JoinSet;
 
 use crate::fs_resolver::{DirectoryScanResult, DirectoryTask, FileEntry};
 use crate::pattern::{CompiledRules, could_match_subtree, matches_last_rule};
 
 pub struct GlobWalker {
+    root: PathBuf,
     compiled_rules: CompiledRules,
     pending_directories: VecDeque<DirectoryTask>,
     visited_directories: HashSet<PathBuf>,
@@ -22,7 +24,7 @@ pub struct GlobWalker {
 }
 
 impl GlobWalker {
-    pub fn new(patterns: impl IntoIterator<Item = String>, cwd: &Path) -> io::Result<Self> {
+    pub async fn new(patterns: impl IntoIterator<Item = String>, cwd: &Path) -> io::Result<Self> {
         let root = init::resolve_root(cwd)?;
         let patterns: Vec<String> = patterns.into_iter().collect();
         let cwd_prefixes = init::build_prefixes_for_pattern_resolution(cwd, &patterns)?;
@@ -30,13 +32,13 @@ impl GlobWalker {
         let mut pending_directories = VecDeque::new();
         let mut visited_directories = HashSet::new();
 
-        if !compiled_rules.include_prefixes.is_empty() {
+        if !compiled_rules.include_patterns.is_empty() {
             let seeded = init::seed_start_directories(
-                root.as_path(),
-                &compiled_rules.include_prefixes,
+                &compiled_rules.include_patterns,
                 &mut pending_directories,
                 &mut visited_directories,
-            )?;
+            )
+            .await?;
             if !seeded {
                 visited_directories.insert(root.clone());
                 pending_directories.push_back(DirectoryTask {
@@ -47,6 +49,7 @@ impl GlobWalker {
         }
 
         Ok(Self {
+            root,
             compiled_rules,
             pending_directories,
             visited_directories,
@@ -69,37 +72,14 @@ impl GlobWalker {
                 return Ok(Some(path));
             }
 
-            let Some(task) = self.pending_directories.pop_front() else {
+            if self.pending_directories.is_empty() {
                 if let Some(error) = self.deferred_scan_error.take() {
                     return Err(error);
                 }
                 return Ok(None);
-            };
-
-            let mut stream = match task.stream().await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    self.defer_scan_error(error);
-                    continue;
-                }
-            };
-
-            loop {
-                if self.is_timed_out() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "globwalker timed out",
-                    ));
-                }
-                match stream.next().await {
-                    Ok(Some(scan_result)) => self.process_scan_result(scan_result).await?,
-                    Ok(None) => break,
-                    Err(error) => {
-                        self.defer_scan_error(error);
-                        break;
-                    }
-                }
             }
+
+            self.process_pending_batch().await?;
         }
     }
 
@@ -121,24 +101,26 @@ impl GlobWalker {
     }
 
     async fn collect_matched_files(&mut self, file: FileEntry) -> io::Result<()> {
-        if !matches_last_rule(&file.relative_path, &self.compiled_rules.ordered_rules) {
+        let absolute_for_match = normalize_path_for_match(file.absolute_path.as_path());
+        if !matches_last_rule(&absolute_for_match, &self.compiled_rules.ordered_rules) {
             return Ok(());
         }
 
         let identity = fs::canonicalize(&file.absolute_path).await?;
 
         if self.seen_files.insert(identity) {
-            self.ready_paths.push(file.relative_path);
+            self.ready_paths.push(render_output_path(
+                self.root.as_path(),
+                file.absolute_path.as_path(),
+            ));
         }
 
         Ok(())
     }
 
     async fn enqueue_pruned_children(&mut self, child_dir: DirectoryTask) -> io::Result<()> {
-        if !could_match_subtree(
-            &child_dir.relative_path,
-            &self.compiled_rules.include_prefixes,
-        ) {
+        let absolute_for_match = normalize_path_for_match(child_dir.absolute_path.as_path());
+        if !could_match_subtree(&absolute_for_match, &self.compiled_rules.include_prefixes) {
             return Ok(());
         }
 
@@ -157,4 +139,101 @@ impl GlobWalker {
         };
         Instant::now() >= deadline
     }
+
+    async fn process_pending_batch(&mut self) -> io::Result<()> {
+        let tasks = self.pending_directories.drain(..).collect::<Vec<_>>();
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let mut join_set = JoinSet::new();
+        for task in tasks {
+            join_set.spawn(scan_directory_task(task));
+        }
+
+        while !join_set.is_empty() {
+            if self.is_timed_out() {
+                join_set.abort_all();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "globwalker timed out",
+                ));
+            }
+
+            let Some(joined) = join_set.join_next().await else {
+                break;
+            };
+            let batch = match joined {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.defer_scan_error(io::Error::other(format!(
+                        "scan task join error: {error}"
+                    )));
+                    continue;
+                }
+            };
+
+            for scan_result in batch.results {
+                self.process_scan_result(scan_result).await?;
+            }
+            if let Some(error) = batch.error {
+                self.defer_scan_error(error);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ScanBatch {
+    results: Vec<DirectoryScanResult>,
+    error: Option<io::Error>,
+}
+
+async fn scan_directory_task(task: DirectoryTask) -> ScanBatch {
+    let mut stream = match task.stream().await {
+        Ok(stream) => stream,
+        Err(error) => {
+            return ScanBatch {
+                results: Vec::new(),
+                error: Some(error),
+            };
+        }
+    };
+
+    let mut results = Vec::new();
+    loop {
+        match stream.next().await {
+            Ok(Some(scan_result)) => results.push(scan_result),
+            Ok(None) => {
+                return ScanBatch {
+                    results,
+                    error: None,
+                };
+            }
+            Err(error) => {
+                return ScanBatch {
+                    results,
+                    error: Some(error),
+                };
+            }
+        }
+    }
+}
+
+fn normalize_path_for_match(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn render_output_path(root: &Path, absolute_path: &Path) -> String {
+    if let Ok(relative) = absolute_path.strip_prefix(root)
+        && !relative.as_os_str().is_empty()
+    {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    absolute_path.to_string_lossy().replace('\\', "/")
 }

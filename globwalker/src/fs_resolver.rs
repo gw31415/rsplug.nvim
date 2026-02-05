@@ -19,7 +19,6 @@ pub(crate) enum DirectoryScanResult {
 #[derive(Debug)]
 pub(crate) struct FileEntry {
     pub(crate) absolute_path: PathBuf,
-    pub(crate) relative_path: String,
 }
 
 pub(crate) struct DirectoryScanStream {
@@ -53,10 +52,7 @@ impl DirectoryScanStream {
             }
 
             if file_type.is_file() {
-                return Ok(Some(DirectoryScanResult::File(FileEntry {
-                    absolute_path,
-                    relative_path,
-                })));
+                return Ok(Some(DirectoryScanResult::File(FileEntry { absolute_path })));
             }
 
             if !file_type.is_symlink() {
@@ -71,10 +67,7 @@ impl DirectoryScanStream {
                     })));
                 }
                 Ok(metadata) if metadata.is_file() => {
-                    return Ok(Some(DirectoryScanResult::File(FileEntry {
-                        absolute_path,
-                        relative_path,
-                    })));
+                    return Ok(Some(DirectoryScanResult::File(FileEntry { absolute_path })));
                 }
                 Ok(_) => continue,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,

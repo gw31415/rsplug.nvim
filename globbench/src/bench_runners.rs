@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -12,7 +12,7 @@ use globwalker::GlobWalker;
 use ignore::{WalkBuilder, WalkState};
 use tokio::task::spawn_blocking;
 
-use crate::bench_rules::{matches_compiled_rules, to_relative_unix_path};
+use crate::bench_rules::matches_compiled_rules;
 use crate::bench_types::{AttemptOutcome, AttemptResult, BenchmarkKind};
 use globwalker::pattern::CompiledRules;
 
@@ -62,7 +62,7 @@ async fn measure_globwalker(
     timeout: Duration,
 ) -> io::Result<AttemptOutcome> {
     let mut matched_files = 0usize;
-    let mut walker = GlobWalker::new(patterns, &cwd)?;
+    let mut walker = GlobWalker::new(patterns, &cwd).await?;
     let started = Instant::now();
     walker.set_deadline(started + timeout);
 
@@ -94,7 +94,7 @@ async fn measure_ignore(
         let start_roots = build_start_roots(cwd.as_path(), &rules.include_prefixes)?;
         let seen = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let timed_out = Arc::new(AtomicBool::new(false));
-        let shared_error = Arc::new(std::sync::Mutex::new(None));
+        let deferred_error = Arc::new(std::sync::Mutex::new(None));
 
         for start_root in start_roots {
             let mut walker = WalkBuilder::new(start_root.as_path());
@@ -108,9 +108,8 @@ async fn measure_ignore(
             walker.build_parallel().run(|| {
                 let seen = Arc::clone(&seen);
                 let timed_out = Arc::clone(&timed_out);
-                let shared_error = Arc::clone(&shared_error);
+                let deferred_error = Arc::clone(&deferred_error);
                 let rules = Arc::clone(&rules);
-                let cwd = cwd.clone();
                 Box::new(move |entry| {
                     if Instant::now() >= deadline {
                         timed_out.store(true, Ordering::Relaxed);
@@ -123,10 +122,8 @@ async fn measure_ignore(
                                 .is_some_and(|file_type| file_type.is_file()) =>
                         {
                             let path = entry.path().to_path_buf();
-                            let Some(relative) = path_to_relative_unix(cwd.as_path(), &path) else {
-                                return WalkState::Continue;
-                            };
-                            if !matches_compiled_rules(relative.as_str(), &rules.ordered_rules) {
+                            let for_match = normalize_path_for_match(path.as_path());
+                            if !matches_compiled_rules(for_match.as_str(), &rules.ordered_rules) {
                                 return WalkState::Continue;
                             }
                             let identity = match std::fs::canonicalize(path) {
@@ -135,16 +132,18 @@ async fn measure_ignore(
                                     return WalkState::Continue;
                                 }
                                 Err(error) => {
-                                    if let Ok(mut stored_error) = shared_error.lock() {
+                                    if let Ok(mut stored_error) = deferred_error.lock()
+                                        && stored_error.is_none()
+                                    {
                                         *stored_error = Some(error);
                                     }
-                                    return WalkState::Quit;
+                                    return WalkState::Continue;
                                 }
                             };
                             if let Ok(mut seen_paths) = seen.lock() {
                                 seen_paths.insert(identity);
                             } else {
-                                if let Ok(mut stored_error) = shared_error.lock() {
+                                if let Ok(mut stored_error) = deferred_error.lock() {
                                     *stored_error =
                                         Some(io::Error::other("ignore benchmark lock poisoned"));
                                 }
@@ -153,24 +152,26 @@ async fn measure_ignore(
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            if let Ok(mut stored_error) = shared_error.lock() {
+                            if let Ok(mut stored_error) = deferred_error.lock()
+                                && stored_error.is_none()
+                            {
                                 *stored_error = Some(io::Error::other(error.to_string()));
                             }
-                            return WalkState::Quit;
+                            return WalkState::Continue;
                         }
                     }
                     WalkState::Continue
                 })
             });
 
-            if let Ok(mut stored_error) = shared_error.lock()
-                && let Some(error) = stored_error.take()
-            {
-                return Err(error);
-            }
             if timed_out.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return Ok(AttemptOutcome::TimedOut);
             }
+        }
+        if let Ok(mut stored_error) = deferred_error.lock()
+            && let Some(error) = stored_error.take()
+        {
+            return Err(error);
         }
 
         Ok(AttemptOutcome::Completed(AttemptResult {
@@ -194,6 +195,7 @@ async fn measure_glob(
         let started = Instant::now();
         let deadline = started + timeout;
         let mut seen = std::collections::HashSet::new();
+        let mut deferred_error: Option<io::Error> = None;
         let start_roots = build_start_roots(cwd.as_path(), &rules.include_prefixes)?;
 
         for start_root in start_roots {
@@ -217,20 +219,26 @@ async fn measure_glob(
                     if !path.is_file() {
                         continue;
                     }
-                    let Some(relative) = path_to_relative_unix(cwd.as_path(), &path) else {
-                        continue;
-                    };
-                    if !matches_compiled_rules(relative.as_str(), &rules.ordered_rules) {
+                    let for_match = normalize_path_for_match(path.as_path());
+                    if !matches_compiled_rules(for_match.as_str(), &rules.ordered_rules) {
                         continue;
                     }
                     let canonical = match std::fs::canonicalize(&path) {
                         Ok(path) => path,
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            if deferred_error.is_none() {
+                                deferred_error = Some(error);
+                            }
+                            continue;
+                        }
                     };
                     seen.insert(canonical);
                 }
             }
+        }
+        if let Some(error) = deferred_error {
+            return Err(error);
         }
 
         Ok(AttemptOutcome::Completed(AttemptResult {
@@ -250,7 +258,7 @@ fn build_start_roots(cwd: &Path, include_prefixes: &[String]) -> io::Result<Vec<
     let mut start_roots = Vec::new();
     let mut seen_roots = HashSet::new();
     for prefix in include_prefixes {
-        let candidate = cwd.join(prefix);
+        let candidate = absolute_path_from_prefix(prefix);
         let metadata = match std::fs::metadata(candidate.as_path()) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -267,45 +275,23 @@ fn build_start_roots(cwd: &Path, include_prefixes: &[String]) -> io::Result<Vec<
     Ok(start_roots)
 }
 
-fn path_to_relative_unix(cwd: &Path, path: &Path) -> Option<String> {
-    if let Some(relative) = to_relative_unix_path(cwd, path) {
-        return Some(relative);
+fn absolute_path_from_prefix(prefix: &str) -> PathBuf {
+    if Path::new(prefix).is_absolute() {
+        return PathBuf::from(prefix);
     }
-
-    let cwd_components = cwd
-        .components()
-        .filter(|component| !matches!(component, Component::CurDir))
-        .collect::<Vec<_>>();
-    let path_components = path
-        .components()
-        .filter(|component| !matches!(component, Component::CurDir))
-        .collect::<Vec<_>>();
-
-    if cwd_components.first() != path_components.first() {
-        return None;
-    }
-
-    let mut common_length = 0usize;
-    while common_length < cwd_components.len()
-        && common_length < path_components.len()
-        && cwd_components[common_length] == path_components[common_length]
+    #[cfg(unix)]
     {
-        common_length += 1;
+        Path::new("/").join(prefix)
     }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(prefix)
+    }
+}
 
-    let mut relative_parts = Vec::new();
-    for component in &cwd_components[common_length..] {
-        if matches!(component, Component::Normal(_) | Component::ParentDir) {
-            relative_parts.push("..".to_string());
-        }
-    }
-    for component in &path_components[common_length..] {
-        match component {
-            Component::Normal(value) => relative_parts.push(value.to_string_lossy().into_owned()),
-            Component::ParentDir => relative_parts.push("..".to_string()),
-            _ => {}
-        }
-    }
-
-    Some(relative_parts.join("/"))
+fn normalize_path_for_match(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string()
 }
