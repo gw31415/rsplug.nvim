@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Component, Path};
 
-use globset::{Glob, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher};
 
 #[derive(Debug, Clone)]
 pub struct PatternRule {
@@ -171,7 +171,9 @@ fn compile_matcher(pattern: &str) -> io::Result<RuleMatcher> {
         return Ok(matcher);
     }
 
-    Glob::new(pattern)
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
         .map(|glob| RuleMatcher::Glob(glob.compile_matcher()))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
 }

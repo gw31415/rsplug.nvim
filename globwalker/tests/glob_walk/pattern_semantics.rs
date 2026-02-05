@@ -97,6 +97,21 @@ async fn normalizes_double_star_to_recursive_match() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn single_star_does_not_cross_directory_boundaries() -> io::Result<()> {
+    let test_dir = TestDir::create()?;
+    create_file(&test_dir.path.join(".config/home-manager/base.toml"))?;
+    create_file(&test_dir.path.join(".config/home-manager/nvim/rsplug/nested.toml"))?;
+
+    let walker = GlobWalker::new(vec![".config/home-manager/*.toml".to_string()], &test_dir.path)?;
+    let result = collect_paths(walker).await?;
+
+    let paths = collect_set(&result);
+    assert_eq!(paths.len(), 1);
+    assert!(paths.contains(".config/home-manager/base.toml"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn supports_absolute_patterns_within_root() -> io::Result<()> {
     let test_dir = TestDir::create()?;
     create_file(&test_dir.path.join("a/b/sample.txt"))?;
