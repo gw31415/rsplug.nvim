@@ -1,55 +1,46 @@
-use std::{path::Path, sync::Arc};
+use std::{env::current_dir, io, path::PathBuf};
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use super::util;
-
-fn is_ignorable_walk_error(e: &ignore::Error) -> bool {
-    e.io_error()
-        .map(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            )
-        })
-        .unwrap_or(false)
-}
-
 pub struct ConfigWalker {
-    rx: mpsc::UnboundedReceiver<Result<Arc<Path>, ignore::Error>>,
+    rx: mpsc::UnboundedReceiver<Result<PathBuf, io::Error>>,
     _handle: JoinHandle<()>,
 }
 
+fn is_ignorable_walk_error(e: &io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::PermissionDenied
+    )
+}
+
 impl ConfigWalker {
-    pub fn recv(&mut self) -> impl Future<Output = Option<Result<Arc<Path>, ignore::Error>>> {
+    pub fn recv(&mut self) -> impl Future<Output = Option<Result<PathBuf, io::Error>>> {
         self.rx.recv()
     }
 
-    pub fn new(patterns: Vec<String>) -> ConfigWalker {
+    pub fn new(patterns: Vec<String>) -> Result<ConfigWalker, io::Error> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let handle = tokio::task::spawn_blocking(move || {
-            let iter = match util::glob::find(patterns.iter().map(String::as_str)) {
-                Ok(iter) => iter,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
-            for entry in iter {
-                match entry {
-                    Ok(path) if !path.is_dir() => {
-                        let _ = tx.send(Ok(path.into()));
+        let mut walker = globwalker::GlobWalker::new(patterns, &current_dir()?)?;
+        let handle = tokio::spawn(async move {
+            loop {
+                let _ = tx.send(match walker.next().await {
+                    Ok(None) => {
+                        break;
                     }
-                    Err(e) if !is_ignorable_walk_error(&e) => {
-                        let _ = tx.send(Err(e));
-                        return;
+                    Ok(Some(path)) => Ok(path.into()),
+                    Err(err) => {
+                        if is_ignorable_walk_error(&err) {
+                            continue;
+                        }
+                        Err(err)
                     }
-                    _ => (),
-                }
+                });
             }
         });
-        ConfigWalker {
+        Ok(ConfigWalker {
             rx,
             _handle: handle,
-        }
+        })
     }
 }

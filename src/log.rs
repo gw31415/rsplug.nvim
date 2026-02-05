@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthStr;
 
 pub enum Message {
-    ConfigFound(Arc<Path>),
+    ConfigFound(PathBuf),
     ConfigWalkFinish,
     Cache(&'static str, Arc<str>),
     CacheFetchObjectsProgress {
@@ -356,7 +356,7 @@ impl ProgressManager {
                         style(path).dim(),
                     ));
                 }
-                self.config_files.push(path);
+                self.config_files.push(path.into());
             }
             Message::ConfigWalkFinish => {
                 let mut pb = self.progress_bars.remove("config_files").unwrap();

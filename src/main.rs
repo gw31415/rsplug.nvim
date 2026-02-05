@@ -52,7 +52,7 @@ async fn app() -> Result<(), Error> {
     // Parse all of config files while walking patterns in background.
     let mut config_tasks = JoinSet::new();
     {
-        let mut walker = ConfigWalker::new(config_files);
+        let mut walker = ConfigWalker::new(config_files)?;
         while let Some(item) = walker.recv().await {
             match item {
                 Ok(path) => {
@@ -60,10 +60,10 @@ async fn app() -> Result<(), Error> {
                     config_tasks.spawn(async move {
                         let content = tokio::fs::read(&path).await?;
                         toml::from_slice::<rsplug::Config>(&content)
-                            .map_err(|e| Error::Parse(e, path.to_path_buf()))
+                            .map_err(|e| Error::Parse(e, path))
                     });
                 }
-                Err(e) => return Err(Error::Ignore(e)),
+                Err(e) => return Err(Error::Io(e)),
             }
         }
         // All tasks in ConfigWalker::rx are done here.
@@ -201,8 +201,6 @@ enum Error {
     Rsplug(#[from] rsplug::Error),
     #[error(transparent)]
     Dag(#[from] dag::DagError),
-    #[error(transparent)]
-    Ignore(#[from] ignore::Error),
 }
 
 #[tokio::main]

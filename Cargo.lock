@@ -389,6 +389,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "globwalker"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "hashbrown",
+ "tokio",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -898,6 +907,7 @@ dependencies = [
  "console",
  "dag",
  "git2",
+ "globwalker",
  "hashbrown",
  "ignore",
  "indicatif",
