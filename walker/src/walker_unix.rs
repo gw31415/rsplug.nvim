@@ -291,8 +291,7 @@ pub(super) fn spawn_single_with_options(
             }
         }
 
-        cancel.store(true, Ordering::Relaxed);
-        queue.close();
+        // Wait for the forwarder to drain all pending events before finishing.
         let _ = forwarder.await;
     });
 
