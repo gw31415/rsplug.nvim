@@ -4,6 +4,7 @@ use std::cmp::max;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::fs::FileType;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -111,6 +112,7 @@ struct TraversalCtx {
 struct State {
     path: PathBuf,
     match_states: Vec<usize>,
+    kind_hint: Option<EntryKind>,
 }
 
 #[cfg(unix)]
@@ -182,6 +184,7 @@ impl Walker {
             let mut frontier = vec![State {
                 path: root,
                 match_states: initial_states,
+                kind_hint: None,
             }];
 
             while !frontier.is_empty() && !ctx.tx.is_closed() {
@@ -250,7 +253,7 @@ async fn process_state(
     }
 
     if ctx.program.is_match_state(&state.match_states) {
-        finalize_match(&ctx, state.path.clone()).await;
+        finalize_match(&ctx, state.path.clone(), state.kind_hint).await;
     }
 
     let signature = states_signature(&state.match_states);
@@ -265,9 +268,10 @@ async fn process_state(
         }
         let candidate_path = state.path.join(&literal);
         match tokio::fs::symlink_metadata(&candidate_path).await {
-            Ok(_) => out.push(State {
+            Ok(metadata) => out.push(State {
                 path: candidate_path,
                 match_states: next_states,
+                kind_hint: Some(entry_kind_from_file_type(metadata.file_type())),
             }),
             Err(err)
                 if matches!(
@@ -316,17 +320,28 @@ async fn process_state(
         if next_states.is_empty() {
             continue;
         }
+        let mut kind_hint = None;
+        if ctx.files_only && ctx.program.is_match_state(&next_states) {
+            if let Ok(file_type) = entry.file_type().await {
+                kind_hint = Some(entry_kind_from_file_type(file_type));
+            }
+        }
         out.push(State {
             path: entry.path(),
             match_states: next_states,
+            kind_hint,
         });
     }
 
     out
 }
 
-async fn finalize_match(ctx: &TraversalCtx, path: PathBuf) {
-    match entry_kind(&path).await {
+async fn finalize_match(ctx: &TraversalCtx, path: PathBuf, kind_hint: Option<EntryKind>) {
+    let kind = match kind_hint {
+        Some(kind) => Ok(kind),
+        None => entry_kind(&path).await,
+    };
+    match kind {
         Ok(kind) => {
             if ctx.files_only && kind != EntryKind::File {
                 return;
@@ -341,16 +356,20 @@ async fn finalize_match(ctx: &TraversalCtx, path: PathBuf) {
 
 async fn entry_kind(path: &Path) -> io::Result<EntryKind> {
     let symlink_meta = tokio::fs::symlink_metadata(path).await?;
-    if symlink_meta.file_type().is_symlink() {
-        return Ok(EntryKind::Symlink);
+    Ok(entry_kind_from_file_type(symlink_meta.file_type()))
+}
+
+fn entry_kind_from_file_type(file_type: FileType) -> EntryKind {
+    if file_type.is_symlink() {
+        return EntryKind::Symlink;
     }
-    if symlink_meta.is_dir() {
-        return Ok(EntryKind::Dir);
+    if file_type.is_dir() {
+        return EntryKind::Dir;
     }
-    if symlink_meta.is_file() {
-        return Ok(EntryKind::File);
+    if file_type.is_file() {
+        return EntryKind::File;
     }
-    Ok(EntryKind::Other)
+    EntryKind::Other
 }
 
 async fn send_error(tx: &mpsc::Sender<WalkMessage>, path: PathBuf, source: io::Error) {
