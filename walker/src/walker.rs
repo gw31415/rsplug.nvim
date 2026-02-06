@@ -467,6 +467,46 @@ mod tests {
 
     #[tokio::test]
     #[cfg(all(unix, not(windows)))]
+    async fn shard_capacity_does_not_drop_late_directories() {
+        let root = test_root("shard_capacity");
+        for idx in 0..10usize {
+            let dir = root.join(format!("d{idx:02}"));
+            fs::create_dir_all(&dir).expect("create dir");
+            fs::write(dir.join("file.txt"), b"x").expect("write file");
+        }
+
+        let pattern = format!("{}/**/file.txt", root.display());
+        let glob = CompiledGlob::new(&pattern).expect("glob must parse");
+        let options = WalkerOptions {
+            max_parallelism: Some(1),
+            ..WalkerOptions::default()
+        };
+        let mut rx = Walker::spawn_with_options(glob, options);
+
+        let mut got = BTreeSet::new();
+        while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("channel should respond")
+        {
+            if let Ok(ev) = msg {
+                got.insert(
+                    ev.path
+                        .strip_prefix(&root)
+                        .expect("path under root")
+                        .to_path_buf(),
+                );
+            }
+        }
+
+        let expected: BTreeSet<PathBuf> = (0..10usize)
+            .map(|idx| PathBuf::from(format!("d{idx:02}/file.txt")))
+            .collect();
+        assert_eq!(got, expected);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
     async fn dropping_receiver_terminates_run_promptly() {
         let root = test_root("drop_rx");
         fs::create_dir_all(root.join("d1/d2/d3")).expect("create tree");

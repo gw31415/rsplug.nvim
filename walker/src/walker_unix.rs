@@ -705,8 +705,11 @@ fn shard_root_jobs(
     let mut local_events = Vec::new();
     let mut split_happened = false;
 
+    let mut capacity_exhausted = false;
+
     while let Some(entry) = reader.next().transpose().ok().flatten() {
         if jobs.len() + local_jobs.len() >= max_jobs {
+            capacity_exhausted = true;
             break;
         }
 
@@ -768,6 +771,10 @@ fn shard_root_jobs(
             root_states: next_states,
         });
         split_happened = true;
+    }
+
+    if capacity_exhausted {
+        return false;
     }
 
     if split_happened {
