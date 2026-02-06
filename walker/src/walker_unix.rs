@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
-const TRANSITION_CACHE_CAPACITY: usize = 16 * 1024;
+const TRANSITION_CACHE_CAPACITY: usize = 64 * 1024;
+const STATE_CACHE_CAPACITY: usize = 64 * 1024;
 const EMIT_BATCH_SIZE: usize = 128;
 const SHARD_FACTOR: usize = 6;
 const SHARD_DEPTH: usize = 2;
@@ -19,6 +20,12 @@ const SHARD_DEPTH: usize = 2;
 struct RootJob {
     path: PathBuf,
     root_states: Vec<usize>,
+}
+
+#[derive(Default)]
+struct StateEvalCache {
+    match_cache: HashMap<u64, bool>,
+    scan_cache: HashMap<u64, bool>,
 }
 
 pub(super) fn spawn_single_with_options(
@@ -142,8 +149,9 @@ fn run_fts_job(
     };
 
     let mut level_states: Vec<Vec<usize>> = Vec::new();
-    let mut transition_cache: HashMap<u64, HashMap<String, Vec<usize>>> = HashMap::new();
+    let mut transition_cache: HashMap<u64, HashMap<String, (Vec<usize>, u64)>> = HashMap::new();
     let mut transition_cache_len = 0usize;
+    let mut state_cache = StateEvalCache::default();
     let mut pending_events = Vec::with_capacity(EMIT_BATCH_SIZE);
 
     while let Some(entry) = fts.read() {
@@ -183,8 +191,10 @@ fn run_fts_job(
         }
 
         let is_dir = matches!(entry.info, FtsInfo::IsDir | FtsInfo::IsDirCyclic);
-        let states = if level == 0 {
-            job.root_states.clone()
+        let (states, states_sig) = if level == 0 {
+            let states = job.root_states.clone();
+            let signature = states_signature(&states);
+            (states, signature)
         } else {
             let parent = match level_states.get(level.saturating_sub(1)) {
                 Some(parent) => parent,
@@ -220,19 +230,24 @@ fn run_fts_job(
                     transition_cache.clear();
                     transition_cache_len = 0;
                 }
+                let next_signature = states_signature(&next);
                 let by_name = transition_cache.entry(signature).or_default();
-                if by_name.insert(name.to_owned(), next.clone()).is_none() {
+                if by_name
+                    .insert(name.to_owned(), (next.clone(), next_signature))
+                    .is_none()
+                {
                     transition_cache_len += 1;
                 }
-                next
+                (next, next_signature)
             }
         };
 
         if level_states.len() <= level {
             level_states.resize(level + 1, Vec::new());
         }
-        level_states[level] = states.clone();
+        level_states[level] = states;
         level_states.truncate(level + 1);
+        let states = &level_states[level];
 
         if states.is_empty() {
             if is_dir {
@@ -241,7 +256,14 @@ fn run_fts_job(
             continue;
         }
 
-        if is_dir && !compiled.needs_directory_scan(&states) {
+        if is_dir
+            && !cached_needs_directory_scan(
+                &mut state_cache,
+                compiled.as_ref(),
+                states_sig,
+                &states,
+            )
+        {
             let _ = fts.set(&entry, FtsSetOption::Skip);
         }
 
@@ -250,7 +272,7 @@ fn run_fts_job(
         }
 
         let kind = entry_kind(entry.info.clone());
-        if compiled.is_match_state(&states) {
+        if cached_is_match_state(&mut state_cache, compiled.as_ref(), states_sig, &states) {
             pending_events.push(WalkEvent {
                 path: entry.path.clone(),
                 kind,
@@ -283,6 +305,7 @@ fn prepare_jobs(
     let roots = normalize_roots(compiled.start_paths());
     let mut jobs = Vec::new();
     let mut initial_events = Vec::new();
+    let mut state_cache = StateEvalCache::default();
 
     for root in roots {
         if jobs.len() >= max_jobs {
@@ -310,6 +333,7 @@ fn prepare_jobs(
             files_only,
             max_jobs,
             SHARD_DEPTH,
+            &mut state_cache,
             &mut jobs,
             &mut initial_events,
         );
@@ -319,7 +343,13 @@ fn prepare_jobs(
                 path: root,
                 root_states,
             });
-        } else if compiled.is_match_state(&root_states) && !files_only {
+        } else if cached_is_match_state(
+            &mut state_cache,
+            compiled,
+            states_signature(&root_states),
+            &root_states,
+        ) && !files_only
+        {
             initial_events.push(WalkEvent {
                 path: root,
                 kind: EntryKind::Dir,
@@ -337,6 +367,7 @@ fn shard_root_jobs(
     files_only: bool,
     max_jobs: usize,
     depth: usize,
+    state_cache: &mut StateEvalCache,
     jobs: &mut Vec<RootJob>,
     initial_events: &mut Vec<WalkEvent>,
 ) -> bool {
@@ -369,8 +400,11 @@ fn shard_root_jobs(
         }
 
         let kind = classify_entry(entry.path().as_path(), entry.file_type().ok());
-        if kind != Some(EntryKind::Dir) || !compiled.needs_directory_scan(&next_states) {
-            if compiled.is_match_state(&next_states)
+        let next_signature = states_signature(&next_states);
+        if kind != Some(EntryKind::Dir)
+            || !cached_needs_directory_scan(state_cache, compiled, next_signature, &next_states)
+        {
+            if cached_is_match_state(state_cache, compiled, next_signature, &next_states)
                 && let Some(kind) = kind
                 && (!files_only || kind == EntryKind::File)
             {
@@ -393,6 +427,7 @@ fn shard_root_jobs(
                 files_only,
                 max_jobs.saturating_sub(jobs.len()),
                 depth - 1,
+                state_cache,
                 &mut child_jobs,
                 &mut child_events,
             );
@@ -494,4 +529,38 @@ fn default_parallelism() -> usize {
         .map(|x| x.get())
         .unwrap_or(1);
     std::cmp::max(4, cores.saturating_mul(2))
+}
+
+fn cached_is_match_state(
+    cache: &mut StateEvalCache,
+    compiled: &CompiledGlob,
+    signature: u64,
+    states: &[usize],
+) -> bool {
+    if let Some(cached) = cache.match_cache.get(&signature) {
+        return *cached;
+    }
+    let value = compiled.is_match_state(states);
+    if cache.match_cache.len() >= STATE_CACHE_CAPACITY {
+        cache.match_cache.clear();
+    }
+    cache.match_cache.insert(signature, value);
+    value
+}
+
+fn cached_needs_directory_scan(
+    cache: &mut StateEvalCache,
+    compiled: &CompiledGlob,
+    signature: u64,
+    states: &[usize],
+) -> bool {
+    if let Some(cached) = cache.scan_cache.get(&signature) {
+        return *cached;
+    }
+    let value = compiled.needs_directory_scan(states);
+    if cache.scan_cache.len() >= STATE_CACHE_CAPACITY {
+        cache.scan_cache.clear();
+    }
+    cache.scan_cache.insert(signature, value);
+    value
 }

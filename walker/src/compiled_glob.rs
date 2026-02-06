@@ -65,10 +65,21 @@ struct RuleTerminal {
 
 type NodeId = usize;
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum WildEdgeKind {
+    Suffix(String),
+    Prefix(String),
+    SingleChar,
+    General,
+}
+
 #[derive(Debug, Default, Clone)]
 struct TrieNode {
     literal_edges: hashbrown::HashMap<String, NodeId>,
-    wild_edges: Vec<(String, WildMatch, NodeId)>,
+    wild_edges_general: Vec<(String, WildMatch, NodeId)>,
+    wild_edges_suffix: hashbrown::HashMap<String, Vec<NodeId>>,
+    wild_edges_prefix: hashbrown::HashMap<String, Vec<NodeId>>,
+    wild_edges_exact1: Vec<NodeId>,
     descend_edge: Option<NodeId>,
     terminals: Vec<RuleTerminal>,
 }
@@ -120,24 +131,7 @@ impl GlobTrie {
                     pattern,
                     matcher: _,
                 } => {
-                    let mut next = None;
-                    for (existing, _, node_id) in &self.nodes[node].wild_edges {
-                        if existing == pattern {
-                            next = Some(*node_id);
-                            break;
-                        }
-                    }
-                    let next = if let Some(node_id) = next {
-                        node_id
-                    } else {
-                        let created = self.add_node();
-                        self.nodes[node].wild_edges.push((
-                            pattern.clone(),
-                            WildMatch::new(pattern),
-                            created,
-                        ));
-                        created
-                    };
+                    let next = self.insert_wild_edge(node, pattern);
                     node = next;
                 }
                 SegmentMatcher::Descend => {
@@ -157,6 +151,65 @@ impl GlobTrie {
             is_exclude: rule.is_exclude,
         });
     }
+
+    fn insert_wild_edge(&mut self, node: NodeId, pattern: &str) -> NodeId {
+        match classify_wild_edge(pattern) {
+            WildEdgeKind::Suffix(suffix) => {
+                if let Some(existing) = self.nodes[node]
+                    .wild_edges_suffix
+                    .get(&suffix)
+                    .and_then(|ids| ids.first())
+                {
+                    return *existing;
+                }
+                let created = self.add_node();
+                self.nodes[node]
+                    .wild_edges_suffix
+                    .entry(suffix)
+                    .or_default()
+                    .push(created);
+                created
+            }
+            WildEdgeKind::Prefix(prefix) => {
+                if let Some(existing) = self.nodes[node]
+                    .wild_edges_prefix
+                    .get(&prefix)
+                    .and_then(|ids| ids.first())
+                {
+                    return *existing;
+                }
+                let created = self.add_node();
+                self.nodes[node]
+                    .wild_edges_prefix
+                    .entry(prefix)
+                    .or_default()
+                    .push(created);
+                created
+            }
+            WildEdgeKind::SingleChar => {
+                if let Some(existing) = self.nodes[node].wild_edges_exact1.first() {
+                    return *existing;
+                }
+                let created = self.add_node();
+                self.nodes[node].wild_edges_exact1.push(created);
+                created
+            }
+            WildEdgeKind::General => {
+                for (existing, _, node_id) in &self.nodes[node].wild_edges_general {
+                    if existing == pattern {
+                        return *node_id;
+                    }
+                }
+                let created = self.add_node();
+                self.nodes[node].wild_edges_general.push((
+                    pattern.to_string(),
+                    WildMatch::new(pattern),
+                    created,
+                ));
+                created
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +217,8 @@ pub struct CompiledGlob {
     ordered_rules: Vec<CompiledRule>,
     trie: GlobTrie,
     epsilon_closures: Vec<Vec<usize>>,
+    node_can_scan: Vec<bool>,
+    node_best_terminal: Vec<Option<(usize, bool)>>,
 }
 
 impl CompiledGlob {
@@ -284,6 +339,8 @@ impl CompiledGlob {
             ordered_rules: Vec::new(),
             trie: GlobTrie::new(),
             epsilon_closures: Vec::new(),
+            node_can_scan: Vec::new(),
+            node_best_terminal: Vec::new(),
         };
         compiled.push_rule(segments, is_exclude, is_absolute);
         Ok(compiled)
@@ -382,7 +439,30 @@ impl CompiledGlob {
             if let Some(next_idx) = node.literal_edges.get(part) {
                 push_unique_state(&mut next, &mut overflow_seen, *next_idx);
             }
-            for (_, matcher, next_idx) in &node.wild_edges {
+
+            if !node.wild_edges_exact1.is_empty() && part.chars().count() == 1 {
+                for next_idx in &node.wild_edges_exact1 {
+                    push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                }
+            }
+
+            for (suffix, ids) in &node.wild_edges_suffix {
+                if part.ends_with(suffix) {
+                    for next_idx in ids {
+                        push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                    }
+                }
+            }
+
+            for (prefix, ids) in &node.wild_edges_prefix {
+                if part.starts_with(prefix) {
+                    for next_idx in ids {
+                        push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                    }
+                }
+            }
+
+            for (_, matcher, next_idx) in &node.wild_edges_general {
                 if matcher.matches(part) {
                     push_unique_state(&mut next, &mut overflow_seen, *next_idx);
                 }
@@ -412,10 +492,9 @@ impl CompiledGlob {
 
     pub(crate) fn needs_directory_scan(&self, current: &[usize]) -> bool {
         let expanded = self.expand_epsilon_nodes(current);
-        expanded.into_iter().any(|node_idx| {
-            let node = &self.trie.nodes[node_idx];
-            !node.wild_edges.is_empty() || node.descend_edge.is_some()
-        })
+        expanded
+            .into_iter()
+            .any(|node_idx| self.node_can_scan.get(node_idx).copied().unwrap_or(false))
     }
 
     fn push_rule(&mut self, segments: Vec<SegmentMatcher>, is_exclude: bool, is_absolute: bool) {
@@ -458,6 +537,8 @@ impl CompiledGlob {
     fn rebuild_epsilon_closure_cache(&mut self) {
         let node_count = self.trie.nodes.len();
         self.epsilon_closures = vec![Vec::new(); node_count];
+        self.node_can_scan = vec![false; node_count];
+        self.node_best_terminal = vec![None; node_count];
         for node_idx in 0..node_count {
             let mut closure = Vec::new();
             let mut cursor = Some(node_idx);
@@ -468,6 +549,24 @@ impl CompiledGlob {
             closure.sort_unstable();
             closure.dedup();
             self.epsilon_closures[node_idx] = closure;
+
+            let node = &self.trie.nodes[node_idx];
+            self.node_can_scan[node_idx] = !node.wild_edges_general.is_empty()
+                || !node.wild_edges_suffix.is_empty()
+                || !node.wild_edges_prefix.is_empty()
+                || !node.wild_edges_exact1.is_empty()
+                || node.descend_edge.is_some();
+
+            let mut selected: Option<(usize, bool)> = None;
+            for terminal in &node.terminals {
+                if selected
+                    .as_ref()
+                    .is_none_or(|(idx, _)| terminal.rule_index >= *idx)
+                {
+                    selected = Some((terminal.rule_index, !terminal.is_exclude));
+                }
+            }
+            self.node_best_terminal[node_idx] = selected;
         }
     }
 
@@ -475,13 +574,11 @@ impl CompiledGlob {
         let expanded = self.expand_epsilon_nodes(current);
         let mut selected: Option<(usize, bool)> = None;
         for node_idx in expanded {
-            for terminal in &self.trie.nodes[node_idx].terminals {
-                if selected
-                    .as_ref()
-                    .is_none_or(|(idx, _)| terminal.rule_index >= *idx)
-                {
-                    selected = Some((terminal.rule_index, !terminal.is_exclude));
-                }
+            if let Some((rule_index, include)) =
+                self.node_best_terminal.get(node_idx).copied().flatten()
+                && selected.as_ref().is_none_or(|(idx, _)| rule_index >= *idx)
+            {
+                selected = Some((rule_index, include));
             }
         }
         selected.map(|(_, include)| include)
@@ -558,6 +655,30 @@ fn push_unique_state(
         }
         *overflow_seen = Some(seen);
     }
+}
+
+fn classify_wild_edge(pattern: &str) -> WildEdgeKind {
+    if pattern == "?" {
+        return WildEdgeKind::SingleChar;
+    }
+
+    if pattern.starts_with('*')
+        && !pattern[1..].is_empty()
+        && !pattern[1..].contains('*')
+        && !pattern[1..].contains('?')
+    {
+        return WildEdgeKind::Suffix(pattern[1..].to_string());
+    }
+
+    if pattern.ends_with('*')
+        && !pattern[..pattern.len() - 1].is_empty()
+        && !pattern[..pattern.len() - 1].contains('*')
+        && !pattern[..pattern.len() - 1].contains('?')
+    {
+        return WildEdgeKind::Prefix(pattern[..pattern.len() - 1].to_string());
+    }
+
+    WildEdgeKind::General
 }
 
 #[cfg(test)]
@@ -714,5 +835,27 @@ mod tests {
         assert!(!states.is_empty());
         let leaf_states = glob.advance_states(&states, "main.rs");
         assert!(glob.is_match_state(&leaf_states));
+    }
+
+    #[test]
+    fn suffix_lane_matches_extension_pattern() {
+        let glob = CompiledGlob::new("/tmp/**/*.rs").expect("glob must parse");
+        assert!(glob.r#match("/tmp/a/main.rs".as_ref()));
+        assert!(!glob.r#match("/tmp/a/main.ts".as_ref()));
+    }
+
+    #[test]
+    fn prefix_lane_matches_prefix_pattern() {
+        let glob = CompiledGlob::new("/tmp/foo*/bar.txt").expect("glob must parse");
+        assert!(glob.r#match("/tmp/foobar/bar.txt".as_ref()));
+        assert!(glob.r#match("/tmp/foo/bar.txt".as_ref()));
+        assert!(!glob.r#match("/tmp/barfoo/bar.txt".as_ref()));
+    }
+
+    #[test]
+    fn complex_wildcard_falls_back_to_general_lane() {
+        let glob = CompiledGlob::new("/tmp/a*?b/file.txt").expect("glob must parse");
+        assert!(glob.r#match("/tmp/axxb/file.txt".as_ref()));
+        assert!(!glob.r#match("/tmp/ab/file.txt".as_ref()));
     }
 }
