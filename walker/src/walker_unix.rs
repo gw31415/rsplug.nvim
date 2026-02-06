@@ -2,12 +2,14 @@ use crate::compiled_glob::CompiledGlob;
 use crate::walker::{EntryKind, WalkError, WalkEvent, WalkMessage, WalkerOptions};
 use fts::fts::{Fts, FtsInfo, FtsSetOption, fts_option};
 use hashbrown::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 const TRANSITION_CACHE_CAPACITY: usize = 64 * 1024;
@@ -15,6 +17,10 @@ const STATE_CACHE_CAPACITY: usize = 64 * 1024;
 const EMIT_BATCH_SIZE: usize = 128;
 const SHARD_FACTOR: usize = 6;
 const SHARD_DEPTH: usize = 2;
+const SPLIT_DEPTH_LIMIT: usize = 2;
+const SPLIT_BACKLOG_FACTOR: usize = 4;
+const SPLIT_MIN_CHILDREN: usize = 24;
+const QUEUE_WAIT_MILLIS: u64 = 5;
 
 #[derive(Clone)]
 struct RootJob {
@@ -22,10 +28,101 @@ struct RootJob {
     root_states: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct TransitionKey {
+    state_sig: u64,
+    name_sig: u64,
+    name_len: u16,
+}
+
+struct TransitionValue {
+    name: Vec<u8>,
+    parent_states: Arc<[usize]>,
+    states: Arc<[usize]>,
+    next_sig: u64,
+}
+
 #[derive(Default)]
 struct StateEvalCache {
     match_cache: HashMap<u64, bool>,
     scan_cache: HashMap<u64, bool>,
+}
+
+enum WorkerMessage {
+    Events(Vec<WalkEvent>),
+    Error(WalkError),
+}
+
+#[derive(Default)]
+struct JobQueueInner {
+    queue: VecDeque<RootJob>,
+    closed: bool,
+}
+
+struct JobQueue {
+    inner: Mutex<JobQueueInner>,
+    cv: Condvar,
+}
+
+impl JobQueue {
+    fn new(init: Vec<RootJob>) -> Self {
+        Self {
+            inner: Mutex::new(JobQueueInner {
+                queue: init.into(),
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn push(&self, job: RootJob) -> bool {
+        let mut inner = self.inner.lock().expect("job queue lock");
+        if inner.closed {
+            return false;
+        }
+        inner.queue.push_back(job);
+        self.cv.notify_one();
+        true
+    }
+
+    fn pop(&self, cancel: &AtomicBool, active_jobs: &AtomicUsize) -> Option<RootJob> {
+        let mut inner = self.inner.lock().expect("job queue lock");
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(job) = inner.queue.pop_front() {
+                return Some(job);
+            }
+            if inner.closed || active_jobs.load(Ordering::Relaxed) == 0 {
+                return None;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(
+                    inner,
+                    std::time::Duration::from_millis(QUEUE_WAIT_MILLIS),
+                )
+                .expect("job queue wait");
+            inner = guard;
+        }
+    }
+
+    fn close(&self) {
+        let mut inner = self.inner.lock().expect("job queue lock");
+        inner.closed = true;
+        self.cv.notify_all();
+    }
+}
+
+struct WorkerCtx {
+    compiled: Arc<CompiledGlob>,
+    files_only: bool,
+    cancel: Arc<AtomicBool>,
+    active_jobs: Arc<AtomicUsize>,
+    queue: Arc<JobQueue>,
+    worker_tx: mpsc::Sender<WorkerMessage>,
+    split_backlog_limit: usize,
 }
 
 pub(super) fn spawn_single_with_options(
@@ -36,7 +133,6 @@ pub(super) fn spawn_single_with_options(
 
     tokio::spawn(async move {
         let compiled = Arc::new(compiled);
-        let tx_on_join = tx.clone();
         let files_only = options.files_only;
         let max_parallelism = options
             .max_parallelism
@@ -44,16 +140,16 @@ pub(super) fn spawn_single_with_options(
             .max(1);
         let max_jobs = max_parallelism.saturating_mul(SHARD_FACTOR).max(1);
 
-        let joined = tokio::task::spawn_blocking({
+        let prepared = tokio::task::spawn_blocking({
             let compiled = Arc::clone(&compiled);
             move || prepare_jobs(compiled.as_ref(), files_only, max_jobs)
         })
         .await;
 
-        let (jobs, initial_events) = match joined {
+        let (jobs, initial_events) = match prepared {
             Ok(value) => value,
             Err(err) => {
-                let _ = tx_on_join
+                let _ = tx
                     .send(Err(WalkError::Io {
                         path: PathBuf::from("<prepare_jobs>"),
                         source: io::Error::other(err.to_string()),
@@ -63,8 +159,10 @@ pub(super) fn spawn_single_with_options(
             }
         };
 
+        let cancel = Arc::new(AtomicBool::new(false));
         for event in initial_events {
             if tx.send(Ok(event)).await.is_err() {
+                cancel.store(true, Ordering::Relaxed);
                 return;
             }
         }
@@ -73,65 +171,77 @@ pub(super) fn spawn_single_with_options(
             return;
         }
 
-        let sem = Arc::new(Semaphore::new(max_parallelism));
-        let mut join_set = JoinSet::new();
+        let active_jobs = Arc::new(AtomicUsize::new(jobs.len()));
+        let queue = Arc::new(JobQueue::new(jobs));
+        let split_backlog_limit = max_parallelism.saturating_mul(SPLIT_BACKLOG_FACTOR).max(1);
 
-        for job in jobs {
-            if tx.is_closed() {
-                break;
-            }
-            let permit = match sem.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => break,
+        let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(options.channel_capacity.max(1));
+        let forward_cancel = Arc::clone(&cancel);
+        let tx_forward = tx.clone();
+        let forwarder = tokio::spawn(async move {
+            forward_worker_messages(worker_rx, tx_forward, forward_cancel).await;
+        });
+
+        let mut worker_set = JoinSet::new();
+        for _ in 0..max_parallelism {
+            let ctx = WorkerCtx {
+                compiled: Arc::clone(&compiled),
+                files_only,
+                cancel: Arc::clone(&cancel),
+                active_jobs: Arc::clone(&active_jobs),
+                queue: Arc::clone(&queue),
+                worker_tx: worker_tx.clone(),
+                split_backlog_limit,
             };
-            let tx_worker = tx.clone();
-            let compiled = Arc::clone(&compiled);
-            join_set.spawn(async move {
-                run_job_blocking(compiled, files_only, tx_worker, job, permit).await;
-            });
+            worker_set.spawn_blocking(move || run_worker(ctx));
         }
+        drop(worker_tx);
 
-        while let Some(joined) = join_set.join_next().await {
+        while let Some(joined) = worker_set.join_next().await {
             if let Err(err) = joined {
-                let _ = tx_on_join
+                cancel.store(true, Ordering::Relaxed);
+                queue.close();
+                let _ = tx
                     .send(Err(WalkError::Io {
-                        path: PathBuf::from("<join>"),
+                        path: PathBuf::from("<join_worker>"),
                         source: io::Error::other(err.to_string()),
                     }))
                     .await;
             }
         }
+
+        cancel.store(true, Ordering::Relaxed);
+        queue.close();
+        let _ = forwarder.await;
     });
 
     rx
 }
 
-async fn run_job_blocking(
-    compiled: Arc<CompiledGlob>,
-    files_only: bool,
-    tx: mpsc::Sender<WalkMessage>,
-    job: RootJob,
-    _permit: OwnedSemaphorePermit,
-) {
-    let tx_on_join = tx.clone();
-    let joined =
-        tokio::task::spawn_blocking(move || run_fts_job(compiled, files_only, tx, job)).await;
-    if let Err(err) = joined {
-        let _ = tx_on_join
-            .send(Err(WalkError::Io {
-                path: PathBuf::from("<join_worker>"),
-                source: io::Error::other(err.to_string()),
-            }))
-            .await;
+fn run_worker(ctx: WorkerCtx) {
+    loop {
+        if ctx.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Some(job) = ctx.queue.pop(&ctx.cancel, &ctx.active_jobs) else {
+            return;
+        };
+
+        run_fts_job(&ctx, job);
+
+        if ctx.active_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            ctx.queue.close();
+            return;
+        }
     }
 }
 
-fn run_fts_job(
-    compiled: Arc<CompiledGlob>,
-    files_only: bool,
-    tx: mpsc::Sender<WalkMessage>,
-    job: RootJob,
-) {
+fn run_fts_job(ctx: &WorkerCtx, job: RootJob) {
+    if ctx.cancel.load(Ordering::Relaxed) {
+        return;
+    }
+
     let root_string = job.path.to_string_lossy().to_string();
     let mut fts = match Fts::new(
         vec![root_string],
@@ -140,7 +250,7 @@ fn run_fts_job(
     ) {
         Ok(fts) => fts,
         Err(err) => {
-            let _ = tx.blocking_send(Err(WalkError::Io {
+            let _ = ctx.worker_tx.blocking_send(WorkerMessage::Error(WalkError::Io {
                 path: job.path,
                 source: io::Error::other(format!("failed to initialize fts: {err:?}")),
             }));
@@ -148,13 +258,18 @@ fn run_fts_job(
         }
     };
 
-    let mut level_states: Vec<Vec<usize>> = Vec::new();
-    let mut transition_cache: HashMap<u64, HashMap<String, (Vec<usize>, u64)>> = HashMap::new();
+    let mut level_states: Vec<Arc<[usize]>> = Vec::new();
+    let mut transition_cache: HashMap<TransitionKey, TransitionValue> = HashMap::new();
     let mut transition_cache_len = 0usize;
     let mut state_cache = StateEvalCache::default();
     let mut pending_events = Vec::with_capacity(EMIT_BATCH_SIZE);
+    let mut next_states_scratch = Vec::new();
 
     while let Some(entry) = fts.read() {
+        if ctx.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
         let level = match usize::try_from(entry.level) {
             Ok(level) => level,
             Err(_) => continue,
@@ -162,26 +277,20 @@ fn run_fts_job(
 
         match entry.info {
             FtsInfo::IsDot | FtsInfo::IsDirPost => {
-                flush_events(&tx, &mut pending_events);
-                if tx.is_closed() {
-                    return;
-                }
+                flush_events(&ctx.worker_tx, &mut pending_events, &ctx.cancel);
                 if level < level_states.len() {
                     level_states.truncate(level);
                 }
                 continue;
             }
             FtsInfo::IsErr | FtsInfo::IsDontRead | FtsInfo::IsNoStat => {
-                flush_events(&tx, &mut pending_events);
-                if tx.is_closed() {
-                    return;
-                }
+                flush_events(&ctx.worker_tx, &mut pending_events, &ctx.cancel);
                 let source = if entry.error == 0 {
                     io::Error::other("fts reported an unreadable entry")
                 } else {
                     io::Error::from_raw_os_error(entry.error)
                 };
-                let _ = tx.blocking_send(Err(WalkError::Io {
+                let _ = ctx.worker_tx.blocking_send(WorkerMessage::Error(WalkError::Io {
                     path: entry.path.clone(),
                     source,
                 }));
@@ -192,8 +301,8 @@ fn run_fts_job(
 
         let is_dir = matches!(entry.info, FtsInfo::IsDir | FtsInfo::IsDirCyclic);
         let (states, states_sig) = if level == 0 {
-            let states = job.root_states.clone();
-            let signature = states_signature(&states);
+            let states = Arc::<[usize]>::from(job.root_states.clone());
+            let signature = states_signature(states.as_ref());
             (states, signature)
         } else {
             let parent = match level_states.get(level.saturating_sub(1)) {
@@ -212,42 +321,70 @@ fn run_fts_job(
                 continue;
             }
 
-            let Some(name) = entry.name.to_str() else {
-                if is_dir {
-                    let _ = fts.set(&entry, FtsSetOption::Skip);
+            let name_bytes = entry.name.as_os_str().as_bytes();
+            let name_len = match u16::try_from(name_bytes.len()) {
+                Ok(v) => v,
+                Err(_) => {
+                    if is_dir {
+                        let _ = fts.set(&entry, FtsSetOption::Skip);
+                    }
+                    continue;
                 }
-                continue;
             };
 
-            let signature = states_signature(parent);
-            if let Some(by_name) = transition_cache.get(&signature)
-                && let Some(cached) = by_name.get(name)
+            let key = TransitionKey {
+                state_sig: states_signature(parent.as_ref()),
+                name_sig: bytes_signature(name_bytes),
+                name_len,
+            };
+
+            if let Some(cached) = transition_cache.get(&key)
+                && cached.name.as_slice() == name_bytes
+                && cached.parent_states.as_ref() == parent.as_ref()
             {
-                cached.clone()
+                (Arc::clone(&cached.states), cached.next_sig)
             } else {
-                let next = compiled.advance_states(parent, name);
+                let Some(name) = entry.name.to_str() else {
+                    if is_dir {
+                        let _ = fts.set(&entry, FtsSetOption::Skip);
+                    }
+                    continue;
+                };
+
+                ctx.compiled
+                    .advance_states_into(parent.as_ref(), name, &mut next_states_scratch);
+                let next_sig = states_signature(&next_states_scratch);
+                let next_states = Arc::<[usize]>::from(next_states_scratch.clone());
+
                 if transition_cache_len >= TRANSITION_CACHE_CAPACITY {
                     transition_cache.clear();
                     transition_cache_len = 0;
                 }
-                let next_signature = states_signature(&next);
-                let by_name = transition_cache.entry(signature).or_default();
-                if by_name
-                    .insert(name.to_owned(), (next.clone(), next_signature))
+                if transition_cache
+                    .insert(
+                        key,
+                        TransitionValue {
+                            name: name_bytes.to_vec(),
+                            parent_states: Arc::clone(parent),
+                            states: Arc::clone(&next_states),
+                            next_sig,
+                        },
+                    )
                     .is_none()
                 {
                     transition_cache_len += 1;
                 }
-                (next, next_signature)
+
+                (next_states, next_sig)
             }
         };
 
         if level_states.len() <= level {
-            level_states.resize(level + 1, Vec::new());
+            level_states.resize(level + 1, Arc::<[usize]>::from(Vec::<usize>::new()));
         }
-        level_states[level] = states;
+        level_states[level] = Arc::clone(&states);
         level_states.truncate(level + 1);
-        let states = &level_states[level];
+        let states = level_states[level].as_ref();
 
         if states.is_empty() {
             if is_dir {
@@ -257,43 +394,133 @@ fn run_fts_job(
         }
 
         if is_dir
-            && !cached_needs_directory_scan(
-                &mut state_cache,
-                compiled.as_ref(),
-                states_sig,
-                &states,
-            )
+            && !cached_needs_directory_scan(&mut state_cache, ctx.compiled.as_ref(), states_sig, states)
         {
             let _ = fts.set(&entry, FtsSetOption::Skip);
-        }
-
-        if files_only && is_dir {
             continue;
         }
 
-        let kind = entry_kind(entry.info.clone());
-        if cached_is_match_state(&mut state_cache, compiled.as_ref(), states_sig, &states) {
+        let is_match = cached_is_match_state(&mut state_cache, ctx.compiled.as_ref(), states_sig, states);
+
+        if is_dir
+            && level > 0
+            && should_split_directory(
+                entry.path.as_path(),
+                level,
+                &ctx.active_jobs,
+                ctx.split_backlog_limit,
+            )
+        {
+            if is_match && !ctx.files_only {
+                pending_events.push(WalkEvent {
+                    path: entry.path.clone(),
+                    kind: EntryKind::Dir,
+                });
+            }
+
+            ctx.active_jobs.fetch_add(1, Ordering::AcqRel);
+            let enqueued = ctx.queue.push(RootJob {
+                path: entry.path.clone(),
+                root_states: states.to_vec(),
+            });
+            if !enqueued {
+                ctx.active_jobs.fetch_sub(1, Ordering::AcqRel);
+            }
+            let _ = fts.set(&entry, FtsSetOption::Skip);
+
+            if pending_events.len() >= EMIT_BATCH_SIZE {
+                flush_events(&ctx.worker_tx, &mut pending_events, &ctx.cancel);
+            }
+            continue;
+        }
+
+        if ctx.files_only && is_dir {
+            continue;
+        }
+
+        if is_match {
+            let kind = entry_kind(entry.info.clone());
             pending_events.push(WalkEvent {
                 path: entry.path.clone(),
                 kind,
             });
             if pending_events.len() >= EMIT_BATCH_SIZE {
-                flush_events(&tx, &mut pending_events);
-                if tx.is_closed() {
+                flush_events(&ctx.worker_tx, &mut pending_events, &ctx.cancel);
+            }
+        }
+    }
+
+    flush_events(&ctx.worker_tx, &mut pending_events, &ctx.cancel);
+}
+
+async fn forward_worker_messages(
+    mut rx: mpsc::Receiver<WorkerMessage>,
+    tx: mpsc::Sender<WalkMessage>,
+    cancel: Arc<AtomicBool>,
+) {
+    while let Some(msg) = rx.recv().await {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match msg {
+            WorkerMessage::Events(events) => {
+                for event in events {
+                    if tx.send(Ok(event)).await.is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+            WorkerMessage::Error(err) => {
+                if tx.send(Err(err)).await.is_err() {
+                    cancel.store(true, Ordering::Relaxed);
                     return;
                 }
             }
         }
     }
-
-    flush_events(&tx, &mut pending_events);
 }
 
-fn flush_events(tx: &mpsc::Sender<WalkMessage>, pending: &mut Vec<WalkEvent>) {
-    for event in pending.drain(..) {
-        if tx.blocking_send(Ok(event)).is_err() {
-            break;
+fn should_split_directory(
+    path: &Path,
+    depth: usize,
+    active_jobs: &AtomicUsize,
+    split_backlog_limit: usize,
+) -> bool {
+    if depth > SPLIT_DEPTH_LIMIT {
+        return false;
+    }
+    if active_jobs.load(Ordering::Relaxed) >= split_backlog_limit {
+        return false;
+    }
+    has_min_children(path, SPLIT_MIN_CHILDREN)
+}
+
+fn has_min_children(path: &Path, min_children: usize) -> bool {
+    let mut count = 0usize;
+    let Ok(read_dir) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in read_dir {
+        if entry.is_err() {
+            continue;
         }
+        count += 1;
+        if count >= min_children {
+            return true;
+        }
+    }
+    false
+}
+
+fn flush_events(tx: &mpsc::Sender<WorkerMessage>, pending: &mut Vec<WalkEvent>, cancel: &AtomicBool) {
+    if pending.is_empty() || cancel.load(Ordering::Relaxed) {
+        pending.clear();
+        return;
+    }
+    let chunk = std::mem::take(pending);
+    if tx.blocking_send(WorkerMessage::Events(chunk)).is_err() {
+        cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -512,6 +739,12 @@ fn states_signature(states: &[usize]) -> u64 {
     for state in states {
         state.hash(&mut hasher);
     }
+    hasher.finish()
+}
+
+fn bytes_signature(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
     hasher.finish()
 }
 

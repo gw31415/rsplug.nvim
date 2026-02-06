@@ -464,4 +464,58 @@ mod tests {
         assert_eq!(got, expected);
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
+    async fn dropping_receiver_terminates_run_promptly() {
+        let root = test_root("drop_rx");
+        fs::create_dir_all(root.join("d1/d2/d3")).expect("create tree");
+        for idx in 0..200usize {
+            fs::write(root.join(format!("d1/d2/d3/file-{idx}.txt")), b"x").expect("write file");
+        }
+
+        let glob = CompiledGlob::new(&format!("{}/**", root.display())).expect("glob must parse");
+        for _ in 0..40usize {
+            let rx = Walker::spawn(glob.clone());
+            drop(rx);
+        }
+
+        // If background tasks fail to terminate, this timeout tends to trip.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        })
+        .await
+        .expect("drop should not stall runtime");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
+    async fn repeated_spawn_with_completion_is_stable() {
+        let root = test_root("repeat_spawn");
+        fs::create_dir_all(root.join("src/bin")).expect("create tree");
+        fs::write(root.join("src/main.rs"), b"fn main(){}").expect("write file");
+        fs::write(root.join("src/bin/tool.rs"), b"fn main(){}").expect("write file");
+        let glob =
+            CompiledGlob::new(&format!("{}/**/*.rs", root.display())).expect("glob must parse");
+
+        for _ in 0..30usize {
+            let mut rx = Walker::spawn(glob.clone());
+            let mut files = 0usize;
+            while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("channel should respond")
+            {
+                if let Ok(ev) = msg
+                    && ev.kind == EntryKind::File
+                {
+                    files += 1;
+                }
+            }
+            assert!(files > 0, "at least one file event should be produced");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

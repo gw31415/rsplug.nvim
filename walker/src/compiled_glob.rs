@@ -431,25 +431,36 @@ impl CompiledGlob {
     }
 
     pub(crate) fn advance_states(&self, current: &[usize], part: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.advance_states_into(current, part, &mut out);
+        out
+    }
+
+    pub(crate) fn advance_states_into(
+        &self,
+        current: &[usize],
+        part: &str,
+        out: &mut Vec<usize>,
+    ) {
         let expanded = self.expand_epsilon_nodes(current);
-        let mut next = Vec::new();
+        out.clear();
         let mut overflow_seen: Option<HashSet<usize>> = None;
         for node_idx in expanded {
             let node = &self.trie.nodes[node_idx];
             if let Some(next_idx) = node.literal_edges.get(part) {
-                push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                push_unique_state(out, &mut overflow_seen, *next_idx);
             }
 
             if !node.wild_edges_exact1.is_empty() && part.chars().count() == 1 {
                 for next_idx in &node.wild_edges_exact1 {
-                    push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                    push_unique_state(out, &mut overflow_seen, *next_idx);
                 }
             }
 
             for (suffix, ids) in &node.wild_edges_suffix {
                 if part.ends_with(suffix) {
                     for next_idx in ids {
-                        push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                        push_unique_state(out, &mut overflow_seen, *next_idx);
                     }
                 }
             }
@@ -457,21 +468,21 @@ impl CompiledGlob {
             for (prefix, ids) in &node.wild_edges_prefix {
                 if part.starts_with(prefix) {
                     for next_idx in ids {
-                        push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                        push_unique_state(out, &mut overflow_seen, *next_idx);
                     }
                 }
             }
 
             for (_, matcher, next_idx) in &node.wild_edges_general {
                 if matcher.matches(part) {
-                    push_unique_state(&mut next, &mut overflow_seen, *next_idx);
+                    push_unique_state(out, &mut overflow_seen, *next_idx);
                 }
             }
             if node.descend_edge.is_some() {
-                push_unique_state(&mut next, &mut overflow_seen, node_idx);
+                push_unique_state(out, &mut overflow_seen, node_idx);
             }
         }
-        self.expand_epsilon_nodes(&next)
+        *out = self.expand_epsilon_nodes(out);
     }
 
     pub(crate) fn is_match_state(&self, current: &[usize]) -> bool {
