@@ -56,6 +56,7 @@ pub type WalkMessage = Result<WalkEvent, WalkError>;
 pub struct WalkerOptions {
     pub max_parallelism: Option<usize>,
     pub channel_capacity: usize,
+    pub files_only: bool,
 }
 
 impl Default for WalkerOptions {
@@ -63,6 +64,7 @@ impl Default for WalkerOptions {
         Self {
             max_parallelism: None,
             channel_capacity: 1024,
+            files_only: false,
         }
     }
 }
@@ -102,6 +104,7 @@ struct TraversalCtx {
     program: Arc<MatchProgram>,
     visited: Arc<Mutex<HashSet<VisitKey>>>,
     tx: mpsc::Sender<WalkMessage>,
+    files_only: bool,
 }
 
 #[derive(Clone)]
@@ -171,6 +174,7 @@ impl Walker {
             program: Arc::new(MatchProgram::new(compiled)),
             visited: Arc::new(Mutex::new(HashSet::new())),
             tx,
+            files_only: options.files_only,
         };
         let initial_states = ctx.program.initial_states();
 
@@ -324,6 +328,9 @@ async fn process_state(
 async fn finalize_match(ctx: &TraversalCtx, path: PathBuf) {
     match entry_kind(&path).await {
         Ok(kind) => {
+            if ctx.files_only && kind != EntryKind::File {
+                return;
+            }
             let _ = ctx.tx.send(Ok(WalkEvent { path, kind })).await;
         }
         Err(err) => {

@@ -13,7 +13,7 @@ use ignore::{WalkBuilder, WalkState};
 use tokio::task::spawn_blocking;
 use tokio::time::Instant as TokioInstant;
 use walker::compiled_glob::CompiledGlob;
-use walker::walker::{EntryKind, Walker};
+use walker::walker::{EntryKind, Walker, WalkerOptions};
 
 use crate::bench_rules::matches_compiled_rules;
 use crate::bench_types::{AttemptOutcome, AttemptResult, BenchmarkKind};
@@ -262,7 +262,11 @@ async fn measure_walker(patterns: Vec<String>, timeout: Duration) -> io::Result<
     for pattern in patterns {
         compiled.push(CompiledGlob::new(&pattern)?);
     }
-    let mut rx = Walker::spawn_many(compiled);
+    let options = WalkerOptions {
+        files_only: true,
+        ..WalkerOptions::default()
+    };
+    let mut rx = Walker::spawn_many_with_options(compiled, options);
     let started = Instant::now();
     let deadline = TokioInstant::now() + timeout;
     let mut matched_files = 0usize;
