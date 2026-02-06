@@ -424,4 +424,44 @@ mod tests {
         assert_eq!(got, expected);
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
+    async fn files_only_does_not_emit_directories() {
+        let root = test_root("files_only");
+        fs::create_dir_all(root.join("src/bin")).expect("create tree");
+        fs::write(root.join("src/main.rs"), b"fn main(){}").expect("write file");
+        fs::write(root.join("src/bin/tool.rs"), b"fn main(){}").expect("write file");
+
+        let pattern = format!("{}/**", root.display());
+        let glob = CompiledGlob::new(&pattern).expect("glob must parse");
+        let options = WalkerOptions {
+            files_only: true,
+            ..WalkerOptions::default()
+        };
+        let mut rx = Walker::spawn_with_options(glob, options);
+
+        let mut got = BTreeSet::new();
+        while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("channel should respond")
+        {
+            if let Ok(ev) = msg {
+                assert_eq!(ev.kind, EntryKind::File);
+                got.insert(
+                    ev.path
+                        .strip_prefix(&root)
+                        .expect("path under root")
+                        .to_path_buf(),
+                );
+            }
+        }
+
+        let expected: BTreeSet<PathBuf> = ["src/main.rs", "src/bin/tool.rs"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(got, expected);
+        let _ = fs::remove_dir_all(&root);
+    }
 }

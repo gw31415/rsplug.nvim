@@ -161,8 +161,10 @@ async fn process_state(
         return Vec::new();
     }
 
-    if ctx.program.is_match_state(&state.match_states) {
-        finalize_match(&ctx, state.path.clone(), state.kind_hint).await;
+    if !ctx.files_only || !matches!(state.kind_hint, Some(EntryKind::Dir | EntryKind::Other)) {
+        if ctx.program.is_match_state(&state.match_states) {
+            finalize_match(&ctx, state.path.clone(), state.kind_hint).await;
+        }
     }
 
     if matches!(state.kind_hint, Some(EntryKind::File | EntryKind::Other)) {
@@ -234,10 +236,18 @@ async fn process_state(
             continue;
         }
         let mut kind_hint = None;
-        if ctx.files_only && ctx.program.is_match_state(&next_states) {
+        if ctx.files_only {
             if let Ok(file_type) = entry.file_type().await {
-                kind_hint = Some(entry_kind_from_file_type(file_type));
+                let kind = entry_kind_from_file_type(file_type);
+                kind_hint = Some(kind);
+                if kind == EntryKind::File && !ctx.program.is_match_state(&next_states) {
+                    kind_hint = None;
+                }
             }
+        } else if ctx.program.is_match_state(&next_states)
+            && let Ok(file_type) = entry.file_type().await
+        {
+            kind_hint = Some(entry_kind_from_file_type(file_type));
         }
         out.push(State {
             path: entry.path(),

@@ -11,6 +11,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 const TRANSITION_CACHE_CAPACITY: usize = 16 * 1024;
+const EMIT_BATCH_SIZE: usize = 128;
+const SHARD_FACTOR: usize = 6;
+const SHARD_DEPTH: usize = 2;
 
 #[derive(Clone)]
 struct RootJob {
@@ -32,10 +35,11 @@ pub(super) fn spawn_single_with_options(
             .max_parallelism
             .unwrap_or_else(default_parallelism)
             .max(1);
+        let max_jobs = max_parallelism.saturating_mul(SHARD_FACTOR).max(1);
 
         let joined = tokio::task::spawn_blocking({
             let compiled = Arc::clone(&compiled);
-            move || prepare_jobs(compiled.as_ref(), files_only)
+            move || prepare_jobs(compiled.as_ref(), files_only, max_jobs)
         })
         .await;
 
@@ -140,6 +144,7 @@ fn run_fts_job(
     let mut level_states: Vec<Vec<usize>> = Vec::new();
     let mut transition_cache: HashMap<u64, HashMap<String, Vec<usize>>> = HashMap::new();
     let mut transition_cache_len = 0usize;
+    let mut pending_events = Vec::with_capacity(EMIT_BATCH_SIZE);
 
     while let Some(entry) = fts.read() {
         let level = match usize::try_from(entry.level) {
@@ -149,12 +154,20 @@ fn run_fts_job(
 
         match entry.info {
             FtsInfo::IsDot | FtsInfo::IsDirPost => {
+                flush_events(&tx, &mut pending_events);
+                if tx.is_closed() {
+                    return;
+                }
                 if level < level_states.len() {
                     level_states.truncate(level);
                 }
                 continue;
             }
             FtsInfo::IsErr | FtsInfo::IsDontRead | FtsInfo::IsNoStat => {
+                flush_events(&tx, &mut pending_events);
+                if tx.is_closed() {
+                    return;
+                }
                 let source = if entry.error == 0 {
                     io::Error::other("fts reported an unreadable entry")
                 } else {
@@ -228,26 +241,54 @@ fn run_fts_job(
             continue;
         }
 
-        let kind = entry_kind(entry.info.clone());
-        if compiled.is_match_state(&states) && (!files_only || kind == EntryKind::File) {
-            let _ = tx.blocking_send(Ok(WalkEvent {
-                path: entry.path.clone(),
-                kind,
-            }));
-        }
-
         if is_dir && !compiled.needs_directory_scan(&states) {
             let _ = fts.set(&entry, FtsSetOption::Skip);
+        }
+
+        if files_only && is_dir {
+            continue;
+        }
+
+        let kind = entry_kind(entry.info.clone());
+        if compiled.is_match_state(&states) {
+            pending_events.push(WalkEvent {
+                path: entry.path.clone(),
+                kind,
+            });
+            if pending_events.len() >= EMIT_BATCH_SIZE {
+                flush_events(&tx, &mut pending_events);
+                if tx.is_closed() {
+                    return;
+                }
+            }
+        }
+    }
+
+    flush_events(&tx, &mut pending_events);
+}
+
+fn flush_events(tx: &mpsc::Sender<WalkMessage>, pending: &mut Vec<WalkEvent>) {
+    for event in pending.drain(..) {
+        if tx.blocking_send(Ok(event)).is_err() {
+            break;
         }
     }
 }
 
-fn prepare_jobs(compiled: &CompiledGlob, files_only: bool) -> (Vec<RootJob>, Vec<WalkEvent>) {
+fn prepare_jobs(
+    compiled: &CompiledGlob,
+    files_only: bool,
+    max_jobs: usize,
+) -> (Vec<RootJob>, Vec<WalkEvent>) {
     let roots = normalize_roots(compiled.start_paths());
     let mut jobs = Vec::new();
     let mut initial_events = Vec::new();
 
     for root in roots {
+        if jobs.len() >= max_jobs {
+            break;
+        }
+
         let metadata = match std::fs::metadata(root.as_path()) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
@@ -262,20 +303,26 @@ fn prepare_jobs(compiled: &CompiledGlob, files_only: bool) -> (Vec<RootJob>, Vec
             continue;
         }
 
-        // If root count is tiny, split by first-level entries to increase parallelism.
-        // Fall back to root-only job when splitting is unsafe or unproductive.
         let sharded = shard_root_jobs(
             compiled,
             root.as_path(),
             &root_states,
             files_only,
+            max_jobs,
+            SHARD_DEPTH,
             &mut jobs,
             &mut initial_events,
         );
+
         if !sharded {
             jobs.push(RootJob {
                 path: root,
                 root_states,
+            });
+        } else if compiled.is_match_state(&root_states) && !files_only {
+            initial_events.push(WalkEvent {
+                path: root,
+                kind: EntryKind::Dir,
             });
         }
     }
@@ -288,18 +335,29 @@ fn shard_root_jobs(
     root: &Path,
     root_states: &[usize],
     files_only: bool,
+    max_jobs: usize,
+    depth: usize,
     jobs: &mut Vec<RootJob>,
     initial_events: &mut Vec<WalkEvent>,
 ) -> bool {
+    if depth == 0 || jobs.len() >= max_jobs {
+        return false;
+    }
+
     let mut reader = match std::fs::read_dir(root) {
         Ok(reader) => reader,
         Err(_) => return false,
     };
 
     let mut local_jobs = Vec::new();
-    let mut sharded = false;
+    let mut local_events = Vec::new();
+    let mut split_happened = false;
 
     while let Some(entry) = reader.next().transpose().ok().flatten() {
+        if jobs.len() + local_jobs.len() >= max_jobs {
+            break;
+        }
+
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             return false;
@@ -310,42 +368,76 @@ fn shard_root_jobs(
             continue;
         }
 
-        let mut kind = None;
-        if let Ok(file_type) = entry.file_type() {
-            if file_type.is_dir() {
-                kind = Some(EntryKind::Dir);
-            } else if file_type.is_file() {
-                kind = Some(EntryKind::File);
-            } else if file_type.is_symlink() {
-                kind = symlink_kind(entry.path().as_path());
-            } else {
-                kind = Some(EntryKind::Other);
+        let kind = classify_entry(entry.path().as_path(), entry.file_type().ok());
+        if kind != Some(EntryKind::Dir) || !compiled.needs_directory_scan(&next_states) {
+            if compiled.is_match_state(&next_states)
+                && let Some(kind) = kind
+                && (!files_only || kind == EntryKind::File)
+            {
+                local_events.push(WalkEvent {
+                    path: entry.path(),
+                    kind,
+                });
+            }
+            continue;
+        }
+
+        if depth > 1 {
+            let child_before = local_jobs.len();
+            let mut child_jobs = Vec::new();
+            let mut child_events = Vec::new();
+            let child_split = shard_root_jobs(
+                compiled,
+                entry.path().as_path(),
+                &next_states,
+                files_only,
+                max_jobs.saturating_sub(jobs.len()),
+                depth - 1,
+                &mut child_jobs,
+                &mut child_events,
+            );
+            if child_split {
+                local_jobs.extend(child_jobs);
+                local_events.extend(child_events);
+                split_happened = true;
+                continue;
+            }
+            if local_jobs.len() > child_before {
+                local_jobs.truncate(child_before);
             }
         }
 
-        if compiled.is_match_state(&next_states)
-            && let Some(kind) = kind
-            && (!files_only || kind == EntryKind::File)
-        {
-            initial_events.push(WalkEvent {
-                path: entry.path(),
-                kind,
-            });
-        }
-
-        if kind == Some(EntryKind::Dir) && compiled.needs_directory_scan(&next_states) {
-            local_jobs.push(RootJob {
-                path: entry.path(),
-                root_states: next_states,
-            });
-            sharded = true;
-        }
+        local_jobs.push(RootJob {
+            path: entry.path(),
+            root_states: next_states,
+        });
+        split_happened = true;
     }
 
-    if sharded {
-        jobs.extend(local_jobs);
+    if split_happened {
+        jobs.extend(
+            local_jobs
+                .into_iter()
+                .take(max_jobs.saturating_sub(jobs.len())),
+        );
+        initial_events.extend(local_events);
     }
-    sharded
+
+    split_happened
+}
+
+fn classify_entry(path: &Path, file_type: Option<std::fs::FileType>) -> Option<EntryKind> {
+    let file_type = file_type?;
+    if file_type.is_dir() {
+        return Some(EntryKind::Dir);
+    }
+    if file_type.is_file() {
+        return Some(EntryKind::File);
+    }
+    if file_type.is_symlink() {
+        return symlink_kind(path);
+    }
+    Some(EntryKind::Other)
 }
 
 fn symlink_kind(path: &Path) -> Option<EntryKind> {
