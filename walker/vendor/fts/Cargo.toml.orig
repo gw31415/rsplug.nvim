@@ -1,0 +1,38 @@
+[package]
+name = "fts"
+version = "0.3.0"
+authors = ["dalance <dalance@gmail.com>"]
+repository = "https://github.com/dalance/fts-rs"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "A Rust library for high performance directory walking using libc fts"
+keywords = ["libc", "directory", "walk", "recursive", "iterator"]
+exclude = ["test_data/*"]
+build = "build.rs"
+
+[badges]
+travis-ci = { repository = "dalance/fts-rs" }
+codecov   = { repository = "dalance/fts-rs", branch = "master", service = "github" }
+
+[dependencies]
+bitflags       = "1"
+enum_primitive = "0.1"
+libc           = "0.2"
+num            = "0.3"
+
+[build-dependencies]
+skeptic        = "0.13"
+
+[dev-dependencies]
+skeptic        = "0.13"
+walkdir        = "2"
+
+[package.metadata.release]
+dev-version-ext            = "pre"
+pre-release-commit-message = "Prepare to v{{version}}"
+pro-release-commit-message = "Start next development iteration v{{version}}"
+pre-release-replacements   = [
+    { file = "README.md", search = "fts = \"[a-z0-9\\.-]+\"", replace = "fts = \"{{version}}\"" },
+]
+tag-message                = "Bump version to {{version}}"
+tag-prefix                 = "v"

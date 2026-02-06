@@ -1,0 +1,14 @@
+[package]
+name = "walker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hashbrown.workspace = true
+tokio.workspace = true
+wildmatch.workspace = true
+
+path-dedot = { version = "3.1.1", features = ["once_cell_cache"] }
+
+[target.'cfg(all(unix, not(windows)))'.dependencies]
+fts = { version = "0.3.0", path = "vendor/fts" }
