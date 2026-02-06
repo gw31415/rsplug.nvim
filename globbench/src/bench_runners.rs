@@ -11,6 +11,9 @@ use glob::glob;
 use globwalker::GlobWalker;
 use ignore::{WalkBuilder, WalkState};
 use tokio::task::spawn_blocking;
+use tokio::time::Instant as TokioInstant;
+use walker::compiled_glob::CompiledGlob;
+use walker::walker::{EntryKind, Walker};
 
 use crate::bench_rules::matches_compiled_rules;
 use crate::bench_types::{AttemptOutcome, AttemptResult, BenchmarkKind};
@@ -38,6 +41,10 @@ pub(crate) async fn run_benchmark_attempt(
             let cwd = cwd.to_path_buf();
             let rules = Arc::clone(rules);
             run_benchmark(timeout, move || measure_glob(cwd, rules, timeout)).await
+        }
+        BenchmarkKind::Walker => {
+            let patterns = raw_patterns.to_vec();
+            run_benchmark(timeout, move || measure_walker(patterns, timeout)).await
         }
     }
 }
@@ -248,6 +255,48 @@ async fn measure_glob(
     })
     .await
     .map_err(|error| io::Error::other(format!("glob task join error: {error}")))?
+}
+
+async fn measure_walker(patterns: Vec<String>, timeout: Duration) -> io::Result<AttemptOutcome> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        compiled.push(CompiledGlob::new(&pattern)?);
+    }
+    let mut rx = Walker::spawn_many(compiled);
+    let started = Instant::now();
+    let deadline = TokioInstant::now() + timeout;
+    let mut matched_files = 0usize;
+
+    loop {
+        let msg = tokio::time::timeout_at(deadline, rx.recv()).await;
+        let Some(msg) = (match msg {
+            Ok(msg) => msg,
+            Err(_) => return Ok(AttemptOutcome::TimedOut),
+        }) else {
+            break;
+        };
+
+        match msg {
+            Ok(event) => {
+                if event.kind == EntryKind::File {
+                    matched_files += 1;
+                }
+            }
+            Err(error)
+                if matches!(
+                    &error,
+                    walker::walker::WalkError::Io { source, .. }
+                        if source.kind() == io::ErrorKind::PermissionDenied
+                            || source.kind() == io::ErrorKind::NotFound
+                ) => {}
+            Err(error) => return Err(io::Error::other(error.to_string())),
+        }
+    }
+
+    Ok(AttemptOutcome::Completed(AttemptResult {
+        elapsed: started.elapsed(),
+        matched_files,
+    }))
 }
 
 fn build_start_roots(cwd: &Path, include_prefixes: &[String]) -> io::Result<Vec<PathBuf>> {

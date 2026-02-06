@@ -36,6 +36,7 @@ pub(crate) enum BenchmarkKind {
     Globwalker = 0,
     IgnoreParallel = 1,
     Glob = 2,
+    Walker = 3,
 }
 
 impl BenchmarkKind {
@@ -44,6 +45,7 @@ impl BenchmarkKind {
             Self::Globwalker => "globwalker",
             Self::IgnoreParallel => "ignore(parallel)",
             Self::Glob => "glob",
+            Self::Walker => "walker",
         }
     }
 }

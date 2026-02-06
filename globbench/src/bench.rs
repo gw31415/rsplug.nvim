@@ -9,10 +9,11 @@ use crate::bench_types::{AttemptOutcome, BenchmarkAccumulator, BenchmarkKind, Be
 
 pub(crate) const BENCHMARK_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const BENCHMARK_RUNS: usize = 3;
-const BENCHMARK_KINDS: [BenchmarkKind; 3] = [
+const BENCHMARK_KINDS: [BenchmarkKind; 4] = [
     BenchmarkKind::Globwalker,
     BenchmarkKind::IgnoreParallel,
     BenchmarkKind::Glob,
+    BenchmarkKind::Walker,
 ];
 
 pub(crate) async fn run_and_print(cwd: &Path, raw_patterns: &[String]) -> io::Result<()> {
@@ -229,21 +230,28 @@ mod tests {
                 .into_iter()
                 .map(BenchmarkKind::name)
                 .collect::<Vec<_>>(),
-            vec!["globwalker", "ignore(parallel)", "glob"]
+            vec!["globwalker", "ignore(parallel)", "glob", "walker"]
         );
         assert_eq!(
             benchmark_round_order(1)
                 .into_iter()
                 .map(BenchmarkKind::name)
                 .collect::<Vec<_>>(),
-            vec!["ignore(parallel)", "glob", "globwalker"]
+            vec!["ignore(parallel)", "glob", "walker", "globwalker"]
         );
         assert_eq!(
             benchmark_round_order(2)
                 .into_iter()
                 .map(BenchmarkKind::name)
                 .collect::<Vec<_>>(),
-            vec!["glob", "globwalker", "ignore(parallel)"]
+            vec!["glob", "walker", "globwalker", "ignore(parallel)"]
+        );
+        assert_eq!(
+            benchmark_round_order(3)
+                .into_iter()
+                .map(BenchmarkKind::name)
+                .collect::<Vec<_>>(),
+            vec!["walker", "globwalker", "ignore(parallel)", "glob"]
         );
     }
 }

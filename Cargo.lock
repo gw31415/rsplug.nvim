@@ -468,6 +468,7 @@ dependencies = [
  "globwalker",
  "ignore",
  "tokio",
+ "walker",
 ]
 
 [[package]]
