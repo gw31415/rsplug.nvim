@@ -1,7 +1,8 @@
-use crate::compiled_glob::{CompiledGlob, SegmentMatcher};
+use crate::compiled_glob::CompiledGlob;
 use hashbrown::HashSet;
 use std::cmp::max;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,8 +25,14 @@ pub struct WalkEvent {
 
 #[derive(Debug)]
 pub enum WalkError {
-    Io { path: PathBuf, source: io::Error },
-    Unsupported { feature: &'static str, path: PathBuf },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Unsupported {
+        feature: &'static str,
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for WalkError {
@@ -69,8 +76,24 @@ impl MatchProgram {
         Self { compiled }
     }
 
-    fn segments(&self) -> &[SegmentMatcher] {
-        self.compiled.segments()
+    fn initial_states(&self) -> Vec<usize> {
+        self.compiled.initial_states()
+    }
+
+    fn advance_states(&self, current: &[usize], part: &str) -> Vec<usize> {
+        self.compiled.advance_states(current, part)
+    }
+
+    fn is_match_state(&self, current: &[usize]) -> bool {
+        self.compiled.is_match_state(current)
+    }
+
+    fn literal_candidates(&self, current: &[usize]) -> Vec<String> {
+        self.compiled.literal_candidates(current)
+    }
+
+    fn needs_directory_scan(&self, current: &[usize]) -> bool {
+        self.compiled.needs_directory_scan(current)
     }
 }
 
@@ -84,14 +107,14 @@ struct TraversalCtx {
 #[derive(Clone)]
 struct State {
     path: PathBuf,
-    seg_idx: usize,
+    match_states: Vec<usize>,
 }
 
 #[cfg(unix)]
 type DirIdentity = (u64, u64);
 #[cfg(not(unix))]
 type DirIdentity = PathBuf;
-type VisitKey = (DirIdentity, usize);
+type VisitKey = (DirIdentity, u64);
 
 pub struct Walker;
 
@@ -100,7 +123,43 @@ impl Walker {
         Self::spawn_with_options(compiled, WalkerOptions::default())
     }
 
+    pub fn spawn_many(
+        globs: impl IntoIterator<Item = CompiledGlob>,
+    ) -> mpsc::Receiver<WalkMessage> {
+        Self::spawn_many_with_options(globs, WalkerOptions::default())
+    }
+
     pub fn spawn_with_options(
+        compiled: CompiledGlob,
+        options: WalkerOptions,
+    ) -> mpsc::Receiver<WalkMessage> {
+        Self::spawn_many_with_options([compiled], options)
+    }
+
+    pub fn spawn_many_with_options(
+        globs: impl IntoIterator<Item = CompiledGlob>,
+        options: WalkerOptions,
+    ) -> mpsc::Receiver<WalkMessage> {
+        let merged = match CompiledGlob::merge_many(globs) {
+            Ok(merged) => merged,
+            Err(err) => {
+                let (tx, rx) = mpsc::channel(options.channel_capacity.max(1));
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(Err(WalkError::Io {
+                            path: PathBuf::from("<spawn_many>"),
+                            source: err,
+                        }))
+                        .await;
+                });
+                return rx;
+            }
+        };
+
+        Self::spawn_single_with_options(merged, options)
+    }
+
+    fn spawn_single_with_options(
         compiled: CompiledGlob,
         options: WalkerOptions,
     ) -> mpsc::Receiver<WalkMessage> {
@@ -113,11 +172,12 @@ impl Walker {
             visited: Arc::new(Mutex::new(HashSet::new())),
             tx,
         };
+        let initial_states = ctx.program.initial_states();
 
         tokio::spawn(async move {
             let mut frontier = vec![State {
                 path: root,
-                seg_idx: 0,
+                match_states: initial_states,
             }];
 
             while !frontier.is_empty() && !ctx.tx.is_closed() {
@@ -133,9 +193,7 @@ impl Walker {
                         Err(_) => break,
                     };
                     let child_ctx = ctx.clone();
-                    join_set.spawn(async move {
-                        process_state(child_ctx, state, permit).await
-                    });
+                    join_set.spawn(async move { process_state(child_ctx, state, permit).await });
                 }
 
                 while let Some(joined) = join_set.join_next().await {
@@ -170,172 +228,97 @@ fn default_walk_root() -> PathBuf {
     PathBuf::from(MAIN_SEPARATOR.to_string())
 }
 
+fn states_signature(states: &[usize]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for state in states {
+        state.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 async fn process_state(
     ctx: TraversalCtx,
     state: State,
     _permit: OwnedSemaphorePermit,
 ) -> Vec<State> {
-    if ctx.tx.is_closed() {
+    if ctx.tx.is_closed() || state.match_states.is_empty() {
         return Vec::new();
     }
 
-    let segments = ctx.program.segments();
-    if state.seg_idx >= segments.len() {
-        finalize_match(&ctx, state.path).await;
-        return Vec::new();
+    if ctx.program.is_match_state(&state.match_states) {
+        finalize_match(&ctx, state.path.clone()).await;
     }
 
-    match &segments[state.seg_idx] {
-        SegmentMatcher::AnyPath(inner) => {
-            let mut next_path = state.path;
-            next_path.push(inner.as_str());
-            vec![State {
-                path: next_path,
-                seg_idx: state.seg_idx + 1,
-            }]
+    let signature = states_signature(&state.match_states);
+    let mut out = Vec::new();
+    let literal_candidates = ctx.program.literal_candidates(&state.match_states);
+    let mut handled_names = HashSet::new();
+    for literal in literal_candidates {
+        handled_names.insert(literal.clone());
+        let next_states = ctx.program.advance_states(&state.match_states, &literal);
+        if next_states.is_empty() {
+            continue;
         }
-        SegmentMatcher::WildMatch(matcher) => {
-            let mut out = Vec::new();
-            if !mark_dir_visited(&ctx.visited, &state.path, state.seg_idx).await {
-                return out;
+        let candidate_path = state.path.join(&literal);
+        match tokio::fs::symlink_metadata(&candidate_path).await {
+            Ok(_) => out.push(State {
+                path: candidate_path,
+                match_states: next_states,
+            }),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(err) => {
+                send_error(&ctx.tx, candidate_path, err).await;
             }
-
-            let mut dir = match tokio::fs::read_dir(&state.path).await {
-                Ok(d) => d,
-                Err(err) => {
-                    send_error(&ctx.tx, state.path, err).await;
-                    return out;
-                }
-            };
-
-            while let Ok(Some(entry)) = dir.next_entry().await {
-                if ctx.tx.is_closed() {
-                    break;
-                }
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if matcher.matches(name) {
-                    out.push(State {
-                        path: entry.path(),
-                        seg_idx: state.seg_idx + 1,
-                    });
-                }
-            }
-            out
         }
-        SegmentMatcher::Descend => process_descend(ctx, state).await,
-    }
-}
-
-#[cfg(all(unix, not(windows)))]
-async fn process_descend(ctx: TraversalCtx, state: State) -> Vec<State> {
-    let segments = ctx.program.segments();
-    let mut next_idx = state.seg_idx + 1;
-    while next_idx < segments.len() && matches!(segments[next_idx], SegmentMatcher::Descend) {
-        next_idx += 1;
     }
 
-    let root = state.path.clone();
-    let (desc_tx, mut desc_rx) = mpsc::unbounded_channel();
-    let walk_task = tokio::task::spawn_blocking(move || walk_descendants(&root, desc_tx));
-
-    if next_idx >= segments.len() {
-        while let Some(item) = desc_rx.recv().await {
-            if ctx.tx.is_closed() {
-                break;
-            }
-            match item {
-                DescendItem::Entry(path, kind) => {
-                    let _ = ctx.tx.send(Ok(WalkEvent { path, kind })).await;
-                }
-                DescendItem::Error(err) => {
-                    send_error(&ctx.tx, state.path.clone(), err).await;
-                }
-            }
-        }
-        if let Err(err) = walk_task.await {
-            send_error(&ctx.tx, state.path, io::Error::other(err.to_string())).await;
-        }
-        return Vec::new();
+    if !ctx.program.needs_directory_scan(&state.match_states) {
+        return out;
     }
 
-    match &segments[next_idx] {
-        SegmentMatcher::AnyPath(inner) => {
-            let mut out = Vec::new();
-            let mut root_dir_added = false;
-            while let Some(item) = desc_rx.recv().await {
-                let (path, kind) = match item {
-                    DescendItem::Entry(path, kind) => (path, kind),
-                    DescendItem::Error(err) => {
-                        send_error(&ctx.tx, state.path.clone(), err).await;
-                        continue;
-                    }
-                };
-                if kind != EntryKind::Dir {
-                    continue;
-                }
-                if !mark_known_dir_visited(&ctx.visited, &path, next_idx + 1).await {
-                    continue;
-                }
-                out.push(State {
-                    path: path.join(inner.as_str()),
-                    seg_idx: next_idx + 1,
-                });
-                if path == state.path {
-                    root_dir_added = true;
-                }
-            }
-            if !root_dir_added && mark_dir_visited(&ctx.visited, &state.path, next_idx + 1).await
-            {
-                out.push(State {
-                    path: state.path.join(inner.as_str()),
-                    seg_idx: next_idx + 1,
-                });
-            }
-            if let Err(err) = walk_task.await {
-                send_error(&ctx.tx, state.path, io::Error::other(err.to_string())).await;
-            }
-            out
-        }
-        SegmentMatcher::WildMatch(matcher) => {
-            let is_terminal = next_idx + 1 >= segments.len();
-            let mut out = Vec::new();
-            while let Some(item) = desc_rx.recv().await {
-                let (path, kind) = match item {
-                    DescendItem::Entry(path, kind) => (path, kind),
-                    DescendItem::Error(err) => {
-                        send_error(&ctx.tx, state.path.clone(), err).await;
-                        continue;
-                    }
-                };
-                let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
-                    continue;
-                };
-                if matcher.matches(name) {
-                    if is_terminal {
-                        let _ = ctx.tx.send(Ok(WalkEvent { path, kind })).await;
-                    } else {
-                        out.push(State {
-                            path,
-                            seg_idx: next_idx + 1,
-                        });
-                    }
-                }
-            }
-            if let Err(err) = walk_task.await {
-                send_error(&ctx.tx, state.path, io::Error::other(err.to_string())).await;
-            }
-            out
-        }
-        SegmentMatcher::Descend => Vec::new(),
+    if !mark_dir_visited(&ctx.visited, &state.path, signature).await {
+        return out;
     }
-}
 
-#[cfg(windows)]
-async fn process_descend(_ctx: TraversalCtx, _state: State) -> Vec<State> {
-    unimplemented!("Descend with fts is not implemented on Windows");
+    let mut dir = match tokio::fs::read_dir(&state.path).await {
+        Ok(d) => d,
+        Err(err) if err.kind() == io::ErrorKind::NotADirectory => {
+            return out;
+        }
+        Err(err) => {
+            send_error(&ctx.tx, state.path, err).await;
+            return out;
+        }
+    };
+
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        if ctx.tx.is_closed() {
+            break;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if handled_names.contains(name) {
+            continue;
+        }
+        let next_states = ctx.program.advance_states(&state.match_states, name);
+        if next_states.is_empty() {
+            continue;
+        }
+        out.push(State {
+            path: entry.path(),
+            match_states: next_states,
+        });
+    }
+
+    out
 }
 
 async fn finalize_match(ctx: &TraversalCtx, path: PathBuf) {
@@ -370,7 +353,7 @@ async fn send_error(tx: &mpsc::Sender<WalkMessage>, path: PathBuf, source: io::E
 async fn mark_dir_visited(
     visited: &Arc<Mutex<HashSet<VisitKey>>>,
     path: &Path,
-    seg_idx: usize,
+    signature: u64,
 ) -> bool {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(meta) => meta,
@@ -387,74 +370,7 @@ async fn mark_dir_visited(
     #[cfg(not(unix))]
     let key = path.to_path_buf();
     let mut guard = visited.lock().expect("visited lock poisoned");
-    guard.insert((key, seg_idx))
-}
-
-#[cfg(all(unix, not(windows)))]
-async fn mark_known_dir_visited(
-    visited: &Arc<Mutex<HashSet<VisitKey>>>,
-    path: &Path,
-    seg_idx: usize,
-) -> bool {
-    #[cfg(unix)]
-    {
-        let metadata = match tokio::fs::metadata(path).await {
-            Ok(meta) => meta,
-            Err(_) => return false,
-        };
-        use std::os::unix::fs::MetadataExt;
-        let key = (metadata.dev(), metadata.ino());
-        let mut guard = visited.lock().expect("visited lock poisoned");
-        guard.insert((key, seg_idx))
-    }
-    #[cfg(not(unix))]
-    {
-        let mut guard = visited.lock().expect("visited lock poisoned");
-        guard.insert((path.to_path_buf(), seg_idx))
-    }
-}
-
-#[cfg(all(unix, not(windows)))]
-enum DescendItem {
-    Entry(PathBuf, EntryKind),
-    Error(io::Error),
-}
-
-#[cfg(all(unix, not(windows)))]
-fn walk_descendants(root: &Path, tx: mpsc::UnboundedSender<DescendItem>) {
-    use fts::walkdir::{WalkDir, WalkDirConf};
-    use std::io::ErrorKind;
-
-    let iter = WalkDir::new(WalkDirConf::new(root).follow_symlink().no_chdir()).into_iter();
-    for item in iter {
-        match item {
-            Ok(entry) => {
-                let path = entry.path().to_path_buf();
-                if path == root {
-                    let _ = tx.send(DescendItem::Entry(path, EntryKind::Dir));
-                    continue;
-                }
-                let ftype = entry.file_type();
-                let kind = if ftype.is_symlink() {
-                    EntryKind::Symlink
-                } else if ftype.is_dir() {
-                    EntryKind::Dir
-                } else if ftype.is_file() {
-                    EntryKind::File
-                } else {
-                    EntryKind::Other
-                };
-                let _ = tx.send(DescendItem::Entry(path, kind));
-            }
-            Err(err) => {
-                let kind = err.kind();
-                if matches!(kind, ErrorKind::PermissionDenied | ErrorKind::NotFound) {
-                    continue;
-                }
-                let _ = tx.send(DescendItem::Error(err));
-            }
-        }
-    }
+    guard.insert((key, signature))
 }
 
 #[cfg(test)]
@@ -487,14 +403,7 @@ mod tests {
     async fn descend_match_equivalence() {
         let one = CompiledGlob::new("a/**/**/b").expect("glob must parse");
         let two = CompiledGlob::new("a/**/b").expect("glob must parse");
-        for path in [
-            "a/b",
-            "a/x/b",
-            "a/x/y/b",
-            "a/x/y/c",
-            "x/a/b",
-            "a/x/y/z",
-        ] {
+        for path in ["a/b", "a/x/b", "a/x/y/b", "a/x/y/c", "x/a/b", "a/x/y/z"] {
             assert_eq!(one.r#match(path.as_ref()), two.r#match(path.as_ref()));
         }
     }
@@ -619,6 +528,159 @@ mod tests {
 
         fs::set_permissions(root.join("blocked"), fs::Permissions::from_mode(0o755))
             .expect("restore perms");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
+    async fn spawn_many_matches_union_of_patterns() {
+        let root = test_root("many_union");
+        fs::create_dir_all(root.join("src")).expect("create tree");
+        fs::create_dir_all(root.join("docs")).expect("create tree");
+        fs::write(root.join("src/main.rs"), b"fn main(){}").expect("write file");
+        fs::write(root.join("docs/readme.md"), b"# hi").expect("write file");
+
+        let g1 =
+            CompiledGlob::new(&format!("{}/**/*.rs", root.display())).expect("glob must parse");
+        let g2 =
+            CompiledGlob::new(&format!("{}/**/*.md", root.display())).expect("glob must parse");
+        let mut rx = Walker::spawn_many(vec![g1, g2]);
+
+        let mut got = BTreeSet::new();
+        while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("channel should respond")
+        {
+            if let Ok(ev) = msg {
+                got.insert(
+                    ev.path
+                        .strip_prefix(&root)
+                        .expect("path under root")
+                        .to_path_buf(),
+                );
+            }
+        }
+
+        let expected: BTreeSet<PathBuf> = ["src/main.rs", "docs/readme.md"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(got, expected);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
+    async fn spawn_many_single_equivalent_to_spawn() {
+        let root = test_root("many_single");
+        fs::create_dir_all(root.join("src/bin")).expect("create tree");
+        fs::write(root.join("src/main.rs"), b"fn main(){}").expect("write file");
+        fs::write(root.join("src/bin/tool.rs"), b"fn main(){}").expect("write file");
+
+        let pattern = format!("{}/**/*.rs", root.display());
+        let glob = CompiledGlob::new(&pattern).expect("glob must parse");
+
+        let mut single_rx = Walker::spawn(CompiledGlob::new(&pattern).expect("glob must parse"));
+        let mut many_rx = Walker::spawn_many(vec![glob]);
+
+        let mut single = BTreeSet::new();
+        while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), single_rx.recv())
+            .await
+            .expect("channel should respond")
+        {
+            if let Ok(ev) = msg {
+                single.insert(
+                    ev.path
+                        .strip_prefix(&root)
+                        .expect("path under root")
+                        .to_path_buf(),
+                );
+            }
+        }
+
+        let mut many = BTreeSet::new();
+        while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), many_rx.recv())
+            .await
+            .expect("channel should respond")
+        {
+            if let Ok(ev) = msg {
+                many.insert(
+                    ev.path
+                        .strip_prefix(&root)
+                        .expect("path under root")
+                        .to_path_buf(),
+                );
+            }
+        }
+
+        assert_eq!(single, many);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
+    async fn spawn_many_duplicate_patterns_no_duplicate_path() {
+        let root = test_root("many_dup");
+        fs::create_dir_all(root.join("src")).expect("create tree");
+        fs::write(root.join("src/main.rs"), b"fn main(){}").expect("write file");
+
+        let pattern = format!("{}/**/*.rs", root.display());
+        let g1 = CompiledGlob::new(&pattern).expect("glob must parse");
+        let g2 = CompiledGlob::new(&pattern).expect("glob must parse");
+        let mut rx = Walker::spawn_many(vec![g1, g2]);
+
+        let mut count = 0usize;
+        while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("channel should respond")
+        {
+            if let Ok(ev) = msg
+                && ev.path.ends_with("src/main.rs")
+            {
+                count += 1;
+            }
+        }
+
+        assert_eq!(count, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(windows)))]
+    async fn spawn_many_applies_last_match_wins_with_excludes() {
+        let root = test_root("many_exclude");
+        fs::create_dir_all(root.join("target")).expect("create tree");
+        fs::write(root.join("target/keep.txt"), b"x").expect("write file");
+        fs::write(root.join("target/ignore.txt"), b"x").expect("write file");
+
+        let include =
+            CompiledGlob::new(&format!("{}/**/*.txt", root.display())).expect("glob must parse");
+        let exclude = CompiledGlob::new(&format!("!{}/**/ignore.txt", root.display()))
+            .expect("glob must parse");
+        let reinclude = CompiledGlob::new(&format!("{}/**/ignore.txt", root.display()))
+            .expect("glob must parse");
+        let mut rx = Walker::spawn_many(vec![include, exclude, reinclude]);
+
+        let mut got = BTreeSet::new();
+        while let Some(msg) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("channel should respond")
+        {
+            if let Ok(ev) = msg {
+                got.insert(
+                    ev.path
+                        .strip_prefix(&root)
+                        .expect("path under root")
+                        .to_path_buf(),
+                );
+            }
+        }
+
+        let expected: BTreeSet<PathBuf> = ["target/keep.txt", "target/ignore.txt"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(got, expected);
         let _ = fs::remove_dir_all(&root);
     }
 }

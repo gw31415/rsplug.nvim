@@ -1,4 +1,5 @@
 use path_dedot::{CWD, ParseDot};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::io;
@@ -30,22 +31,149 @@ impl AsRef<Path> for PathInner {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum SegmentMatcher {
     AnyPath(PathInner),
-    WildMatch(WildMatch),
+    WildMatch { pattern: String, matcher: WildMatch },
     Descend,
 }
 
 #[derive(Debug)]
-pub struct CompiledGlob {
+struct CompiledRule {
+    rule_index: usize,
+    is_exclude: bool,
     segments: Vec<SegmentMatcher>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct RuleTerminal {
+    rule_index: usize,
+    is_exclude: bool,
+}
+
+type NodeId = usize;
+
+#[derive(Debug, Default)]
+struct TrieNode {
+    literal_edges: hashbrown::HashMap<String, NodeId>,
+    wild_edges: Vec<(String, WildMatch, NodeId)>,
+    descend_edge: Option<NodeId>,
+    terminals: Vec<RuleTerminal>,
+}
+
+#[derive(Debug)]
+struct GlobTrie {
+    nodes: Vec<TrieNode>,
+}
+
+impl GlobTrie {
+    fn new() -> Self {
+        Self {
+            nodes: vec![TrieNode::default()],
+        }
+    }
+
+    fn add_node(&mut self) -> NodeId {
+        self.nodes.push(TrieNode::default());
+        self.nodes.len() - 1
+    }
+
+    fn insert_rule(&mut self, rule: &CompiledRule) {
+        fn any_path_parts(text: &str) -> impl Iterator<Item = &str> {
+            text.split(MAIN_SEPARATOR).filter(|s| !s.is_empty())
+        }
+
+        let mut node = 0usize;
+        for segment in &rule.segments {
+            match segment {
+                SegmentMatcher::AnyPath(inner) => {
+                    for part in any_path_parts(inner.as_str()) {
+                        if part.is_empty() {
+                            continue;
+                        }
+                        let next = if let Some(existing) = self.nodes[node].literal_edges.get(part)
+                        {
+                            *existing
+                        } else {
+                            let created = self.add_node();
+                            self.nodes[node]
+                                .literal_edges
+                                .insert(part.to_string(), created);
+                            created
+                        };
+                        node = next;
+                    }
+                }
+                SegmentMatcher::WildMatch {
+                    pattern,
+                    matcher: _,
+                } => {
+                    let mut next = None;
+                    for (existing, _, node_id) in &self.nodes[node].wild_edges {
+                        if existing == pattern {
+                            next = Some(*node_id);
+                            break;
+                        }
+                    }
+                    let next = if let Some(node_id) = next {
+                        node_id
+                    } else {
+                        let created = self.add_node();
+                        self.nodes[node].wild_edges.push((
+                            pattern.clone(),
+                            WildMatch::new(pattern),
+                            created,
+                        ));
+                        created
+                    };
+                    node = next;
+                }
+                SegmentMatcher::Descend => {
+                    let next = if let Some(existing) = self.nodes[node].descend_edge {
+                        existing
+                    } else {
+                        let created = self.add_node();
+                        self.nodes[node].descend_edge = Some(created);
+                        created
+                    };
+                    node = next;
+                }
+            }
+        }
+        self.nodes[node].terminals.push(RuleTerminal {
+            rule_index: rule.rule_index,
+            is_exclude: rule.is_exclude,
+        });
+    }
+}
+
+#[derive(Debug)]
+pub struct CompiledGlob {
+    ordered_rules: Vec<CompiledRule>,
+    trie: GlobTrie,
 }
 
 impl CompiledGlob {
     /// 文字列をパースしてCompiledGlobを生成します。
     pub fn new(pattern: &str) -> io::Result<Self> {
-        let parsed = Path::new(pattern).parse_dot()?;
+        if pattern.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pattern must not be empty",
+            ));
+        }
+        let is_exclude = pattern.starts_with('!');
+        let pattern_body = if is_exclude { &pattern[1..] } else { pattern };
+        if pattern_body.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exclude pattern must include body after '!'",
+            ));
+        }
+
+        let parsed = Path::new(pattern_body).parse_dot()?;
         let is_absolute = parsed.is_absolute();
         let pattern = parsed.to_str().unwrap().to_string();
         let pattern = Arc::new(pattern);
@@ -73,24 +201,36 @@ impl CompiledGlob {
                     segments.push(SegmentMatcher::Descend);
                     let mut tail = String::from("*");
                     tail.push_str(&pattern[post]);
-                    segments.push(SegmentMatcher::WildMatch(WildMatch::new(&tail)));
+                    segments.push(SegmentMatcher::WildMatch {
+                        pattern: tail.clone(),
+                        matcher: WildMatch::new(&tail),
+                    });
                     return;
                 }
                 if !pre.is_empty() && post.is_empty() {
                     let mut head = pattern[pre].to_string();
                     head.push('*');
-                    segments.push(SegmentMatcher::WildMatch(WildMatch::new(&head)));
+                    segments.push(SegmentMatcher::WildMatch {
+                        pattern: head.clone(),
+                        matcher: WildMatch::new(&head),
+                    });
                     segments.push(SegmentMatcher::Descend);
                     return;
                 }
                 if !pre.is_empty() && !post.is_empty() {
                     let mut head = pattern[pre].to_string();
                     head.push('*');
-                    segments.push(SegmentMatcher::WildMatch(WildMatch::new(&head)));
+                    segments.push(SegmentMatcher::WildMatch {
+                        pattern: head.clone(),
+                        matcher: WildMatch::new(&head),
+                    });
                     segments.push(SegmentMatcher::Descend);
                     let mut tail = String::from("*");
                     tail.push_str(&pattern[post]);
-                    segments.push(SegmentMatcher::WildMatch(WildMatch::new(&tail)));
+                    segments.push(SegmentMatcher::WildMatch {
+                        pattern: tail.clone(),
+                        matcher: WildMatch::new(&tail),
+                    });
                     return;
                 }
                 return;
@@ -98,7 +238,10 @@ impl CompiledGlob {
 
             let has_wild = seg.chars().any(|ch| matches!(ch, '*' | '?'));
             if has_wild {
-                segments.push(SegmentMatcher::WildMatch(WildMatch::new(seg)));
+                segments.push(SegmentMatcher::WildMatch {
+                    pattern: seg.to_string(),
+                    matcher: WildMatch::new(seg),
+                });
             } else if let Some(SegmentMatcher::AnyPath(last)) = segments.last_mut() {
                 last.range.end = range.end;
             } else {
@@ -126,72 +269,130 @@ impl CompiledGlob {
                 SegmentMatcher::AnyPath(PathInner { pathbase, range }),
             );
         }
-        Ok(CompiledGlob { segments })
+        let mut compiled = CompiledGlob {
+            ordered_rules: Vec::new(),
+            trie: GlobTrie::new(),
+        };
+        compiled.push_rule(segments, is_exclude);
+        Ok(compiled)
+    }
+
+    pub fn merge(mut self, other: CompiledGlob) -> CompiledGlob {
+        let base = self.ordered_rules.len();
+        for (offset, mut rule) in other.ordered_rules.into_iter().enumerate() {
+            rule.rule_index = base + offset;
+            self.trie.insert_rule(&rule);
+            self.ordered_rules.push(rule);
+        }
+        self
+    }
+
+    pub fn merge_many(globs: impl IntoIterator<Item = CompiledGlob>) -> io::Result<CompiledGlob> {
+        let mut iter = globs.into_iter();
+        let Some(mut merged) = iter.next() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "merge_many requires at least one compiled glob",
+            ));
+        };
+        for glob in iter {
+            merged = merged.merge(glob);
+        }
+        Ok(merged)
+    }
+
+    pub(crate) fn initial_states(&self) -> Vec<usize> {
+        self.expand_epsilon_nodes([0usize].as_ref())
+    }
+
+    pub(crate) fn advance_states(&self, current: &[usize], part: &str) -> Vec<usize> {
+        let expanded = self.expand_epsilon_nodes(current);
+        let mut next = HashSet::new();
+        for node_idx in expanded {
+            let node = &self.trie.nodes[node_idx];
+            if let Some(next_idx) = node.literal_edges.get(part) {
+                next.insert(*next_idx);
+            }
+            for (_, matcher, next_idx) in &node.wild_edges {
+                if matcher.matches(part) {
+                    next.insert(*next_idx);
+                }
+            }
+            if node.descend_edge.is_some() {
+                next.insert(node_idx);
+            }
+        }
+        let next = next.into_iter().collect::<Vec<_>>();
+        self.expand_epsilon_nodes(&next)
+    }
+
+    pub(crate) fn is_match_state(&self, current: &[usize]) -> bool {
+        matches!(self.match_decision(current), Some(true))
+    }
+
+    pub(crate) fn literal_candidates(&self, current: &[usize]) -> Vec<String> {
+        let expanded = self.expand_epsilon_nodes(current);
+        let mut out = hashbrown::HashSet::new();
+        for node_idx in expanded {
+            out.extend(self.trie.nodes[node_idx].literal_edges.keys().cloned());
+        }
+        let mut out = out.into_iter().collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    pub(crate) fn needs_directory_scan(&self, current: &[usize]) -> bool {
+        let expanded = self.expand_epsilon_nodes(current);
+        expanded.into_iter().any(|node_idx| {
+            let node = &self.trie.nodes[node_idx];
+            !node.wild_edges.is_empty() || node.descend_edge.is_some()
+        })
+    }
+
+    fn push_rule(&mut self, segments: Vec<SegmentMatcher>, is_exclude: bool) {
+        let rule = CompiledRule {
+            rule_index: self.ordered_rules.len(),
+            is_exclude,
+            segments,
+        };
+        self.trie.insert_rule(&rule);
+        self.ordered_rules.push(rule);
+    }
+
+    fn expand_epsilon_nodes(&self, current: &[usize]) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut stack = current.to_vec();
+        while let Some(node_idx) = stack.pop() {
+            if !seen.insert(node_idx) {
+                continue;
+            }
+            if let Some(next) = self.trie.nodes[node_idx].descend_edge {
+                stack.push(next);
+            }
+        }
+        let mut out = seen.into_iter().collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    fn match_decision(&self, current: &[usize]) -> Option<bool> {
+        let expanded = self.expand_epsilon_nodes(current);
+        let mut selected: Option<(usize, bool)> = None;
+        for node_idx in expanded {
+            for terminal in &self.trie.nodes[node_idx].terminals {
+                if selected
+                    .as_ref()
+                    .is_none_or(|(idx, _)| terminal.rule_index >= *idx)
+                {
+                    selected = Some((terminal.rule_index, !terminal.is_exclude));
+                }
+            }
+        }
+        selected.map(|(_, include)| include)
     }
 
     /// 固定文字列がマッチするかどうかを判定します。
     pub fn r#match(&self, path: &OsStr) -> bool {
-        fn any_path_parts(text: &str) -> impl Iterator<Item = &str> {
-            text.split(MAIN_SEPARATOR).filter(|s| !s.is_empty())
-        }
-
-        fn matches_from(
-            compiled: &CompiledGlob,
-            seg_idx: usize,
-            path_idx: usize,
-            path_parts: &[&str],
-            memo: &mut [Option<bool>],
-        ) -> bool {
-            let width = path_parts.len() + 1;
-            let memo_idx = seg_idx * width + path_idx;
-            if let Some(v) = memo[memo_idx] {
-                return v;
-            }
-
-            let result = if seg_idx == compiled.segments.len() {
-                path_idx == path_parts.len()
-            } else {
-                match &compiled.segments[seg_idx] {
-                    SegmentMatcher::AnyPath(inner) => {
-                        let literal = &inner.pathbase[inner.range.clone()];
-                        let mut current = path_idx;
-                        let mut ok = true;
-                        for expected in any_path_parts(literal) {
-                            if current >= path_parts.len() || path_parts[current] != expected {
-                                ok = false;
-                                break;
-                            }
-                            current += 1;
-                        }
-                        ok && matches_from(compiled, seg_idx + 1, current, path_parts, memo)
-                    }
-                    SegmentMatcher::WildMatch(matcher) => {
-                        path_parts
-                            .get(path_idx)
-                            .is_some_and(|part| matcher.matches(part))
-                            && matches_from(compiled, seg_idx + 1, path_idx + 1, path_parts, memo)
-                    }
-                    SegmentMatcher::Descend => {
-                        let mut next_seg = seg_idx + 1;
-                        while next_seg < compiled.segments.len()
-                            && matches!(compiled.segments[next_seg], SegmentMatcher::Descend)
-                        {
-                            next_seg += 1;
-                        }
-                        if next_seg == compiled.segments.len() {
-                            true
-                        } else {
-                            (path_idx..=path_parts.len())
-                                .any(|i| matches_from(compiled, next_seg, i, path_parts, memo))
-                        }
-                    }
-                }
-            };
-
-            memo[memo_idx] = Some(result);
-            result
-        }
-
         let normalized = match Path::new(path).parse_dot() {
             Ok(v) => v,
             Err(_) => return false,
@@ -204,13 +405,34 @@ impl CompiledGlob {
             .split(MAIN_SEPARATOR)
             .filter(|s| !s.is_empty())
             .collect();
-
-        let mut memo = vec![None; (self.segments.len() + 1) * (path_parts.len() + 1)];
-        matches_from(self, 0, 0, &path_parts, &mut memo)
+        let mut states = self.initial_states();
+        for part in path_parts {
+            states = self.advance_states(&states, part);
+            if states.is_empty() {
+                return false;
+            }
+        }
+        self.match_decision(&states).unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn segments(&self) -> &[SegmentMatcher] {
-        &self.segments
+        assert!(
+            self.ordered_rules.len() <= 1,
+            "segments() is only available for single-rule CompiledGlob"
+        );
+        self.ordered_rules
+            .first()
+            .map(|rule| rule.segments.as_slice())
+            .unwrap_or(&[])
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ordered_rules_segments(&self) -> Vec<&[SegmentMatcher]> {
+        self.ordered_rules
+            .iter()
+            .map(|rule| rule.segments.as_slice())
+            .collect()
     }
 }
 
@@ -218,6 +440,7 @@ impl CompiledGlob {
 mod tests {
     use super::{CompiledGlob, SegmentMatcher};
     use path_dedot::CWD;
+    use std::io;
     use std::path::Path;
 
     #[test]
@@ -275,5 +498,81 @@ mod tests {
         let ok = format!("{}/target/file.txt", CWD.display());
         assert!(glob.r#match(Path::new(&ok).as_os_str()));
         assert!(!glob.r#match(Path::new("/target/file.txt").as_os_str()));
+    }
+
+    #[test]
+    fn merge_many_or_union_matches() {
+        let one = CompiledGlob::new("/tmp/**/*.rs").expect("glob must parse");
+        let two = CompiledGlob::new("/tmp/**/*.txt").expect("glob must parse");
+        let merged = CompiledGlob::merge_many(vec![one, two]).expect("must merge");
+        assert!(merged.r#match("/tmp/a/b/main.rs".as_ref()));
+        assert!(merged.r#match("/tmp/a/b/readme.txt".as_ref()));
+        assert!(!merged.r#match("/tmp/a/b/readme.md".as_ref()));
+    }
+
+    #[test]
+    fn merge_preserves_rule_order() {
+        let one = CompiledGlob::new("/tmp/**/*.rs").expect("glob must parse");
+        let two = CompiledGlob::new("/tmp/**/*.txt").expect("glob must parse");
+        let merged = one.merge(two);
+        assert_eq!(merged.ordered_rules.len(), 2);
+        assert_eq!(merged.ordered_rules[0].rule_index, 0);
+        assert_eq!(merged.ordered_rules[1].rule_index, 1);
+    }
+
+    #[test]
+    fn descend_dedup_equivalence_under_merge() {
+        let one = CompiledGlob::new("a/**/**/b").expect("glob must parse");
+        let two = CompiledGlob::new("a/**/b").expect("glob must parse");
+        let merged = one.merge(two);
+        let canonical = CompiledGlob::new("a/**/b").expect("glob must parse");
+        for path in ["a/b", "a/x/b", "a/x/y/b", "a/x/y/c"] {
+            assert_eq!(
+                merged.r#match(path.as_ref()),
+                canonical.r#match(path.as_ref())
+            );
+        }
+    }
+
+    #[test]
+    fn empty_merge_many_is_invalid_input() {
+        let merged = CompiledGlob::merge_many(Vec::new());
+        assert!(matches!(
+            merged,
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn supports_exclude_with_last_match_wins() {
+        let include = CompiledGlob::new("/tmp/**/*.txt").expect("glob must parse");
+        let exclude = CompiledGlob::new("!/tmp/**/ignore.txt").expect("glob must parse");
+        let reinclude = CompiledGlob::new("/tmp/**/ignore.txt").expect("glob must parse");
+
+        let merged =
+            CompiledGlob::merge_many(vec![include, exclude, reinclude]).expect("must merge");
+        assert!(merged.r#match("/tmp/a/keep.txt".as_ref()));
+        assert!(merged.r#match("/tmp/a/ignore.txt".as_ref()));
+    }
+
+    #[test]
+    fn exclude_can_remove_previous_include() {
+        let include = CompiledGlob::new("/tmp/**/*.txt").expect("glob must parse");
+        let exclude = CompiledGlob::new("!/tmp/**/ignore.txt").expect("glob must parse");
+        let merged = CompiledGlob::merge_many(vec![include, exclude]).expect("must merge");
+        assert!(merged.r#match("/tmp/a/keep.txt".as_ref()));
+        assert!(!merged.r#match("/tmp/a/ignore.txt".as_ref()));
+    }
+
+    #[test]
+    fn reject_empty_pattern_and_bare_exclude() {
+        assert!(matches!(
+            CompiledGlob::new(""),
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            CompiledGlob::new("!"),
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput
+        ));
     }
 }

@@ -54,12 +54,32 @@ async fn applies_last_match_wins_with_excludes() -> io::Result<()> {
             "**/ignore.txt".to_string(),
         ],
         &test_dir.path,
-    ).await?;
+    )
+    .await?;
     let result = collect_paths(walker).await?;
 
     let paths = collect_set(&result);
     assert!(paths.contains("target/keep.txt"));
     assert!(paths.contains("target/ignore.txt"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn excludes_when_last_matching_rule_is_exclude() -> io::Result<()> {
+    let test_dir = TestDir::create()?;
+    create_file(&test_dir.path.join("target/keep.txt"))?;
+    create_file(&test_dir.path.join("target/ignore.txt"))?;
+
+    let walker = GlobWalker::new(
+        vec!["**/*.txt".to_string(), "!**/ignore.txt".to_string()],
+        &test_dir.path,
+    )
+    .await?;
+    let result = collect_paths(walker).await?;
+
+    let paths = collect_set(&result);
+    assert!(paths.contains("target/keep.txt"));
+    assert!(!paths.contains("target/ignore.txt"));
     Ok(())
 }
 
@@ -109,7 +129,8 @@ async fn single_star_does_not_cross_directory_boundaries() -> io::Result<()> {
     let walker = GlobWalker::new(
         vec![".config/home-manager/*.toml".to_string()],
         &test_dir.path,
-    ).await?;
+    )
+    .await?;
     let result = collect_paths(walker).await?;
 
     let paths = collect_set(&result);

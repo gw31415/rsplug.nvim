@@ -18,7 +18,8 @@ async fn streams_first_result_before_error_from_later_scan() -> io::Result<()> {
     let mut walker = GlobWalker::new(
         vec!["*.txt".to_string(), "blocked/**/*.txt".to_string()],
         &test_dir.path,
-    ).await?;
+    )
+    .await?;
     let first = walker
         .next()
         .await?

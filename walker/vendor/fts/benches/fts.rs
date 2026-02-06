@@ -68,9 +68,11 @@ fn fts_walkdir(b: &mut Bencher) {
             fts::walkdir::WalkDir::new(fts::walkdir::WalkDirConf::new("/usr").no_metadata())
         {
             match entry {
-                Ok(x) => if x.file_type().is_file() {
-                    _cnt += 1
-                },
+                Ok(x) => {
+                    if x.file_type().is_file() {
+                        _cnt += 1
+                    }
+                }
                 Err(_) => (),
             }
         }
@@ -84,9 +86,11 @@ fn walkdir(b: &mut Bencher) {
         let mut _cnt = 0;
         for entry in walkdir::WalkDir::new("/usr") {
             match entry {
-                Ok(x) => if x.file_type().is_file() {
-                    _cnt += 1
-                },
+                Ok(x) => {
+                    if x.file_type().is_file() {
+                        _cnt += 1
+                    }
+                }
                 Err(_) => (),
             }
         }
@@ -113,10 +117,12 @@ fn fts_walkdir_metadata(b: &mut Bencher) {
         let mut _size = 0;
         for entry in fts::walkdir::WalkDir::new(fts::walkdir::WalkDirConf::new("/usr")) {
             match entry {
-                Ok(x) => if x.file_type().is_file() {
-                    _cnt += 1;
-                    _size += x.metadata().unwrap().len()
-                },
+                Ok(x) => {
+                    if x.file_type().is_file() {
+                        _cnt += 1;
+                        _size += x.metadata().unwrap().len()
+                    }
+                }
                 Err(_) => (),
             }
         }
@@ -131,10 +137,12 @@ fn walkdir_metadata(b: &mut Bencher) {
         let mut _size = 0;
         for entry in walkdir::WalkDir::new("/usr") {
             match entry {
-                Ok(x) => if x.file_type().is_file() {
-                    _cnt += 1;
-                    _size += x.metadata().unwrap().len()
-                },
+                Ok(x) => {
+                    if x.file_type().is_file() {
+                        _cnt += 1;
+                        _size += x.metadata().unwrap().len()
+                    }
+                }
                 Err(_) => (),
             }
         }
