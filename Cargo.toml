@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "dag", "walker", "globwalker", "globbench"]
+members = [".", "dag", "walker", "globbench"]
 resolver = "3"
 
 [workspace.package]
@@ -31,7 +31,7 @@ console = "0.16.2"
 dag = { path = "dag", features = ["hashbrown"] }
 git2 = "0.20"
 ignore = "0.4"
-globwalker = { path = "globwalker" }
+walker = { path = "walker" }
 indicatif = { version = "0.18", features = ["tokio"] }
 itertools = "0.14"
 once_cell = "1.21"

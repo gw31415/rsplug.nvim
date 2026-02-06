@@ -33,18 +33,14 @@ pub(crate) struct BenchmarkAccumulator {
 #[derive(Copy, Clone, Debug)]
 #[repr(usize)]
 pub(crate) enum BenchmarkKind {
-    Globwalker = 0,
-    IgnoreParallel = 1,
-    Glob = 2,
-    Walker = 3,
+    IgnoreParallel = 0,
+    Walker = 1,
 }
 
 impl BenchmarkKind {
     pub(crate) const fn name(self) -> &'static str {
         match self {
-            Self::Globwalker => "globwalker",
             Self::IgnoreParallel => "ignore(parallel)",
-            Self::Glob => "glob",
             Self::Walker => "walker",
         }
     }

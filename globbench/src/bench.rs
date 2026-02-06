@@ -9,12 +9,7 @@ use crate::bench_types::{AttemptOutcome, BenchmarkAccumulator, BenchmarkKind, Be
 
 pub(crate) const BENCHMARK_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const BENCHMARK_RUNS: usize = 3;
-const BENCHMARK_KINDS: [BenchmarkKind; 4] = [
-    BenchmarkKind::Globwalker,
-    BenchmarkKind::IgnoreParallel,
-    BenchmarkKind::Glob,
-    BenchmarkKind::Walker,
-];
+const BENCHMARK_KINDS: [BenchmarkKind; 2] = [BenchmarkKind::IgnoreParallel, BenchmarkKind::Walker];
 
 pub(crate) async fn run_and_print(cwd: &Path, raw_patterns: &[String]) -> io::Result<()> {
     let rules = Arc::new(compile_benchmark_rules(raw_patterns, cwd)?);
@@ -67,7 +62,7 @@ pub(crate) async fn run_and_print(cwd: &Path, raw_patterns: &[String]) -> io::Re
 async fn run_benchmarks(
     cwd: &Path,
     raw_patterns: &[String],
-    rules: Arc<globwalker::pattern::CompiledRules>,
+    rules: Arc<walker::compiled_glob::CompiledGlob>,
 ) -> Vec<BenchmarkResult> {
     let mut accumulators = vec![BenchmarkAccumulator::default(); BENCHMARK_KINDS.len()];
 
@@ -230,28 +225,14 @@ mod tests {
                 .into_iter()
                 .map(BenchmarkKind::name)
                 .collect::<Vec<_>>(),
-            vec!["globwalker", "ignore(parallel)", "glob", "walker"]
+            vec!["ignore(parallel)", "walker"]
         );
         assert_eq!(
             benchmark_round_order(1)
                 .into_iter()
                 .map(BenchmarkKind::name)
                 .collect::<Vec<_>>(),
-            vec!["ignore(parallel)", "glob", "walker", "globwalker"]
-        );
-        assert_eq!(
-            benchmark_round_order(2)
-                .into_iter()
-                .map(BenchmarkKind::name)
-                .collect::<Vec<_>>(),
-            vec!["glob", "walker", "globwalker", "ignore(parallel)"]
-        );
-        assert_eq!(
-            benchmark_round_order(3)
-                .into_iter()
-                .map(BenchmarkKind::name)
-                .collect::<Vec<_>>(),
-            vec!["walker", "globwalker", "ignore(parallel)", "glob"]
+            vec!["walker", "ignore(parallel)"]
         );
     }
 }

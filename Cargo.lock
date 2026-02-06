@@ -464,8 +464,6 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 name = "globbench"
 version = "0.1.0"
 dependencies = [
- "glob",
- "globwalker",
  "ignore",
  "tokio",
  "walker",
@@ -482,15 +480,6 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax",
-]
-
-[[package]]
-name = "globwalker"
-version = "0.1.0"
-dependencies = [
- "hashbrown",
- "tokio",
- "wildmatch",
 ]
 
 [[package]]
@@ -1104,7 +1093,6 @@ dependencies = [
  "console",
  "dag",
  "git2",
- "globwalker",
  "hashbrown",
  "ignore",
  "indicatif",
@@ -1119,6 +1107,7 @@ dependencies = [
  "tokio",
  "toml 0.9.11+spec-1.1.0",
  "unicode-width",
+ "walker",
  "wildmatch",
  "xxhash-rust",
 ]
