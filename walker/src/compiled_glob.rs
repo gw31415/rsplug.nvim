@@ -436,12 +436,7 @@ impl CompiledGlob {
         out
     }
 
-    pub(crate) fn advance_states_into(
-        &self,
-        current: &[usize],
-        part: &str,
-        out: &mut Vec<usize>,
-    ) {
+    pub(crate) fn advance_states_into(&self, current: &[usize], part: &str, out: &mut Vec<usize>) {
         let expanded = self.expand_epsilon_nodes(current);
         out.clear();
         let mut overflow_seen: Option<HashSet<usize>> = None;

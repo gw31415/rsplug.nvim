@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::mpsc;
+#[cfg(not(feature = "bench-persistent-workers"))]
 use tokio::task::JoinSet;
 
 const TRANSITION_CACHE_CAPACITY: usize = 64 * 1024;
@@ -99,10 +100,7 @@ impl JobQueue {
             }
             let (guard, _) = self
                 .cv
-                .wait_timeout(
-                    inner,
-                    std::time::Duration::from_millis(QUEUE_WAIT_MILLIS),
-                )
+                .wait_timeout(inner, std::time::Duration::from_millis(QUEUE_WAIT_MILLIS))
                 .expect("job queue wait");
             inner = guard;
         }
@@ -123,6 +121,63 @@ struct WorkerCtx {
     queue: Arc<JobQueue>,
     worker_tx: mpsc::Sender<WorkerMessage>,
     split_backlog_limit: usize,
+}
+
+#[cfg(feature = "bench-persistent-workers")]
+mod persistent_pool {
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use tokio::sync::oneshot;
+
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    pub(super) struct PersistentPool {
+        tx: mpsc::Sender<Job>,
+    }
+
+    impl PersistentPool {
+        fn new(thread_count: usize) -> Self {
+            let (tx, rx) = mpsc::channel::<Job>();
+            let rx = Arc::new(Mutex::new(rx));
+
+            for idx in 0..thread_count.max(1) {
+                let rx = Arc::clone(&rx);
+                std::thread::Builder::new()
+                    .name(format!("walker-bench-{idx}"))
+                    .spawn(move || {
+                        loop {
+                            let job = {
+                                let guard = rx.lock().expect("persistent queue lock");
+                                guard.recv()
+                            };
+                            match job {
+                                Ok(job) => job(),
+                                Err(_) => break,
+                            }
+                        }
+                    })
+                    .expect("failed to spawn persistent bench worker");
+            }
+
+            Self { tx }
+        }
+
+        pub(super) fn spawn<F>(&self, f: F) -> oneshot::Receiver<bool>
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            let (tx, rx) = oneshot::channel();
+            let _ = self.tx.send(Box::new(move || {
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_ok();
+                let _ = tx.send(ok);
+            }));
+            rx
+        }
+    }
+
+    pub(super) fn global(thread_count: usize) -> &'static PersistentPool {
+        static POOL: OnceLock<PersistentPool> = OnceLock::new();
+        POOL.get_or_init(|| PersistentPool::new(thread_count))
+    }
 }
 
 pub(super) fn spawn_single_with_options(
@@ -175,14 +230,19 @@ pub(super) fn spawn_single_with_options(
         let queue = Arc::new(JobQueue::new(jobs));
         let split_backlog_limit = max_parallelism.saturating_mul(SPLIT_BACKLOG_FACTOR).max(1);
 
-        let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(options.channel_capacity.max(1));
+        let (worker_tx, worker_rx) =
+            mpsc::channel::<WorkerMessage>(options.channel_capacity.max(1));
         let forward_cancel = Arc::clone(&cancel);
         let tx_forward = tx.clone();
         let forwarder = tokio::spawn(async move {
             forward_worker_messages(worker_rx, tx_forward, forward_cancel).await;
         });
 
+        #[cfg(not(feature = "bench-persistent-workers"))]
         let mut worker_set = JoinSet::new();
+        #[cfg(feature = "bench-persistent-workers")]
+        let mut waiters = Vec::with_capacity(max_parallelism);
+
         for _ in 0..max_parallelism {
             let ctx = WorkerCtx {
                 compiled: Arc::clone(&compiled),
@@ -193,10 +253,14 @@ pub(super) fn spawn_single_with_options(
                 worker_tx: worker_tx.clone(),
                 split_backlog_limit,
             };
+            #[cfg(not(feature = "bench-persistent-workers"))]
             worker_set.spawn_blocking(move || run_worker(ctx));
+            #[cfg(feature = "bench-persistent-workers")]
+            waiters.push(persistent_pool::global(max_parallelism).spawn(move || run_worker(ctx)));
         }
         drop(worker_tx);
 
+        #[cfg(not(feature = "bench-persistent-workers"))]
         while let Some(joined) = worker_set.join_next().await {
             if let Err(err) = joined {
                 cancel.store(true, Ordering::Relaxed);
@@ -207,6 +271,23 @@ pub(super) fn spawn_single_with_options(
                         source: io::Error::other(err.to_string()),
                     }))
                     .await;
+            }
+        }
+
+        #[cfg(feature = "bench-persistent-workers")]
+        for waiter in waiters {
+            match waiter.await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    queue.close();
+                    let _ = tx
+                        .send(Err(WalkError::Io {
+                            path: PathBuf::from("<join_worker>"),
+                            source: io::Error::other("persistent worker panicked"),
+                        }))
+                        .await;
+                }
             }
         }
 
@@ -250,10 +331,12 @@ fn run_fts_job(ctx: &WorkerCtx, job: RootJob) {
     ) {
         Ok(fts) => fts,
         Err(err) => {
-            let _ = ctx.worker_tx.blocking_send(WorkerMessage::Error(WalkError::Io {
-                path: job.path,
-                source: io::Error::other(format!("failed to initialize fts: {err:?}")),
-            }));
+            let _ = ctx
+                .worker_tx
+                .blocking_send(WorkerMessage::Error(WalkError::Io {
+                    path: job.path,
+                    source: io::Error::other(format!("failed to initialize fts: {err:?}")),
+                }));
             return;
         }
     };
@@ -290,10 +373,12 @@ fn run_fts_job(ctx: &WorkerCtx, job: RootJob) {
                 } else {
                     io::Error::from_raw_os_error(entry.error)
                 };
-                let _ = ctx.worker_tx.blocking_send(WorkerMessage::Error(WalkError::Io {
-                    path: entry.path.clone(),
-                    source,
-                }));
+                let _ = ctx
+                    .worker_tx
+                    .blocking_send(WorkerMessage::Error(WalkError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    }));
                 continue;
             }
             _ => {}
@@ -394,13 +479,19 @@ fn run_fts_job(ctx: &WorkerCtx, job: RootJob) {
         }
 
         if is_dir
-            && !cached_needs_directory_scan(&mut state_cache, ctx.compiled.as_ref(), states_sig, states)
+            && !cached_needs_directory_scan(
+                &mut state_cache,
+                ctx.compiled.as_ref(),
+                states_sig,
+                states,
+            )
         {
             let _ = fts.set(&entry, FtsSetOption::Skip);
             continue;
         }
 
-        let is_match = cached_is_match_state(&mut state_cache, ctx.compiled.as_ref(), states_sig, states);
+        let is_match =
+            cached_is_match_state(&mut state_cache, ctx.compiled.as_ref(), states_sig, states);
 
         if is_dir
             && level > 0
@@ -513,7 +604,11 @@ fn has_min_children(path: &Path, min_children: usize) -> bool {
     false
 }
 
-fn flush_events(tx: &mpsc::Sender<WorkerMessage>, pending: &mut Vec<WalkEvent>, cancel: &AtomicBool) {
+fn flush_events(
+    tx: &mpsc::Sender<WorkerMessage>,
+    pending: &mut Vec<WalkEvent>,
+    cancel: &AtomicBool,
+) {
     if pending.is_empty() || cancel.load(Ordering::Relaxed) {
         pending.clear();
         return;

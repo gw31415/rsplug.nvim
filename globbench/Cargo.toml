@@ -3,6 +3,10 @@ name = "globbench"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["walker-bench-persistent"]
+walker-bench-persistent = ["walker/bench-persistent-workers"]
+
 [dependencies]
 ignore = "0.4.23"
 tokio.workspace = true

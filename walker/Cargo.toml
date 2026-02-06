@@ -3,6 +3,10 @@ name = "walker"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+bench-persistent-workers = []
+
 [dependencies]
 hashbrown.workspace = true
 tokio.workspace = true
