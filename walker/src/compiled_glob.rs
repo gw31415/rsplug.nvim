@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::io;
 use std::ops::Range;
-use std::path::{MAIN_SEPARATOR, Path};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Arc;
 use wildmatch::WildMatch;
 
@@ -31,23 +31,33 @@ impl AsRef<Path> for PathInner {
     }
 }
 
+impl Clone for PathInner {
+    fn clone(&self) -> Self {
+        Self {
+            pathbase: Arc::clone(&self.pathbase),
+            range: self.range.clone(),
+        }
+    }
+}
+
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum SegmentMatcher {
     AnyPath(PathInner),
     WildMatch { pattern: String, matcher: WildMatch },
     Descend,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledRule {
     rule_index: usize,
     is_exclude: bool,
+    is_absolute: bool,
     segments: Vec<SegmentMatcher>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RuleTerminal {
     rule_index: usize,
     is_exclude: bool,
@@ -55,7 +65,7 @@ struct RuleTerminal {
 
 type NodeId = usize;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct TrieNode {
     literal_edges: hashbrown::HashMap<String, NodeId>,
     wild_edges: Vec<(String, WildMatch, NodeId)>,
@@ -63,7 +73,7 @@ struct TrieNode {
     terminals: Vec<RuleTerminal>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GlobTrie {
     nodes: Vec<TrieNode>,
 }
@@ -149,10 +159,11 @@ impl GlobTrie {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledGlob {
     ordered_rules: Vec<CompiledRule>,
     trie: GlobTrie,
+    epsilon_closures: Vec<Vec<usize>>,
 }
 
 impl CompiledGlob {
@@ -272,8 +283,9 @@ impl CompiledGlob {
         let mut compiled = CompiledGlob {
             ordered_rules: Vec::new(),
             trie: GlobTrie::new(),
+            epsilon_closures: Vec::new(),
         };
-        compiled.push_rule(segments, is_exclude);
+        compiled.push_rule(segments, is_exclude, is_absolute);
         Ok(compiled)
     }
 
@@ -284,6 +296,7 @@ impl CompiledGlob {
             self.trie.insert_rule(&rule);
             self.ordered_rules.push(rule);
         }
+        self.rebuild_epsilon_closure_cache();
         self
     }
 
@@ -305,24 +318,79 @@ impl CompiledGlob {
         self.expand_epsilon_nodes([0usize].as_ref())
     }
 
+    pub(crate) fn states_for_path(&self, path: &Path) -> Vec<usize> {
+        let mut states = self.initial_states();
+        for part in path
+            .to_string_lossy()
+            .split(MAIN_SEPARATOR)
+            .filter(|s| !s.is_empty())
+        {
+            states = self.advance_states(&states, part);
+            if states.is_empty() {
+                break;
+            }
+        }
+        states
+    }
+
+    pub(crate) fn start_paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut seen = hashbrown::HashSet::new();
+
+        for rule in &self.ordered_rules {
+            if rule.is_exclude {
+                continue;
+            }
+
+            let mut prefix = PathBuf::new();
+            for seg in &rule.segments {
+                match seg {
+                    SegmentMatcher::AnyPath(part) => {
+                        prefix.push(part.as_ref());
+                    }
+                    SegmentMatcher::WildMatch { .. } | SegmentMatcher::Descend => break,
+                }
+            }
+
+            let mut candidate = if prefix.as_os_str().is_empty() {
+                PathBuf::from(MAIN_SEPARATOR.to_string())
+            } else {
+                prefix
+            };
+            if rule.is_absolute && !candidate.is_absolute() {
+                candidate = PathBuf::from(MAIN_SEPARATOR.to_string()).join(candidate);
+            }
+
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+            }
+        }
+
+        if out.is_empty() {
+            out.push(PathBuf::from(MAIN_SEPARATOR.to_string()));
+        }
+
+        out
+    }
+
     pub(crate) fn advance_states(&self, current: &[usize], part: &str) -> Vec<usize> {
         let expanded = self.expand_epsilon_nodes(current);
-        let mut next = HashSet::new();
+        let mut next = Vec::new();
+        let mut overflow_seen: Option<HashSet<usize>> = None;
         for node_idx in expanded {
             let node = &self.trie.nodes[node_idx];
             if let Some(next_idx) = node.literal_edges.get(part) {
-                next.insert(*next_idx);
+                push_unique_state(&mut next, &mut overflow_seen, *next_idx);
             }
             for (_, matcher, next_idx) in &node.wild_edges {
                 if matcher.matches(part) {
-                    next.insert(*next_idx);
+                    push_unique_state(&mut next, &mut overflow_seen, *next_idx);
                 }
             }
             if node.descend_edge.is_some() {
-                next.insert(node_idx);
+                push_unique_state(&mut next, &mut overflow_seen, node_idx);
             }
         }
-        let next = next.into_iter().collect::<Vec<_>>();
         self.expand_epsilon_nodes(&next)
     }
 
@@ -330,6 +398,7 @@ impl CompiledGlob {
         matches!(self.match_decision(current), Some(true))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn literal_candidates(&self, current: &[usize]) -> Vec<String> {
         let expanded = self.expand_epsilon_nodes(current);
         let mut out = hashbrown::HashSet::new();
@@ -349,30 +418,57 @@ impl CompiledGlob {
         })
     }
 
-    fn push_rule(&mut self, segments: Vec<SegmentMatcher>, is_exclude: bool) {
+    fn push_rule(&mut self, segments: Vec<SegmentMatcher>, is_exclude: bool, is_absolute: bool) {
         let rule = CompiledRule {
             rule_index: self.ordered_rules.len(),
             is_exclude,
+            is_absolute,
             segments,
         };
         self.trie.insert_rule(&rule);
         self.ordered_rules.push(rule);
+        self.rebuild_epsilon_closure_cache();
     }
 
     fn expand_epsilon_nodes(&self, current: &[usize]) -> Vec<usize> {
-        let mut seen = HashSet::new();
-        let mut stack = current.to_vec();
-        while let Some(node_idx) = stack.pop() {
-            if !seen.insert(node_idx) {
-                continue;
+        if current.is_empty() {
+            return Vec::new();
+        }
+        if current.len() == 1 {
+            if let Some(cached) = self.epsilon_closures.get(current[0]) {
+                return cached.clone();
             }
-            if let Some(next) = self.trie.nodes[node_idx].descend_edge {
-                stack.push(next);
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut overflow_seen: Option<HashSet<usize>> = None;
+        for node_idx in current {
+            let Some(cached) = self.epsilon_closures.get(*node_idx) else {
+                continue;
+            };
+            for value in cached {
+                push_unique_state(&mut out, &mut overflow_seen, *value);
             }
         }
-        let mut out = seen.into_iter().collect::<Vec<_>>();
         out.sort_unstable();
         out
+    }
+
+    fn rebuild_epsilon_closure_cache(&mut self) {
+        let node_count = self.trie.nodes.len();
+        self.epsilon_closures = vec![Vec::new(); node_count];
+        for node_idx in 0..node_count {
+            let mut closure = Vec::new();
+            let mut cursor = Some(node_idx);
+            while let Some(idx) = cursor {
+                closure.push(idx);
+                cursor = self.trie.nodes[idx].descend_edge;
+            }
+            closure.sort_unstable();
+            closure.dedup();
+            self.epsilon_closures[node_idx] = closure;
+        }
     }
 
     fn match_decision(&self, current: &[usize]) -> Option<bool> {
@@ -433,6 +529,34 @@ impl CompiledGlob {
             .iter()
             .map(|rule| rule.segments.as_slice())
             .collect()
+    }
+}
+
+const INLINE_STATE_DEDUP_LIMIT: usize = 16;
+
+fn push_unique_state(
+    out: &mut Vec<usize>,
+    overflow_seen: &mut Option<HashSet<usize>>,
+    value: usize,
+) {
+    if let Some(seen) = overflow_seen.as_mut() {
+        if seen.insert(value) {
+            out.push(value);
+        }
+        return;
+    }
+
+    if out.contains(&value) {
+        return;
+    }
+    out.push(value);
+
+    if out.len() > INLINE_STATE_DEDUP_LIMIT {
+        let mut seen = HashSet::with_capacity(out.len() * 2);
+        for existing in out.iter().copied() {
+            seen.insert(existing);
+        }
+        *overflow_seen = Some(seen);
     }
 }
 
@@ -574,5 +698,21 @@ mod tests {
             CompiledGlob::new("!"),
             Err(err) if err.kind() == io::ErrorKind::InvalidInput
         ));
+    }
+
+    #[test]
+    fn start_paths_include_static_prefix_of_include_rules() {
+        let glob = CompiledGlob::new("/tmp/root/**.rs").expect("glob must parse");
+        let starts = glob.start_paths();
+        assert!(starts.iter().any(|p| p == Path::new("/tmp/root")));
+    }
+
+    #[test]
+    fn states_for_path_keeps_descend_capability() {
+        let glob = CompiledGlob::new("/tmp/root/**.rs").expect("glob must parse");
+        let states = glob.states_for_path(Path::new("/tmp/root"));
+        assert!(!states.is_empty());
+        let leaf_states = glob.advance_states(&states, "main.rs");
+        assert!(glob.is_match_state(&leaf_states));
     }
 }
