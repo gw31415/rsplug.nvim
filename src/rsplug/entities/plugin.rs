@@ -1,7 +1,10 @@
 use std::{
+    borrow::Cow,
+    ffi::OsStr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
@@ -158,6 +161,7 @@ impl Plugin {
             repo,
             manually_to_sym: _,
             build,
+            lua_build,
         } = cache;
 
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
@@ -250,11 +254,15 @@ impl Plugin {
                         head_rev.extend(i.to_ne_bytes());
                         head_rev.extend(comp.as_bytes());
                     }
+                    if let Some(lua_build) = lua_build.as_deref() {
+                        head_rev.extend(b"lua_build");
+                        head_rev.extend(lua_build.as_bytes());
+                    }
                     hash::digest(&head_rev)
                 });
 
                 // ビルド実行
-                if !build.is_empty() {
+                if !build.is_empty() || lua_build.is_some() {
                     let next_build_success_id = id.as_str();
                     let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
                     if let Some(ref prev_build_success_id) =
@@ -279,46 +287,81 @@ impl Plugin {
                                     owner
                                 }
                             };
-                            let logid_progress = logid.clone();
-                            let code = match execute(build.iter(), proj_root, {
-                                move |(stdtype, line)| {
-                                    msg(Message::CacheBuildProgress {
-                                        id: logid_progress.clone(),
-                                        stdtype,
-                                        line,
-                                    });
+
+                            if !build.is_empty() {
+                                let id = Arc::new(format!("{logid} (sh)"));
+                                let result: Result<(), Error> = {
+                                    let id = id.clone();
+                                    async {
+                                        let code = execute(build.iter(), proj_root.clone(), {
+                                            move |(stdtype, line)| {
+                                                msg(Message::CacheBuildProgress {
+                                                    id: id.clone(),
+                                                    stdtype,
+                                                    line,
+                                                });
+                                            }
+                                        })
+                                        .await?;
+                                        if code != 0 {
+                                            return Err(Error::BuildScriptFailed {
+                                                code,
+                                                build,
+                                                repo: repo.clone(),
+                                            });
+                                        }
+                                        Ok(())
+                                    }
                                 }
-                            })
-                            .await
-                            {
-                                Ok(code) => {
-                                    msg(Message::CacheBuildFinished {
-                                        id: logid.clone(),
-                                        success: code == 0,
-                                    });
-                                    code
-                                }
-                                Err(err) => {
-                                    msg(Message::CacheBuildFinished {
-                                        id: logid.clone(),
-                                        success: false,
-                                    });
-                                    return Err(err.into());
-                                }
-                            };
-                            if code == 0 {
-                                tokio::fs::write(
-                                    rsplug_build_success_file,
-                                    next_build_success_id.as_bytes(),
-                                )
-                                .await?;
-                                Ok::<_, Error>(())
-                            } else {
-                                Err(Error::BuildScriptFailed {
-                                    code,
-                                    build: build.clone(),
-                                })
+                                .await;
+                                msg(Message::CacheBuildFinished {
+                                    id,
+                                    success: result.is_ok(),
+                                });
+                                result?;
                             }
+
+                            if let Some(lua_build) = lua_build.as_deref() {
+                                let id = Arc::new(format!("{logid} (lua)"));
+                                let result: Result<(), Error> = {
+                                    let id = id.clone();
+                                    async {
+                                        let lua_build_path =
+                                            create_lua_build_script(lua_build).await?;
+                                        let code = execute(
+                                            lua_build_nvim_command(lua_build_path.as_os_str()),
+                                            proj_root.clone(),
+                                            move |(stdtype, line)| {
+                                                msg(Message::CacheBuildProgress {
+                                                    id: id.clone(),
+                                                    stdtype,
+                                                    line,
+                                                });
+                                            },
+                                        )
+                                        .await;
+                                        let _ = tokio::fs::remove_file(&lua_build_path).await;
+                                        let code = code?;
+                                        if code != 0 {
+                                            return Err(Error::BuildLuaScriptFailed { code, repo });
+                                        }
+                                        Ok(())
+                                    }
+                                }
+                                .await;
+                                msg(Message::CacheBuildFinished {
+                                    id,
+                                    success: result.is_ok(),
+                                });
+                                result?;
+                            }
+
+                            tokio::fs::write(
+                                rsplug_build_success_file,
+                                next_build_success_id.as_bytes(),
+                            )
+                            .await?;
+                            Ok::<_, Error>(())
                         };
                         exec.await?;
                     }
@@ -405,4 +448,33 @@ fn extract_unique_lua_modules<'a>(
 
 fn is_full_hex_hash(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn lua_build_nvim_command(lua_script_path: &OsStr) -> [Cow<'_, OsStr>; 6] {
+    [
+        Cow::Borrowed(OsStr::new("nvim")),
+        Cow::Borrowed(OsStr::new("--headless")),
+        Cow::Borrowed(OsStr::new("-u")),
+        Cow::Borrowed(OsStr::new("NONE")),
+        Cow::Borrowed(OsStr::new("-l")),
+        Cow::Borrowed(lua_script_path),
+    ]
+}
+
+fn lua_build_wrapper(lua_script: &str) -> String {
+    format!(
+        "local ok, err = xpcall(function()\n{}\nend, debug.traceback)\nif not ok then\n  vim.api.nvim_err_writeln(err)\n  os.exit(1)\nend\n",
+        lua_script
+    )
+}
+
+async fn create_lua_build_script(lua_script: &str) -> Result<PathBuf, std::io::Error> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let filename = format!("rsplug-build-lua-{}-{}.lua", std::process::id(), nonce);
+    let path = std::env::temp_dir().join(filename);
+    tokio::fs::write(&path, lua_build_wrapper(lua_script)).await?;
+    Ok(path)
 }

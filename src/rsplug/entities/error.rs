@@ -14,6 +14,12 @@ pub enum Error {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error(transparent)]
     Git2(#[from] git2::Error),
-    #[error("Build script failed with exit code {code}: {build:?}")]
-    BuildScriptFailed { code: i32, build: Vec<String> },
+    #[error("Build script failed with exit code {code} in repo {repo:?}: {build:?}")]
+    BuildScriptFailed {
+        code: i32,
+        build: Vec<String>,
+        repo: Arc<str>,
+    },
+    #[error("Build Lua script failed with exit code {code} in repo {repo:?}")]
+    BuildLuaScriptFailed { code: i32, repo: Arc<str> },
 }

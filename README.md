@@ -155,6 +155,7 @@ lua_after = "require('which-key').setup{}"    # After plugin loads
 [[plugins]]
 repo = "yetone/avante.nvim"
 build = ["make"]                              # Run after install/update
+lua_build = "vim.fn.system({'make', 'docs'})" # Run Lua after install/update
 ```
 
 ### Dependencies
@@ -227,6 +228,7 @@ rsplug
 | `lua_before` | String | Lua code to run before plugin loads |
 | `lua_after` | String | Lua code to run after plugin loads |
 | `build` | Array | Subprocess to run after install/update |
+| `lua_build` | String | Lua script to run after install/update |
 | `name` | String | Custom plugin name (default: repo name) |
 | `sym` | Boolean | Use symlink instead of file copy |
 | `ignore` | String | Gitignore-style patterns for files to exclude |
@@ -280,7 +282,7 @@ rsplug **synchronizes the pack packages** from your TOML configuration:
   - Update repos if it provided the option `--update`
   - Synchronizes to specific commit from lock file if `--locked` is provided
 4. Writes lock file with exact commit hashes
-5. Runs build commands if specified
+5. Runs build commands / `lua_build` scripts if specified
 6. Generates plugin structure in `~/.cache/rsplug/pack/_gen/`
 
 **Important:** The pack directory reflects exactly what's in your current configuration file(s). If you change which configuration file you pass as an argument, the pack directory will be re-synchronized to match only those plugins.
@@ -301,7 +303,7 @@ rsplug automatically merges plugins with the same lazy-loading trigger when thei
 Build commands are cached using a hash of:
 - Git commit SHA
 - Working directory changes
-- Build command itself
+- Build command itself (`build` and `lua_build`)
 
 Rebuilds only occur when necessary, speeding up subsequent runs.
 

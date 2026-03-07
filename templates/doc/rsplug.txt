@@ -407,6 +407,22 @@ build~
     
     Build results are cached (see |rsplug-build-cache|).
 
+lua_build~
+    Type: String
+
+    Lua script executed after the plugin is installed or updated.
+    Runs in the plugin's repository directory under headless Neovim.
+
+    Example:
+>toml
+        lua_build = "vim.fn.system({'make'})"
+        lua_build = '''
+        vim.fn.system({'cargo', 'build', '--release'})
+        '''
+<
+
+    Build results are cached (see |rsplug-build-cache|).
+
 name~
     Type: String
     Default: Last component of repo path
@@ -423,10 +439,10 @@ name~
 
 sym~
     Type: Boolean
-    Default: `false` (or `true` if `build` is specified)
+    Default: `false` (or `true` if `build` or `lua_build` is specified)
     
     If `true`, creates a symbolic link to the repository instead of copying
-    files. Automatically set to `true` when `build` is specified.
+    files. Automatically set to `true` when `build` or `lua_build` is specified.
     
     Example:
 >toml
@@ -589,6 +605,20 @@ Example:
 Build commands run in the plugin's repository directory. See
 |rsplug-build-cache| for caching behavior.
 
+Build Lua script~
+
+The `lua_build` field specifies Lua code to run after install/update.
+It runs in headless Neovim with the plugin repository as current directory.
+
+Example:
+>toml
+    [[plugins]]
+    repo = "yetone/avante.nvim"
+    lua_build = "vim.fn.system({'make'})"
+<
+
+`build` and `lua_build` share the same cache behavior.
+
 ------------------------------------------------------------------------------
 5.5 Dependencies                                        *rsplug-dependencies*
 
@@ -703,12 +733,12 @@ Phase 3: Repository management~
 
 Phase 4: Build execution~
     1. Check build cache (see |rsplug-build-cache|)
-    2. If cache miss: run build commands
+    2. If cache miss: run `build` and `lua_build`
     3. Store success marker
 
 Phase 5: File installation~
     1. Determine installation mode (symlink vs. copy)
-    2. If sym=true or build exists: create symlink
+    2. If sym=true or build/lua_build exists: create symlink
     3. Otherwise: copy/hard-link files
     4. Apply ignore patterns
     5. Place in `pack/_gen/start/` or `pack/_gen/opt/`
@@ -831,7 +861,7 @@ Build commands can be slow, so rsplug caches build results.
 Cache key components:~
     - Git HEAD commit SHA
     - Git working directory diff hash
-    - Build command string
+    - Build command string (`build` / `lua_build`)
 
 If all components match a previous build, the build is skipped.
 
@@ -973,6 +1003,15 @@ Example 3: Plugin with build subprocess~
     repo = "yetone/avante.nvim"
     on_event = "BufReadPost"
     build = ["make"]
+    lua_after = "require('avante').setup{}"
+<
+
+Example 3.1: Plugin with lua_build~
+>toml
+    [[plugins]]
+    repo = "yetone/avante.nvim"
+    on_event = "BufReadPost"
+    lua_build = "vim.fn.system({'make'})"
     lua_after = "require('avante').setup{}"
 <
 

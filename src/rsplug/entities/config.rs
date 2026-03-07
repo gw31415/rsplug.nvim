@@ -57,11 +57,13 @@ pub struct CacheConfig {
     pub manually_to_sym: bool,
     #[serde(default)]
     pub build: Vec<String>,
+    #[serde(default)]
+    pub lua_build: Option<String>,
 }
 
 impl CacheConfig {
     pub fn to_sym(&self) -> bool {
-        self.manually_to_sym || !self.build.is_empty()
+        self.manually_to_sym || !self.build.is_empty() || self.lua_build.is_some()
     }
 }
 

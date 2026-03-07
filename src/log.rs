@@ -22,12 +22,12 @@ pub enum Message {
         received_objs_count: usize,
     },
     CacheBuildProgress {
-        id: String,
+        id: Arc<String>,
         stdtype: usize,
         line: String,
     },
     CacheBuildFinished {
-        id: String,
+        id: Arc<String>,
         success: bool,
     },
     LoadDone,
@@ -470,7 +470,6 @@ impl ProgressManager {
             Message::CacheBuildProgress { id, stdtype, line } => {
                 self.finish_fetch_stage();
                 if let Some(sanitized) = sanitize_build_line(&line) {
-                    let entry = format!("build-{id}");
                     let prefix = {
                         let mut prefix = format!("Building [{id}]");
                         const MAX_PREFIX_WIDTH: usize = 30;
@@ -478,7 +477,7 @@ impl ProgressManager {
                             .push_str(&" ".repeat(MAX_PREFIX_WIDTH.saturating_sub(prefix.width())));
                         prefix
                     };
-                    let bar = self.progress_bars.entry(entry).or_insert_with(|| {
+                    let bar = self.progress_bars.entry(id.to_string()).or_insert_with(|| {
                         let style = self.pb_style_spinner.clone();
                         let pb = ProgressBar::new_spinner().with_style(style);
                         pb.enable_steady_tick(Duration::from_millis(100));
@@ -499,8 +498,7 @@ impl ProgressManager {
                 }
             }
             Message::CacheBuildFinished { id, success } => {
-                let entry = format!("build-{id}");
-                if let Some(pb_state) = self.progress_bars.remove(&entry) {
+                if let Some(pb_state) = self.progress_bars.remove(id.as_str()) {
                     pb_state.bar.set_style(self.pb_style.clone());
                     pb_state.bar.set_prefix("Build");
                     if success {
