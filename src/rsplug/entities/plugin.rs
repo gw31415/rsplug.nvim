@@ -159,7 +159,7 @@ impl Plugin {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
-            rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, hash, truncate},
+            rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, truncate},
         };
         use std::sync::Arc;
         use unicode_width::UnicodeWidthStr;
@@ -263,22 +263,9 @@ impl Plugin {
                     )));
                 }
 
-                // ディレクトリ内容からのIDの決定
-                let id = PluginID::new({
-                    let mut head_rev = head_rev;
-                    if repository.is_dirty().await? {
-                        head_rev.extend(repository.diff_hash().await?);
-                    }
-                    for (i, comp) in build.iter().enumerate() {
-                        head_rev.extend(i.to_ne_bytes());
-                        head_rev.extend(comp.as_bytes());
-                    }
-                    if let Some(lua_build) = lua_build.as_deref() {
-                        head_rev.extend(b"lua_build");
-                        head_rev.extend(lua_build.as_bytes());
-                    }
-                    hash::digest(&head_rev)
-                });
+                let mut id =
+                    build_aware_plugin_id(&repository, head_rev, &build, lua_build.as_deref())
+                        .await?;
 
                 // ビルド実行
                 if !build.is_empty() || lua_build.is_some() {
@@ -305,7 +292,7 @@ impl Plugin {
                     {
                         // ビルド成功の痕跡があればビルドをスキップ
                     } else {
-                        let exec = async move {
+                        let exec = async {
                             let _ = tokio::fs::remove_file(&rsplug_build_success_file).await;
                             let logid = {
                                 const MAX_LOGID_LEN: usize = 20;
@@ -340,7 +327,7 @@ impl Plugin {
                                         if code != 0 {
                                             return Err(Error::BuildScriptFailed {
                                                 code,
-                                                build,
+                                                build: build.clone(),
                                                 repo: repo.clone(),
                                             });
                                         }
@@ -391,14 +378,17 @@ impl Plugin {
                                 result?;
                             }
 
-                            tokio::fs::write(
-                                rsplug_build_success_file,
-                                next_build_success_id.as_bytes(),
-                            )
-                            .await?;
                             Ok::<_, Error>(())
                         };
                         exec.await?;
+                        id = build_aware_plugin_id(
+                            &repository,
+                            repository.head_hash().await?,
+                            &build,
+                            lua_build.as_deref(),
+                        )
+                        .await?;
+                        tokio::fs::write(rsplug_build_success_file, id.as_str().as_bytes()).await?;
                     }
                 }
 
@@ -479,6 +469,28 @@ fn extract_unique_lua_modules<'a>(
             None
         }
     })
+}
+
+async fn build_aware_plugin_id(
+    repository: &util::git::Repository,
+    mut head_rev: Vec<u8>,
+    build: &[String],
+    lua_build: Option<&str>,
+) -> Result<PluginID, Error> {
+    use crate::rsplug::util::hash;
+
+    if repository.is_dirty().await? {
+        head_rev.extend(repository.diff_hash().await?);
+    }
+    for (i, comp) in build.iter().enumerate() {
+        head_rev.extend(i.to_ne_bytes());
+        head_rev.extend(comp.as_bytes());
+    }
+    if let Some(lua_build) = lua_build {
+        head_rev.extend(b"lua_build");
+        head_rev.extend(lua_build.as_bytes());
+    }
+    Ok(PluginID::new(hash::digest(&head_rev)))
 }
 
 fn is_full_hex_hash(value: &str) -> bool {

@@ -234,6 +234,7 @@ pub mod git {
             let repo = self.0.clone();
             spawn_blocking(move || {
                 let repo = repo.lock().unwrap();
+                repo.add_ignore_rule(RSPLUG_BUILD_SUCCESS_FILE).unwrap();
                 let mut opts = git2::StatusOptions::new();
                 opts.include_untracked(true)
                     .recurse_untracked_dirs(true)
