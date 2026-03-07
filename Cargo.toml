@@ -10,7 +10,7 @@ repository = "https://github.com/gw31415/rsplug.nvim"
 [workspace.dependencies]
 hashbrown = "0.16"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
 wildmatch = "2.6"
 
 [package]
@@ -43,7 +43,7 @@ serde_with = { version = "3.16", features = [
 	"macros",
 	"hashbrown_0_16",
 ], default-features = false }
-toml = "0.9"
+toml = "1.0"
 unicode-width = "0.2"
 wildmatch = "2.6"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
