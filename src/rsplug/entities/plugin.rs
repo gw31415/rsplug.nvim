@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashSet,
     ffi::OsStr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -7,6 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use dag::DagNode;
 use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
 use git2::Oid;
 use once_cell::sync::Lazy;
@@ -26,6 +28,8 @@ pub struct Plugin {
     pub script: SetupScript,
     /// マージ設定
     pub merge: MergeConfig,
+    /// `with` で指定された依存プラグインのキャッシュ相対パス
+    pub dependency_cachedirs: Vec<PathBuf>,
 }
 
 /// プラグインの取得元
@@ -102,15 +106,19 @@ impl Plugin {
     /// 設定ファイルから Plugin のコレクションを構築する
     pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, DagError> {
         let Config { plugins } = config;
+        let id_to_cachedir = plugins
+            .iter()
+            .map(|plug| (plug.id().to_string(), plug.cache.repo.default_cachedir()))
+            .collect::<hashbrown::HashMap<_, _>>();
         Ok(plugins.try_dag()?.into_map_iter(
-            |DagIteratorMapFuncArgs {
-                 inner,
-                 dependents_iter,
-             }| {
+            move |DagIteratorMapFuncArgs {
+                      inner,
+                      dependents_iter,
+                  }| {
                 let PluginConfig {
                     cache,
                     lazy_type,
-                    with: _,
+                    with,
                     custom_name: _,
                     script,
                     merge,
@@ -119,11 +127,21 @@ impl Plugin {
                 let lazy_type = dependents_iter
                     .flatten()
                     .fold(lazy_type, |dep, plug| dep & plug.lazy_type.clone());
+                let dependency_cachedirs = with
+                    .into_iter()
+                    .map(|dep_id| {
+                        id_to_cachedir
+                            .get(&dep_id)
+                            .cloned()
+                            .expect("dependency id must be resolvable in DAG")
+                    })
+                    .collect();
                 Plugin {
                     cache,
                     lazy_type,
                     script,
                     merge,
+                    dependency_cachedirs,
                 }
             },
         ))
@@ -154,6 +172,7 @@ impl Plugin {
             lazy_type,
             script,
             merge,
+            dependency_cachedirs,
         } = self;
 
         let to_sym = cache.to_sym();
@@ -263,6 +282,21 @@ impl Plugin {
 
                 // ビルド実行
                 if !build.is_empty() || lua_build.is_some() {
+                    let mut lua_runtimepaths = Vec::new();
+                    let mut seen_runtimepaths = HashSet::new();
+                    let mut add_runtimepath = |path: PathBuf| {
+                        if seen_runtimepaths.insert(path.clone()) {
+                            lua_runtimepaths.push(path);
+                        }
+                    };
+                    add_runtimepath(proj_root.to_path_buf());
+                    for dep_cachedir in &dependency_cachedirs {
+                        let dep_path = cache_dir.as_ref().join(dep_cachedir);
+                        if let Ok(dep_path) = tokio::fs::canonicalize(dep_path).await {
+                            add_runtimepath(dep_path);
+                        }
+                    }
+
                     let next_build_success_id = id.as_str();
                     let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
                     if let Some(ref prev_build_success_id) =
@@ -327,7 +361,8 @@ impl Plugin {
                                     let id = id.clone();
                                     async {
                                         let lua_build_path =
-                                            create_lua_build_script(lua_build).await?;
+                                            create_lua_build_script(lua_build, &lua_runtimepaths)
+                                                .await?;
                                         let code = execute(
                                             lua_build_nvim_command(lua_build_path.as_os_str()),
                                             proj_root.clone(),
@@ -461,20 +496,54 @@ fn lua_build_nvim_command(lua_script_path: &OsStr) -> [Cow<'_, OsStr>; 6] {
     ]
 }
 
-fn lua_build_wrapper(lua_script: &str) -> String {
+fn lua_build_wrapper(lua_script: &str, runtimepaths: &[PathBuf]) -> String {
+    fn lua_single_quoted(s: &str) -> String {
+        let mut escaped = String::with_capacity(s.len() + 8);
+        escaped.push('\'');
+        for ch in s.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '\'' => escaped.push_str("\\'"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped.push('\'');
+        escaped
+    }
+    fn lua_runtimepath_setup(runtimepaths: &[PathBuf]) -> String {
+        let runtimepaths = runtimepaths
+            .iter()
+            .map(|path| format!("  {},", lua_single_quoted(path.to_string_lossy().as_ref())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if runtimepaths.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "for _, rtp in ipairs({{\n{}\n}}) do\n  vim.opt.runtimepath:prepend(rtp)\nend\n",
+                runtimepaths
+            )
+        }
+    }
     format!(
-        "local ok, err = xpcall(function()\n{}\nend, debug.traceback)\nif not ok then\n  vim.api.nvim_err_writeln(err)\n  os.exit(1)\nend\n",
+        "local ok, err = xpcall(function()\n{}\n{}\nend, debug.traceback)\nif not ok then\n  vim.api.nvim_err_writeln(err)\n  os.exit(1)\nend\n",
+        lua_runtimepath_setup(runtimepaths),
         lua_script
     )
 }
 
-async fn create_lua_build_script(lua_script: &str) -> Result<PathBuf, std::io::Error> {
+async fn create_lua_build_script(
+    lua_script: &str,
+    runtimepaths: &[PathBuf],
+) -> Result<PathBuf, std::io::Error> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let filename = format!("rsplug-build-lua-{}-{}.lua", std::process::id(), nonce);
     let path = std::env::temp_dir().join(filename);
-    tokio::fs::write(&path, lua_build_wrapper(lua_script)).await?;
+    tokio::fs::write(&path, lua_build_wrapper(lua_script, runtimepaths)).await?;
     Ok(path)
 }
