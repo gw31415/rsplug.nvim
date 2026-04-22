@@ -37,7 +37,9 @@ fn collect_doc_files_from_root(root: &Path) -> HashMap<PathBuf, FileItem> {
         if depth > 128 {
             continue;
         }
-        let canonical = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+        let Ok(canonical) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
         if !seen_dirs.insert(canonical) {
             continue;
         }

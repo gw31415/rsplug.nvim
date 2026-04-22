@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     convert::Infallible,
     hash::Hash,
@@ -255,7 +256,11 @@ impl std::fmt::Debug for FileSpecifier {
 impl FileSpecifier {
     pub fn matched(&self, filepath: impl AsRef<Path>) -> bool {
         let path = filepath.as_ref().to_string_lossy();
-        let path = path.replace('\\', "/");
+        let path = if path.contains('\\') {
+            Cow::Owned(path.replace('\\', "/"))
+        } else {
+            path
+        };
         let mut ignored = false;
 
         for pat in &self.0 {
