@@ -28,7 +28,6 @@ thiserror.workspace = true
 
 clap = { version = "4.5", features = ["derive", "env"] }
 console = "0.16.2"
-cliclack = "0.5.4"
 dag = { path = "dag", features = ["hashbrown"] }
 git2 = "0.20"
 ignore = "0.4"
