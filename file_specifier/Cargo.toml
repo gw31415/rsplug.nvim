@@ -1,0 +1,8 @@
+[package]
+name = "file_specifier"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+wildmatch.workspace = true
