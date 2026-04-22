@@ -1,3 +1,4 @@
+use cliclack::log as cliclack_log;
 use console::style;
 use hashbrown::{HashMap, hash_map::Entry};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -283,6 +284,24 @@ fn sanitize_build_line(line: &str) -> Option<String> {
 }
 
 impl ProgressManager {
+    fn print_info(&self, message: impl Into<String>) {
+        self.multipb.suspend(|| {
+            let _ = cliclack_log::info(message.into());
+        });
+    }
+
+    fn print_success(&self, message: impl Into<String>) {
+        self.multipb.suspend(|| {
+            let _ = cliclack_log::success(message.into());
+        });
+    }
+
+    fn print_error(&self, message: impl Into<String>) {
+        self.multipb.suspend(|| {
+            let _ = cliclack_log::error(message.into());
+        });
+    }
+
     fn new() -> Self {
         let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
         let pb_style_spinner =
@@ -337,9 +356,7 @@ impl ProgressManager {
     fn finish_fetch_stage(&mut self) {
         if let Some(pb) = self.progress_bars.remove(CACHE_FETCH_STAGE_ID) {
             self.cache_fetch_stage = None;
-            self.multipb
-                .println(format!("{} all packages", style("Fetched").blue().bold()))
-                .unwrap();
+            self.print_success("Fetched all packages");
             pb.bar.set_style(self.pb_style.clone());
             pb.bar.finish_and_clear();
         }
@@ -363,23 +380,16 @@ impl ProgressManager {
                 pb.set_message_if_changed(format!("{} files", self.config_files.len()));
                 pb.bar.finish_and_clear();
                 let display = ConfigList::from_files(std::mem::take(&mut self.config_files));
-                self.multipb.println(display.to_string()).unwrap();
+                self.print_info(display.to_string().trim_end().to_string());
             }
             Message::MergeFinished { total, merged } => {
-                let message = format!(
-                    "plugins {}",
-                    style(format!("(total:{total} merged:{merged})"))
-                        .green()
-                        .dim()
-                );
+                let message = format!("plugins (total:{total} merged:{merged})");
                 if let Some(pb) = self.progress_bars.remove("loading") {
                     pb.bar.set_style(self.pb_style.clone());
                     pb.bar.set_prefix("Loaded");
                     pb.bar.finish_with_message(message);
                 } else {
-                    self.multipb
-                        .println(format!("{} {message}", style("Loaded").blue().bold()))
-                        .unwrap();
+                    self.print_success(format!("Loaded {message}"));
                 }
             }
             Message::Cache(r#type, url) => {
@@ -524,13 +534,7 @@ impl ProgressManager {
                 }
             }
             Message::DetectLockFile(path) => {
-                self.multipb
-                    .println(format!(
-                        "{} {}",
-                        style("LockFile:").blue().dim(),
-                        style(path.to_string_lossy()).dim()
-                    ))
-                    .unwrap();
+                self.print_info(format!("LockFile: {}", path.to_string_lossy()));
             }
             Message::InstallSkipped(id) => {
                 self.installskipped_count += 1;
@@ -603,10 +607,7 @@ impl ProgressManager {
                 }
             }
             Message::Error(e) => {
-                // To prevent flicker with other progress bars, suspend drawing.
-                self.multipb.suspend(|| {
-                    eprintln!("{} {e}", style("error:").red().bold());
-                });
+                self.print_error(e.to_string());
             }
         }
     }
