@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
-    convert::Infallible,
     hash::Hash,
     iter::{Sum, once},
     ops::AddAssign,
@@ -240,7 +239,7 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    s.parse().map_err(|e: Infallible| match e {})
+    Ok(s.parse().unwrap())
 }
 
 /// キーパターン
