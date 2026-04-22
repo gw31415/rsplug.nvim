@@ -3,17 +3,15 @@ use std::{
     hash::Hash,
     iter::{Sum, once},
     ops::AddAssign,
-    path::Path,
-    str::FromStr,
     sync::Arc,
 };
 
 use dag::DagNode;
+use file_specifier::FileSpecifier;
 use hashbrown::HashMap;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sailfish::runtime::Render;
-use serde::Deserialize;
-use serde_with::{DeserializeFromStr, FromInto, OneOrMany, serde_as};
+use serde::{Deserialize, Deserializer};
+use serde_with::{FromInto, OneOrMany, serde_as};
 
 use super::*;
 
@@ -225,39 +223,23 @@ impl AddAssign for SetupScript {
 /// プラグインのセットアップに用いるスクリプト群
 #[derive(Deserialize)]
 pub struct MergeConfig {
+    #[serde(deserialize_with = "deserialize_file_specifier")]
     #[serde(default = "default_ignore")]
     pub ignore: FileSpecifier,
 }
 
 fn default_ignore() -> FileSpecifier {
-    FileSpecifier::from_str(include_str!("../../../templates/ignore.gitignore")).unwrap()
+    include_str!("../../../templates/ignore.gitignore")
+        .parse()
+        .unwrap()
 }
 
-/// Gitignore形式のファイル指定子
-#[derive(DeserializeFromStr)]
-pub struct FileSpecifier(Arc<Gitignore>, String);
-
-impl std::fmt::Debug for FileSpecifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("FileSpecifier").field(&self.1).finish()
-    }
-}
-
-impl FileSpecifier {
-    pub fn matched(&self, filepath: impl AsRef<Path>) -> bool {
-        self.0.matched(filepath.as_ref(), false).is_ignore()
-    }
-}
-
-impl FromStr for FileSpecifier {
-    type Err = ignore::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut builder = GitignoreBuilder::new("");
-        for line in s.lines() {
-            builder.add_line(None, line)?;
-        }
-        Ok(FileSpecifier(builder.build()?.into(), s.to_string()))
-    }
+fn deserialize_file_specifier<'de, D>(deserializer: D) -> Result<FileSpecifier, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(s.parse().unwrap())
 }
 
 /// キーパターン

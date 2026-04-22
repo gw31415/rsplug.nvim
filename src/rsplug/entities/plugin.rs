@@ -404,10 +404,7 @@ impl Plugin {
                         files
                             .into_iter()
                             .filter_map(|path| {
-                                let ignored = path.iter().any(|k| {
-                                    let k = k.to_str().unwrap(); // 上でUTF-8に変換済み
-                                    merge.ignore.matched(k)
-                                });
+                                let ignored = merge.ignore.matched(&path);
                                 if !ignored && proj_root.join(&path).is_file() {
                                     Some((
                                         path,

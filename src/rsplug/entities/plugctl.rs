@@ -1,15 +1,14 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, btree_map::Keys},
+    collections::{BTreeMap, HashSet, btree_map::Keys},
     fmt::Display,
     iter::Sum,
     ops::AddAssign,
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use hashbrown::HashMap;
-use ignore::{WalkBuilder, WalkState};
 use sailfish::{TemplateSimple, runtime::Render};
 
 use super::*;
@@ -21,7 +20,7 @@ struct PkgId2ScriptsItem {
     start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
 }
 
-fn collect_doc_files_from_root(root: &std::path::Path) -> HashMap<PathBuf, FileItem> {
+fn collect_doc_files_from_root(root: &Path) -> HashMap<PathBuf, FileItem> {
     let doc_root = root.join("doc");
     if !doc_root.is_dir() {
         return HashMap::new();
@@ -30,52 +29,63 @@ fn collect_doc_files_from_root(root: &std::path::Path) -> HashMap<PathBuf, FileI
     let source = Arc::new(FileSource::Directory {
         path: Arc::from(root.to_path_buf()),
     });
-    let root = Arc::new(root.to_path_buf());
-    let files = Arc::new(Mutex::new(HashMap::new()));
+    let mut files = HashMap::new();
+    let mut seen_dirs = HashSet::new();
+    let mut stack = vec![(doc_root, 0usize)];
 
-    WalkBuilder::new(&doc_root)
-        .standard_filters(false)
-        .hidden(false)
-        .max_depth(Some(128))
-        .follow_links(true)
-        .build_parallel()
-        .run(|| {
-            let root = root.clone();
-            let source = source.clone();
-            let files = files.clone();
-            Box::new(move |entry| {
-                let Ok(entry) = entry else {
-                    return WalkState::Continue;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 128 {
+            continue;
+        }
+        let Ok(canonical) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
+        if !seen_dirs.insert(canonical) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+
+            if kind.is_dir() {
+                stack.push((path, depth + 1));
+                continue;
+            }
+
+            if kind.is_symlink() {
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
                 };
-                if !entry
-                    .file_type()
-                    .map(|meta| meta.is_file())
-                    .unwrap_or(false)
-                {
-                    return WalkState::Continue;
+                if meta.is_dir() {
+                    stack.push((path, depth + 1));
+                    continue;
                 }
-                let path = entry.into_path();
-                let Ok(rel_path) = path.strip_prefix(root.as_path()) else {
-                    return WalkState::Continue;
-                };
-                files.lock().unwrap().insert(
-                    rel_path.to_path_buf(),
-                    FileItem {
-                        source: source.clone(),
-                        merge_type: MergeType::Overwrite,
-                    },
-                );
-                WalkState::Continue
-            })
-        });
+                if !meta.is_file() {
+                    continue;
+                }
+            } else if !kind.is_file() {
+                continue;
+            }
 
-    match Arc::try_unwrap(files) {
-        Ok(files) => files.into_inner().unwrap_or_default(),
-        Err(files) => {
-            let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *guard)
+            let Ok(rel_path) = path.strip_prefix(root) else {
+                continue;
+            };
+            files.insert(
+                rel_path.to_path_buf(),
+                FileItem {
+                    source: source.clone(),
+                    merge_type: MergeType::Overwrite,
+                },
+            );
         }
     }
+
+    files
 }
 
 #[derive(Hash, Eq, PartialEq, PartialOrd, Ord)]

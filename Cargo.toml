@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "dag", "walker"]
+members = [".", "dag", "file_specifier", "walker"]
 resolver = "3"
 
 [workspace.package]
@@ -29,8 +29,8 @@ thiserror.workspace = true
 clap = { version = "4.5", features = ["derive", "env"] }
 console = "0.16.2"
 dag = { path = "dag", features = ["hashbrown"] }
+file_specifier = { path = "file_specifier" }
 git2 = "0.20"
-ignore = "0.4"
 walker = { path = "walker" }
 indicatif = { version = "0.18", features = ["tokio"] }
 itertools = "0.14"
