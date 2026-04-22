@@ -286,19 +286,19 @@ fn sanitize_build_line(line: &str) -> Option<String> {
 impl ProgressManager {
     fn print_info(&self, message: impl Into<String>) {
         self.multipb.suspend(|| {
-            let _ = cliclack_log::info(message.into());
+            cliclack_log::info(message.into()).expect("failed to write info log");
         });
     }
 
     fn print_success(&self, message: impl Into<String>) {
         self.multipb.suspend(|| {
-            let _ = cliclack_log::success(message.into());
+            cliclack_log::success(message.into()).expect("failed to write success log");
         });
     }
 
     fn print_error(&self, message: impl Into<String>) {
         self.multipb.suspend(|| {
-            let _ = cliclack_log::error(message.into());
+            cliclack_log::error(message.into()).expect("failed to write error log");
         });
     }
 
@@ -380,7 +380,8 @@ impl ProgressManager {
                 pb.set_message_if_changed(format!("{} files", self.config_files.len()));
                 pb.bar.finish_and_clear();
                 let display = ConfigList::from_files(std::mem::take(&mut self.config_files));
-                self.print_info(display.to_string().trim_end().to_string());
+                let display = display.to_string();
+                self.print_info(display.trim_end().to_string());
             }
             Message::MergeFinished { total, merged } => {
                 let message = format!("plugins (total:{total} merged:{merged})");
