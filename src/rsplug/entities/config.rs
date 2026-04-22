@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    convert::Infallible,
     hash::Hash,
     iter::{Sum, once},
     ops::AddAssign,
@@ -10,7 +11,7 @@ use dag::DagNode;
 use file_specifier::FileSpecifier;
 use hashbrown::HashMap;
 use sailfish::runtime::Render;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_with::{FromInto, OneOrMany, serde_as};
 
 use super::*;
@@ -223,6 +224,7 @@ impl AddAssign for SetupScript {
 /// プラグインのセットアップに用いるスクリプト群
 #[derive(Deserialize)]
 pub struct MergeConfig {
+    #[serde(deserialize_with = "deserialize_file_specifier")]
     #[serde(default = "default_ignore")]
     pub ignore: FileSpecifier,
 }
@@ -231,6 +233,14 @@ fn default_ignore() -> FileSpecifier {
     include_str!("../../../templates/ignore.gitignore")
         .parse()
         .unwrap()
+}
+
+fn deserialize_file_specifier<'de, D>(deserializer: D) -> Result<FileSpecifier, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse().map_err(|e: Infallible| match e {})
 }
 
 /// キーパターン
