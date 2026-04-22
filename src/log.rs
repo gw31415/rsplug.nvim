@@ -286,12 +286,14 @@ impl ProgressManager {
     fn new() -> Self {
         let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
         let pb_style_spinner =
-            ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}").unwrap();
+            ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}")
+                .unwrap()
+                .tick_strings(&["◒", "◐", "◓", "◑", " "]);
         let pb_style_bar = ProgressStyle::with_template(
             "{spinner} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
         )
         .unwrap()
-        .progress_chars("#>-");
+        .progress_chars("■□ ");
 
         let multipb = MultiProgress::new();
         multipb.set_draw_target(ProgressDrawTarget::stderr());
