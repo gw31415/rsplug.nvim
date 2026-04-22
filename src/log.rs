@@ -284,13 +284,13 @@ fn sanitize_build_line(line: &str) -> Option<String> {
 
 impl ProgressManager {
     fn new() -> Self {
-        let pb_style = ProgressStyle::with_template("{prefix:.cyan.bold} {wide_msg}").unwrap();
+        let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
         let pb_style_spinner =
-            ProgressStyle::with_template("{spinner:.cyan} {prefix:.cyan.bold} {wide_msg}")
+            ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}")
                 .unwrap()
                 .tick_strings(&["◒", "◐", "◓", "◑", " "]);
         let pb_style_bar = ProgressStyle::with_template(
-            "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
+            "{spinner} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
         )
         .unwrap()
         .progress_chars("■□ ");
