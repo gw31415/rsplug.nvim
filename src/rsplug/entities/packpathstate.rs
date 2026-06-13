@@ -9,8 +9,8 @@ use std::{
     sync::Arc,
 };
 
-use crate::adaptive_semaphore::AdaptiveSemaphore;
 use crate::log::{Message, msg};
+use adaptive_semaphore::AdaptiveSemaphore;
 use hashbrown::{HashMap, HashSet};
 use tokio::task::JoinSet;
 

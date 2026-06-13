@@ -1,0 +1,8 @@
+[package]
+name = "adaptive_semaphore"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true

@@ -1,4 +1,3 @@
-mod adaptive_semaphore;
 mod log;
 mod osc94;
 mod rsplug;

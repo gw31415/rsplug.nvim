@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "dag", "file_specifier", "walker"]
+members = [".", "adaptive_semaphore", "dag", "file_specifier", "walker"]
 resolver = "3"
 
 [workspace.package]
@@ -26,6 +26,7 @@ tokio.workspace = true
 hashbrown.workspace = true
 thiserror.workspace = true
 
+adaptive_semaphore = { path = "adaptive_semaphore" }
 clap = { version = "4.6", features = ["derive", "env"] }
 console = "0.16"
 dag = { path = "dag", features = ["hashbrown"] }

@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "adaptive_semaphore"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1095,6 +1102,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 name = "rsplug"
 version = "0.1.0"
 dependencies = [
+ "adaptive_semaphore",
  "clap",
  "console",
  "dag",

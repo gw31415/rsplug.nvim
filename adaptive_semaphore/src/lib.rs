@@ -13,7 +13,7 @@ const MIN_ADJUST_INTERVAL: Duration = Duration::from_millis(64);
 const MAX_ADJUST_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
-pub(crate) struct AdaptiveSemaphore {
+pub struct AdaptiveSemaphore {
     state: Arc<State>,
 }
 
@@ -36,7 +36,7 @@ struct Inner {
 }
 
 #[derive(Debug)]
-pub(crate) struct AdaptiveSemaphorePermit {
+pub struct AdaptiveSemaphorePermit {
     semaphore: AdaptiveSemaphore,
     started_at: Instant,
     finished: bool,
@@ -62,7 +62,7 @@ impl Default for AdaptiveSemaphore {
 }
 
 impl AdaptiveSemaphore {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_limits(
             DEFAULT_INITIAL_LIMIT,
             DEFAULT_MIN_LIMIT,
@@ -71,7 +71,7 @@ impl AdaptiveSemaphore {
         )
     }
 
-    pub(crate) fn with_limits(
+    pub fn with_limits(
         initial_limit: usize,
         min_limit: usize,
         max_limit: usize,
@@ -108,7 +108,7 @@ impl AdaptiveSemaphore {
         self.state.inner.lock().unwrap().adjust_interval
     }
 
-    pub(crate) async fn acquire(&self) -> AdaptiveSemaphorePermit {
+    pub async fn acquire(&self) -> AdaptiveSemaphorePermit {
         loop {
             let notified = {
                 let mut inner = self.state.inner.lock().unwrap();
@@ -157,7 +157,7 @@ impl AdaptiveSemaphore {
 }
 
 impl AdaptiveSemaphorePermit {
-    pub(crate) fn finish(mut self, is_error: bool) {
+    pub fn finish(mut self, is_error: bool) {
         let elapsed = self.started_at.elapsed();
         self.finished = true;
         self.semaphore.release(Some((elapsed, is_error)));
