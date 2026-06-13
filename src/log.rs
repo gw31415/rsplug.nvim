@@ -85,7 +85,7 @@ impl ConfigGroup {
     }
 
     fn join_names(&self) -> String {
-        let mut names: Vec<String> = self
+        let names: Vec<String> = self
             .files
             .iter()
             .map(|path| {
@@ -95,7 +95,8 @@ impl ConfigGroup {
                     .to_string()
             })
             .collect();
-        names.sort();
+        // ConfigGroup::new でパス順に整列済み
+        // names.sort();
         names.join(" ")
     }
 }
