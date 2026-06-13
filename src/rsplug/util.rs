@@ -28,10 +28,10 @@ pub mod hash {
             unsafe {
                 res.get_mut(idx)
                     .unwrap_unchecked()
-                    .write(HEX_TABLE[(b / 16u8) as usize]);
+                    .write(HEX_TABLE[(b >> 4) as usize]);
                 res.get_mut(idx + 1)
                     .unwrap_unchecked()
-                    .write(HEX_TABLE[(b % 16u8) as usize]);
+                    .write(HEX_TABLE[(b & 0x0f) as usize]);
             }
         }
         unsafe { std::mem::transmute::<[MaybeUninit<u8>; 32], [u8; 32]>(res) }
