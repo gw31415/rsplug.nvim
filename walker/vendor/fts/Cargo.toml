@@ -12,6 +12,7 @@
 
 [package]
 name = "fts"
+edition = "2015"
 version = "0.3.0"
 authors = ["dalance <dalance@gmail.com>"]
 build = "build.rs"
