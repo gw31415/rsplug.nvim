@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use unicode_width::UnicodeWidthStr;
+use once_cell::sync::OnceCell;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::error::Error;
 
@@ -485,9 +486,54 @@ pub async fn execute(
 pub fn truncate(val: &impl ToString, len: usize) -> String {
     let mut val = val.to_string();
     if val.width_cjk() > len {
-        const ELIPSIS: &str = "……";
-        val.truncate(len - ELIPSIS.width_cjk());
-        val.push_str(ELIPSIS);
+        const ELLIPSIS: &str = "……";
+        static ELLIPSIS_WIDTH: OnceCell<usize> = OnceCell::new();
+        let limit = len.saturating_sub(*ELLIPSIS_WIDTH.get_or_init(|| ELLIPSIS.width_cjk()));
+
+        // 表示幅で切るため、UTF-8 のバイト境界ではなく文字単位で詰める。
+        //
+        // Before:
+        // val.truncate(limit);
+        //
+        // After:
+
+        let mut width = 0;
+        let byte_len = val
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                let next = width + ch.width_cjk().unwrap_or(0);
+                if next > limit {
+                    Some(idx)
+                } else {
+                    width = next;
+                    None
+                }
+            })
+            .unwrap_or(val.len());
+        val.truncate(byte_len);
+
+        // After ここまで
+
+        if limit != 0 {
+            val.push_str(ELLIPSIS);
+        }
     }
     val
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_respects_utf8_boundaries_and_display_width() {
+        assert_eq!(truncate(&"abcdefghijkl", 8), "abcd……");
+        assert_eq!(truncate(&"日本語abcdef", 8), "日本……");
+        assert_eq!(truncate(&"日本語", 0), "");
+        assert_eq!(truncate(&"日本語", 1), "");
+        assert_eq!(truncate(&"日本", 4), "日本");
+        assert_eq!(truncate(&"ééééabcd", 8), "ééééabcd");
+        assert_eq!(truncate(&"aあいうえ", 8), "aあ……");
+        assert_eq!(truncate(&"🙂🙂abcdef", 8), "🙂🙂……");
+    }
 }
