@@ -445,7 +445,7 @@ pub async fn execute(
             tx: tokio::sync::mpsc::UnboundedSender<Result<(usize, String), std::io::Error>>,
             id: usize,
             reader: impl AsyncRead + Unpin + Send + 'static,
-        ) -> tokio::task::JoinHandle<()> {
+        ) -> tokio::task::JoinHandle<std::io::Result<()>> {
             let mut reader = tokio::io::BufReader::new(reader).lines();
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -453,13 +453,19 @@ pub async fn execute(
                     match reader.next_line().await {
                         Ok(line) => line,
                         Err(e) => {
-                            tx.send(Err(e)).unwrap();
+                            if tx.send(Err(e)).is_err() {
+                                return Ok(());
+                            }
                             continue 'line;
                         }
                     }
                 } {
-                    tx.send(Ok((id, line))).unwrap();
+                    // 受信側が先に終了した場合は子プロセス出力の転送を静かに止める。
+                    if tx.send(Ok((id, line))).is_err() {
+                        return Ok(());
+                    }
                 }
+                Ok(())
             })
         }
 
@@ -474,9 +480,9 @@ pub async fn execute(
         });
 
         let status = child.wait().await?;
-        stdout_task.await.unwrap();
-        stderr_task.await.unwrap();
-        receiving_task.await.unwrap()?;
+        stdout_task.await.map_err(std::io::Error::other)??;
+        stderr_task.await.map_err(std::io::Error::other)??;
+        receiving_task.await.map_err(std::io::Error::other)??;
 
         Ok(status.code().unwrap_or(-1))
     })
