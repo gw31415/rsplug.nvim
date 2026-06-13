@@ -126,7 +126,7 @@ impl Plugin {
                 // 依存元の lazy_type を集約
                 let lazy_type = dependents_iter
                     .flatten()
-                    .fold(lazy_type, |dep, plug| dep & plug.lazy_type.clone());
+                    .fold(lazy_type, |dep, plug| dep & &plug.lazy_type);
                 let dependency_cachedirs = with
                     .into_iter()
                     .map(|dep_id| {

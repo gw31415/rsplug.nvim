@@ -83,9 +83,9 @@ impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAndAssign<Rhs> for LazyType {
     }
 }
 
-impl BitAnd for LazyType {
+impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAnd<Rhs> for LazyType {
     type Output = Self;
-    fn bitand(mut self, rhs: Self) -> Self::Output {
+    fn bitand(mut self, rhs: Rhs) -> Self::Output {
         self &= rhs;
         self
     }
