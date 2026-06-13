@@ -80,8 +80,7 @@ impl AdaptiveSemaphore {
         let min_limit = min_limit.max(1);
         let max_limit = max_limit.max(min_limit);
         let limit = initial_limit.clamp(min_limit, max_limit);
-        let adjust_interval =
-            adjust_interval.clamp(MIN_ADJUST_INTERVAL, MAX_ADJUST_INTERVAL);
+        let adjust_interval = adjust_interval.clamp(MIN_ADJUST_INTERVAL, MAX_ADJUST_INTERVAL);
         Self {
             state: Arc::new(State {
                 inner: Mutex::new(Inner {

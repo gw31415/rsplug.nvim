@@ -314,6 +314,8 @@ impl PackPathState {
         } = self;
         let mut tasks = JoinSet::new();
         let yank_semaphore = AdaptiveSemaphore::new();
+        let symlink_semaphore = AdaptiveSemaphore::new();
+        let cleanup_semaphore = AdaptiveSemaphore::new();
 
         for (
             id,
@@ -402,10 +404,19 @@ impl PackPathState {
                         });
                     }
                     DirectoryExtractionType::Symlink(sym) => {
+                        let symlink_semaphore = symlink_semaphore.clone();
                         tasks.spawn(async move {
-                            tokio::fs::remove_dir_all(&dir).await.ok();
-                            tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
-                            tokio::fs::symlink(sym, dir.as_path()).await?;
+                            let permit = symlink_semaphore.acquire().await;
+                            let result = async {
+                                tokio::fs::remove_dir_all(&dir).await.ok();
+                                tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
+                                tokio::fs::symlink(sym, dir.as_path()).await?;
+                                Ok::<_, io::Error>(())
+                            }
+                            .await;
+                            let is_error = result.is_err();
+                            permit.finish(is_error);
+                            result?;
                             // Avoid mutating symlink source; helptags are generated
                             // from PlugCtl's copied doc files instead.
                             Ok(())
@@ -421,12 +432,17 @@ impl PackPathState {
             if let Ok(mut read_dir) = tokio::fs::read_dir(path).await {
                 while let Some(entry) = read_dir.next_entry().await? {
                     let installing = installing.clone();
+                    let cleanup_semaphore = cleanup_semaphore.clone();
                     tasks.spawn(async move {
                         let not_installed_entry =
                             !installing.contains(&entry.file_name().into_vec().into_boxed_slice());
                         let path = entry.path();
                         if not_installed_entry && path.is_dir() {
-                            tokio::fs::remove_dir_all(path).await?;
+                            let permit = cleanup_semaphore.acquire().await;
+                            let result = tokio::fs::remove_dir_all(path).await;
+                            let is_error = result.is_err();
+                            permit.finish(is_error);
+                            result?;
                         }
                         Ok(())
                     });

@@ -7,8 +7,10 @@ use std::{
     collections::{BTreeMap, BinaryHeap},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
+use adaptive_semaphore::AdaptiveSemaphore;
 use clap::Parser;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
@@ -53,14 +55,21 @@ async fn app() -> Result<(), Error> {
 
     // Parse all of config files while walking patterns in background.
     let mut config_tasks = JoinSet::new();
+    let config_read_semaphore =
+        AdaptiveSemaphore::with_limits(64, 1, 256, Duration::from_millis(64));
     {
         let mut walker = ConfigWalker::new(config_files).await?;
         while let Some(item) = walker.recv().await {
             match item {
                 Ok(path) => {
                     msg(Message::ConfigFound(path.clone()));
+                    let config_read_semaphore = config_read_semaphore.clone();
                     config_tasks.spawn(async move {
-                        let content = tokio::fs::read(&path).await?;
+                        let permit = config_read_semaphore.acquire().await;
+                        let content = tokio::fs::read(&path).await;
+                        let is_error = content.is_err();
+                        permit.finish(is_error);
+                        let content = content?;
                         toml::from_slice::<rsplug::Config>(&content)
                             .map_err(|e| Error::Parse(e, path))
                     });
