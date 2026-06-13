@@ -12,6 +12,8 @@ use std::{
 use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthStr;
 
+use crate::osc94::OSC94;
+
 pub enum Message {
     ConfigFound(PathBuf),
     ConfigWalkFinish,
@@ -241,6 +243,7 @@ struct ProgressManager {
     updating_bar: Option<BarState>,
     cache_fetch_stage: Option<&'static str>,
     config_files: Vec<Arc<Path>>,
+    osc94: Option<OSC94>,
 }
 
 struct BarState {
@@ -319,6 +322,7 @@ impl ProgressManager {
             updating_bar: None,
             cache_fetch_stage: None,
             config_files: Vec::new(),
+            osc94: None,
         }
     }
 
@@ -451,6 +455,9 @@ impl ProgressManager {
                 total_objs_count,
                 received_objs_count,
             } => {
+                self.osc94
+                    .get_or_insert_with(OSC94::new)
+                    .progress(Some(received_objs_count * 100 / total_objs_count));
                 let style = self.pb_style_bar.clone();
                 let pb = self
                     .progress_bars
@@ -512,6 +519,7 @@ impl ProgressManager {
             }
             Message::LoadDone => {
                 self.finish_fetch_stage();
+                drop(self.osc94.take());
                 let mut pbs = std::mem::take(&mut self.progress_bars);
                 if let Some(pb) = pbs.remove(CACHE_FETCH_PROGRESS_ID) {
                     pb.bar.set_style(self.pb_style.clone());
@@ -551,6 +559,9 @@ impl ProgressManager {
             }
             Message::InstallYank { id, which: file } => {
                 self.yankfile_count += 1;
+                self.osc94
+                    .get_or_insert_with(OSC94::new)
+                    .progress::<u8>(None);
                 let pb = self
                     .progress_bars
                     .entry("install_yank".to_string())
@@ -583,6 +594,7 @@ impl ProgressManager {
                 pb.set_message_if_changed(help_dir.to_string_lossy().into_owned());
             }
             Message::InstallDone => {
+                drop(self.osc94.take());
                 if let Some(pb) = self.progress_bars.remove("install_skipped") {
                     pb.bar.set_style(self.pb_style.clone());
                     if self.installskipped_count != 0 {
