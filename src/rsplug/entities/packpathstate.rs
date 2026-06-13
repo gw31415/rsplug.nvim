@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::adaptive_semaphore::AdaptiveSemaphore;
 use crate::log::{Message, msg};
 use hashbrown::{HashMap, HashSet};
 use tokio::task::JoinSet;
@@ -312,6 +313,7 @@ impl PackPathState {
             ctl: _,
         } = self;
         let mut tasks = JoinSet::new();
+        let yank_semaphore = AdaptiveSemaphore::new();
 
         for (
             id,
@@ -373,26 +375,31 @@ impl PackPathState {
                     DirectoryExtractionType::Files(files) => {
                         tokio::fs::remove_file(dir.as_path()).await.ok();
                         let dir = Arc::new(dir);
-                        let copies = files
-                            .into_iter()
-                            .map(|(which, source)| {
-                                let dir = dir.clone();
-                                let id = id.clone();
-                                async move {
-                                    source.yank(&which, dir.as_path()).await?;
-                                    msg(Message::InstallYank { id, which });
-                                    Ok::<_, io::Error>(())
-                                }
-                            })
-                            .collect::<JoinSet<_>>();
-                        tokio::spawn(async move {
-                            let mut copies = copies;
+                        // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
+                        let yank_semaphore = yank_semaphore.clone();
+                        tasks.spawn(async move {
+                            let mut copies = files
+                                .into_iter()
+                                .map(|(which, source)| {
+                                    let dir = dir.clone();
+                                    let id = id.clone();
+                                    let yank_semaphore = yank_semaphore.clone();
+                                    async move {
+                                        let permit = yank_semaphore.acquire().await;
+                                        let result = source.yank(&which, dir.as_path()).await;
+                                        let is_error = result.is_err();
+                                        permit.finish(is_error);
+                                        result?;
+                                        msg(Message::InstallYank { id, which });
+                                        Ok::<_, io::Error>(())
+                                    }
+                                })
+                                .collect::<JoinSet<_>>();
                             while let Some(res) = copies.join_next().await {
                                 res??;
                             }
                             helptags(dir.as_path()).await
-                        })
-                        .await??;
+                        });
                     }
                     DirectoryExtractionType::Symlink(sym) => {
                         tasks.spawn(async move {
