@@ -454,10 +454,9 @@ impl AddAssign for PlugCtl {
                 .extend(ids.into_iter());
         }
         for (key, pattern) in keypattern2pkgid {
+            let mode_entry = self.keypattern2pkgid.entry(key).or_default();
             for (pattern, ids) in pattern {
-                self.keypattern2pkgid
-                    .entry(key.clone())
-                    .or_default()
+                mode_entry
                     .entry(pattern)
                     .or_default()
                     .extend(ids.into_iter());
