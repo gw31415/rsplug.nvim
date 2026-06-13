@@ -253,7 +253,7 @@ impl PackPathState {
         let id_str = id.as_str();
         let already_installed = !self.installing.insert(id_str.clone().into());
         if already_installed {
-            return Default::default();
+            return;
         }
         let start_or_opt = if lazy_type.is_start() { "start" } else { "opt" };
 
