@@ -1,4 +1,5 @@
 mod log;
+mod osc94;
 mod rsplug;
 
 use std::{
