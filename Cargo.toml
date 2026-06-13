@@ -8,7 +8,7 @@ edition = "2024"
 repository = "https://github.com/gw31415/rsplug.nvim"
 
 [workspace.dependencies]
-hashbrown = "0.17"
+hashbrown = "0.16"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 wildmatch = "2.6"
@@ -26,24 +26,24 @@ tokio.workspace = true
 hashbrown.workspace = true
 thiserror.workspace = true
 
-clap = { version = "4.6", features = ["derive", "env"] }
-console = "0.16"
+clap = { version = "4.5", features = ["derive", "env"] }
+console = "0.16.2"
 dag = { path = "dag", features = ["hashbrown"] }
 file_specifier = { path = "file_specifier" }
-git2 = "0.21"
+git2 = "0.20"
 walker = { path = "walker" }
 indicatif = { version = "0.18", features = ["tokio"] }
 itertools = "0.14"
 once_cell = "1.21"
 regex = "1.12"
-sailfish = "0.11"
+sailfish = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-serde_with = { version = "3.21", features = [
+serde_with = { version = "3.16", features = [
 	"macros",
-	"hashbrown_0_17",
+	"hashbrown_0_16",
 ], default-features = false }
-toml = "1.1"
+toml = "1.0"
 unicode-width = "0.2"
 wildmatch = "2.6"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
