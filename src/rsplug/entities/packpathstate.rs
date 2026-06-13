@@ -113,11 +113,19 @@ impl Add for LoadedPlugin {
         match (&self.files, &rhs.files) {
             (HowToPlaceFiles::CopyEachFile(files), HowToPlaceFiles::CopyEachFile(rfiles)) => {
                 let mergeable = {
-                    let (sfname, rfname): (HashSet<_>, HashSet<_>) =
-                        (files.keys().collect(), rfiles.keys().collect());
-                    sfname.intersection(&rfname).all(|path| {
-                        let a = &files.get(*path).unwrap().merge_type;
-                        let b = &rfiles.get(*path).unwrap().merge_type;
+                    let (small, large) = if files.len() <= rfiles.len() {
+                        (files, rfiles)
+                    } else {
+                        (rfiles, files)
+                    };
+                    // 重複ファイルの検出
+                    small.iter().all(|(path, item)| {
+                        let Some(other) = large.get(path) else {
+                            return true;
+                        };
+                        // 重複ファイルがあった場合
+                        let a = &item.merge_type;
+                        let b = &other.merge_type;
                         !matches!((a, b), (MergeType::Conflict, _) | (_, MergeType::Conflict))
                     })
                 };
