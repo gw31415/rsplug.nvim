@@ -188,14 +188,10 @@ impl Plugin {
         let (loaded_plugin, lock_info) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
                 tokio::fs::create_dir_all(&proj_root).await?;
-                let proj_root = tokio::fs::canonicalize(&proj_root).await?;
+                let proj_root: Arc<Path> = tokio::fs::canonicalize(&proj_root).await?.into();
                 let filesource = Arc::new(FileSource::Directory {
-                    path: proj_root.into(),
+                    path: proj_root.clone(),
                 });
-                let FileSource::Directory { path: proj_root } = filesource.as_ref() else {
-                    // SAFETY: すぐ上の行で `sourcefile` を `Directory` として宣言している。
-                    unsafe { std::hint::unreachable_unchecked() };
-                };
 
                 let repository = 'repo: {
                     if let Ok(mut repo) = git::open(proj_root.clone()).await {
