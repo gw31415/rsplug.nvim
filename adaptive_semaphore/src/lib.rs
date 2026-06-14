@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -21,6 +21,7 @@ pub struct AdaptiveSemaphore {
 struct State {
     inner: Mutex<Inner>,
     notify: Notify,
+    blocking_notify: Condvar,
 }
 
 #[derive(Debug)]
@@ -94,6 +95,7 @@ impl AdaptiveSemaphore {
                     previous: None,
                 }),
                 notify: Notify::new(),
+                blocking_notify: Condvar::new(),
             }),
         }
     }
@@ -126,6 +128,21 @@ impl AdaptiveSemaphore {
         }
     }
 
+    pub fn blocking_acquire(&self) -> AdaptiveSemaphorePermit {
+        let mut inner = self.state.inner.lock().unwrap();
+        loop {
+            if inner.in_flight < inner.limit {
+                inner.in_flight += 1;
+                return AdaptiveSemaphorePermit {
+                    semaphore: self.clone(),
+                    started_at: Instant::now(),
+                    finished: false,
+                };
+            }
+            inner = self.state.blocking_notify.wait(inner).unwrap();
+        }
+    }
+
     fn release(&self, outcome: Option<(Duration, bool)>) {
         let should_notify = {
             let mut inner = self.state.inner.lock().unwrap();
@@ -138,6 +155,7 @@ impl AdaptiveSemaphore {
         };
         if should_notify {
             self.state.notify.notify_one();
+            self.state.blocking_notify.notify_one();
         }
     }
 
@@ -151,6 +169,7 @@ impl AdaptiveSemaphore {
         let changed = self.state.inner.lock().unwrap().adjust(elapsed);
         if changed {
             self.state.notify.notify_waiters();
+            self.state.blocking_notify.notify_all();
         }
         changed
     }
@@ -458,5 +477,24 @@ mod tests {
 
         let max_semaphore = AdaptiveSemaphore::with_limits(16, 1, 256, Duration::from_secs(10));
         assert_eq!(max_semaphore.adjust_interval(), MAX_ADJUST_INTERVAL);
+    }
+
+    #[test]
+    fn blocking_acquire_waits_for_release() {
+        let semaphore = AdaptiveSemaphore::with_limits(1, 1, 1, MIN_ADJUST_INTERVAL);
+        let permit = semaphore.blocking_acquire();
+        let waiting = semaphore.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let permit = waiting.blocking_acquire();
+            tx.send(()).expect("test receiver should be alive");
+            permit.finish(false);
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        permit.finish(false);
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("blocking waiter should be notified");
+        handle.join().expect("waiter should not panic");
     }
 }

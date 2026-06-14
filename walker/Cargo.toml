@@ -8,6 +8,7 @@ default = []
 bench-persistent-workers = []
 
 [dependencies]
+adaptive_semaphore = { path = "../adaptive_semaphore" }
 hashbrown.workspace = true
 tokio.workspace = true
 wildmatch.workspace = true

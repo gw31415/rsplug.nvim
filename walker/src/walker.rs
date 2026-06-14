@@ -56,7 +56,6 @@ pub type WalkMessage = Result<WalkEvent, WalkError>;
 
 #[derive(Clone, Debug)]
 pub struct WalkerOptions {
-    pub max_parallelism: Option<usize>,
     pub channel_capacity: usize,
     pub files_only: bool,
 }
@@ -64,7 +63,6 @@ pub struct WalkerOptions {
 impl Default for WalkerOptions {
     fn default() -> Self {
         Self {
-            max_parallelism: None,
             channel_capacity: 1024,
             files_only: false,
         }
@@ -478,7 +476,6 @@ mod tests {
         let pattern = format!("{}/**/file.txt", root.display());
         let glob = CompiledGlob::new(&pattern).expect("glob must parse");
         let options = WalkerOptions {
-            max_parallelism: Some(1),
             ..WalkerOptions::default()
         };
         let mut rx = Walker::spawn_with_options(glob, options);

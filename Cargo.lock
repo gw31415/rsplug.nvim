@@ -1650,6 +1650,7 @@ dependencies = [
 name = "walker"
 version = "0.1.0"
 dependencies = [
+ "adaptive_semaphore",
  "fts",
  "hashbrown 0.17.1",
  "path-dedot",

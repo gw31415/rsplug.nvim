@@ -1,5 +1,6 @@
 use crate::compiled_glob::CompiledGlob;
 use crate::walker::{EntryKind, WalkError, WalkEvent, WalkMessage, WalkerOptions};
+use adaptive_semaphore::{AdaptiveSemaphore, AdaptiveSemaphorePermit};
 use hashbrown::HashSet;
 use std::cmp::max;
 use std::fs::FileType;
@@ -7,7 +8,8 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 struct MatchProgram {
@@ -67,8 +69,8 @@ pub(super) fn spawn_single_with_options(
     options: WalkerOptions,
 ) -> mpsc::Receiver<WalkMessage> {
     let (tx, rx) = mpsc::channel(options.channel_capacity.max(1));
-    let max_parallelism = options.max_parallelism.unwrap_or_else(default_parallelism);
-    let sem = Arc::new(Semaphore::new(max_parallelism.max(1)));
+    let semaphore =
+        AdaptiveSemaphore::with_limits(default_parallelism(), 1, 256, Duration::from_millis(64));
     let ctx = TraversalCtx {
         program: Arc::new(MatchProgram::new(compiled)),
         visited: Arc::new(Mutex::new(HashSet::new())),
@@ -109,10 +111,7 @@ pub(super) fn spawn_single_with_options(
                 if ctx.tx.is_closed() {
                     break;
                 }
-                let permit = match sem.clone().acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                };
+                let permit = semaphore.acquire().await;
                 let child_ctx = ctx.clone();
                 join_set.spawn(async move { process_state(child_ctx, state, permit).await });
             }
@@ -155,8 +154,14 @@ fn states_signature(states: &[usize]) -> u64 {
 async fn process_state(
     ctx: TraversalCtx,
     state: State,
-    _permit: OwnedSemaphorePermit,
+    permit: AdaptiveSemaphorePermit,
 ) -> Vec<State> {
+    let out = process_state_inner(ctx, state).await;
+    permit.finish(false);
+    out
+}
+
+async fn process_state_inner(ctx: TraversalCtx, state: State) -> Vec<State> {
     if ctx.tx.is_closed() || state.match_states.is_empty() {
         return Vec::new();
     }

@@ -1,5 +1,6 @@
 use crate::compiled_glob::CompiledGlob;
 use crate::walker::{EntryKind, WalkError, WalkEvent, WalkMessage, WalkerOptions};
+use adaptive_semaphore::AdaptiveSemaphore;
 use fts::fts::{Fts, FtsInfo, FtsSetOption, fts_option};
 use hashbrown::HashMap;
 use std::collections::{HashSet, VecDeque};
@@ -9,6 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 #[cfg(not(feature = "bench-persistent-workers"))]
 use tokio::task::JoinSet;
@@ -22,6 +24,8 @@ const SPLIT_DEPTH_LIMIT: usize = 2;
 const SPLIT_BACKLOG_FACTOR: usize = 4;
 const SPLIT_MIN_CHILDREN: usize = 24;
 const QUEUE_WAIT_MILLIS: u64 = 5;
+const ADAPTIVE_MAX_PARALLELISM: usize = 256;
+const ADAPTIVE_ADJUST_INTERVAL: Duration = Duration::from_millis(64);
 
 #[derive(Clone)]
 struct RootJob {
@@ -121,6 +125,7 @@ struct WorkerCtx {
     queue: Arc<JobQueue>,
     worker_tx: mpsc::Sender<WorkerMessage>,
     split_backlog_limit: usize,
+    traversal_semaphore: AdaptiveSemaphore,
 }
 
 #[cfg(feature = "bench-persistent-workers")]
@@ -189,11 +194,15 @@ pub(super) fn spawn_single_with_options(
     tokio::spawn(async move {
         let compiled = Arc::new(compiled);
         let files_only = options.files_only;
-        let max_parallelism = options
-            .max_parallelism
-            .unwrap_or_else(default_parallelism)
-            .max(1);
-        let max_jobs = max_parallelism.saturating_mul(SHARD_FACTOR).max(1);
+        let initial_parallelism = default_parallelism().max(1);
+        let worker_count = ADAPTIVE_MAX_PARALLELISM;
+        let max_jobs = worker_count.saturating_mul(SHARD_FACTOR).max(1);
+        let traversal_semaphore = AdaptiveSemaphore::with_limits(
+            initial_parallelism,
+            1,
+            ADAPTIVE_MAX_PARALLELISM,
+            ADAPTIVE_ADJUST_INTERVAL,
+        );
 
         let prepared = tokio::task::spawn_blocking({
             let compiled = Arc::clone(&compiled);
@@ -228,7 +237,7 @@ pub(super) fn spawn_single_with_options(
 
         let active_jobs = Arc::new(AtomicUsize::new(jobs.len()));
         let queue = Arc::new(JobQueue::new(jobs));
-        let split_backlog_limit = max_parallelism.saturating_mul(SPLIT_BACKLOG_FACTOR).max(1);
+        let split_backlog_limit = worker_count.saturating_mul(SPLIT_BACKLOG_FACTOR).max(1);
 
         let (worker_tx, worker_rx) =
             mpsc::channel::<WorkerMessage>(options.channel_capacity.max(1));
@@ -241,9 +250,9 @@ pub(super) fn spawn_single_with_options(
         #[cfg(not(feature = "bench-persistent-workers"))]
         let mut worker_set = JoinSet::new();
         #[cfg(feature = "bench-persistent-workers")]
-        let mut waiters = Vec::with_capacity(max_parallelism);
+        let mut waiters = Vec::with_capacity(worker_count);
 
-        for _ in 0..max_parallelism {
+        for _ in 0..worker_count {
             let ctx = WorkerCtx {
                 compiled: Arc::clone(&compiled),
                 files_only,
@@ -252,11 +261,12 @@ pub(super) fn spawn_single_with_options(
                 queue: Arc::clone(&queue),
                 worker_tx: worker_tx.clone(),
                 split_backlog_limit,
+                traversal_semaphore: traversal_semaphore.clone(),
             };
             #[cfg(not(feature = "bench-persistent-workers"))]
             worker_set.spawn_blocking(move || run_worker(ctx));
             #[cfg(feature = "bench-persistent-workers")]
-            waiters.push(persistent_pool::global(max_parallelism).spawn(move || run_worker(ctx)));
+            waiters.push(persistent_pool::global(worker_count).spawn(move || run_worker(ctx)));
         }
         drop(worker_tx);
 
@@ -347,10 +357,23 @@ fn run_fts_job(ctx: &WorkerCtx, job: RootJob) {
     let mut pending_events = Vec::with_capacity(EMIT_BATCH_SIZE);
     let mut next_states_scratch = Vec::new();
 
-    while let Some(entry) = fts.read() {
+    loop {
         if ctx.cancel.load(Ordering::Relaxed) {
             return;
         }
+
+        let permit = ctx.traversal_semaphore.blocking_acquire();
+        let entry = fts.read();
+        let is_error = entry.as_ref().is_some_and(|entry| {
+            matches!(
+                entry.info,
+                FtsInfo::IsErr | FtsInfo::IsDontRead | FtsInfo::IsNoStat
+            )
+        });
+        permit.finish(is_error);
+        let Some(entry) = entry else {
+            break;
+        };
 
         let level = match usize::try_from(entry.level) {
             Ok(level) => level,
@@ -499,6 +522,7 @@ fn run_fts_job(ctx: &WorkerCtx, job: RootJob) {
                 level,
                 &ctx.active_jobs,
                 ctx.split_backlog_limit,
+                &ctx.traversal_semaphore,
             )
         {
             if is_match && !ctx.files_only {
@@ -576,6 +600,7 @@ fn should_split_directory(
     depth: usize,
     active_jobs: &AtomicUsize,
     split_backlog_limit: usize,
+    traversal_semaphore: &AdaptiveSemaphore,
 ) -> bool {
     if depth > SPLIT_DEPTH_LIMIT {
         return false;
@@ -583,24 +608,34 @@ fn should_split_directory(
     if active_jobs.load(Ordering::Relaxed) >= split_backlog_limit {
         return false;
     }
-    has_min_children(path, SPLIT_MIN_CHILDREN)
+    has_min_children(path, SPLIT_MIN_CHILDREN, traversal_semaphore)
 }
 
-fn has_min_children(path: &Path, min_children: usize) -> bool {
+fn has_min_children(
+    path: &Path,
+    min_children: usize,
+    traversal_semaphore: &AdaptiveSemaphore,
+) -> bool {
+    let permit = traversal_semaphore.blocking_acquire();
+    let result = has_min_children_inner(path, min_children);
+    let is_error = result.is_err();
+    permit.finish(is_error);
+    result.unwrap_or(false)
+}
+
+fn has_min_children_inner(path: &Path, min_children: usize) -> io::Result<bool> {
     let mut count = 0usize;
-    let Ok(read_dir) = std::fs::read_dir(path) else {
-        return false;
-    };
+    let read_dir = std::fs::read_dir(path)?;
     for entry in read_dir {
         if entry.is_err() {
             continue;
         }
         count += 1;
         if count >= min_children {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn flush_events(
