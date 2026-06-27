@@ -35,10 +35,6 @@ jobs:
           - os: macos-15-intel    # Intel
             target: x86_64-apple-darwin
             archive: tar.gz
-          # Windows
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
 
     steps:
       - uses: actions/checkout@v4
