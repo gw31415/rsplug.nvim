@@ -6,6 +6,9 @@ repository.workspace = true
 license.workspace = true
 description = "Directed acyclic graph (DAG) data structure library"
 
+[lib]
+name = "dag"
+
 [dependencies]
 thiserror.workspace = true
 hashbrown = { optional = true, workspace = true }

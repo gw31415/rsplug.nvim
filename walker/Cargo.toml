@@ -6,6 +6,10 @@ repository.workspace = true
 license.workspace = true
 description = "High-performance async directory walker with adaptive concurrency"
 exclude = ["vendor/"]
+autobins = false
+
+[lib]
+name = "walker"
 
 [features]
 default = []

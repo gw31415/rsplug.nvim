@@ -6,5 +6,8 @@ repository.workspace = true
 license.workspace = true
 description = "File path glob pattern matching and expansion library"
 
+[lib]
+name = "file_specifier"
+
 [dependencies]
 wildmatch.workspace = true

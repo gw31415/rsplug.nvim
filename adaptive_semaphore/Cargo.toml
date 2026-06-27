@@ -6,5 +6,8 @@ repository.workspace = true
 license.workspace = true
 description = "Adaptive concurrency semaphore for Tokio async runtime"
 
+[lib]
+name = "adaptive_semaphore"
+
 [dependencies]
 tokio.workspace = true
