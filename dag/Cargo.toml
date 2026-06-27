@@ -1,5 +1,5 @@
 [package]
-name = "dag"
+name = "rsplug-dag"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

@@ -14,10 +14,10 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 wildmatch = "2.6"
 # Internal crates (version must match [workspace.package].version)
-adaptive_semaphore = { path = "adaptive_semaphore", version = "0.1.0" }
-dag = { path = "dag", version = "0.1.0" }
-file_specifier = { path = "file_specifier", version = "0.1.0" }
-walker = { path = "walker", version = "0.1.0" }
+adaptive_semaphore = { package = "rsplug-adaptive-semaphore", path = "adaptive_semaphore", version = "0.1.0" }
+dag = { package = "rsplug-dag", path = "dag", version = "0.1.0" }
+file_specifier = { package = "rsplug-file-specifier", path = "file_specifier", version = "0.1.0" }
+walker = { package = "rsplug-walker", path = "walker", version = "0.1.0" }
 
 [profile.release]
 strip = true

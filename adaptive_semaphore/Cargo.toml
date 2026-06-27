@@ -1,5 +1,5 @@
 [package]
-name = "adaptive_semaphore"
+name = "rsplug-adaptive-semaphore"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

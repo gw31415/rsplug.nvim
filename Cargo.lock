@@ -3,13 +3,6 @@
 version = 4
 
 [[package]]
-name = "adaptive_semaphore"
-version = "0.1.0"
-dependencies = [
- "tokio",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -244,14 +237,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dag"
-version = "0.1.0"
-dependencies = [
- "hashbrown 0.17.1",
- "thiserror",
-]
-
-[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -356,13 +341,6 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
-
-[[package]]
-name = "file_specifier"
-version = "0.1.0"
-dependencies = [
- "wildmatch",
-]
 
 [[package]]
 name = "filetime"
@@ -1102,17 +1080,18 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 name = "rsplug"
 version = "0.1.0"
 dependencies = [
- "adaptive_semaphore",
  "clap",
  "console",
- "dag",
- "file_specifier",
  "git2",
  "hashbrown 0.17.1",
  "indicatif",
  "itertools",
  "once_cell",
  "regex",
+ "rsplug-adaptive-semaphore",
+ "rsplug-dag",
+ "rsplug-file-specifier",
+ "rsplug-walker",
  "sailfish",
  "serde",
  "serde_json",
@@ -1121,9 +1100,42 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "unicode-width",
- "walker",
  "wildmatch",
  "xxhash-rust",
+]
+
+[[package]]
+name = "rsplug-adaptive-semaphore"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "rsplug-dag"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.17.1",
+ "thiserror",
+]
+
+[[package]]
+name = "rsplug-file-specifier"
+version = "0.1.0"
+dependencies = [
+ "wildmatch",
+]
+
+[[package]]
+name = "rsplug-walker"
+version = "0.1.0"
+dependencies = [
+ "fts",
+ "hashbrown 0.17.1",
+ "path-dedot",
+ "rsplug-adaptive-semaphore",
+ "tokio",
+ "wildmatch",
 ]
 
 [[package]]
@@ -1644,18 +1656,6 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
-]
-
-[[package]]
-name = "walker"
-version = "0.1.0"
-dependencies = [
- "adaptive_semaphore",
- "fts",
- "hashbrown 0.17.1",
- "path-dedot",
- "tokio",
- "wildmatch",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "file_specifier"
+name = "rsplug-file-specifier"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

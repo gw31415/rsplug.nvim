@@ -5,7 +5,6 @@ on:
     tags:
       - "v*"
 
-# Cancel in-progress runs for the same tag
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -22,19 +21,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux
+          # Linux (native runners — no cross-linker needed)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
-            cross: true
           # macOS
-          - os: macos-latest
+          - os: macos-15          # ARM64
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-latest
+          - os: macos-15-intel    # Intel
             target: x86_64-apple-darwin
             archive: tar.gz
           # Windows
@@ -45,19 +43,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Set version from tag
         run: |
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
-          rustup target add ${{ matrix.target }}
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting version to ${VERSION}"
+          bash scripts/set-version.sh "${VERSION}"
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - name: Build binary
-        run: |
-          cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -85,29 +85,36 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      id-token: write   # Required for trusted publishing
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
-
       - name: Set version from tag
         run: |
-          # Strip leading 'v' from tag name: v0.2.0 → 0.2.0
           VERSION="${GITHUB_REF_NAME#v}"
           echo "Setting version to ${VERSION}"
           bash scripts/set-version.sh "${VERSION}"
 
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish (dependency order)
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          for crate in adaptive_semaphore dag file_specifier walker rsplug; do
-            echo "→ Publishing ${crate}…"
-            cargo publish -p "${crate}" --no-verify
-            sleep 5
+          VERSION="${GITHUB_REF_NAME#v}"
+          for crate in rsplug-adaptive-semaphore rsplug-dag rsplug-file-specifier rsplug-walker rsplug; do
+            echo "→ Checking ${crate} ${VERSION}…"
+            if curl -fsS -A "rsplug.nvim release workflow" "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null; then
+              echo "✓ ${crate} ${VERSION} is already published; skipping"
+              continue
+            fi
+
+            echo "→ Publishing ${crate} ${VERSION}…"
+            cargo publish -p "${crate}" --no-verify --allow-dirty
+            sleep 10
           done
 
   # ── Create GitHub Release with all binary assets ───────────────
@@ -119,16 +126,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
-
-      - name: Set version from tag
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/set-version.sh "${VERSION}"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
