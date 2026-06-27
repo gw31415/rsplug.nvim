@@ -11,17 +11,20 @@
 # will likely look very different (and much more reasonable)
 
 [package]
-name = "fts"
+name = "rsplug-fts"
 edition = "2015"
 version = "0.3.0"
 authors = ["dalance <dalance@gmail.com>"]
 build = "build.rs"
-exclude = ["test_data/*"]
-description = "A Rust library for high performance directory walking using libc fts"
+exclude = ["test_data/*", ".cargo_vcs_info.json", ".cargo-ok", "Cargo.toml.orig"]
+description = "Vendored fork of dalance/fts-rs for rsplug.nvim"
 readme = "README.md"
 keywords = ["libc", "directory", "walk", "recursive", "iterator"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/dalance/fts-rs"
+repository = "https://github.com/gw31415/rsplug.nvim"
+
+[lib]
+name = "fts"
 [package.metadata.release]
 dev-version-ext = "pre"
 pre-release-commit-message = "Prepare to v{{version}}"

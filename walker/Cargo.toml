@@ -1,6 +1,6 @@
 [package]
 name = "rsplug-walker"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -24,4 +24,4 @@ wildmatch.workspace = true
 path-dedot = { version = "3.1.1", features = ["once_cell_cache"] }
 
 [target.'cfg(all(unix, not(windows)))'.dependencies]
-fts = { version = "0.3.0", path = "vendor/fts" }
+fts.workspace = true

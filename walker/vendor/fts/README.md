@@ -1,75 +1,101 @@
-# fts-rs
+# rsplug-fts
 
-[![Actions Status](https://github.com/dalance/fts-rs/workflows/Regression/badge.svg)](https://github.com/dalance/fts-rs/actions)
-[![Crates.io](https://img.shields.io/crates/v/fts.svg)](https://crates.io/crates/fts)
-[![Docs.rs](https://docs.rs/fts/badge.svg)](https://docs.rs/fts)
-[![codecov](https://codecov.io/gh/dalance/fts-rs/branch/master/graph/badge.svg)](https://codecov.io/gh/dalance/fts-rs)
+`rsplug-fts` is a vendored fork of [`fts-rs`](https://github.com/dalance/fts-rs),
+a Rust wrapper around libc `fts` for high-performance directory walking.
 
-A Rust library for high performance directory walking using libc fts.
+This package is published for use by [`rsplug.nvim`](https://github.com/gw31415/rsplug.nvim).
+It is **not** the upstream `fts` crate and does not imply endorsement by the
+upstream author.
 
-[Documentation](https://docs.rs/fts)
+## Acknowledgement
+
+The original project is:
+
+- Project: [`dalance/fts-rs`](https://github.com/dalance/fts-rs)
+- crates.io: [`fts`](https://crates.io/crates/fts)
+- Original author/copyright holder: `dalance`
+- Original copyright notice: `Copyright (c) 2018 dalance`
+- Original license: `MIT OR Apache-2.0`
+
+The original license texts are preserved in this package as `LICENSE-MIT` and
+`LICENSE-APACHE`. Additional attribution and change notes are in `NOTICE.md`.
+
+## Why this package exists
+
+`rsplug.nvim` vendors `fts-rs` so it can depend on the known vendored source
+rather than the upstream `fts` package when publishing its workspace crates.
+The crates.io package name is therefore changed to `rsplug-fts`, while the Rust
+library crate name remains `fts` for source compatibility.
 
 ## Usage
 
-```Cargo.toml
+```toml
 [dependencies]
-fts = "0.3.0"
+fts = { package = "rsplug-fts", version = "0.3.0" }
 ```
 
-## Example
+Then use the library as `fts` in Rust code:
 
-Use `WalkDir` for directory walking:
-
-```rust,skt-default
+```rust
 use std::path::Path;
 use fts::walkdir::{WalkDir, WalkDirConf};
 
-let path = Path::new( "." );
-for p in WalkDir::new( WalkDirConf::new( path ) ) {
-    println!( "{:?}", p.unwrap() );
+let path = Path::new(".");
+for entry in WalkDir::new(WalkDirConf::new(path)) {
+    println!("{:?}", entry.unwrap());
 }
 ```
 
-Call `fts_*` function directly:
+Call `fts_*` functions directly:
 
-```rust,skt-default
+```rust
 use std::ffi::CString;
 use fts::ffi::{fts_open, fts_read, fts_close, FTS_LOGICAL};
 
-let path    = CString::new( "." ).unwrap();
-let paths   = vec![path.as_ptr(), std::ptr::null()];
-let fts     = unsafe { fts_open ( paths.as_ptr(), FTS_LOGICAL, None ) };
-let _ftsent = unsafe { fts_read ( fts ) };
-let _       = unsafe { fts_close( fts ) };
+let path = CString::new(".").unwrap();
+let paths = vec![path.as_ptr(), std::ptr::null()];
+let fts = unsafe { fts_open(paths.as_ptr(), FTS_LOGICAL, None) };
+let _ftsent = unsafe { fts_read(fts) };
+let _ = unsafe { fts_close(fts) };
 ```
 
-## Benchmark
+## Changes from upstream
 
-A `cargo bench` result is the following.
-`fts_walkdir` is this library, `readdir` is `std::fs:read_dir`, `walkdir` is [walkdir::WalkDir](https://github.com/BurntSushi/walkdir).
-a suffix `_metadata` means using call `DirEntry::metadata()`.
+See `NOTICE.md` for the maintained list of packaging changes. In short, this
+fork changes package metadata/name for `rsplug.nvim` and keeps the library crate
+name as `fts`.
 
+### macOS-specific note
+
+`rsplug-walker` uses this vendored package on Unix platforms, including macOS,
+instead of depending on the upstream crates.io package named `fts`.
+
+The dependency is intentionally written with a different package name but the
+same Rust crate name:
+
+```toml
+fts = { package = "rsplug-fts", version = "0.3.0" }
 ```
-test fts_walkdir          ... bench: 315,114,126 ns/iter (+/- 8,478,709)
-test fts_walkdir_metadata ... bench: 480,089,245 ns/iter (+/- 11,478,335)
-test readdir              ... bench: 575,856,224 ns/iter (+/- 15,021,486)
-test readdir_metadata     ... bench: 790,838,218 ns/iter (+/- 12,780,010)
-test walkdir              ... bench: 688,884,058 ns/iter (+/- 8,023,838)
-test walkdir_metadata     ... bench: 904,379,691 ns/iter (+/- 10,212,776)
-```
+
+This was done because the upstream `fts` registry package caused downstream
+`rsplug` binary verification/linking on macOS to fail with unresolved libc
+`fts_*` symbols, including `_fts_open$INODE64`, `_fts_read$INODE64`,
+`_fts_set$INODE64`, and `_fts_close$INODE64`. Publishing the vendored source as
+`rsplug-fts` makes that macOS-sensitive dependency explicit and keeps the
+published dependency graph aligned with the source used by `rsplug.nvim`.
+
+This is a packaging/forking difference for `rsplug.nvim`; it is not an upstream
+claim or endorsement.
 
 ## License
 
-Licensed under either of
+Licensed under either of:
 
- * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
-at your option.
+at your option, matching the upstream `fts-rs` license.
 
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in the work by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms or
-conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this vendored fork shall be dual licensed as above, without any
+additional terms or conditions.
