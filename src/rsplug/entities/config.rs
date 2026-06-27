@@ -173,6 +173,7 @@ impl DagNode for PluginConfig {
         self.custom_name.as_ref().map_or(
             match &self.cache.repo {
                 RepoSource::GitHub { repo, .. } => repo.as_ref(),
+                RepoSource::Git { url, .. } => url.as_ref(),
             },
             |v| v,
         )

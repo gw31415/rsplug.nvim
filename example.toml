@@ -55,3 +55,13 @@ lua_before = "vim.api.nvim_set_var('winresizer_start_key', '<c-w>e')"
 repo = "navarasu/onedark.nvim"
 # Disable lazy loading
 start = true
+
+# General Git URL (any hosting service supported)
+[[plugins]]
+repo = "https://gitlab.com/HiPhish/rainbow-delimiters.nvim"
+on_event = "BufReadPre"
+
+# URL with explicit revision (branch, tag, or wildcard)
+[[plugins]]
+repo = "https://codeberg.org/andyg/leap.nvim@main"
+on_event = "InsertEnter"

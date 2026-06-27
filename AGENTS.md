@@ -30,6 +30,15 @@ fit into Nix-based workflows.
 - Lock file format is **JSON** (`rsplug.lock.json`) with a `version` field and
   per-repository locked resources (`type`, `rev`).
 
+## Repository source model
+
+`repo` in TOML is parsed as a `RepoSource` enum with two variants:
+
+- **`GitHub { owner, repo, rev }`** — shorthand `owner/repo[@rev]` (no `://` in string)
+- **`Git { url, rev }`** — any string containing `://`; the `@rev` suffix is split from the path portion of the URL (authority-section `@` for userinfo is ignored)
+
+Cache directory for URL sources: scheme, auth, port, and `.git` suffix are stripped from the URL, leaving `host/path` as a relative path under `~/.cache/rsplug/`.
+
 ## Implemented status (synced with resolved GitHub issues + current log implementation)
 
 - TOML parsing.

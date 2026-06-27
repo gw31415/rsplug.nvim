@@ -44,6 +44,13 @@ pub enum RepoSource {
         /// リビジョン
         rev: Option<Arc<str>>,
     },
+    /// 任意の Git リポジトリ URL
+    Git {
+        /// リポジトリの URL
+        url: Arc<str>,
+        /// リビジョン
+        rev: Option<Arc<str>>,
+    },
 }
 
 impl Serialize for RepoSource {
@@ -59,6 +66,13 @@ impl Serialize for RepoSource {
                     format!("{}/{}", owner, repo)
                 }
             }
+            RepoSource::Git { url, rev } => {
+                if let Some(r) = rev {
+                    format!("{}@{}", url, r)
+                } else {
+                    url.to_string()
+                }
+            }
         };
         serializer.serialize_str(&s)
     }
@@ -69,6 +83,7 @@ impl RepoSource {
     pub fn url(&self) -> String {
         match self {
             RepoSource::GitHub { owner, repo, .. } => util::github::url(owner, repo),
+            RepoSource::Git { url, .. } => url.to_string(),
         }
     }
 
@@ -82,18 +97,59 @@ impl RepoSource {
                 path.push(repo.as_ref());
                 path
             }
+            RepoSource::Git { url, .. } => {
+                // scheme://[userinfo@]host[:port]/path → host/path (no scheme, auth, port, or .git)
+                let s = url.as_ref();
+                let after_scheme = s.find("://").map(|i| &s[i + 3..]).unwrap_or(s);
+                let normalized = if let Some(slash) = after_scheme.find('/') {
+                    let authority = &after_scheme[..slash];
+                    let host_start = authority.rfind('@').map(|at| at + 1).unwrap_or(0);
+                    let host = authority[host_start..].split(':').next().unwrap_or(&authority[host_start..]);
+                    format!("{}{}", host, &after_scheme[slash..])
+                } else {
+                    let host_start = after_scheme.rfind('@').map(|at| at + 1).unwrap_or(0);
+                    after_scheme[host_start..].split(':').next().unwrap_or(&after_scheme[host_start..]).to_string()
+                };
+                let path_str = normalized.trim_end_matches(".git");
+                let mut result = PathBuf::new();
+                for comp in path_str.split('/').filter(|s| !s.is_empty()) {
+                    result.push(comp);
+                }
+                result
+            }
         }
+    }
+}
+
+/// URL末尾の `@rev` を分離する。authority部（`://` 〜 最初の `/`）内の `@` は無視する。
+fn split_url_rev(s: &str) -> (&str, Option<&str>) {
+    let path_start = s
+        .find("://")
+        .and_then(|i| s[i + 3..].find('/').map(|j| i + 3 + j))
+        .unwrap_or(s.len());
+    if let Some(at_offset) = s[path_start..].rfind('@') {
+        let at_pos = path_start + at_offset;
+        (&s[..at_pos], Some(&s[at_pos + 1..]))
+    } else {
+        (s, None)
     }
 }
 
 impl FromStr for RepoSource {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains("://") {
+            let (url, rev) = split_url_rev(s);
+            return Ok(RepoSource::Git {
+                url: url.into(),
+                rev: rev.map(Into::into),
+            });
+        }
         static GITHUB_REPO_REGEX: Lazy<Regex> = Lazy::new(|| {
             Regex::new(r"^(?<owner>[a-zA-Z0-9]([a-zA-Z0-9]?|[\-]?([a-zA-Z0-9])){0,38})/(?<repo>[a-zA-Z0-9][a-zA-Z0-9_.-]{0,38})(@(?<rev>\S+))?$").unwrap()
         });
         let Some(cap) = GITHUB_REPO_REGEX.captures(s) else {
-            return Err("GitHub repository format must be 'owner/repo[@rev]'");
+            return Err("GitHub repository format must be 'owner/repo[@rev]' or a URL containing '://'");
         };
         let owner = cap["owner"].to_string();
         let repo = cap["repo"].into();
@@ -185,252 +241,258 @@ impl Plugin {
 
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
-        let (loaded_plugin, lock_info) = match repo {
+
+        // バリアント固有のフィールドを抽出（ログ・エラー表示用）
+        let (rev, logid, repo_name): (Option<Arc<str>>, String, Arc<str>) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
-                tokio::fs::create_dir_all(&proj_root).await?;
-                let proj_root: Arc<Path> = tokio::fs::canonicalize(&proj_root).await?.into();
-                let filesource = Arc::new(FileSource::Directory {
-                    path: proj_root.clone(),
-                });
-
-                let repository = 'repo: {
-                    if let Ok(mut repo) = git::open(proj_root.clone()).await {
-                        // リポジトリが存在する場合
-
-                        // アップデート処理
-                        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
-                            // locked モード
-                            if !is_full_hex_hash(locked_rev) {
-                                return Err(invalid_data(format!(
-                                    "Locked revision must be full hash for {}: got {}",
-                                    url, locked_rev
-                                )));
-                            }
-                            Oid::from_str(locked_rev).map_err(Error::Git2)?
-                        } else if update {
-                            msg(Message::Cache("Updating", url.clone()));
-                            git::ls_remote(url.clone(), rev).await?
-                        } else {
-                            break 'repo repo;
-                        };
-                        repo.fetch(oid).await?;
-                        msg(Message::Cache("Updating:done", url.clone()));
-                        repo
-                    } else if install {
-                        // リポジトリがない場合のインストール処理
-                        msg(Message::Cache("Initializing", url.clone()));
-                        let mut repo = git::init(proj_root.clone(), url.clone()).await?;
-                        msg(Message::Cache("Fetching", url.clone()));
-                        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
-                            // locked モード
-                            if !is_full_hex_hash(locked_rev) {
-                                return Err(invalid_data(format!(
-                                    "Locked revision must be full hash for {}: got {}",
-                                    url, locked_rev
-                                )));
-                            }
-                            Oid::from_str(locked_rev).map_err(Error::Git2)?
-                        } else {
-                            git::ls_remote(url.clone(), rev).await?
-                        };
-                        repo.fetch(oid).await?;
-                        repo
-                    } else {
-                        if locked_rev.is_some() {
-                            return Err(invalid_data(format!(
-                                "Missing cached repository for locked revision: {}",
-                                url
-                            )));
-                        }
-                        // 見つからない場合はスキップ
-                        return Ok(None);
-                    }
-                };
-
-                let head_rev = repository.head_hash().await?;
-                let head_rev_str = String::from_utf8_lossy(&head_rev).to_string();
-
-                if let Some(locked_rev) = locked_rev.as_deref()
-                    && head_rev_str != locked_rev
-                {
-                    return Err(invalid_data(format!(
-                        "Locked revision mismatch for {}: expected {}, got {}",
-                        url, locked_rev, head_rev_str
-                    )));
-                }
-
-                let mut id =
-                    build_aware_plugin_id(&repository, head_rev, &build, lua_build.as_deref())
-                        .await?;
-
-                // ビルド実行
-                if !build.is_empty() || lua_build.is_some() {
-                    let mut lua_runtimepaths = Vec::new();
-                    let mut seen_runtimepaths = HashSet::new();
-                    let mut add_runtimepath = |path: PathBuf| {
-                        if seen_runtimepaths.insert(path.clone()) {
-                            lua_runtimepaths.push(path);
-                        }
-                    };
-                    add_runtimepath(proj_root.to_path_buf());
-                    for dep_cachedir in &dependency_cachedirs {
-                        let dep_path = cache_dir.as_ref().join(dep_cachedir);
-                        if let Ok(dep_path) = tokio::fs::canonicalize(dep_path).await {
-                            add_runtimepath(dep_path);
-                        }
-                    }
-
-                    let next_build_success_id = id.as_str();
-                    let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
-                    if let Some(ref prev_build_success_id) =
-                        tokio::fs::read(&rsplug_build_success_file).await.ok()
-                        && prev_build_success_id == next_build_success_id.as_bytes()
-                    {
-                        // ビルド成功の痕跡があればビルドをスキップ
-                    } else {
-                        let exec = async {
-                            let _ = tokio::fs::remove_file(&rsplug_build_success_file).await;
-                            let logid = {
-                                const MAX_LOGID_LEN: usize = 20;
-                                let repo = truncate(&repo, MAX_LOGID_LEN);
-
-                                let len = MAX_LOGID_LEN.saturating_sub(repo.width_cjk() + 1);
-                                if len < 2 {
-                                    repo
-                                } else {
-                                    let mut owner = truncate(&owner, len);
-                                    owner.push('/');
-                                    owner.push_str(&repo);
-                                    owner
-                                }
-                            };
-
-                            if !build.is_empty() {
-                                let id = Arc::new(format!("{logid} (sh)"));
-                                let result: Result<(), Error> = {
-                                    let id = id.clone();
-                                    async {
-                                        let code = execute(build.iter(), proj_root.clone(), {
-                                            move |(stdtype, line)| {
-                                                msg(Message::CacheBuildProgress {
-                                                    id: id.clone(),
-                                                    stdtype,
-                                                    line,
-                                                });
-                                            }
-                                        })
-                                        .await?;
-                                        if code != 0 {
-                                            return Err(Error::BuildScriptFailed {
-                                                code,
-                                                build: build.clone(),
-                                                repo: repo.clone(),
-                                            });
-                                        }
-                                        Ok(())
-                                    }
-                                }
-                                .await;
-                                msg(Message::CacheBuildFinished {
-                                    id,
-                                    success: result.is_ok(),
-                                });
-                                result?;
-                            }
-
-                            if let Some(lua_build) = lua_build.as_deref() {
-                                let id = Arc::new(format!("{logid} (lua)"));
-                                let result: Result<(), Error> = {
-                                    let id = id.clone();
-                                    async {
-                                        let lua_build_path =
-                                            create_lua_build_script(lua_build, &lua_runtimepaths)
-                                                .await?;
-                                        let code = execute(
-                                            lua_build_nvim_command(lua_build_path.as_os_str()),
-                                            proj_root.clone(),
-                                            move |(stdtype, line)| {
-                                                msg(Message::CacheBuildProgress {
-                                                    id: id.clone(),
-                                                    stdtype,
-                                                    line,
-                                                });
-                                            },
-                                        )
-                                        .await;
-                                        let _ = tokio::fs::remove_file(&lua_build_path).await;
-                                        let code = code?;
-                                        if code != 0 {
-                                            return Err(Error::BuildLuaScriptFailed { code, repo });
-                                        }
-                                        Ok(())
-                                    }
-                                }
-                                .await;
-                                msg(Message::CacheBuildFinished {
-                                    id,
-                                    success: result.is_ok(),
-                                });
-                                result?;
-                            }
-
-                            Ok::<_, Error>(())
-                        };
-                        exec.await?;
-                        id = build_aware_plugin_id(
-                            &repository,
-                            repository.head_hash().await?,
-                            &build,
-                            lua_build.as_deref(),
-                        )
-                        .await?;
-                        tokio::fs::write(rsplug_build_success_file, id.as_str().as_bytes()).await?;
-                    }
-                }
-
-                let files = repository.ls_files().await?;
-                let mut lazy_type = lazy_type.clone();
-                for luam in extract_unique_lua_modules(files.iter()) {
-                    lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
-                }
-                let files: HowToPlaceFiles = if to_sym {
-                    HowToPlaceFiles::SymlinkDirectory(proj_root.clone())
+                const MAX_LOGID_LEN: usize = 20;
+                let repo_t = truncate(&repo, MAX_LOGID_LEN);
+                let len = MAX_LOGID_LEN.saturating_sub(repo_t.width_cjk() + 1);
+                let logid = if len < 2 {
+                    repo_t
                 } else {
-                    HowToPlaceFiles::CopyEachFile(
-                        files
-                            .into_iter()
-                            .filter_map(|path| {
-                                let ignored = merge.ignore.matched(&path);
-                                if !ignored && proj_root.join(&path).is_file() {
-                                    Some((
-                                        path,
-                                        FileItem {
-                                            source: filesource.clone(),
-                                            merge_type: MergeType::Conflict,
-                                        },
-                                    ))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect(),
-                    )
+                    let mut o = truncate(&owner, len);
+                    o.push('/');
+                    o.push_str(&repo_t);
+                    o
                 };
-
-                let loaded = LoadedPlugin {
-                    id,
-                    files,
-                    lazy_type,
-                    script: script.clone(),
-                    is_plugctl: false,
-                };
-                let lock_info = (url.to_string(), head_rev_str);
-
-                (loaded, lock_info)
+                (rev, logid, repo)
+            }
+            RepoSource::Git { url, rev } => {
+                const MAX_LOGID_LEN: usize = 20;
+                (rev, truncate(&url, MAX_LOGID_LEN), url)
             }
         };
 
-        Ok(Some((loaded_plugin, lock_info)))
+        tokio::fs::create_dir_all(&proj_root).await?;
+        let proj_root: Arc<Path> = tokio::fs::canonicalize(&proj_root).await?.into();
+        let filesource = Arc::new(FileSource::Directory {
+            path: proj_root.clone(),
+        });
+
+        let repository = 'repo: {
+            if let Ok(mut repo) = git::open(proj_root.clone()).await {
+                // リポジトリが存在する場合
+
+                // アップデート処理
+                let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+                    // locked モード
+                    if !is_full_hex_hash(locked_rev) {
+                        return Err(invalid_data(format!(
+                            "Locked revision must be full hash for {}: got {}",
+                            url, locked_rev
+                        )));
+                    }
+                    Oid::from_str(locked_rev).map_err(Error::Git2)?
+                } else if update {
+                    msg(Message::Cache("Updating", url.clone()));
+                    git::ls_remote(url.clone(), rev.clone()).await?
+                } else {
+                    break 'repo repo;
+                };
+                repo.fetch(oid).await?;
+                msg(Message::Cache("Updating:done", url.clone()));
+                repo
+            } else if install {
+                // リポジトリがない場合のインストール処理
+                msg(Message::Cache("Initializing", url.clone()));
+                let mut repo = git::init(proj_root.clone(), url.clone()).await?;
+                msg(Message::Cache("Fetching", url.clone()));
+                let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+                    // locked モード
+                    if !is_full_hex_hash(locked_rev) {
+                        return Err(invalid_data(format!(
+                            "Locked revision must be full hash for {}: got {}",
+                            url, locked_rev
+                        )));
+                    }
+                    Oid::from_str(locked_rev).map_err(Error::Git2)?
+                } else {
+                    git::ls_remote(url.clone(), rev).await?
+                };
+                repo.fetch(oid).await?;
+                repo
+            } else {
+                if locked_rev.is_some() {
+                    return Err(invalid_data(format!(
+                        "Missing cached repository for locked revision: {}",
+                        url
+                    )));
+                }
+                // 見つからない場合はスキップ
+                return Ok(None);
+            }
+        };
+
+        let head_rev = repository.head_hash().await?;
+        let head_rev_str = String::from_utf8_lossy(&head_rev).to_string();
+
+        if let Some(locked_rev) = locked_rev.as_deref()
+            && head_rev_str != locked_rev
+        {
+            return Err(invalid_data(format!(
+                "Locked revision mismatch for {}: expected {}, got {}",
+                url, locked_rev, head_rev_str
+            )));
+        }
+
+        let mut id =
+            build_aware_plugin_id(&repository, head_rev, &build, lua_build.as_deref())
+                .await?;
+
+        // ビルド実行
+        if !build.is_empty() || lua_build.is_some() {
+            let mut lua_runtimepaths = Vec::new();
+            let mut seen_runtimepaths = HashSet::new();
+            let mut add_runtimepath = |path: PathBuf| {
+                if seen_runtimepaths.insert(path.clone()) {
+                    lua_runtimepaths.push(path);
+                }
+            };
+            add_runtimepath(proj_root.to_path_buf());
+            for dep_cachedir in &dependency_cachedirs {
+                let dep_path = cache_dir.as_ref().join(dep_cachedir);
+                if let Ok(dep_path) = tokio::fs::canonicalize(dep_path).await {
+                    add_runtimepath(dep_path);
+                }
+            }
+
+            let next_build_success_id = id.as_str();
+            let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
+            if let Some(ref prev_build_success_id) =
+                tokio::fs::read(&rsplug_build_success_file).await.ok()
+                && prev_build_success_id == next_build_success_id.as_bytes()
+            {
+                // ビルド成功の痕跡があればビルドをスキップ
+            } else {
+                let exec = async {
+                    let _ = tokio::fs::remove_file(&rsplug_build_success_file).await;
+
+                    if !build.is_empty() {
+                        let id = Arc::new(format!("{logid} (sh)"));
+                        let result: Result<(), Error> = {
+                            let id = id.clone();
+                            async {
+                                let code = execute(build.iter(), proj_root.clone(), {
+                                    move |(stdtype, line)| {
+                                        msg(Message::CacheBuildProgress {
+                                            id: id.clone(),
+                                            stdtype,
+                                            line,
+                                        });
+                                    }
+                                })
+                                .await?;
+                                if code != 0 {
+                                    return Err(Error::BuildScriptFailed {
+                                        code,
+                                        build: build.clone(),
+                                        repo: repo_name.clone(),
+                                    });
+                                }
+                                Ok(())
+                            }
+                        }
+                        .await;
+                        msg(Message::CacheBuildFinished {
+                            id,
+                            success: result.is_ok(),
+                        });
+                        result?;
+                    }
+
+                    if let Some(lua_build) = lua_build.as_deref() {
+                        let id = Arc::new(format!("{logid} (lua)"));
+                        let result: Result<(), Error> = {
+                            let id = id.clone();
+                            async {
+                                let lua_build_path =
+                                    create_lua_build_script(lua_build, &lua_runtimepaths)
+                                        .await?;
+                                let code = execute(
+                                    lua_build_nvim_command(lua_build_path.as_os_str()),
+                                    proj_root.clone(),
+                                    move |(stdtype, line)| {
+                                        msg(Message::CacheBuildProgress {
+                                            id: id.clone(),
+                                            stdtype,
+                                            line,
+                                        });
+                                    },
+                                )
+                                .await;
+                                let _ = tokio::fs::remove_file(&lua_build_path).await;
+                                let code = code?;
+                                if code != 0 {
+                                    return Err(Error::BuildLuaScriptFailed {
+                                        code,
+                                        repo: repo_name.clone(),
+                                    });
+                                }
+                                Ok(())
+                            }
+                        }
+                        .await;
+                        msg(Message::CacheBuildFinished {
+                            id,
+                            success: result.is_ok(),
+                        });
+                        result?;
+                    }
+
+                    Ok::<_, Error>(())
+                };
+                exec.await?;
+                id = build_aware_plugin_id(
+                    &repository,
+                    repository.head_hash().await?,
+                    &build,
+                    lua_build.as_deref(),
+                )
+                .await?;
+                tokio::fs::write(rsplug_build_success_file, id.as_str().as_bytes()).await?;
+            }
+        }
+
+        let files = repository.ls_files().await?;
+        let mut lazy_type = lazy_type.clone();
+        for luam in extract_unique_lua_modules(files.iter()) {
+            lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
+        }
+        let files: HowToPlaceFiles = if to_sym {
+            HowToPlaceFiles::SymlinkDirectory(proj_root.clone())
+        } else {
+            HowToPlaceFiles::CopyEachFile(
+                files
+                    .into_iter()
+                    .filter_map(|path| {
+                        let ignored = merge.ignore.matched(&path);
+                        if !ignored && proj_root.join(&path).is_file() {
+                            Some((
+                                path,
+                                FileItem {
+                                    source: filesource.clone(),
+                                    merge_type: MergeType::Conflict,
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            )
+        };
+
+        let loaded = LoadedPlugin {
+            id,
+            files,
+            lazy_type,
+            script: script.clone(),
+            is_plugctl: false,
+        };
+        let lock_info = (url.to_string(), head_rev_str);
+
+        Ok(Some((loaded, lock_info)))
     }
 }
 

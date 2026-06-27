@@ -169,6 +169,37 @@ with = ["plenary.nvim"]                # Load plenary.nvim simultaneously
 on_cmd = "Telescope"
 ```
 
+### Repository Sources
+
+#### GitHub (shorthand)
+
+```toml
+[[plugins]]
+repo = "owner/repo"               # Default branch
+repo = "owner/repo@main"          # Specific branch
+repo = "owner/repo@v1.2.0"        # Exact tag
+repo = "owner/repo@v*"            # Latest matching tag (wildcard)
+```
+
+#### General Git URL
+
+Any repository accessible via `git` can be specified by providing a full URL containing `://`:
+
+```toml
+[[plugins]]
+repo = "https://gitlab.com/owner/plugin"          # Default branch
+repo = "https://gitlab.com/owner/plugin@main"     # Branch / tag / commit
+repo = "https://codeberg.org/owner/plugin@v1.0"  # Any hosting
+```
+
+The `@rev` suffix works the same as for GitHub shorthand — it accepts branch names, tags, and wildcard patterns.
+
+The cache directory is derived from the URL's host and path (scheme, authentication, port, and `.git` suffix are stripped), e.g.:
+
+```
+https://gitlab.com/owner/plugin  →  ~/.cache/rsplug/gitlab.com/owner/plugin
+```
+
 ### Version Control
 
 Lock to specific versions or use wildcards:
@@ -218,7 +249,7 @@ rsplug
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `repo` | String | Repository in `owner/repo[@version]` format (GitHub) |
+| `repo` | String | `owner/repo[@rev]` (GitHub) or any Git URL (`https://…[@rev]`) |
 | `start` | Boolean | If `true`, always load at startup (default: `false`) |
 | `on_event` | String/Array | Autocmd event(s) to trigger lazy-load |
 | `on_cmd` | String/Array | User command(s) to trigger lazy-load |
