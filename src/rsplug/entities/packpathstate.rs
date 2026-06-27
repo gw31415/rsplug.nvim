@@ -2,9 +2,9 @@ use std::{
     borrow::Cow,
     cmp::Ordering,
     collections::BinaryHeap,
+    ffi::OsString,
     io,
     ops::Add,
-    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -225,6 +225,35 @@ enum DirectoryExtractionType {
     Symlink(Arc<Path>),
 }
 
+#[cfg(unix)]
+fn os_string_to_install_key(name: OsString) -> Box<[u8]> {
+    use std::os::unix::ffi::OsStringExt;
+
+    name.into_vec().into_boxed_slice()
+}
+
+#[cfg(windows)]
+fn os_string_to_install_key(name: OsString) -> Box<[u8]> {
+    // PluginIDStr directory names are generated from lowercase hexadecimal
+    // ASCII. Windows stores OsString as WTF-8/UTF-16 internally, but converting
+    // the directory name back through UTF-8 is lossless for these IDs and avoids
+    // Unix-only OsStringExt::into_vec().
+    name.to_string_lossy()
+        .into_owned()
+        .into_bytes()
+        .into_boxed_slice()
+}
+
+#[cfg(unix)]
+async fn symlink_plugin_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    tokio::fs::symlink(original, link).await
+}
+
+#[cfg(windows)]
+async fn symlink_plugin_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    tokio::fs::symlink_dir(original, link).await
+}
+
 /// PackPath の象徴となる状態。この構造体に PluginLoaded をインサートしていき、最後に実際のパスを指定して install を行う。
 #[derive(Default)]
 pub struct PackPathState {
@@ -410,7 +439,7 @@ impl PackPathState {
                             let result = async {
                                 tokio::fs::remove_dir_all(&dir).await.ok();
                                 tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
-                                tokio::fs::symlink(sym, dir.as_path()).await?;
+                                symlink_plugin_dir(sym, dir.as_path()).await?;
                                 Ok::<_, io::Error>(())
                             }
                             .await;
@@ -435,7 +464,7 @@ impl PackPathState {
                     let cleanup_semaphore = cleanup_semaphore.clone();
                     tasks.spawn(async move {
                         let not_installed_entry =
-                            !installing.contains(&entry.file_name().into_vec().into_boxed_slice());
+                            !installing.contains(&os_string_to_install_key(entry.file_name()));
                         let path = entry.path();
                         if not_installed_entry && path.is_dir() {
                             let permit = cleanup_semaphore.acquire().await;
