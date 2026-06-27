@@ -24,4 +24,19 @@ for crate in adaptive_semaphore dag file_specifier walker; do
     rm -f "${ROOT}/Cargo.toml.bak"
 done
 
-echo "✓ Set all versions to ${VERSION}"
+# rsplug-walker 0.1.0 was already published with a broken upstream fts dependency.
+# For the rsplug v0.1.0 release, root must depend on rsplug-walker 0.1.1.
+WALKER_VERSION="${VERSION}"
+if [ "${VERSION}" = "0.1.0" ]; then
+    WALKER_VERSION="0.1.1"
+fi
+
+sed -i.bak -E "/^walker = \{ .*path = / s/version = \"[^\"]+\"/version = \"${WALKER_VERSION}\"/" \
+    "${ROOT}/Cargo.toml"
+rm -f "${ROOT}/Cargo.toml.bak"
+
+sed -i.bak -E "s/^version = \".*\"/version = \"${WALKER_VERSION}\"/" \
+    "${ROOT}/walker/Cargo.toml"
+rm -f "${ROOT}/walker/Cargo.toml.bak"
+
+echo "✓ Set workspace version to ${VERSION} (rsplug-walker ${WALKER_VERSION})"

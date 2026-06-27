@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "adaptive_semaphore", "dag", "file_specifier", "walker"]
+members = [".", "adaptive_semaphore", "dag", "file_specifier", "walker", "walker/vendor/fts"]
 resolver = "3"
 
 [workspace.package]
@@ -17,7 +17,8 @@ wildmatch = "2.6"
 adaptive_semaphore = { package = "rsplug-adaptive-semaphore", path = "adaptive_semaphore", version = "0.1.0" }
 dag = { package = "rsplug-dag", path = "dag", version = "0.1.0" }
 file_specifier = { package = "rsplug-file-specifier", path = "file_specifier", version = "0.1.0" }
-walker = { package = "rsplug-walker", path = "walker", version = "0.1.0" }
+walker = { package = "rsplug-walker", path = "walker", version = "0.1.1" }
+fts = { package = "rsplug-fts", path = "walker/vendor/fts", version = "0.3.0" }
 
 [profile.release]
 strip = true

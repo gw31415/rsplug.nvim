@@ -104,15 +104,15 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          for crate in rsplug-adaptive-semaphore rsplug-dag rsplug-file-specifier rsplug-walker rsplug; do
-            echo "→ Checking ${crate} ${VERSION}…"
-            if curl -fsS -A "rsplug.nvim release workflow" "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null; then
-              echo "✓ ${crate} ${VERSION} is already published; skipping"
+          for crate in rsplug-adaptive-semaphore rsplug-dag rsplug-file-specifier rsplug-fts rsplug-walker rsplug; do
+            CRATE_VERSION="$(cargo pkgid -p "${crate}" | sed -E 's/.*@//')"
+            echo "→ Checking ${crate} ${CRATE_VERSION}…"
+            if curl -fsS -A "rsplug.nvim release workflow" "https://crates.io/api/v1/crates/${crate}/${CRATE_VERSION}" >/dev/null; then
+              echo "✓ ${crate} ${CRATE_VERSION} is already published; skipping"
               continue
             fi
 
-            echo "→ Publishing ${crate} ${VERSION}…"
+            echo "→ Publishing ${crate} ${CRATE_VERSION}…"
             cargo publish -p "${crate}" --no-verify --allow-dirty
             sleep 10
           done
