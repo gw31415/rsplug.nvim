@@ -2,6 +2,9 @@
 name = "dag"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Directed acyclic graph (DAG) data structure library"
 
 [dependencies]
 thiserror.workspace = true

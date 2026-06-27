@@ -3,6 +3,8 @@ name = "file_specifier"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
+description = "File path glob pattern matching and expansion library"
 
 [dependencies]
 wildmatch.workspace = true

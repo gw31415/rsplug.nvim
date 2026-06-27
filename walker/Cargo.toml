@@ -1,14 +1,18 @@
 [package]
 name = "walker"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "High-performance async directory walker with adaptive concurrency"
+exclude = ["vendor/"]
 
 [features]
 default = []
 bench-persistent-workers = []
 
 [dependencies]
-adaptive_semaphore = { path = "../adaptive_semaphore" }
+adaptive_semaphore.workspace = true
 hashbrown.workspace = true
 tokio.workspace = true
 wildmatch.workspace = true

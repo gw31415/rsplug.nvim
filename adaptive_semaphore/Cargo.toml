@@ -3,6 +3,8 @@ name = "adaptive_semaphore"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
+description = "Adaptive concurrency semaphore for Tokio async runtime"
 
 [dependencies]
 tokio.workspace = true
