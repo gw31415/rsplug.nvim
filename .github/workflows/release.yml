@@ -41,7 +41,7 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set version from tag
         shell: bash
@@ -76,7 +76,7 @@ jobs:
           cd dist && 7z a ../rsplug-${{ matrix.target }}.zip rsplug.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rsplug-${{ matrix.target }}
           path: rsplug-${{ matrix.target }}.${{ matrix.archive }}
@@ -90,7 +90,7 @@ jobs:
     permissions:
       id-token: write   # Required for trusted publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set version from tag
         run: |
@@ -127,10 +127,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: true
