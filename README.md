@@ -197,7 +197,7 @@ The `@rev` suffix works the same as for GitHub shorthand — it accepts branch n
 The cache directory is derived from the URL's host and path (scheme, authentication, port, and `.git` suffix are stripped), e.g.:
 
 ```
-https://gitlab.com/owner/plugin  →  ~/.cache/rsplug/gitlab.com/owner/plugin
+https://gitlab.com/owner/plugin  →  ~/.cache/rsplug/repos/gitlab.com/owner/plugin
 ```
 
 ### Version Control

@@ -91,7 +91,7 @@ impl RepoSource {
         }
     }
 
-    /// Such as [Given: ~/.cache/rsplug/]./github.com/owner/repo
+    /// Such as [Given: ~/.cache/rsplug/]./repos/gitlab.com/owner/repo
     pub(super) fn default_cachedir(&self) -> PathBuf {
         match self {
             RepoSource::GitHub { owner, repo, .. } => {
@@ -122,7 +122,7 @@ impl RepoSource {
                         .to_string()
                 };
                 let path_str = normalized.trim_end_matches(".git");
-                let mut result = PathBuf::new();
+                let mut result = PathBuf::from("repos");
                 for comp in path_str.split('/').filter(|s| !s.is_empty()) {
                     result.push(comp);
                 }
@@ -686,4 +686,19 @@ async fn create_lua_build_script(
     let path = std::env::temp_dir().join(filename);
     tokio::fs::write(&path, lua_build_wrapper(lua_script, runtimepaths)).await?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_url_default_cachedir_is_under_repos_namespace() {
+        let repo = RepoSource::from_str("https://gitlab.com/owner/plugin").unwrap();
+
+        assert_eq!(
+            repo.default_cachedir(),
+            PathBuf::from("repos/gitlab.com/owner/plugin")
+        );
+    }
 }
