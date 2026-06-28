@@ -211,7 +211,9 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 },
             );
             let mut startup_plugins = startup_plugins;
-            startup_plugins.sort_by_key(|(order, _)| *order);
+            startup_plugins.sort_by(|(l_order, l_pkgid), (r_order, r_pkgid)| {
+                l_order.cmp(r_order).then_with(|| l_pkgid.cmp(r_pkgid))
+            });
             let startup_plugins = startup_plugins
                 .into_iter()
                 .map(|(_, pkgid)| pkgid)

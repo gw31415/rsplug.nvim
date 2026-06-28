@@ -2,17 +2,14 @@ mod log;
 mod osc94;
 mod rsplug;
 
+use clap::Parser;
+use log::{Message, close, msg};
+use once_cell::sync::Lazy;
 use std::{
     collections::{BTreeMap, BinaryHeap},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
-
-use adaptive_semaphore::AdaptiveSemaphore;
-use clap::Parser;
-use log::{Message, close, msg};
-use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 
 use rsplug::config_walker::ConfigWalker;
@@ -52,41 +49,32 @@ async fn app() -> Result<(), Error> {
     } = Args::parse();
     let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));
 
-    // Parse all of config files while walking patterns in background.
-    let mut config_tasks = JoinSet::new();
-    let config_read_semaphore =
-        AdaptiveSemaphore::with_limits(64, 1, 256, Duration::from_millis(64));
-    {
+    // Parse config files in deterministic path order.
+    // `order` uses config_index, so walker receive order must not affect config order.
+    let config = {
+        let mut config_paths = Vec::new();
         let mut walker = ConfigWalker::new(config_files).await?;
         while let Some(item) = walker.recv().await {
             match item {
                 Ok(path) => {
                     msg(Message::ConfigFound(path.clone()));
-                    let config_read_semaphore = config_read_semaphore.clone();
-                    config_tasks.spawn(async move {
-                        let permit = config_read_semaphore.acquire().await;
-                        let content = tokio::fs::read(&path).await;
-                        let is_error = content.is_err();
-                        permit.finish(is_error);
-                        let content = content?;
-                        toml::from_slice::<rsplug::Config>(&content)
-                            .map_err(|e| Error::Parse(e, path))
-                    });
+                    config_paths.push(path);
                 }
                 Err(e) => return Err(Error::Io(e)),
             }
         }
-        // All tasks in ConfigWalker::rx are done here.
+        config_paths.sort();
         log::msg(Message::ConfigWalkFinish);
-    }
 
-    let config = config_tasks
-        .join_all()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .sum::<rsplug::Config>();
+        let mut configs = Vec::with_capacity(config_paths.len());
+        for path in config_paths {
+            let content = tokio::fs::read(&path).await?;
+            configs.push(
+                toml::from_slice::<rsplug::Config>(&content).map_err(|e| Error::Parse(e, path))?,
+            );
+        }
+        configs.into_iter().sum::<rsplug::Config>()
+    };
 
     let locked_map = if locked {
         match rsplug::LockFile::read(lockfile.as_path()).await {

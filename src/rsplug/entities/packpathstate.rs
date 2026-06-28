@@ -88,24 +88,60 @@ impl Ord for LoadedPlugin {
 }
 
 impl LoadedPlugin {
-    /// BinaryHeap に保存された PluginLoaded 群を可能な範囲でマージする
-    pub fn merge(plugs: &mut BinaryHeap<Self>) {
-        let mut done_items = Vec::new();
+    fn deterministic_cmp(&self, other: &Self) -> Ordering {
+        self.lazy_type
+            .cmp(&other.lazy_type)
+            .then_with(|| self.order.cmp(&other.order))
+            .then_with(|| self.is_plugctl.cmp(&other.is_plugctl))
+            .then_with(|| self.id.cmp(&other.id))
+    }
 
-        while plugs.len() > 1 {
-            let (tail, tail2) = (plugs.pop().unwrap(), plugs.pop().unwrap());
-            match tail + tail2 {
-                (tail, Some(tail2)) => {
-                    done_items.push(tail);
-                    plugs.push(tail2);
+    /// BinaryHeap に保存された PluginLoaded 群を可能な範囲でマージする。
+    ///
+    /// BinaryHeap の pop 順に基づいて貪欲にマージすると、同順位要素や
+    /// マージ後に id/order が変化する要素によって、マージの組み合わせが
+    /// 実行ごとに変わり得る。いったん決定的な順序に並べ、同じ順序で
+    /// first-fit の fixed point を作ることで、マージパターンを一意にする。
+    pub fn merge(plugs: &mut BinaryHeap<Self>) {
+        let mut items = Vec::with_capacity(plugs.len());
+        while let Some(plug) = plugs.pop() {
+            items.push(plug);
+        }
+        items.sort_by(Self::deterministic_cmp);
+
+        let mut groups: Vec<Self> = Vec::with_capacity(items.len());
+        for item in items {
+            let mut pending = item;
+
+            loop {
+                groups.sort_by(Self::deterministic_cmp);
+                let mut merged = false;
+
+                for i in 0..groups.len() {
+                    let candidate = groups.remove(i);
+                    match candidate + pending {
+                        (merged_group, None) => {
+                            pending = merged_group;
+                            merged = true;
+                            break;
+                        }
+                        (candidate, Some(rest)) => {
+                            groups.insert(i, candidate);
+                            pending = rest;
+                        }
+                    }
                 }
-                (tail, None) => {
-                    plugs.push(tail);
+
+                if !merged {
+                    break;
                 }
             }
+
+            groups.push(pending);
         }
 
-        plugs.extend(done_items);
+        groups.sort_by(Self::deterministic_cmp);
+        plugs.extend(groups);
     }
 }
 
@@ -120,7 +156,9 @@ impl Add for LoadedPlugin {
         } else if rhs.id.0.is_superset(&self.id.0) {
             return (rhs, None);
         }
-        if self.lazy_type.is_start() && !(self.merge_enabled && rhs.merge_enabled) {
+        if self.lazy_type.is_start()
+            && (self.is_plugctl != rhs.is_plugctl || !(self.merge_enabled && rhs.merge_enabled))
+        {
             return (self, Some(rhs));
         }
         match (&self.files, &rhs.files) {
