@@ -1002,7 +1002,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rsplug"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "console",
@@ -1030,14 +1030,14 @@ dependencies = [
 
 [[package]]
 name = "rsplug-adaptive-semaphore"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "rsplug-dag"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hashbrown 0.17.1",
  "thiserror",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "rsplug-file-specifier"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "wildmatch",
 ]
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "rsplug-walker"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hashbrown 0.17.1",
  "path-dedot",

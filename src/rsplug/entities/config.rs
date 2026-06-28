@@ -158,7 +158,7 @@ pub(super) struct PluginConfig {
     pub lazy_type: LazyType,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
-    pub with: Vec<String>,
+    pub depends: Vec<String>,
     #[serde(rename = "name")]
     pub custom_name: Option<String>,
     #[serde(flatten)]
@@ -179,7 +179,7 @@ impl DagNode for PluginConfig {
         )
     }
     fn depends(&self) -> impl IntoIterator<Item = &impl AsRef<str>> {
-        &self.with
+        &self.depends
     }
 }
 
@@ -227,6 +227,12 @@ pub struct MergeConfig {
     #[serde(deserialize_with = "deserialize_file_specifier")]
     #[serde(default = "default_ignore")]
     pub ignore: FileSpecifier,
+    #[serde(default = "default_merge_true")]
+    pub merge: bool,
+}
+
+fn default_merge_true() -> bool {
+    true
 }
 
 fn default_ignore() -> FileSpecifier {

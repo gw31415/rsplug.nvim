@@ -17,6 +17,7 @@ use crate::rsplug::util::hash;
 struct PkgId2ScriptsItem {
     pkgid: PluginIDStr,
     script: SetupScript,
+    order: usize,
     start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
 }
 
@@ -144,6 +145,8 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Loade
         lazy_type: LazyType::Start,
         files: HowToPlaceFiles::CopyEachFile(files),
         script: Default::default(),
+        order: usize::MAX,
+        merge_enabled: true,
         is_plugctl: true,
     }
 }
@@ -170,12 +173,13 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
 
         {
             // Add packages to place scripts that does the initial setup of the plugin
-            let (pkgid2scripts, startplugins_setupscripts) = pkgid2scripts.into_iter().fold(
-                (Vec::new(), BTreeMap::new()),
+            let (pkgid2scripts, startup_plugins) = pkgid2scripts.into_iter().fold(
+                (Vec::new(), Vec::new()),
                 |(mut scripts_lazy, mut scripts_start),
                  PkgId2ScriptsItem {
                      pkgid,
                      script,
+                     order,
                      start,
                  }| {
                     let SetupScript {
@@ -185,37 +189,42 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     let lua_after = lua_after.into_iter().map(|s| (AfterOrBefore::After, s));
                     let lua_before = lua_before.into_iter().map(|s| (AfterOrBefore::Before, s));
                     let mut script_set: BTreeMap<AfterOrBefore, Vec<String>> = Default::default();
-                    {
-                        let script_set = if start {
-                            &mut scripts_start
-                        } else {
-                            &mut script_set
-                        };
-                        for (script_type, content) in lua_after.chain(lua_before) {
-                            let module_id = format!(
-                                "{script_type}_{}",
-                                hash::digest_hex_string(content.as_bytes())
-                            );
-                            plugs.push(instant_startup_pkg(
-                                &format!("lua/{module_id}.lua"),
-                                content.into_bytes(),
-                            ));
-                            script_set.entry(script_type).or_default().push(module_id);
-                        }
+                    for (script_type, content) in lua_after.chain(lua_before) {
+                        let module_id = format!(
+                            "{script_type}_{}",
+                            hash::digest_hex_string(content.as_bytes())
+                        );
+                        plugs.push(instant_startup_pkg(
+                            &format!("lua/{module_id}.lua"),
+                            content.into_bytes(),
+                        ));
+                        script_set.entry(script_type).or_default().push(module_id);
                     }
 
+                    if start {
+                        scripts_start.push((order, pkgid.clone()));
+                    }
                     if !script_set.is_empty() {
                         scripts_lazy.push((pkgid, script_set));
                     }
                     (scripts_lazy, scripts_start)
                 },
             );
+            let mut startup_plugins = startup_plugins;
+            startup_plugins.sort_by_key(|(order, _)| *order);
+            let startup_plugins = startup_plugins
+                .into_iter()
+                .map(|(_, pkgid)| pkgid)
+                .collect();
             plugs.push(instant_startup_pkg(
                 "lua/_rsplug/init.lua",
-                CustomPackaddTemplate { pkgid2scripts }
-                    .render_once()
-                    .unwrap()
-                    .into_bytes(),
+                CustomPackaddTemplate {
+                    pkgid2scripts,
+                    startup_plugins,
+                }
+                .render_once()
+                .unwrap()
+                .into_bytes(),
             ));
         }
 
@@ -279,6 +288,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
+                    order: usize::MAX,
+                    merge_enabled: true,
                     is_plugctl: true,
                 }
             });
@@ -323,6 +334,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
+                    order: usize::MAX,
+                    merge_enabled: true,
                     is_plugctl: true,
                 }
             });
@@ -361,6 +374,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
+                order: usize::MAX,
+                merge_enabled: true,
                 is_plugctl: true,
             });
         }
@@ -411,6 +426,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(overwrite_copies),
                     script: Default::default(),
+                    order: usize::MAX,
+                    merge_enabled: true,
                     is_plugctl: true,
                 });
             }
@@ -509,6 +526,7 @@ impl PlugCtl {
         id: PluginID,
         lazy_type: LazyType,
         script: SetupScript,
+        order: usize,
         files: &mut HowToPlaceFiles,
     ) -> Self {
         // Steal `doc/**` files
@@ -540,6 +558,7 @@ impl PlugCtl {
                 pkgid2scripts: vec![PkgId2ScriptsItem {
                     pkgid: id.as_str(),
                     script,
+                    order,
                     start: true,
                 }],
                 overwrite_files: overwrite_files(id),
@@ -556,6 +575,7 @@ impl PlugCtl {
         let pkgid2scripts = vec![PkgId2ScriptsItem {
             pkgid: id.as_str(),
             script,
+            order,
             start: false,
         }];
         for ev in events {
@@ -614,6 +634,7 @@ struct FtpluginTemplate {
 #[template(escape = false)]
 struct CustomPackaddTemplate {
     pkgid2scripts: Vec<(PluginIDStr, BTreeMap<AfterOrBefore, Vec<String>>)>,
+    startup_plugins: Vec<PluginIDStr>,
 }
 
 #[derive(TemplateSimple)]

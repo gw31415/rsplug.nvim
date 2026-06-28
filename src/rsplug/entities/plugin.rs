@@ -28,8 +28,12 @@ pub struct Plugin {
     pub script: SetupScript,
     /// マージ設定
     pub merge: MergeConfig,
-    /// `with` で指定された依存プラグインのキャッシュ相対パス
+    /// `depends` で指定された依存プラグインのキャッシュ相対パス
     pub dependency_cachedirs: Vec<PathBuf>,
+    /// マージを許可するかどうか（TOML の `merge` フィールドから設定）
+    pub merge_enabled: bool,
+    /// DAGトポロジカル順。controlled startup の順序維持に使う。
+    pub order: usize,
 }
 
 /// プラグインの取得元
@@ -104,11 +108,18 @@ impl RepoSource {
                 let normalized = if let Some(slash) = after_scheme.find('/') {
                     let authority = &after_scheme[..slash];
                     let host_start = authority.rfind('@').map(|at| at + 1).unwrap_or(0);
-                    let host = authority[host_start..].split(':').next().unwrap_or(&authority[host_start..]);
+                    let host = authority[host_start..]
+                        .split(':')
+                        .next()
+                        .unwrap_or(&authority[host_start..]);
                     format!("{}{}", host, &after_scheme[slash..])
                 } else {
                     let host_start = after_scheme.rfind('@').map(|at| at + 1).unwrap_or(0);
-                    after_scheme[host_start..].split(':').next().unwrap_or(&after_scheme[host_start..]).to_string()
+                    after_scheme[host_start..]
+                        .split(':')
+                        .next()
+                        .unwrap_or(&after_scheme[host_start..])
+                        .to_string()
                 };
                 let path_str = normalized.trim_end_matches(".git");
                 let mut result = PathBuf::new();
@@ -149,7 +160,9 @@ impl FromStr for RepoSource {
             Regex::new(r"^(?<owner>[a-zA-Z0-9]([a-zA-Z0-9]?|[\-]?([a-zA-Z0-9])){0,38})/(?<repo>[a-zA-Z0-9][a-zA-Z0-9_.-]{0,38})(@(?<rev>\S+))?$").unwrap()
         });
         let Some(cap) = GITHUB_REPO_REGEX.captures(s) else {
-            return Err("GitHub repository format must be 'owner/repo[@rev]' or a URL containing '://'");
+            return Err(
+                "GitHub repository format must be 'owner/repo[@rev]' or a URL containing '://'",
+            );
         };
         let owner = cap["owner"].to_string();
         let repo = cap["repo"].into();
@@ -166,15 +179,70 @@ impl Plugin {
             .iter()
             .map(|plug| (plug.id().to_string(), plug.cache.repo.default_cachedir()))
             .collect::<hashbrown::HashMap<_, _>>();
+
+        // order を (depends_depth, config_index) の複合キーで計算する。
+        // depth = 依存チェーンの最長深さ。depends がないなら 0。
+        // tiebreak は config 出現順。
+        let total = plugins.len();
+        let id_to_config_index: hashbrown::HashMap<String, usize> = plugins
+            .iter()
+            .enumerate()
+            .map(|(i, plug)| (plug.id().to_string(), i))
+            .collect();
+        let id_to_depth = {
+            let id_to_deps: hashbrown::HashMap<String, Vec<String>> = plugins
+                .iter()
+                .map(|plug| {
+                    (
+                        plug.id().to_string(),
+                        plug.depends.iter().map(|s| s.to_string()).collect(),
+                    )
+                })
+                .collect();
+            let mut depths: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+            fn compute_depth(
+                id: &str,
+                id_to_deps: &hashbrown::HashMap<String, Vec<String>>,
+                depths: &mut hashbrown::HashMap<String, usize>,
+            ) -> usize {
+                if let Some(&d) = depths.get(id) {
+                    return d;
+                }
+                let d = id_to_deps
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .map(|dep| compute_depth(dep, id_to_deps, depths))
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0);
+                depths.insert(id.to_string(), d);
+                d
+            }
+            for plug in &plugins {
+                compute_depth(plug.id(), &id_to_deps, &mut depths);
+            }
+            depths
+        };
+        let id_to_order: hashbrown::HashMap<String, usize> = id_to_config_index
+            .iter()
+            .map(|(id, &config_index)| {
+                let depth = *id_to_depth.get(id).unwrap_or(&0);
+                (id.clone(), depth * (total + 1) + config_index)
+            })
+            .collect();
+
         Ok(plugins.try_dag()?.into_map_iter(
             move |DagIteratorMapFuncArgs {
                       inner,
                       dependents_iter,
                   }| {
+                let id_str = inner.id().to_string();
+                let order = id_to_order.get(&id_str).copied().unwrap_or(usize::MAX);
                 let PluginConfig {
                     cache,
                     lazy_type,
-                    with,
+                    depends,
                     custom_name: _,
                     script,
                     merge,
@@ -183,7 +251,7 @@ impl Plugin {
                 let lazy_type = dependents_iter
                     .flatten()
                     .fold(lazy_type, |dep, plug| dep & &plug.lazy_type);
-                let dependency_cachedirs = with
+                let dependency_cachedirs = depends
                     .into_iter()
                     .map(|dep_id| {
                         id_to_cachedir
@@ -192,12 +260,15 @@ impl Plugin {
                             .expect("dependency id must be resolvable in DAG")
                     })
                     .collect();
+                let merge_enabled = merge.merge;
                 Plugin {
                     cache,
                     lazy_type,
                     script,
                     merge,
                     dependency_cachedirs,
+                    merge_enabled,
+                    order,
                 }
             },
         ))
@@ -229,6 +300,8 @@ impl Plugin {
             script,
             merge,
             dependency_cachedirs,
+            merge_enabled,
+            order,
         } = self;
 
         let to_sym = cache.to_sym();
@@ -337,8 +410,7 @@ impl Plugin {
         }
 
         let mut id =
-            build_aware_plugin_id(&repository, head_rev, &build, lua_build.as_deref())
-                .await?;
+            build_aware_plugin_id(&repository, head_rev, &build, lua_build.as_deref()).await?;
 
         // ビルド実行
         if !build.is_empty() || lua_build.is_some() {
@@ -407,8 +479,7 @@ impl Plugin {
                             let id = id.clone();
                             async {
                                 let lua_build_path =
-                                    create_lua_build_script(lua_build, &lua_runtimepaths)
-                                        .await?;
+                                    create_lua_build_script(lua_build, &lua_runtimepaths).await?;
                                 let code = execute(
                                     lua_build_nvim_command(lua_build_path.as_os_str()),
                                     proj_root.clone(),
@@ -488,6 +559,8 @@ impl Plugin {
             files,
             lazy_type,
             script: script.clone(),
+            order,
+            merge_enabled,
             is_plugctl: false,
         };
         let lock_info = (url.to_string(), head_rev_str);

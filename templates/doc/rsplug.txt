@@ -20,11 +20,12 @@ CONTENTS                                                      *rsplug-contents*
     6. Lock File .............................. |rsplug-lockfile|
     7. Plugin Lifecycle ....................... |rsplug-lifecycle|
     8. Runtime Integration .................... |rsplug-runtime|
-    9. Advanced Topics ........................ |rsplug-advanced|
-        9.1 Plugin Merging .................... |rsplug-merging|
-        9.2 Build Caching ..................... |rsplug-build-cache|
-    10. Troubleshooting ....................... |rsplug-troubleshooting|
-    11. Examples .............................. |rsplug-examples|
+    9. Migration Notes ........................ |rsplug-migration|
+    10. Advanced Topics ....................... |rsplug-advanced|
+        10.1 Plugin Merging ................... |rsplug-merging|
+        10.2 Build Caching .................... |rsplug-build-cache|
+    11. Troubleshooting ....................... |rsplug-troubleshooting|
+    12. Examples .............................. |rsplug-examples|
 
 ==============================================================================
 1. Introduction                                           *rsplug-introduction*
@@ -50,8 +51,10 @@ External Binary Model~
 
 Pack System Integration~
     rsplug generates a standard Neovim |packages| directory structure. Plugins
-    are placed in `pack/_gen/start/` or `pack/_gen/opt/` directories, making
-    them compatible with Neovim's native plugin loading mechanism.
+    are placed in `pack/_gen/opt/` and loaded through rsplug's generated
+    runtime. rsplug's own generated control package is placed in
+    `pack/_gen/start/` so it can register lazy-loading triggers and perform
+    startup loads.
 
 Configuration-Driven~
     All plugin definitions live in TOML configuration files. Changes to your
@@ -70,7 +73,7 @@ Neovim Configuration:~
 
 First, add this line to your Neovim configuration (`init.lua`):
 >lua
-    vim.opt.packpath:prepend("~/.cache/rsplug")
+    dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
 <
 
 Binary Installation:~
@@ -235,6 +238,7 @@ Environment Variables:~
 Default Paths:~
 
     App directory:     `~/.cache/rsplug/`
+    Bootstrap script:  `~/.cache/rsplug/init.lua`
     Repository cache:  `~/.cache/rsplug/repos/`
     Pack output:       `~/.cache/rsplug/pack/_gen/`
     Lock file:         `~/.cache/rsplug/rsplug.lock.json`
@@ -273,9 +277,10 @@ start~
     Type: Boolean
     Default: `false`
     
-    If `true`, plugin is always loaded at Neovim startup (placed in
-    `pack/_gen/start/`). If `false`, plugin is lazy-loaded (placed in
-    `pack/_gen/opt/`).
+    If `true`, plugin is loaded during rsplug startup through the controlled
+    `lua_before` -> `:packadd!` -> `lua_after` path. Managed plugins are placed
+    in `pack/_gen/opt/`; rsplug's generated runtime decides whether to load
+    them at startup or lazily.
     
     Example:
 >toml
@@ -345,7 +350,7 @@ on_map~
     
     Note: on_map is currently broken and being fixed.
 
-with~
+depends~
     Type: Array of Strings
     
     Dependency plugin names that load simultaneously with this plugin. The
@@ -355,7 +360,7 @@ with~
 >toml
         [[plugins]]
         repo = "nvim-telescope/telescope.nvim"
-        with = ["plenary.nvim"]
+        depends = ["plenary.nvim"]
 <
 
 lua_before~
@@ -532,6 +537,9 @@ When a trigger occurs:
     1. Execute `lua_before` code (if specified)
     2. Run `:packadd <plugin-name>`
     3. Execute `lua_after` code (if specified)
+
+For `start = true` plugins the same order is used during startup, except the
+load command is `:packadd!` so it follows Neovim's startup package semantics.
 
 Multiple triggers:~
 
@@ -741,7 +749,8 @@ Phase 5: File installation~
     2. If sym=true or build/lua_build exists: create symlink
     3. Otherwise: copy/hard-link files
     4. Apply ignore patterns
-    5. Place in `pack/_gen/start/` or `pack/_gen/opt/`
+    5. Place managed plugins in `pack/_gen/opt/`
+    6. Place rsplug's generated control package in `pack/_gen/start/`
 
 Phase 6: Lazy-loading infrastructure~
     1. Scan for Lua modules (auto-detect requires)
@@ -772,29 +781,23 @@ into Neovim.
 
 Basic setup in init.lua:~
 >lua
-    -- Add rsplug output directory to packpath
-    vim.opt.packpath:prepend(vim.fn.expand("~/.cache/rsplug"))
-    
-    -- Load lazy-loading infrastructure
-    require("_rsplug")
+    dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
 <
 
 What happens:~
 
-1. `packpath:prepend()` makes Neovim aware of the plugin directory
-2. `require("_rsplug")` loads the lazy-loading dispatcher
+1. The generated `init.lua` prepends the rsplug output directory to 'packpath'
+2. It loads rsplug's generated control package
 3. Lazy-loading triggers are registered (autocmds, commands, keymaps)
-4. Plugins in `pack/_gen/start/` load immediately
-5. Plugins in `pack/_gen/opt/` wait for triggers
+4. `start = true` plugins are loaded through the controlled `:packadd!` path
+5. Lazy plugins in `pack/_gen/opt/` wait for triggers
 
 Custom packpath:~
 
 If you use a custom lock file location or output directory, adjust
 accordingly:
 >lua
-    local rsplug_dir = vim.fn.expand("~/my-custom-path/_gen")
-    vim.opt.packpath:prepend(rsplug_dir)
-    require("_rsplug")
+    dofile(vim.fn.expand("~/my-custom-path/init.lua"))
 <
 
 Checking loaded plugins:~
@@ -814,10 +817,35 @@ Debugging lazy-loading:~
 <
 
 ==============================================================================
-9. Advanced Topics                                            *rsplug-advanced*
+9. Migration Notes                                         *rsplug-migration*
+
+v0.2.0 Breaking Change~
+
+rsplug v0.2.0 changes the Neovim bootstrap line and the generated package
+layout so `start = true` plugins can run `lua_before` and `lua_after`
+deterministically.
+
+Update your `init.lua` from:
+>lua
+    vim.opt.packpath:prepend("~/.cache/rsplug")
+<
+
+to:
+>lua
+    dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
+<
+
+Managed plugins, including `start = true` plugins, are now placed under
+`pack/_gen/opt/` and loaded by rsplug's generated runtime.
+
+To preserve deterministic `lua_before` / `lua_after` ordering, managed
+`start = true` plugins are not merged with other managed startup plugins.
+
+==============================================================================
+10. Advanced Topics                                           *rsplug-advanced*
 
 ------------------------------------------------------------------------------
-9.1 Plugin Merging                                            *rsplug-merging*
+10.1 Plugin Merging                                           *rsplug-merging*
 
 To reduce the number of entries in 'runtimepath', rsplug automatically merges
 compatible plugins.
@@ -854,7 +882,7 @@ Currently, there is no explicit way to prevent merging. If you encounter
 issues due to merging, please file an issue at the repository.
 
 ------------------------------------------------------------------------------
-9.2 Build Caching                                        *rsplug-build-cache*
+10.2 Build Caching                                       *rsplug-build-cache*
 
 Build commands can be slow, so rsplug caches build results.
 
@@ -887,7 +915,7 @@ Manual cache clearing:~
 <
 
 ==============================================================================
-10. Troubleshooting                                   *rsplug-troubleshooting*
+11. Troubleshooting                                   *rsplug-troubleshooting*
 
 Common issues and solutions:
 
@@ -961,7 +989,7 @@ For other issues, please check:
     - Repository documentation
 
 ==============================================================================
-11. Examples                                                  *rsplug-examples*
+12. Examples                                                  *rsplug-examples*
 
 Example 1: Basic LSP setup~
 >toml

@@ -24,9 +24,15 @@ impl ConfigWalker {
     }
 
     pub async fn new(patterns: Vec<String>) -> Result<ConfigWalker, io::Error> {
+        let mut direct_files = Vec::new();
         let mut compiled_patterns = Vec::with_capacity(patterns.len());
         for pattern in patterns {
-            compiled_patterns.push(CompiledGlob::new(&pattern)?);
+            let path = PathBuf::from(&pattern);
+            if path.is_file() {
+                direct_files.push(path);
+            } else {
+                compiled_patterns.push(CompiledGlob::new(&pattern)?);
+            }
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -35,8 +41,16 @@ impl ConfigWalker {
             files_only: true,
             ..WalkerOptions::default()
         };
-        let mut walker = Walker::spawn_many_with_options(compiled_patterns, options);
         let handle = tokio::spawn(async move {
+            for path in direct_files {
+                let _ = tx.send(Ok(path));
+            }
+
+            if compiled_patterns.is_empty() {
+                return;
+            }
+
+            let mut walker = Walker::spawn_many_with_options(compiled_patterns, options);
             while let Some(item) = walker.recv().await {
                 match item {
                     Ok(event) => {

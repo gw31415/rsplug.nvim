@@ -44,6 +44,10 @@ pub struct LoadedPlugin {
     pub(super) files: HowToPlaceFiles,
     /// セットアップスクリプト
     pub(super) script: SetupScript,
+    /// 設定/DAG後の読み込み順。特に controlled startup の順序維持に使う。
+    pub(super) order: usize,
+    /// マージを許可するか（TOMLの `merge` フィールド）
+    pub(super) merge_enabled: bool,
     /// PlugCtlを元に作成されたかどうか
     pub(super) is_plugctl: bool,
 }
@@ -70,9 +74,14 @@ impl PartialOrd for LoadedPlugin {
 
 impl Ord for LoadedPlugin {
     fn cmp(&self, other: &Self) -> Ordering {
+        // lazy_type → order の順で比較する。
+        // BinaryHeap (max-heap) では先頭に来るほど pop が早い。
+        // startup load で order 昇順に取り出すため、
+        // heap 上では order が小さいほど「大きい」と見なす必要がある。
         let cmp = self.lazy_type.cmp(&other.lazy_type);
         if let Ordering::Equal = cmp {
-            return self.id.cmp(&other.id);
+            // order は小さいほど先に取り出したいので逆順
+            return self.order.cmp(&other.order).reverse();
         }
         cmp
     }
@@ -111,6 +120,9 @@ impl Add for LoadedPlugin {
         } else if rhs.id.0.is_superset(&self.id.0) {
             return (rhs, None);
         }
+        if self.lazy_type.is_start() && !(self.merge_enabled && rhs.merge_enabled) {
+            return (self, Some(rhs));
+        }
         match (&self.files, &rhs.files) {
             (HowToPlaceFiles::CopyEachFile(files), HowToPlaceFiles::CopyEachFile(rfiles)) => {
                 let mergeable = {
@@ -136,6 +148,8 @@ impl Add for LoadedPlugin {
                         lazy_type,
                         files: HowToPlaceFiles::CopyEachFile(mut files),
                         mut script,
+                        order,
+                        merge_enabled,
                         is_plugctl,
                     } = self
                     else {
@@ -146,6 +160,8 @@ impl Add for LoadedPlugin {
                         lazy_type: _,
                         files: HowToPlaceFiles::CopyEachFile(rfiles),
                         script: rscript,
+                        order: r_order,
+                        merge_enabled: _,
                         is_plugctl: r_is_plugctl,
                     } = rhs
                     else {
@@ -154,6 +170,7 @@ impl Add for LoadedPlugin {
                     files.extend(rfiles);
                     id += rid;
                     script += rscript;
+                    let order = order.min(r_order);
 
                     return (
                         Self {
@@ -161,6 +178,8 @@ impl Add for LoadedPlugin {
                             lazy_type,
                             files: HowToPlaceFiles::CopyEachFile(files),
                             script,
+                            order,
+                            merge_enabled,
                             is_plugctl: is_plugctl || r_is_plugctl,
                         },
                         None,
@@ -277,6 +296,8 @@ impl PackPathState {
             lazy_type,
             mut files,
             script,
+            order,
+            merge_enabled: _,
             is_plugctl,
         } = loaded_plugin;
 
@@ -285,10 +306,10 @@ impl PackPathState {
         if already_installed {
             return;
         }
-        let start_or_opt = if lazy_type.is_start() { "start" } else { "opt" };
+        let start_or_opt = if is_plugctl { "start" } else { "opt" };
 
         if !is_plugctl {
-            self.ctl += PlugCtl::create(id, lazy_type, script, &mut files);
+            self.ctl += PlugCtl::create(id, lazy_type, script, order, &mut files);
         }
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
@@ -336,11 +357,26 @@ impl PackPathState {
         }
         let gen_root = packpath.join("pack").join("_gen");
         tokio::fs::create_dir_all(&gen_root).await?;
+        tokio::fs::write(
+            packpath.join("init.lua"),
+            include_bytes!("../../../templates/init.lua"),
+        )
+        .await?;
         let Self {
-            installing,
+            installing: _,
             files,
             ctl: _,
         } = self;
+        let installing_entries: HashSet<Box<[u8]>> = files
+            .iter()
+            .map(|(id, files)| {
+                let mut key = Vec::with_capacity(files.start_or_opt.len() + 1 + id.len());
+                key.extend_from_slice(files.start_or_opt.as_bytes());
+                key.push(b'/');
+                key.extend_from_slice(id.as_bytes());
+                key.into_boxed_slice()
+            })
+            .collect();
         let mut tasks = JoinSet::new();
         let yank_semaphore = AdaptiveSemaphore::new();
         let symlink_semaphore = AdaptiveSemaphore::new();
@@ -455,16 +491,23 @@ impl PackPathState {
             }
         }
 
-        let installing = Arc::new(installing);
+        let installing_entries = Arc::new(installing_entries);
         for start_or_opt in ["start", "opt"] {
             let path = gen_root.join(start_or_opt);
             if let Ok(mut read_dir) = tokio::fs::read_dir(path).await {
                 while let Some(entry) = read_dir.next_entry().await? {
-                    let installing = installing.clone();
+                    let installing_entries = installing_entries.clone();
                     let cleanup_semaphore = cleanup_semaphore.clone();
+                    let start_or_opt = start_or_opt.as_bytes().to_vec();
                     tasks.spawn(async move {
+                        let file_name = os_string_to_install_key(entry.file_name());
+                        let mut entry_key =
+                            Vec::with_capacity(start_or_opt.len() + 1 + file_name.len());
+                        entry_key.extend_from_slice(&start_or_opt);
+                        entry_key.push(b'/');
+                        entry_key.extend_from_slice(&file_name);
                         let not_installed_entry =
-                            !installing.contains(&os_string_to_install_key(entry.file_name()));
+                            !installing_entries.contains(entry_key.as_slice());
                         let path = entry.path();
                         if not_installed_entry && path.is_dir() {
                             let permit = cleanup_semaphore.acquire().await;

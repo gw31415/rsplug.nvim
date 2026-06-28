@@ -24,7 +24,7 @@
 First, you need to add one liner to your Neovim configuration.
 
 ```lua
-vim.opt.packpath:prepend("~/.cache/rsplug")
+dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
 ```
 
 Then, install the `rsplug` binary:
@@ -165,7 +165,7 @@ Declare plugin dependencies that load together:
 ```toml
 [[plugins]]
 repo = "nvim-telescope/telescope.nvim"
-with = ["plenary.nvim"]                # Load plenary.nvim simultaneously
+depends = ["plenary.nvim"]             # Load plenary.nvim simultaneously
 on_cmd = "Telescope"
 ```
 
@@ -255,7 +255,7 @@ rsplug
 | `on_cmd` | String/Array | User command(s) to trigger lazy-load |
 | `on_ft` | String/Array | Filetype(s) to trigger lazy-load |
 | `on_map` | String/Table | Keymap(s) to trigger lazy-load |
-| `with` | Array | Plugin dependencies loaded simultaneously |
+| `depends` | Array | Plugin dependencies loaded simultaneously |
 | `lua_before` | String | Lua code to run before plugin loads |
 | `lua_after` | String | Lua code to run after plugin loads |
 | `build` | Array | Subprocess to run after install/update |
@@ -314,14 +314,39 @@ rsplug **synchronizes the pack packages** from your TOML configuration:
   - Synchronizes to specific commit from lock file if `--locked` is provided
 4. Writes lock file with exact commit hashes
 5. Runs build commands / `lua_build` scripts if specified
-6. Generates plugin structure in `~/.cache/rsplug/pack/_gen/`
+6. Generates `~/.cache/rsplug/init.lua` and the plugin structure in `~/.cache/rsplug/pack/_gen/`
 
 **Important:** The pack directory reflects exactly what's in your current configuration file(s). If you change which configuration file you pass as an argument, the pack directory will be re-synchronized to match only those plugins.
 
 ### 2. Runtime Phase (Neovim)
 
+- `~/.cache/rsplug/init.lua` prepends the generated packpath and loads rsplug's generated runtime
+- `start = true` plugins are placed under `pack/_gen/opt/` and loaded during startup via rsplug's controlled `:packadd!` path
 - Registers lazy-loading triggers (autocmds, commands, keymaps)
-- On trigger, loads plugin via `:packadd` with before/after hooks
+- On startup or lazy trigger, loads plugin via `:packadd` with before/after hooks
+
+### v0.2.0 Breaking Change
+
+rsplug v0.2.0 changes the Neovim bootstrap line and the generated package layout
+so `start = true` plugins can run `lua_before` and `lua_after` deterministically.
+
+Update your `init.lua` from:
+
+```lua
+vim.opt.packpath:prepend("~/.cache/rsplug")
+```
+
+to:
+
+```lua
+dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
+```
+
+Managed plugins, including `start = true` plugins, are now placed under
+`pack/_gen/opt/` and loaded by rsplug's generated runtime.
+
+To preserve deterministic `lua_before` / `lua_after` ordering, managed
+`start = true` plugins are not merged with other managed startup plugins.
 
 ## Advanced Topics
 
