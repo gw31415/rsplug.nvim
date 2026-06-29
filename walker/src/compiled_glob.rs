@@ -600,12 +600,8 @@ impl CompiledGlob {
             Some(v) => v,
             None => return false,
         };
-        let path_parts: Vec<&str> = normalized
-            .split(MAIN_SEPARATOR)
-            .filter(|s| !s.is_empty())
-            .collect();
         let mut states = self.initial_states();
-        for part in path_parts {
+        for part in normalized.split(MAIN_SEPARATOR).filter(|s| !s.is_empty()) {
             states = self.advance_states(&states, part);
             if states.is_empty() {
                 return false;

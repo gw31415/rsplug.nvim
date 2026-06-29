@@ -112,9 +112,9 @@ impl LoadedPlugin {
         let mut groups: Vec<Self> = Vec::with_capacity(items.len());
         for item in items {
             let mut pending = item;
+            groups.sort_by(Self::deterministic_cmp);
 
             loop {
-                groups.sort_by(Self::deterministic_cmp);
                 let mut merged = false;
 
                 for i in 0..groups.len() {
@@ -532,16 +532,17 @@ impl PackPathState {
         let installing_entries = Arc::new(installing_entries);
         for start_or_opt in ["start", "opt"] {
             let path = gen_root.join(start_or_opt);
+            let start_or_opt_key: Arc<[u8]> = Arc::from(start_or_opt.as_bytes());
             if let Ok(mut read_dir) = tokio::fs::read_dir(path).await {
                 while let Some(entry) = read_dir.next_entry().await? {
                     let installing_entries = installing_entries.clone();
                     let cleanup_semaphore = cleanup_semaphore.clone();
-                    let start_or_opt = start_or_opt.as_bytes().to_vec();
+                    let start_or_opt_key = Arc::clone(&start_or_opt_key);
                     tasks.spawn(async move {
                         let file_name = os_string_to_install_key(entry.file_name());
                         let mut entry_key =
-                            Vec::with_capacity(start_or_opt.len() + 1 + file_name.len());
-                        entry_key.extend_from_slice(&start_or_opt);
+                            Vec::with_capacity(start_or_opt_key.len() + 1 + file_name.len());
+                        entry_key.extend_from_slice(&start_or_opt_key);
                         entry_key.push(b'/');
                         entry_key.extend_from_slice(&file_name);
                         let not_installed_entry =

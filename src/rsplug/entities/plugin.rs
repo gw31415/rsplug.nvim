@@ -175,70 +175,71 @@ impl Plugin {
     /// 設定ファイルから Plugin のコレクションを構築する
     pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, DagError> {
         let Config { plugins } = config;
-        let id_to_cachedir = plugins
-            .iter()
-            .map(|plug| (plug.id().to_string(), plug.cache.repo.default_cachedir()))
-            .collect::<hashbrown::HashMap<_, _>>();
 
         // order を (depends_depth, config_index) の複合キーで計算する。
         // depth = 依存チェーンの最長深さ。depends がないなら 0。
         // tiebreak は config 出現順。
         let total = plugins.len();
-        let id_to_config_index: hashbrown::HashMap<String, usize> = plugins
+        struct PluginMeta {
+            cachedir: PathBuf,
+            config_index: usize,
+            deps: Vec<String>,
+            depth: Option<usize>,
+        }
+        let mut meta_by_id: hashbrown::HashMap<String, PluginMeta> = plugins
             .iter()
             .enumerate()
-            .map(|(i, plug)| (plug.id().to_string(), i))
-            .collect();
-        let id_to_depth = {
-            let id_to_deps: hashbrown::HashMap<String, Vec<String>> = plugins
-                .iter()
-                .map(|plug| {
-                    (
-                        plug.id().to_string(),
-                        plug.depends.iter().map(|s| s.to_string()).collect(),
-                    )
-                })
-                .collect();
-            let mut depths: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
-            fn compute_depth(
-                id: &str,
-                id_to_deps: &hashbrown::HashMap<String, Vec<String>>,
-                depths: &mut hashbrown::HashMap<String, usize>,
-            ) -> usize {
-                if let Some(&d) = depths.get(id) {
-                    return d;
-                }
-                let d = id_to_deps
-                    .get(id)
-                    .into_iter()
-                    .flatten()
-                    .map(|dep| compute_depth(dep, id_to_deps, depths))
-                    .max()
-                    .map(|m| m + 1)
-                    .unwrap_or(0);
-                depths.insert(id.to_string(), d);
-                d
-            }
-            for plug in &plugins {
-                compute_depth(plug.id(), &id_to_deps, &mut depths);
-            }
-            depths
-        };
-        let id_to_order: hashbrown::HashMap<String, usize> = id_to_config_index
-            .iter()
-            .map(|(id, &config_index)| {
-                let depth = *id_to_depth.get(id).unwrap_or(&0);
-                (id.clone(), depth * (total + 1) + config_index)
+            .map(|(config_index, plug)| {
+                (
+                    plug.id().to_string(),
+                    PluginMeta {
+                        cachedir: plug.cache.repo.default_cachedir(),
+                        config_index,
+                        deps: plug.depends.clone(),
+                        depth: None,
+                    },
+                )
             })
             .collect();
+        fn compute_depth(
+            id: &str,
+            meta_by_id: &mut hashbrown::HashMap<String, PluginMeta>,
+        ) -> usize {
+            if let Some(Some(depth)) = meta_by_id.get(id).map(|meta| meta.depth) {
+                return depth;
+            }
+            let deps = meta_by_id
+                .get(id)
+                .map(|meta| meta.deps.clone())
+                .unwrap_or_default();
+            let depth = deps
+                .iter()
+                .map(|dep| compute_depth(dep, meta_by_id))
+                .max()
+                .map(|depth| depth + 1)
+                .unwrap_or(0);
+            if let Some(meta) = meta_by_id.get_mut(id) {
+                meta.depth = Some(depth);
+            }
+            depth
+        }
+        for id in plugins
+            .iter()
+            .map(|plug| plug.id().to_string())
+            .collect::<Vec<_>>()
+        {
+            compute_depth(&id, &mut meta_by_id);
+        }
 
         Ok(plugins.try_dag()?.into_map_iter(
             move |DagIteratorMapFuncArgs {
                       inner,
                       dependents_iter,
                   }| {
-                let id_str = inner.id().to_string();
-                let order = id_to_order.get(&id_str).copied().unwrap_or(usize::MAX);
+                let order = meta_by_id
+                    .get(inner.id())
+                    .map(|meta| meta.depth.unwrap_or(0) * (total + 1) + meta.config_index)
+                    .unwrap_or(usize::MAX);
                 let PluginConfig {
                     cache,
                     lazy_type,
@@ -254,9 +255,9 @@ impl Plugin {
                 let dependency_cachedirs = depends
                     .into_iter()
                     .map(|dep_id| {
-                        id_to_cachedir
+                        meta_by_id
                             .get(&dep_id)
-                            .cloned()
+                            .map(|meta| meta.cachedir.clone())
                             .expect("dependency id must be resolvable in DAG")
                     })
                     .collect();
