@@ -2,6 +2,7 @@
 
 > A blazingly fast Neovim plugin manager written in Rust
 
+[![Crates.io](https://img.shields.io/crates/v/rsplug.svg)](https://crates.io/crates/rsplug)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 ## Overview
