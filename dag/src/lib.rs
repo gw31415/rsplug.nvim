@@ -199,16 +199,12 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
         }
 
         // 7) 現時点での依存関係をセット
+        let mut topo_positions = vec![0usize; n];
+        for (topo_index, &node_index) in topo.iter().enumerate() {
+            topo_positions[node_index] = topo_index;
+        }
         for (node, r) in nodes.iter_mut().zip(references) {
-            node.dependents_indexes = r
-                .into_iter()
-                .map(|e| {
-                    topo.iter()
-                        .enumerate()
-                        .find_map(|(i, t)| if *t == e { Some(i) } else { None })
-                        .unwrap()
-                })
-                .collect();
+            node.dependents_indexes = r.into_iter().map(|e| topo_positions[e]).collect();
         }
 
         // 6) topo 順に取り出す（swap_removeは使わずtake）
