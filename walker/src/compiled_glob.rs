@@ -1,4 +1,5 @@
 use path_dedot::{CWD, ParseDot};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -437,16 +438,20 @@ impl CompiledGlob {
     }
 
     pub(crate) fn advance_states_into(&self, current: &[usize], part: &str, out: &mut Vec<usize>) {
-        let expanded = self.expand_epsilon_nodes(current);
+        // 2 本の scratch を交互に使い、epsilon 展開ごとの Vec 確保を避ける。
+        let mut scratch_a = Vec::new();
+        let mut scratch_b = Vec::new();
+        self.expand_epsilon_nodes_into(current, &mut scratch_a);
         out.clear();
+        let single_char = is_single_char(part);
         let mut overflow_seen: Option<HashSet<usize>> = None;
-        for node_idx in expanded {
-            let node = &self.trie.nodes[node_idx];
+        for node_idx in &scratch_a {
+            let node = &self.trie.nodes[*node_idx];
             if let Some(next_idx) = node.literal_edges.get(part) {
                 push_unique_state(out, &mut overflow_seen, *next_idx);
             }
 
-            if !node.wild_edges_exact1.is_empty() && part.chars().count() == 1 {
+            if !node.wild_edges_exact1.is_empty() && single_char {
                 for next_idx in &node.wild_edges_exact1 {
                     push_unique_state(out, &mut overflow_seen, *next_idx);
                 }
@@ -474,10 +479,12 @@ impl CompiledGlob {
                 }
             }
             if node.descend_edge.is_some() {
-                push_unique_state(out, &mut overflow_seen, node_idx);
+                push_unique_state(out, &mut overflow_seen, *node_idx);
             }
         }
-        *out = self.expand_epsilon_nodes(out);
+        // out の epsilon 再展開を scratch_b に書き、swap で out に戻す（再確保なし）。
+        self.expand_epsilon_nodes_into(out, &mut scratch_b);
+        std::mem::swap(out, &mut scratch_b);
     }
 
     pub(crate) fn is_match_state(&self, current: &[usize]) -> bool {
@@ -486,10 +493,10 @@ impl CompiledGlob {
 
     #[allow(dead_code)]
     pub(crate) fn literal_candidates(&self, current: &[usize]) -> Vec<String> {
-        let expanded = self.expand_epsilon_nodes(current);
+        let expanded = self.expand_epsilon_nodes_borrowed(current);
         let mut out = hashbrown::HashSet::new();
-        for node_idx in expanded {
-            out.extend(self.trie.nodes[node_idx].literal_edges.keys().cloned());
+        for node_idx in expanded.iter() {
+            out.extend(self.trie.nodes[*node_idx].literal_edges.keys().cloned());
         }
         let mut out = out.into_iter().collect::<Vec<_>>();
         out.sort_unstable();
@@ -497,10 +504,9 @@ impl CompiledGlob {
     }
 
     pub(crate) fn needs_directory_scan(&self, current: &[usize]) -> bool {
-        let expanded = self.expand_epsilon_nodes(current);
-        expanded
-            .into_iter()
-            .any(|node_idx| self.node_can_scan.get(node_idx).copied().unwrap_or(false))
+        self.expand_epsilon_nodes_borrowed(current)
+            .iter()
+            .any(|node_idx| self.node_can_scan.get(*node_idx).copied().unwrap_or(false))
     }
 
     fn push_rule(&mut self, segments: Vec<SegmentMatcher>, is_exclude: bool, is_absolute: bool) {
@@ -516,28 +522,53 @@ impl CompiledGlob {
     }
 
     fn expand_epsilon_nodes(&self, current: &[usize]) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.expand_epsilon_nodes_into(current, &mut out);
+        out
+    }
+
+    /// `current` の epsilon 閉包を `out` に書き込む。`out.clear()` から始まる。
+    /// 呼び出し側の scratch を再利用し、`Vec` の再確保を防ぐ。
+    fn expand_epsilon_nodes_into(&self, current: &[usize], out: &mut Vec<usize>) {
+        out.clear();
         if current.is_empty() {
-            return Vec::new();
+            return;
         }
         if current.len() == 1 {
             if let Some(cached) = self.epsilon_closures.get(current[0]) {
-                return cached.clone();
+                out.extend_from_slice(cached);
             }
-            return Vec::new();
+            return;
         }
 
-        let mut out = Vec::new();
         let mut overflow_seen: Option<HashSet<usize>> = None;
         for node_idx in current {
             let Some(cached) = self.epsilon_closures.get(*node_idx) else {
                 continue;
             };
             for value in cached {
-                push_unique_state(&mut out, &mut overflow_seen, *value);
+                push_unique_state(out, &mut overflow_seen, *value);
             }
         }
         out.sort_unstable();
-        out
+    }
+
+    /// `current` の epsilon 閉包を借用で返す。
+    /// `len == 1` のとき（walker の最頻ケース）は cached closure を直接借用し、
+    /// clone も allocation も発生しない。
+    fn expand_epsilon_nodes_borrowed<'a>(&'a self, current: &[usize]) -> Cow<'a, [usize]> {
+        match current {
+            [] => Cow::Borrowed(&[]),
+            [one] => match self.epsilon_closures.get(*one) {
+                Some(c) => Cow::Borrowed(c.as_slice()),
+                None => Cow::Borrowed(&[]),
+            },
+            _ => {
+                let mut out = Vec::new();
+                self.expand_epsilon_nodes_into(current, &mut out);
+                Cow::Owned(out)
+            }
+        }
     }
 
     fn rebuild_epsilon_closure_cache(&mut self) {
@@ -577,11 +608,11 @@ impl CompiledGlob {
     }
 
     fn match_decision(&self, current: &[usize]) -> Option<bool> {
-        let expanded = self.expand_epsilon_nodes(current);
+        let expanded = self.expand_epsilon_nodes_borrowed(current);
         let mut selected: Option<(usize, bool)> = None;
-        for node_idx in expanded {
+        for node_idx in expanded.iter() {
             if let Some((rule_index, include)) =
-                self.node_best_terminal.get(node_idx).copied().flatten()
+                self.node_best_terminal.get(*node_idx).copied().flatten()
                 && selected.as_ref().is_none_or(|(idx, _)| rule_index >= *idx)
             {
                 selected = Some((rule_index, include));
@@ -657,6 +688,14 @@ fn push_unique_state(
         }
         *overflow_seen = Some(seen);
     }
+}
+
+/// 文字列がちょうど 1 文字かを判定する。
+/// `s.chars().count() == 1` と等価だが、全文字デコードを避け最大2要素で short-circuit する。
+#[inline]
+fn is_single_char(s: &str) -> bool {
+    let mut it = s.chars();
+    it.next().is_some() && it.next().is_none()
 }
 
 fn classify_wild_edge(pattern: &str) -> WildEdgeKind {

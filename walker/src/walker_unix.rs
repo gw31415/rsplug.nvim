@@ -461,7 +461,7 @@ fn run_fts_job(ctx: &WorkerCtx, job: RootJob) {
                 ctx.compiled
                     .advance_states_into(parent.as_ref(), name, &mut next_states_scratch);
                 let next_sig = states_signature(&next_states_scratch);
-                let next_states = Arc::<[usize]>::from(next_states_scratch.clone());
+                let next_states = Arc::<[usize]>::from(next_states_scratch.as_slice());
 
                 if transition_cache_len >= TRANSITION_CACHE_CAPACITY {
                     transition_cache.clear();
