@@ -180,55 +180,44 @@ impl Plugin {
         // depth = 依存チェーンの最長深さ。depends がないなら 0。
         // tiebreak は config 出現順。
         let total = plugins.len();
-        struct PluginMeta {
-            cachedir: PathBuf,
-            config_index: usize,
-            deps: Vec<String>,
-            depth: Option<usize>,
-        }
-        let mut meta_by_id: hashbrown::HashMap<String, PluginMeta> = plugins
+        let id_to_index: hashbrown::HashMap<String, usize> = plugins
             .iter()
             .enumerate()
-            .map(|(config_index, plug)| {
-                (
-                    plug.id().to_string(),
-                    PluginMeta {
-                        cachedir: plug.cache.repo.default_cachedir(),
-                        config_index,
-                        deps: plug.depends.clone(),
-                        depth: None,
-                    },
-                )
-            })
+            .map(|(index, plug)| (plug.id().to_string(), index))
             .collect();
+        let cachedirs = plugins
+            .iter()
+            .map(|plug| plug.cache.repo.default_cachedir())
+            .collect::<Vec<_>>();
+        let deps_by_index = plugins
+            .iter()
+            .map(|plug| {
+                plug.depends
+                    .iter()
+                    .filter_map(|dep| id_to_index.get(dep).copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut depths = vec![None; total];
         fn compute_depth(
-            id: &str,
-            meta_by_id: &mut hashbrown::HashMap<String, PluginMeta>,
+            index: usize,
+            deps_by_index: &[Vec<usize>],
+            depths: &mut [Option<usize>],
         ) -> usize {
-            if let Some(Some(depth)) = meta_by_id.get(id).map(|meta| meta.depth) {
+            if let Some(depth) = depths[index] {
                 return depth;
             }
-            let deps = meta_by_id
-                .get(id)
-                .map(|meta| meta.deps.clone())
-                .unwrap_or_default();
-            let depth = deps
+            let depth = deps_by_index[index]
                 .iter()
-                .map(|dep| compute_depth(dep, meta_by_id))
+                .map(|&dep| compute_depth(dep, deps_by_index, depths))
                 .max()
                 .map(|depth| depth + 1)
                 .unwrap_or(0);
-            if let Some(meta) = meta_by_id.get_mut(id) {
-                meta.depth = Some(depth);
-            }
+            depths[index] = Some(depth);
             depth
         }
-        for id in plugins
-            .iter()
-            .map(|plug| plug.id().to_string())
-            .collect::<Vec<_>>()
-        {
-            compute_depth(&id, &mut meta_by_id);
+        for index in 0..total {
+            compute_depth(index, &deps_by_index, &mut depths);
         }
 
         Ok(plugins.try_dag()?.into_map_iter(
@@ -236,9 +225,9 @@ impl Plugin {
                       inner,
                       dependents_iter,
                   }| {
-                let order = meta_by_id
+                let order = id_to_index
                     .get(inner.id())
-                    .map(|meta| meta.depth.unwrap_or(0) * (total + 1) + meta.config_index)
+                    .map(|&index| depths[index].unwrap_or(0) * (total + 1) + index)
                     .unwrap_or(usize::MAX);
                 let PluginConfig {
                     cache,
@@ -255,10 +244,10 @@ impl Plugin {
                 let dependency_cachedirs = depends
                     .into_iter()
                     .map(|dep_id| {
-                        meta_by_id
+                        let dep_index = *id_to_index
                             .get(&dep_id)
-                            .map(|meta| meta.cachedir.clone())
-                            .expect("dependency id must be resolvable in DAG")
+                            .expect("dependency id must be resolvable in DAG");
+                        cachedirs[dep_index].clone()
                     })
                     .collect();
                 let merge_enabled = merge.merge;
