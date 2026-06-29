@@ -661,7 +661,12 @@ fn prepare_jobs(
     let roots = normalize_roots(compiled.start_paths());
     let mut jobs = Vec::new();
     let mut initial_events = Vec::new();
-    let mut state_cache = StateEvalCache::default();
+    let mut ctx = ShardCtx {
+        compiled,
+        files_only,
+        max_jobs,
+        state_cache: StateEvalCache::default(),
+    };
 
     for root in roots {
         if jobs.len() >= max_jobs {
@@ -683,13 +688,10 @@ fn prepare_jobs(
         }
 
         let sharded = shard_root_jobs(
-            compiled,
+            &mut ctx,
             root.as_path(),
             &root_states,
-            files_only,
-            max_jobs,
             SHARD_DEPTH,
-            &mut state_cache,
             &mut jobs,
             &mut initial_events,
         );
@@ -700,11 +702,11 @@ fn prepare_jobs(
                 root_states,
             });
         } else if cached_is_match_state(
-            &mut state_cache,
-            compiled,
+            &mut ctx.state_cache,
+            ctx.compiled,
             states_signature(&root_states),
             &root_states,
-        ) && !files_only
+        ) && !ctx.files_only
         {
             initial_events.push(WalkEvent {
                 path: root,
@@ -716,18 +718,22 @@ fn prepare_jobs(
     (jobs, initial_events)
 }
 
-fn shard_root_jobs(
-    compiled: &CompiledGlob,
-    root: &Path,
-    root_states: &[usize],
+struct ShardCtx<'a> {
+    compiled: &'a CompiledGlob,
     files_only: bool,
     max_jobs: usize,
+    state_cache: StateEvalCache,
+}
+
+fn shard_root_jobs(
+    ctx: &mut ShardCtx<'_>,
+    root: &Path,
+    root_states: &[usize],
     depth: usize,
-    state_cache: &mut StateEvalCache,
     jobs: &mut Vec<RootJob>,
     initial_events: &mut Vec<WalkEvent>,
 ) -> bool {
-    if depth == 0 || jobs.len() >= max_jobs {
+    if depth == 0 || jobs.len() >= ctx.max_jobs {
         return false;
     }
 
@@ -743,7 +749,7 @@ fn shard_root_jobs(
     let mut capacity_exhausted = false;
 
     while let Some(entry) = reader.next().transpose().ok().flatten() {
-        if jobs.len() + local_jobs.len() >= max_jobs {
+        if jobs.len() + local_jobs.len() >= ctx.max_jobs {
             capacity_exhausted = true;
             break;
         }
@@ -753,24 +759,31 @@ fn shard_root_jobs(
             return false;
         };
 
-        let next_states = compiled.advance_states(root_states, name);
+        let next_states = ctx.compiled.advance_states(root_states, name);
         if next_states.is_empty() {
             continue;
         }
 
-        let kind = classify_entry(entry.path().as_path(), entry.file_type().ok());
+        let path = entry.path();
+        let kind = classify_entry(path.as_path(), entry.file_type().ok());
         let next_signature = states_signature(&next_states);
         if kind != Some(EntryKind::Dir)
-            || !cached_needs_directory_scan(state_cache, compiled, next_signature, &next_states)
+            || !cached_needs_directory_scan(
+                &mut ctx.state_cache,
+                ctx.compiled,
+                next_signature,
+                &next_states,
+            )
         {
-            if cached_is_match_state(state_cache, compiled, next_signature, &next_states)
-                && let Some(kind) = kind
-                && (!files_only || kind == EntryKind::File)
+            if cached_is_match_state(
+                &mut ctx.state_cache,
+                ctx.compiled,
+                next_signature,
+                &next_states,
+            ) && let Some(kind) = kind
+                && (!ctx.files_only || kind == EntryKind::File)
             {
-                local_events.push(WalkEvent {
-                    path: entry.path(),
-                    kind,
-                });
+                local_events.push(WalkEvent { path, kind });
             }
             continue;
         }
@@ -779,17 +792,17 @@ fn shard_root_jobs(
             let child_before = local_jobs.len();
             let mut child_jobs = Vec::new();
             let mut child_events = Vec::new();
+            let old_max_jobs = ctx.max_jobs;
+            ctx.max_jobs = ctx.max_jobs.saturating_sub(jobs.len());
             let child_split = shard_root_jobs(
-                compiled,
-                entry.path().as_path(),
+                ctx,
+                path.as_path(),
                 &next_states,
-                files_only,
-                max_jobs.saturating_sub(jobs.len()),
                 depth - 1,
-                state_cache,
                 &mut child_jobs,
                 &mut child_events,
             );
+            ctx.max_jobs = old_max_jobs;
             if child_split {
                 local_jobs.extend(child_jobs);
                 local_events.extend(child_events);
@@ -802,7 +815,7 @@ fn shard_root_jobs(
         }
 
         local_jobs.push(RootJob {
-            path: entry.path(),
+            path,
             root_states: next_states,
         });
         split_happened = true;
@@ -816,7 +829,7 @@ fn shard_root_jobs(
         jobs.extend(
             local_jobs
                 .into_iter()
-                .take(max_jobs.saturating_sub(jobs.len())),
+                .take(ctx.max_jobs.saturating_sub(jobs.len())),
         );
         initial_events.extend(local_events);
     }
