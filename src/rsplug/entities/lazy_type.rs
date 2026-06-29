@@ -75,7 +75,7 @@ impl<'a, Rhs: Into<Cow<'a, LazyType>>> BitAndAssign<Rhs> for LazyType {
         let rhs: Cow<'a, LazyType> = rhs.into();
         if let LazyType::Opt(events) = self {
             if let LazyType::Opt(events_rhs) = rhs.borrow() {
-                events.extend(events_rhs.clone());
+                events.extend(events_rhs.iter().cloned());
             } else {
                 *self = rhs.into_owned();
             }
