@@ -186,6 +186,8 @@ impl DagNode for PluginConfig {
 /// プラグインのセットアップに用いるスクリプト群
 #[derive(Deserialize, Default)]
 struct SetupScriptOne {
+    /// Neovim 起動時に実行される Lua スクリプト
+    lua_start: Option<String>,
     /// プラグイン読み込み直後に実行される Lua スクリプト
     lua_after: Option<String>,
     /// プラグイン読み込み直前に実行される Lua スクリプト
@@ -195,6 +197,8 @@ struct SetupScriptOne {
 /// プラグインのセットアップに用いるスクリプト群
 #[derive(Clone, Default, Debug)]
 pub struct SetupScript {
+    /// Neovim 起動時に実行される Lua スクリプト
+    pub lua_start: BTreeSet<String>,
     /// プラグイン読み込み直後に実行される Lua スクリプト
     pub lua_after: BTreeSet<String>,
     /// プラグイン読み込み直前に実行される Lua スクリプト
@@ -204,10 +208,12 @@ pub struct SetupScript {
 impl From<SetupScriptOne> for SetupScript {
     fn from(value: SetupScriptOne) -> Self {
         let SetupScriptOne {
+            lua_start,
             lua_after,
             lua_before,
         } = value;
         SetupScript {
+            lua_start: lua_start.into_iter().collect(),
             lua_after: lua_after.into_iter().collect(),
             lua_before: lua_before.into_iter().collect(),
         }
@@ -216,6 +222,7 @@ impl From<SetupScriptOne> for SetupScript {
 
 impl AddAssign for SetupScript {
     fn add_assign(&mut self, rhs: Self) {
+        self.lua_start.extend(rhs.lua_start);
         self.lua_after.extend(rhs.lua_after);
         self.lua_before.extend(rhs.lua_before);
     }
@@ -247,6 +254,30 @@ where
 {
     let s = String::deserialize(deserializer)?;
     Ok(s.parse().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_config_deserializes_lua_start() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "owner/plugin"
+            lua_start = "vim.g.rsplug_lua_start = true"
+            lua_before = "vim.g.rsplug_before = true"
+            lua_after = "vim.g.rsplug_after = true"
+            "#,
+        )
+        .unwrap();
+
+        let script = &config.plugins[0].script;
+        assert!(script.lua_start.contains("vim.g.rsplug_lua_start = true"));
+        assert!(script.lua_before.contains("vim.g.rsplug_before = true"));
+        assert!(script.lua_after.contains("vim.g.rsplug_after = true"));
+    }
 }
 
 /// キーパターン

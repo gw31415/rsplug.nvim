@@ -257,6 +257,7 @@ rsplug
 | `on_ft` | String/Array | Filetype(s) to trigger lazy-load |
 | `on_map` | String/Table | Keymap(s) to trigger lazy-load |
 | `depends` | Array | Plugin dependencies loaded simultaneously |
+| `lua_start` | String | Lua code to run at Neovim startup |
 | `lua_before` | String | Lua code to run before plugin loads |
 | `lua_after` | String | Lua code to run after plugin loads |
 | `build` | Array | Subprocess to run after install/update |
@@ -322,6 +323,7 @@ rsplug **synchronizes the pack packages** from your TOML configuration:
 ### 2. Runtime Phase (Neovim)
 
 - `~/.cache/rsplug/init.lua` prepends the generated packpath and loads rsplug's generated runtime
+- `lua_start` scripts run at startup before controlled startup plugin loads
 - `start = true` plugins are placed under `pack/_gen/opt/` and loaded during startup via rsplug's controlled `:packadd!` path
 - Registers lazy-loading triggers (autocmds, commands, keymaps)
 - On startup or lazy trigger, loads plugin via `:packadd` with before/after hooks

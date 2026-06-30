@@ -363,6 +363,23 @@ depends~
         depends = ["plenary.nvim"]
 <
 
+lua_start~
+    Type: String
+
+    Lua code executed once during rsplug startup before `start = true` plugins
+    are loaded. Use this for startup-time Lua that is associated with a plugin
+    entry but does not require loading that plugin.
+
+    Example:
+>toml
+        lua_start = "vim.g.some_startup_flag = true"
+        lua_start = '''
+        vim.api.nvim_create_user_command('Hello', function()
+            print('hello from startup')
+        end, {})
+        '''
+<
+
 lua_before~
     Type: String
     

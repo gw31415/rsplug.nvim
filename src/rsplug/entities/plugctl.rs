@@ -173,9 +173,9 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
 
         {
             // Add packages to place scripts that does the initial setup of the plugin
-            let (pkgid2scripts, startup_plugins) = pkgid2scripts.into_iter().fold(
-                (Vec::new(), Vec::new()),
-                |(mut scripts_lazy, mut scripts_start),
+            let (pkgid2scripts, startup_plugins, startup_scripts) = pkgid2scripts.into_iter().fold(
+                (Vec::new(), Vec::new(), Vec::new()),
+                |(mut scripts_lazy, mut scripts_start, mut scripts_startup),
                  PkgId2ScriptsItem {
                      pkgid,
                      script,
@@ -183,6 +183,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                      start,
                  }| {
                     let SetupScript {
+                        lua_start,
                         lua_after,
                         lua_before,
                     } = script;
@@ -200,6 +201,15 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                         ));
                         script_set.entry(script_type).or_default().push(module_id);
                     }
+                    for content in lua_start {
+                        let module_id =
+                            format!("lua_start_{}", hash::digest_hex_string(content.as_bytes()));
+                        plugs.push(instant_startup_pkg(
+                            &format!("lua/{module_id}.lua"),
+                            content.into_bytes(),
+                        ));
+                        scripts_startup.push((order, pkgid.clone(), module_id));
+                    }
 
                     if start {
                         scripts_start.push((order, pkgid.clone()));
@@ -207,7 +217,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     if !script_set.is_empty() {
                         scripts_lazy.push((pkgid, script_set));
                     }
-                    (scripts_lazy, scripts_start)
+                    (scripts_lazy, scripts_start, scripts_startup)
                 },
             );
             let mut startup_plugins = startup_plugins;
@@ -218,11 +228,25 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 .into_iter()
                 .map(|(_, pkgid)| pkgid)
                 .collect();
+            let mut startup_scripts = startup_scripts;
+            startup_scripts.sort_by(
+                |(l_order, l_pkgid, l_module), (r_order, r_pkgid, r_module)| {
+                    l_order
+                        .cmp(r_order)
+                        .then_with(|| l_pkgid.cmp(r_pkgid))
+                        .then_with(|| l_module.cmp(r_module))
+                },
+            );
+            let startup_scripts = startup_scripts
+                .into_iter()
+                .map(|(_, _, module_id)| module_id)
+                .collect();
             plugs.push(instant_startup_pkg(
                 "lua/_rsplug/init.lua",
                 CustomPackaddTemplate {
                     pkgid2scripts,
                     startup_plugins,
+                    startup_scripts,
                 }
                 .render_once()
                 .unwrap()
@@ -637,6 +661,7 @@ struct FtpluginTemplate {
 struct CustomPackaddTemplate {
     pkgid2scripts: Vec<(PluginIDStr, BTreeMap<AfterOrBefore, Vec<String>>)>,
     startup_plugins: Vec<PluginIDStr>,
+    startup_scripts: Vec<String>,
 }
 
 #[derive(TemplateSimple)]
@@ -680,4 +705,30 @@ struct OnLuaTemplate<'a> {
 struct OnMapTemplate<'a> {
     mode: &'a ModeChar,
     keypattern2pkgid: &'a BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_packadd_template_runs_lua_start_before_startup_plugins() {
+        let startup_plugin = PluginID::new(b"startup-plugin").as_str();
+        let rendered = CustomPackaddTemplate {
+            pkgid2scripts: Vec::new(),
+            startup_plugins: vec![startup_plugin.clone()],
+            startup_scripts: vec!["lua_start_abc123".to_string()],
+        }
+        .render_once()
+        .unwrap();
+
+        let lua_start_pos = rendered.find("require(module_id)").unwrap();
+        let packadd_pos = rendered
+            .find("require('_rsplug').packadd(id, true)")
+            .unwrap();
+
+        assert!(rendered.contains("local startup_scripts = {'lua_start_abc123',}"));
+        assert!(rendered.contains(&format!("local startup_plugins = {{'{startup_plugin}',}}")));
+        assert!(lua_start_pos < packadd_pos);
+    }
 }
