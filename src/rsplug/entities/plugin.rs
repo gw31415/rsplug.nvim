@@ -13,6 +13,7 @@ use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
 use git2::Oid;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use sailfish::TemplateSimple;
 use serde::{Serialize, Serializer};
 use serde_with::DeserializeFromStr;
 
@@ -626,6 +627,14 @@ fn lua_build_nvim_command(lua_script_path: &OsStr) -> [Cow<'_, OsStr>; 6] {
     ]
 }
 
+#[derive(TemplateSimple)]
+#[template(path = "lua_build.stpl")]
+#[template(escape = false)]
+struct LuaBuildTemplate<'a> {
+    runtimepaths: Vec<String>,
+    lua_script: &'a str,
+}
+
 fn lua_build_wrapper(lua_script: &str, runtimepaths: &[PathBuf]) -> String {
     fn lua_single_quoted(s: &str) -> String {
         let mut escaped = String::with_capacity(s.len() + 8);
@@ -642,26 +651,16 @@ fn lua_build_wrapper(lua_script: &str, runtimepaths: &[PathBuf]) -> String {
         escaped.push('\'');
         escaped
     }
-    fn lua_runtimepath_setup(runtimepaths: &[PathBuf]) -> String {
-        let runtimepaths = runtimepaths
-            .iter()
-            .map(|path| format!("  {},", lua_single_quoted(path.to_string_lossy().as_ref())))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if runtimepaths.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "for _, rtp in ipairs({{\n{}\n}}) do\n  vim.opt.runtimepath:prepend(rtp)\nend\n",
-                runtimepaths
-            )
-        }
+    let quoted: Vec<String> = runtimepaths
+        .iter()
+        .map(|p| lua_single_quoted(p.to_string_lossy().as_ref()))
+        .collect();
+    LuaBuildTemplate {
+        runtimepaths: quoted,
+        lua_script,
     }
-    format!(
-        "local ok, err = xpcall(function()\n{}\n{}\nend, debug.traceback)\nif not ok then\n  vim.api.nvim_err_writeln(err)\n  os.exit(1)\nend\n",
-        lua_runtimepath_setup(runtimepaths),
-        lua_script
-    )
+    .render_once()
+    .unwrap_or_default()
 }
 
 async fn create_lua_build_script(
@@ -690,5 +689,32 @@ mod tests {
             repo.default_cachedir(),
             PathBuf::from("repos/gitlab.com/owner/plugin")
         );
+    }
+
+    #[test]
+    fn lua_build_wrapper_wraps_script_and_runtimepaths() {
+        let script = "vim.cmd('echo hi')";
+        let rtp = vec![PathBuf::from("/path/with'quote"), PathBuf::from("/normal")];
+        let out = lua_build_wrapper(script, &rtp);
+
+        // ponytail: locks in the xpcall/ipairs wrapper shape and single-quote escaping.
+        assert!(out.starts_with("local ok, err = xpcall(function()\n"));
+        assert!(out.contains("for _, rtp in ipairs({"));
+        // single-quote escaping applied to runtimepath entries
+        assert!(out.contains("  '/path/with\\'quote',\n"));
+        assert!(out.contains("  '/normal',\n"));
+        // the user script body is embedded verbatim
+        assert!(out.contains("vim.cmd('echo hi')"));
+        assert!(out.contains("end, debug.traceback)"));
+        assert!(out.contains("os.exit(1)"));
+    }
+
+    #[test]
+    fn lua_build_wrapper_omits_runtimepath_block_when_empty() {
+        let out = lua_build_wrapper("do return end", &[]);
+        // no ipairs block when there are no runtimepaths
+        assert!(!out.contains("ipairs"));
+        assert!(out.contains("local ok, err = xpcall(function()"));
+        assert!(out.contains("do return end"));
     }
 }

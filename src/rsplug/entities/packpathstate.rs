@@ -711,9 +711,8 @@ mod tests {
             .split("native startup package scanning.\n")
             .nth(1)
             .unwrap();
-        let expected = format!(
-            "vim.cmd('packadd {a}')\nvim.cmd('packadd {b}')\n\nlocal ok, rsplug"
-        );
+        let expected =
+            format!("vim.cmd('packadd {a}')\nvim.cmd('packadd {b}')\n\nlocal ok, rsplug");
         assert!(
             actual.starts_with(&expected),
             "unexpected init template output: {actual:?}\nexpected prefix: {expected:?}"
