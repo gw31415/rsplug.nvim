@@ -13,11 +13,11 @@ if not vim.o.loadplugins then
 	return
 end
 
--- Load rsplug's generated control package now.  This marks package loading as
--- done for startup, so Neovim will not source the same generated plugin files a
--- second time after user init.lua finishes.
-vim.cmd.packloadall()
-
+-- Load the generated control package for this generation explicitly.
+-- The control package lives under pack/_gen/opt/<id>, so retained older
+-- generations are not loaded by native startup package scanning.
+<% for id in control_ids {%>vim.cmd('packadd <%= id %>')
+<%}%>
 local ok, rsplug = pcall(require, '_rsplug')
 if not ok then
 	error('[rsplug] failed to load generated runtime: ' .. tostring(rsplug))

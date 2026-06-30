@@ -316,13 +316,13 @@ rsplug **synchronizes the pack packages** from your TOML configuration:
   - Synchronizes to specific commit from lock file if `--locked` is provided
 4. Writes lock file with exact commit hashes
 5. Runs build commands / `lua_build` scripts if specified
-6. Generates `~/.cache/rsplug/init.lua` and the plugin structure in `~/.cache/rsplug/pack/_gen/`
+6. Generates `~/.cache/rsplug/init.lua`, writes the generated control plugin under `~/.cache/rsplug/pack/_gen/opt/`, and stores that generation's `manifest.json` inside the control plugin
 
 **Important:** The pack directory reflects exactly what's in your current configuration file(s). If you change which configuration file you pass as an argument, the pack directory will be re-synchronized to match only those plugins.
 
 ### 2. Runtime Phase (Neovim)
 
-- `~/.cache/rsplug/init.lua` prepends the generated packpath and loads rsplug's generated runtime
+- `~/.cache/rsplug/init.lua` prepends the generated packpath and explicitly `packadd`s the current generated control plugin
 - `lua_start` scripts run at startup before controlled startup plugin loads
 - `start = true` plugins are placed under `pack/_gen/opt/` and loaded during startup via rsplug's controlled `:packadd!` path
 - Registers lazy-loading triggers (autocmds, commands, keymaps)
@@ -365,6 +365,20 @@ Build commands are cached using a hash of:
 - Build command itself (`build` and `lua_build`)
 
 Rebuilds only occur when necessary, speeding up subsequent runs.
+
+### Startup Generation Manifests
+
+rsplug writes the generated control plugin under `pack/_gen/opt/<hash>/` and
+loads the current control plugin from `init.lua` with `:packadd <hash>`. Older
+retained control plugins are not native startup packages, so they are not loaded
+by `packloadall` or startup package scanning.
+
+Each control plugin contains a `manifest.json` listing the shared `_gen` entries
+that generation references. The runtime exposes this data as `_rsplug.manifest`.
+rsplug keeps the latest few control manifests and only cleans `_gen` plugin
+directories when no retained manifest references them. This avoids deleting Lua
+hook/runtime modules still referenced by a Neovim instance that started before a
+later rsplug update.
 
 ## Who Is This For?
 

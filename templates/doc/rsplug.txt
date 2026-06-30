@@ -767,7 +767,9 @@ Phase 5: File installation~
     3. Otherwise: copy/hard-link files
     4. Apply ignore patterns
     5. Place managed plugins in `pack/_gen/opt/`
-    6. Place rsplug's generated control package in `pack/_gen/start/`
+    6. Place rsplug's generated control package in `pack/_gen/opt/`
+    7. Write `manifest.json` inside the generated control package
+    8. Generate `init.lua` so it explicitly `packadd`s the current control package
 
 Phase 6: Lazy-loading infrastructure~
     1. Scan for Lua modules (auto-detect requires)
@@ -804,10 +806,24 @@ Basic setup in init.lua:~
 What happens:~
 
 1. The generated `init.lua` prepends the rsplug output directory to 'packpath'
-2. It loads rsplug's generated control package
-3. Lazy-loading triggers are registered (autocmds, commands, keymaps)
-4. `start = true` plugins are loaded through the controlled `:packadd!` path
-5. Lazy plugins in `pack/_gen/opt/` wait for triggers
+2. It explicitly loads the current generated control package with `:packadd`
+3. It requires `_rsplug` from that control package
+4. Lazy-loading triggers are registered (autocmds, commands, keymaps)
+5. `start = true` plugins are loaded through the controlled `:packadd!` path
+6. Lazy plugins in `pack/_gen/opt/` wait for triggers
+
+Startup generation manifests:~
+
+rsplug stores each generated control package under `pack/_gen/opt/<hash>/`.
+The current root `init.lua` explicitly `packadd`s the current control package,
+so retained older control packages are not loaded by native startup scanning.
+
+Each control package contains a `manifest.json` listing the shared `_gen` entries
+that generation references. The runtime exposes this data as `_rsplug.manifest`.
+rsplug keeps the latest few control manifests and only removes `_gen` plugin
+directories when no retained manifest references them. This prevents an already-
+running Neovim from failing because an update deleted hook/runtime modules that
+its loaded control package still refers to.
 
 Custom packpath:~
 

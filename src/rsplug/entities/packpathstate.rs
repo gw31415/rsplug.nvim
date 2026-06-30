@@ -7,11 +7,14 @@ use std::{
     ops::Add,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use crate::log::{Message, msg};
 use adaptive_semaphore::AdaptiveSemaphore;
 use hashbrown::{HashMap, HashSet};
+use sailfish::TemplateSimple;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 use super::*;
@@ -274,6 +277,7 @@ impl FileSource {
 
 struct Files {
     start_or_opt: &'static str,
+    is_plugctl: bool,
     dir_type: DirectoryExtractionType,
 }
 
@@ -311,6 +315,83 @@ async fn symlink_plugin_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) 
     tokio::fs::symlink_dir(original, link).await
 }
 
+const RETAIN_GENERATIONS: usize = 3;
+
+#[derive(Serialize, Deserialize)]
+struct GenerationManifest {
+    version: u8,
+    entries: Vec<String>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "init.stpl")]
+#[template(escape = false)]
+struct InitTemplate<'a> {
+    control_ids: &'a [PluginIDStr],
+}
+
+fn render_init(control_ids: &[PluginIDStr]) -> Vec<u8> {
+    InitTemplate { control_ids }
+        .render_once()
+        .map(String::into_bytes)
+        .unwrap_or_else(|_| Vec::new())
+}
+
+fn manifest_entries(manifest: &GenerationManifest) -> HashSet<Box<[u8]>> {
+    manifest
+        .entries
+        .iter()
+        .map(|entry| entry.as_bytes().to_vec().into_boxed_slice())
+        .collect()
+}
+
+async fn retained_manifest_entries(
+    gen_root: &Path,
+    current_control_ids: &[PluginIDStr],
+    current_manifest: &GenerationManifest,
+) -> io::Result<HashSet<Box<[u8]>>> {
+    let mut manifests = Vec::new();
+    let current_control_set: HashSet<Box<[u8]>> = current_control_ids
+        .iter()
+        .map(|id| id.as_bytes().to_vec().into_boxed_slice())
+        .collect();
+    let opt_root = gen_root.join("opt");
+    if let Ok(mut read_dir) = tokio::fs::read_dir(opt_root).await {
+        while let Some(entry) = read_dir.next_entry().await? {
+            let path = entry.path().join("manifest.json");
+            if !path.is_file() {
+                continue;
+            }
+            let modified = tokio::fs::metadata(&path)
+                .await
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            manifests.push((modified, entry.file_name(), path));
+        }
+    }
+    manifests.sort_by(|(l_time, l_name, _), (r_time, r_name, _)| {
+        r_time.cmp(l_time).then_with(|| r_name.cmp(l_name))
+    });
+
+    let mut retained_entries = manifest_entries(current_manifest);
+    let mut retained_count = current_control_ids.len();
+    for (_, control_id, path) in manifests {
+        if current_control_set.contains(control_id.as_encoded_bytes()) {
+            continue;
+        }
+        if retained_count >= RETAIN_GENERATIONS {
+            break;
+        }
+        if let Ok(content) = tokio::fs::read(&path).await
+            && let Ok(manifest) = serde_json::from_slice::<GenerationManifest>(&content)
+        {
+            retained_entries.extend(manifest_entries(&manifest));
+            retained_count += 1;
+        }
+    }
+    Ok(retained_entries)
+}
+
 /// PackPath の象徴となる状態。この構造体に PluginLoaded をインサートしていき、最後に実際のパスを指定して install を行う。
 #[derive(Default)]
 pub struct PackPathState {
@@ -344,7 +425,7 @@ impl PackPathState {
         if already_installed {
             return;
         }
-        let start_or_opt = if is_plugctl { "start" } else { "opt" };
+        let start_or_opt = "opt";
 
         if !is_plugctl {
             self.ctl += PlugCtl::create(id, lazy_type, script, order, &mut files);
@@ -354,9 +435,11 @@ impl PackPathState {
                 for (path, item) in files {
                     let Files {
                         start_or_opt: _,
+                        is_plugctl: _,
                         dir_type: DirectoryExtractionType::Files(tree),
                     } = self.files.entry(id_str.clone()).or_insert(Files {
                         start_or_opt,
+                        is_plugctl,
                         dir_type: DirectoryExtractionType::Files(Vec::new()),
                     })
                     else {
@@ -370,6 +453,7 @@ impl PackPathState {
                     id_str.clone(),
                     Files {
                         start_or_opt,
+                        is_plugctl,
                         dir_type: DirectoryExtractionType::Symlink(dir),
                     },
                 );
@@ -395,35 +479,43 @@ impl PackPathState {
         }
         let gen_root = packpath.join("pack").join("_gen");
         tokio::fs::create_dir_all(&gen_root).await?;
-        tokio::fs::write(
-            packpath.join("init.lua"),
-            include_bytes!("../../../templates/init.lua"),
-        )
-        .await?;
         let Self {
             installing: _,
             files,
             ctl: _,
         } = self;
-        let installing_entries: HashSet<Box<[u8]>> = files
+        let mut generation_entries: Vec<String> = files
             .iter()
             .map(|(id, files)| {
-                let mut key = Vec::with_capacity(files.start_or_opt.len() + 1 + id.len());
-                key.extend_from_slice(files.start_or_opt.as_bytes());
-                key.push(b'/');
-                key.extend_from_slice(id.as_bytes());
-                key.into_boxed_slice()
+                let mut key = String::with_capacity(files.start_or_opt.len() + 1 + id.len());
+                key.push_str(files.start_or_opt);
+                key.push('/');
+                key.push_str(id);
+                key
             })
             .collect();
+        generation_entries.sort();
+        let manifest = GenerationManifest {
+            version: 1,
+            entries: generation_entries,
+        };
+        let manifest_content = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+        let mut control_ids: Vec<PluginIDStr> = files
+            .iter()
+            .filter(|(_, files)| files.is_plugctl)
+            .map(|(id, _)| id.clone())
+            .collect();
+        control_ids.sort();
+        let init_content = render_init(&control_ids);
         let mut tasks = JoinSet::new();
         let yank_semaphore = AdaptiveSemaphore::new();
         let symlink_semaphore = AdaptiveSemaphore::new();
-        let cleanup_semaphore = AdaptiveSemaphore::new();
 
         for (
             id,
             Files {
                 start_or_opt,
+                is_plugctl: _,
                 dir_type,
             },
         ) in files
@@ -529,26 +621,50 @@ impl PackPathState {
             }
         }
 
-        let installing_entries = Arc::new(installing_entries);
+        tasks
+            .join_all()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for id in &control_ids {
+            let manifest_path = gen_root
+                .join("opt")
+                .join(<PluginIDStr as AsRef<Path>>::as_ref(id))
+                .join("manifest.json");
+            tokio::fs::create_dir_all(manifest_path.parent().unwrap()).await?;
+            tokio::fs::write(manifest_path, &manifest_content).await?;
+        }
+        tokio::fs::remove_file(packpath.join("init.lua")).await.ok();
+        tokio::fs::write(packpath.join("init.lua"), init_content).await?;
+        tokio::fs::remove_dir_all(packpath.join("generations"))
+            .await
+            .ok();
+
+        let retained_entries =
+            retained_manifest_entries(&gen_root, &control_ids, &manifest).await?;
+
+        let retained_entries = Arc::new(retained_entries);
+        let cleanup_semaphore = AdaptiveSemaphore::new();
+        let mut cleanup_tasks = JoinSet::new();
         for start_or_opt in ["start", "opt"] {
             let path = gen_root.join(start_or_opt);
             let start_or_opt_key: Arc<[u8]> = Arc::from(start_or_opt.as_bytes());
             if let Ok(mut read_dir) = tokio::fs::read_dir(path).await {
                 while let Some(entry) = read_dir.next_entry().await? {
-                    let installing_entries = installing_entries.clone();
+                    let retained_entries = retained_entries.clone();
                     let cleanup_semaphore = cleanup_semaphore.clone();
                     let start_or_opt_key = Arc::clone(&start_or_opt_key);
-                    tasks.spawn(async move {
+                    cleanup_tasks.spawn(async move {
                         let file_name = os_string_to_install_key(entry.file_name());
                         let mut entry_key =
                             Vec::with_capacity(start_or_opt_key.len() + 1 + file_name.len());
                         entry_key.extend_from_slice(&start_or_opt_key);
                         entry_key.push(b'/');
                         entry_key.extend_from_slice(&file_name);
-                        let not_installed_entry =
-                            !installing_entries.contains(entry_key.as_slice());
+                        let not_retained_entry = !retained_entries.contains(entry_key.as_slice());
                         let path = entry.path();
-                        if not_installed_entry && path.is_dir() {
+                        if not_retained_entry && path.is_dir() {
                             let permit = cleanup_semaphore.acquire().await;
                             let result = tokio::fs::remove_dir_all(path).await;
                             let is_error = result.is_err();
@@ -561,7 +677,7 @@ impl PackPathState {
             }
         }
 
-        let res = tasks
+        let res = cleanup_tasks
             .join_all()
             .await
             .into_iter()
@@ -569,5 +685,53 @@ impl PackPathState {
             .and(Ok(()));
         msg(Message::InstallDone);
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_template_packadds_control_packages() {
+        let control_id = PluginID::new(b"control-package").as_str();
+        let script = String::from_utf8(render_init(std::slice::from_ref(&control_id))).unwrap();
+
+        assert!(script.contains(&format!("vim.cmd('packadd {control_id}')")));
+        assert!(!script.contains("packloadall"));
+    }
+
+    #[test]
+    fn init_template_emits_exact_packadd_block() {
+        let a = PluginID::new(b"aaaa").as_str();
+        let b = PluginID::new(b"bbbb").as_str();
+        let script = String::from_utf8(render_init(&[a.clone(), b.clone()])).unwrap();
+        // ponytail: locks in the exact packadd block shape; break whitespace here if the template changes.
+        let actual = script
+            .split("native startup package scanning.\n")
+            .nth(1)
+            .unwrap();
+        let expected = format!(
+            "vim.cmd('packadd {a}')\nvim.cmd('packadd {b}')\n\nlocal ok, rsplug"
+        );
+        assert!(
+            actual.starts_with(&expected),
+            "unexpected init template output: {actual:?}\nexpected prefix: {expected:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_entries_are_parsed_from_json_model() {
+        let manifest = GenerationManifest {
+            version: 1,
+            entries: vec![
+                "opt/22222222222222222222222222222222".to_string(),
+                "opt/11111111111111111111111111111111".to_string(),
+            ],
+        };
+        let parsed = manifest_entries(&manifest);
+
+        assert!(parsed.contains("opt/22222222222222222222222222222222".as_bytes()));
+        assert!(parsed.contains("opt/11111111111111111111111111111111".as_bytes()));
     }
 }

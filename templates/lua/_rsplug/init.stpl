@@ -3,7 +3,7 @@ local pkgid2scripts = {<% for (id, script_set) in pkgid2scripts {%>['<%=id%>']={
 local startup_plugins = {<% for id in startup_plugins {%>'<%=id%>',<%}%>}
 local startup_scripts = {<% for module_id in startup_scripts {%>'<%=module_id%>',<%}%>}
 local loaded = {}
-return {
+return setmetatable({
 	loaded = loaded,
 	---@param id string
 	---@param startup boolean|nil
@@ -63,4 +63,17 @@ return {
 			return true
 		end, current)
 	end,
-}
+}, {
+	__index = function(t, key)
+		if key ~= 'manifest' then return nil end
+		local source = debug.getinfo(1, 'S').source
+		local script = source:sub(1, 1) == '@' and source:sub(2) or source
+		local manifest_path = vim.fn.fnamemodify(script, ':h:h:h') .. '/manifest.json'
+		local ok, decoded = pcall(function()
+			return vim.json.decode(table.concat(vim.fn.readfile(manifest_path), '\n'))
+		end)
+		local m = (ok and type(decoded) == 'table') and decoded or {}
+		rawset(t, key, m)
+		return m
+	end,
+})
