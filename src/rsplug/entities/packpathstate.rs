@@ -315,6 +315,16 @@ async fn symlink_plugin_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) 
     tokio::fs::symlink_dir(original, link).await
 }
 
+#[cfg(unix)]
+async fn symlink_file(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    tokio::fs::symlink(original, link).await
+}
+
+#[cfg(windows)]
+async fn symlink_file(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    tokio::fs::symlink_file(original, link).await
+}
+
 const RETAIN_GENERATIONS: usize = 3;
 
 #[derive(Serialize, Deserialize)]
@@ -650,7 +660,7 @@ impl PackPathState {
             tokio::fs::write(&gen_path, &init_content).await?;
             let init_path = packpath.join("init.lua");
             tokio::fs::remove_file(&init_path).await.ok();
-            tokio::fs::symlink(&gen_path, &init_path).await?;
+            symlink_file(&gen_path, &init_path).await?;
         }
 
         let retained_entries =
@@ -754,8 +764,14 @@ mod tests {
         let script = String::from_utf8(render_init(std::slice::from_ref(&id))).unwrap();
         // init.lua is a symlink into generations/; resolve + :h:h recovers ~/.cache/rsplug
         // whether loaded through the symlink or directly as a generation file.
-        assert!(script.contains("vim.fn.resolve"), "must resolve the init.lua symlink");
-        assert!(script.contains(":h:h"), "must go up two levels from generations/<id>.lua");
+        assert!(
+            script.contains("vim.fn.resolve"),
+            "must resolve the init.lua symlink"
+        );
+        assert!(
+            script.contains(":h:h"),
+            "must go up two levels from generations/<id>.lua"
+        );
     }
 
     #[test]
