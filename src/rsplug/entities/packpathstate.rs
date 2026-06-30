@@ -635,11 +635,23 @@ impl PackPathState {
             tokio::fs::create_dir_all(manifest_path.parent().unwrap()).await?;
             tokio::fs::write(manifest_path, &manifest_content).await?;
         }
-        tokio::fs::remove_file(packpath.join("init.lua")).await.ok();
-        tokio::fs::write(packpath.join("init.lua"), init_content).await?;
-        tokio::fs::remove_dir_all(packpath.join("generations"))
-            .await
-            .ok();
+        let generations_dir = packpath.join("generations");
+        tokio::fs::create_dir_all(&generations_dir).await?;
+        if control_ids.is_empty() {
+            // ponytail: no control package to anchor a generation file; fall back to a plain init.lua.
+            tokio::fs::remove_file(packpath.join("init.lua")).await.ok();
+            tokio::fs::write(packpath.join("init.lua"), &init_content).await?;
+        } else {
+            // Each generation's loader lives at generations/<control_id>.lua; init.lua is a
+            // pure symlink to it, so older retained generations stay addressable by name.
+            let gen_path = generations_dir
+                .join(<PluginIDStr as AsRef<Path>>::as_ref(&control_ids[0]))
+                .with_extension("lua");
+            tokio::fs::write(&gen_path, &init_content).await?;
+            let init_path = packpath.join("init.lua");
+            tokio::fs::remove_file(&init_path).await.ok();
+            tokio::fs::symlink(&gen_path, &init_path).await?;
+        }
 
         let retained_entries =
             retained_manifest_entries(&gen_root, &control_ids, &manifest).await?;
@@ -683,6 +695,23 @@ impl PackPathState {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .and(Ok(()));
+        // Best-effort: drop retained generation loaders whose anchor control package was pruned.
+        if res.is_ok()
+            && let Ok(mut read_dir) = tokio::fs::read_dir(&generations_dir).await
+        {
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if !gen_root.join("opt").join(id).is_dir() {
+                    tokio::fs::remove_file(&path).await.ok();
+                }
+            }
+        }
         msg(Message::InstallDone);
         res
     }
@@ -717,6 +746,16 @@ mod tests {
             actual.starts_with(&expected),
             "unexpected init template output: {actual:?}\nexpected prefix: {expected:?}"
         );
+    }
+
+    #[test]
+    fn init_template_resolves_symlink_and_goes_up_two_levels() {
+        let id = PluginID::new(b"gen").as_str();
+        let script = String::from_utf8(render_init(std::slice::from_ref(&id))).unwrap();
+        // init.lua is a symlink into generations/; resolve + :h:h recovers ~/.cache/rsplug
+        // whether loaded through the symlink or directly as a generation file.
+        assert!(script.contains("vim.fn.resolve"), "must resolve the init.lua symlink");
+        assert!(script.contains(":h:h"), "must go up two levels from generations/<id>.lua");
     }
 
     #[test]
