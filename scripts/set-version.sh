@@ -36,7 +36,7 @@ sed -i.bak -E "/^walker = \{ .*path = / s/version = \"[^\"]+\"/version = \"${WAL
 rm -f "${ROOT}/Cargo.toml.bak"
 
 sed -i.bak -E "s/^version = \".*\"/version = \"${WALKER_VERSION}\"/" \
-    "${ROOT}/walker/Cargo.toml"
-rm -f "${ROOT}/walker/Cargo.toml.bak"
+    "${ROOT}/crates/walker/Cargo.toml"
+rm -f "${ROOT}/crates/walker/Cargo.toml.bak"
 
 echo "✓ Set workspace version to ${VERSION} (rsplug-walker ${WALKER_VERSION})"
