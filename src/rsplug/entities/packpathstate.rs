@@ -736,7 +736,7 @@ mod tests {
         let control_id = PluginID::new(b"control-package").as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&control_id))).unwrap();
 
-        assert!(script.contains(&format!("vim.cmd('packadd {control_id}')")));
+        assert!(script.contains(&format!("vim.cmd.packadd '{control_id}'")));
         assert!(!script.contains("packloadall"));
     }
 
@@ -747,11 +747,10 @@ mod tests {
         let script = String::from_utf8(render_init(&[a.clone(), b.clone()])).unwrap();
         // ponytail: locks in the exact packadd block shape; break whitespace here if the template changes.
         let actual = script
-            .split("native startup package scanning.\n")
+            .split("vim.opt.packpath:prepend(root)\n\n")
             .nth(1)
             .unwrap();
-        let expected =
-            format!("vim.cmd('packadd {a}')\nvim.cmd('packadd {b}')\n\nlocal ok, rsplug");
+        let expected = format!("vim.cmd.packadd '{a}'\nvim.cmd.packadd '{b}'\n\nlocal ok, rsplug");
         assert!(
             actual.starts_with(&expected),
             "unexpected init template output: {actual:?}\nexpected prefix: {expected:?}"

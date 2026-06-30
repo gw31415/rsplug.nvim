@@ -11,7 +11,7 @@ local root = vim.fn.fnamemodify(vim.fn.resolve(source), ':h:h')
 
 vim.opt.packpath:prepend(root)
 
-<% for id in control_ids {%>vim.cmd('packadd <%= id %>')
+<% for id in control_ids {%>vim.cmd.packadd '<%= id %>'
 <%}%>
 local ok, rsplug = pcall(require, '_rsplug')
 if not ok then
