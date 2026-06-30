@@ -3,7 +3,7 @@ members = [".", "adaptive_semaphore", "dag", "file_specifier", "walker", "walker
 resolver = "3"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 repository = "https://github.com/gw31415/rsplug.nvim"
 license = "Apache-2.0"
