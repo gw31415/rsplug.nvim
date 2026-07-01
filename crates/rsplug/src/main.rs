@@ -3,6 +3,7 @@ mod osc94;
 mod rsplug;
 
 use clap::Parser;
+use console::style;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use std::{
@@ -68,10 +69,20 @@ async fn app() -> Result<(), Error> {
 
         let mut configs = Vec::with_capacity(config_paths.len());
         for path in config_paths {
-            let content = tokio::fs::read(&path).await?;
-            configs.push(
-                toml::from_slice::<rsplug::Config>(&content).map_err(|e| Error::Parse(e, path))?,
-            );
+            let input =
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|source| Error::ConfigRead {
+                        path: path.clone(),
+                        source,
+                    })?;
+            configs.push(toml::from_str::<rsplug::Config>(&input).map_err(|source| {
+                Error::Parse {
+                    source,
+                    path,
+                    input,
+                }
+            })?);
         }
         configs.into_iter().sum::<rsplug::Config>()
     };
@@ -191,14 +202,199 @@ static DEFAULT_REPOCACHE_DIR: Lazy<PathBuf> = Lazy::new(|| DEFAULT_APP_DIR.join(
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
-    #[error("failed to parse {1:?}: {0}")]
-    Parse(toml::de::Error, PathBuf),
+    #[error("{}", format_toml_parse_error(path, input, source))]
+    Parse {
+        source: toml::de::Error,
+        path: PathBuf,
+        input: String,
+    },
+    #[error("failed to read config {}: {source}", path.display())]
+    ConfigRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
     #[error(transparent)]
     Dag(#[from] dag::DagError),
+}
+
+fn format_toml_parse_error(
+    path: &std::path::Path,
+    input: &str,
+    source: &toml::de::Error,
+) -> String {
+    let Some(orig_span) = source.span() else {
+        return format!(
+            "failed to parse config {}: {}",
+            path.display(),
+            source.message()
+        );
+    };
+    // ponytail: `toml` reports the enclosing table-header span for any error
+    // inside a table. Narrow to the actual offending field where possible.
+    let span = refine_parse_error_span(input, orig_span.clone()).unwrap_or(orig_span);
+    let (line_no, col_no, line_start, line_end) = line_info(input, span.start);
+    let line = &input[line_start..line_end];
+    let span_start_col = span.start.saturating_sub(line_start) + 1;
+    let span_end_col = span
+        .end
+        .min(line_end)
+        .saturating_sub(line_start)
+        .max(span_start_col);
+    let caret_len = span_end_col.saturating_sub(span_start_col).max(1);
+    let gutter = style("|").blue();
+    format!(
+        "failed to parse config\n {} {}:{}:{}\n   {}\n{} {} {}\n   {} {}{}",
+        style("-->").blue(),
+        path.display(),
+        line_no,
+        col_no,
+        gutter,
+        style(format!("{line_no:>2}")).blue(),
+        gutter,
+        highlight_toml_line(line, span_start_col, span_end_col),
+        gutter,
+        " ".repeat(span_start_col.saturating_sub(1)),
+        format!(
+            "{} {}",
+            style("^".repeat(caret_len)).red().bold(),
+            source.message()
+        )
+    )
+}
+
+/// The `toml` crate reports the enclosing table-header span (e.g. `[[plugins]]`)
+/// for *any* error inside that table, so the caret points at the header instead
+/// of the bad value. Re-parse with `toml_edit` (which keeps per-value spans) and
+/// isolate which field actually fails.
+///
+/// `repo` is the only required field of a plugin entry. We test it alone first;
+/// if it parses, we probe every other value-typed field against a known-valid
+/// repo. Works for both serde type errors and custom `RepoSource` errors.
+fn refine_parse_error_span(
+    input: &str,
+    header_span: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let doc = toml_edit::Document::parse(input).ok()?;
+    let plugins = doc.get("plugins")?.as_array_of_tables()?;
+    let entry = plugins
+        .iter()
+        .find(|t| t.span() == Some(header_span.clone()))?;
+
+    // (key, raw value text, value span) for each value-typed field.
+    let fields: Vec<(&str, &str, std::ops::Range<usize>)> = entry
+        .iter()
+        .filter_map(|(key, item)| {
+            let span = item.as_value()?.span()?;
+            Some((key, &input[span.start..span.end], span))
+        })
+        .collect();
+
+    let (_, repo_text, repo_span) = fields.iter().find(|(k, _, _)| *k == "repo")?;
+    let base = format!("[[plugins]]\nrepo = {}\n", repo_text);
+
+    if toml::from_str::<rsplug::Config>(&base).is_err() {
+        return Some(repo_span.clone());
+    }
+    for (key, text, span) in &fields {
+        if *key == "repo" {
+            continue;
+        }
+        let probe = format!("{}{} = {}\n", base, key, text);
+        if toml::from_str::<rsplug::Config>(&probe).is_err() {
+            return Some(span.clone());
+        }
+    }
+    None
+}
+
+fn line_info(input: &str, offset: usize) -> (usize, usize, usize, usize) {
+    let mut line_no = 1;
+    let mut line_start = 0;
+    for (idx, ch) in input.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line_no += 1;
+            line_start = idx + 1;
+        }
+    }
+    let line_end = input[line_start..]
+        .find('\n')
+        .map(|idx| line_start + idx)
+        .unwrap_or(input.len());
+    (
+        line_no,
+        offset.saturating_sub(line_start) + 1,
+        line_start,
+        line_end,
+    )
+}
+
+fn highlight_toml_line(line: &str, span_start_col: usize, span_end_col: usize) -> String {
+    let span_start = span_start_col.saturating_sub(1).min(line.len());
+    let span_end = span_end_col.min(line.len());
+    let mut rendered = String::new();
+    rendered.push_str(&line[..span_start]);
+    rendered.push_str(&style(&line[span_start..span_end]).red().bold().to_string());
+    rendered.push_str(&line[span_end..]);
+    rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_error_span_points_at_offending_value_not_header() {
+        let cases: &[(&str, &str, &str)] = &[
+            // input, expected snippet line, exact offending token
+            ("[[plugins]]\nrepo = 1 #\"x\"\n", "repo = 1", "1"),
+            ("[[plugins]]\nrepo = \"badformat\"\n", "\"badformat\"", "\"badformat\""),
+            ("[[plugins]]\nrepo = \"owner/x\"\non_ft = 7\n", "on_ft = 7", "7"),
+        ];
+        for (input, want_line, want_token) in cases {
+            let err = match toml::from_str::<rsplug::Config>(input) {
+                Ok(_) => panic!("expected parse error for {input:?}"),
+                Err(e) => e,
+            };
+            let refined = refine_parse_error_span(input, err.span().unwrap());
+            let span = refined.expect("span should be refined");
+            let bad = &input[span.start..span.end];
+            assert_eq!(bad, *want_token, "for {input:?}");
+            let rendered = format_toml_parse_error(std::path::Path::new("x"), input, &err);
+            assert!(rendered.contains(want_line), "missing line {want_line:?} in:\n{rendered}");
+            // Header line must NOT be the one carrying the code snippet anymore.
+            assert!(!rendered.contains(" 1 | [[plugins]]"), "still pointing at header:\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn toml_parse_error_format_includes_source_snippet() {
+        let input = "[[plugins]]\nrepo = \"owner/plugin\"\nstart = tru\n";
+        let err = match toml::from_str::<rsplug::Config>(input) {
+            Ok(_) => panic!("expected parse error"),
+            Err(err) => err,
+        };
+        let rendered = format_toml_parse_error(std::path::Path::new("bad.toml"), input, &err);
+
+        assert!(rendered.contains("failed to parse config"));
+        assert!(rendered.contains("bad.toml:3:9"));
+        assert!(rendered.contains("start = tru"));
+        assert!(rendered.contains("^"));
+        assert!(rendered.contains("invalid boolean"));
+
+        // ponytail: gutter `|` must align across all lines (lock indent fix).
+        for line in rendered.lines() {
+            if let Some(pos) = line.find('|') {
+                assert_eq!(pos, 3, "gutter pipe misaligned: {line:?}");
+            }
+        }
+    }
 }
 
 #[tokio::main]

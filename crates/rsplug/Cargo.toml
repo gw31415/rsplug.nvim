@@ -30,6 +30,7 @@ serde_with = { version = "3.21", features = [
 	"hashbrown_0_17",
 ], default-features = false }
 toml = "1.1"
+toml_edit = "0.23"
 unicode-width = "0.2"
 wildmatch = "2.6"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
