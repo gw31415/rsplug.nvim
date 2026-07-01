@@ -208,7 +208,7 @@ impl DagNode for PluginConfig {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize, Default)]
+#[derive(Default)]
 struct SetupScriptOne {
     /// Neovim 起動時に実行される Lua スクリプト
     lua_start: Option<String>,
@@ -216,6 +216,56 @@ struct SetupScriptOne {
     lua_after: Option<String>,
     /// プラグイン読み込み直前に実行される Lua スクリプト
     lua_before: Option<String>,
+    /// `lua_{autocmd}` 形式の autocmd Lua スクリプト
+    lua_autocmd: BTreeMap<String, String>,
+}
+
+// 手動 Deserialize: `lua_*` キーだけを取り込み、それ以外(`merge`/`ignore`/`repo`/...)
+// は無視する。かつて `#[serde(flatten)] BTreeMap<String,String>` が兄弟フィールドを
+// 総取りで飲み込んでいたのを防ぐため、明示的にプレフィックスで絞る。
+impl<'de> Deserialize<'de> for SetupScriptOne {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{IgnoredAny, MapAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = SetupScriptOne;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("plugin script fields")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut lua_start = None;
+                let mut lua_after = None;
+                let mut lua_before = None;
+                let mut lua_autocmd: BTreeMap<String, String> = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "lua_start" => lua_start = Some(map.next_value()?),
+                        "lua_after" => lua_after = Some(map.next_value()?),
+                        "lua_before" => lua_before = Some(map.next_value()?),
+                        k if k.starts_with("lua_") => {
+                            lua_autocmd.insert(k.to_string(), map.next_value()?);
+                        }
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(SetupScriptOne {
+                    lua_start,
+                    lua_after,
+                    lua_before,
+                    lua_autocmd,
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
 }
 
 /// プラグインのセットアップに用いるスクリプト群
@@ -227,6 +277,8 @@ pub struct SetupScript {
     pub lua_after: BTreeSet<String>,
     /// プラグイン読み込み直前に実行される Lua スクリプト
     pub lua_before: BTreeSet<String>,
+    /// autocmd 発火時に実行される Lua スクリプト
+    pub lua_autocmd: BTreeMap<Autocmd, BTreeSet<String>>,
 }
 
 impl From<SetupScriptOne> for SetupScript {
@@ -235,11 +287,29 @@ impl From<SetupScriptOne> for SetupScript {
             lua_start,
             lua_after,
             lua_before,
+            lua_autocmd,
         } = value;
+        let lua_autocmd = lua_autocmd
+            .into_iter()
+            .filter_map(|(key, script)| {
+                let event = key.strip_prefix("lua_")?;
+                if matches!(event, "start" | "before" | "after" | "build") {
+                    return None;
+                }
+                Some((event.parse::<Autocmd>().ok()?, script))
+            })
+            .fold(
+                BTreeMap::<Autocmd, BTreeSet<String>>::new(),
+                |mut acc, (event, script)| {
+                    acc.entry(event).or_default().insert(script);
+                    acc
+                },
+            );
         SetupScript {
             lua_start: lua_start.into_iter().collect(),
             lua_after: lua_after.into_iter().collect(),
             lua_before: lua_before.into_iter().collect(),
+            lua_autocmd,
         }
     }
 }
@@ -249,6 +319,9 @@ impl AddAssign for SetupScript {
         self.lua_start.extend(rhs.lua_start);
         self.lua_after.extend(rhs.lua_after);
         self.lua_before.extend(rhs.lua_before);
+        for (event, scripts) in rhs.lua_autocmd {
+            self.lua_autocmd.entry(event).or_default().extend(scripts);
+        }
     }
 }
 
@@ -358,6 +431,36 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, LoadEvent::OnSource(source) if source == "host.nvim"))
+        );
+    }
+
+    #[test]
+    fn plugin_merge_and_ignore_parse_without_being_swallowed_by_lua_catchall() {
+        // ponytail: guards against the greedy `#[serde(flatten)] BTreeMap<String,String>`
+        // catch-all in SetupScriptOne swallowing sibling keys like `merge`/`ignore`.
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "owner/plugin"
+            sym = true
+            start = true
+            merge = false
+            ignore = "*.tmp"
+            lua_User = "vim.g.x = true"
+            "#,
+        )
+        .unwrap();
+        let p = &config.plugins[0];
+        assert!(!p.merge.merge, "merge bool must reach MergeConfig");
+        assert_eq!(
+            p.merge.ignore.matched("foo.tmp"),
+            true,
+            "ignore must reach MergeConfig, not be swallowed"
+        );
+        assert!(
+            p.script.lua_autocmd.len() == 1
+                && p.script.lua_autocmd.values().flatten().any(|s| s.contains("vim.g.x")),
+            "lua_User must still reach the autocmd script map"
         );
         assert!(config.plugins[0].cache.to_sym(&config.plugins[0].lazy_type));
     }

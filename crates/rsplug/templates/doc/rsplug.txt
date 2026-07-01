@@ -410,6 +410,18 @@ lua_start~
         '''
 <
 
+lua_{Event}~
+    Type: String
+
+    Lua code executed when the named Neovim autocmd event fires. The field name
+    is formed by prefixing the event with `lua_`, for example `lua_User`.
+
+    Example:
+>toml
+        [[plugins]]
+        lua_User = "vim.g.rsplug_user_event = true"
+<
+
 lua_before~
     Type: String
     

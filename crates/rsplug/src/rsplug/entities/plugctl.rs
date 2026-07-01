@@ -132,6 +132,7 @@ pub struct PlugCtl {
     luam2pkgid: BTreeMap<LuaModule, Vec<PluginIDStr>>,
     source_name2pkgid: BTreeMap<String, Vec<PluginIDStr>>,
     source_target2pkgid: BTreeMap<String, PluginIDStr>,
+    lua_autocmd2scripts: BTreeMap<Autocmd, Vec<String>>,
     keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
     overwrite_files: BTreeMap<PluginID, HowToPlaceFiles>,
 }
@@ -173,6 +174,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             luam2pkgid,
             source_name2pkgid,
             source_target2pkgid,
+            lua_autocmd2scripts,
             keypattern2pkgid,
             overwrite_files,
         } = value;
@@ -197,6 +199,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                         lua_start,
                         lua_after,
                         lua_before,
+                        lua_autocmd: _,
                     } = script;
                     let lua_after = lua_after.into_iter().map(|s| (AfterOrBefore::After, s));
                     let lua_before = lua_before.into_iter().map(|s| (AfterOrBefore::Before, s));
@@ -290,6 +293,36 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 merge_enabled: true,
                 is_plugctl: true,
             });
+        }
+
+        if !lua_autocmd2scripts.is_empty() {
+            let mut event2modules: BTreeMap<Autocmd, Vec<String>> = BTreeMap::new();
+            for (event, scripts) in lua_autocmd2scripts {
+                for content in scripts {
+                    let module_id = format!(
+                        "lua_{}_{}",
+                        event,
+                        hash::digest_hex_string(content.as_bytes())
+                    );
+                    plugs.push(instant_startup_pkg(
+                        &format!("lua/{module_id}.lua"),
+                        content.into_bytes(),
+                    ));
+                    event2modules
+                        .entry(event.clone())
+                        .or_default()
+                        .push(module_id);
+                }
+            }
+            plugs.push(instant_startup_pkg(
+                "plugin/lua_autocmd.lua",
+                LuaAutocmdTemplate {
+                    event2modules: &event2modules,
+                }
+                .render_once()
+                .unwrap()
+                .into_bytes(),
+            ));
         }
 
         if !ft2pkgid.is_empty() {
@@ -560,6 +593,7 @@ impl AddAssign for PlugCtl {
             luam2pkgid,
             source_name2pkgid,
             source_target2pkgid,
+            lua_autocmd2scripts,
             keypattern2pkgid,
             overwrite_files,
         } = other;
@@ -590,6 +624,12 @@ impl AddAssign for PlugCtl {
                 .entry(luam)
                 .or_default()
                 .extend(ids.into_iter());
+        }
+        for (event, scripts) in lua_autocmd2scripts {
+            self.lua_autocmd2scripts
+                .entry(event)
+                .or_default()
+                .extend(scripts.into_iter());
         }
         for (source, ids) in source_name2pkgid {
             self.source_name2pkgid
@@ -637,6 +677,7 @@ impl PlugCtl {
             luam2pkgid,
             source_name2pkgid,
             source_target2pkgid,
+            lua_autocmd2scripts,
             keypattern2pkgid,
             overwrite_files,
         } = self;
@@ -648,7 +689,8 @@ impl PlugCtl {
             && luam2pkgid.is_empty()
             && source_name2pkgid.is_empty()
             && source_target2pkgid.is_empty()
-            && keypattern2pkgid.values().all(|v| v.is_empty())
+        && lua_autocmd2scripts.is_empty()
+        && keypattern2pkgid.values().all(|v| v.is_empty())
             && overwrite_files.is_empty()
     }
 
@@ -690,20 +732,26 @@ impl PlugCtl {
 
         let id_str = id.as_str();
         let source_target2pkgid = BTreeMap::from([(source_name, id_str.clone())]);
+        let lua_autocmd2scripts: BTreeMap<Autocmd, Vec<String>> = script
+            .lua_autocmd
+            .iter()
+            .map(|(event, scripts)| (event.clone(), scripts.iter().cloned().collect()))
+            .collect();
 
         let LazyType::Opt(events) = lazy_type else {
-            return Self {
-                pkgid2scripts: vec![PkgId2ScriptsItem {
-                    pkgid: id_str,
-                    script,
-                    order,
-                    start: true,
-                }],
-                source_target2pkgid,
-                overwrite_files: overwrite_files(id),
-                ..Default::default()
-            };
+        return Self {
+            pkgid2scripts: vec![PkgId2ScriptsItem {
+                pkgid: id_str,
+                script,
+                order,
+                start: true,
+            }],
+            source_target2pkgid,
+            lua_autocmd2scripts,
+            overwrite_files: overwrite_files(id),
+            ..Default::default()
         };
+    };
         let mut event2pkgid: BTreeMap<Autocmd, Vec<_>> = BTreeMap::new();
         let mut cmd2pkgid: BTreeMap<UserCmd, Vec<_>> = BTreeMap::new();
         let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
@@ -768,6 +816,7 @@ impl PlugCtl {
             luam2pkgid,
             source_name2pkgid,
             source_target2pkgid,
+            lua_autocmd2scripts,
             keypattern2pkgid,
             overwrite_files: overwrite_files(id),
         }
@@ -852,6 +901,13 @@ struct OnFuncSetupTemplate<'a> {
 #[template(escape = false)]
 struct OnFuncTemplate<'a> {
     func2pkgid: &'a BTreeMap<VimFunc, Vec<PluginIDStr>>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "plugin/lua_autocmd.stpl")]
+#[template(escape = false)]
+struct LuaAutocmdTemplate<'a> {
+    event2modules: &'a BTreeMap<Autocmd, Vec<String>>,
 }
 
 #[derive(TemplateSimple)]

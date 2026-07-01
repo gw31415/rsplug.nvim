@@ -260,6 +260,7 @@ rsplug
 | `on_map` | String/Table | Keymap(s) to trigger lazy-load |
 | `depends` | Array | Plugin dependencies loaded simultaneously |
 | `lua_start` | String | Lua code to run at Neovim startup |
+| `lua_{Event}` | String | Lua code to run when the named autocmd event fires |
 | `lua_before` | String | Lua code to run before plugin loads |
 | `lua_after` | String | Lua code to run after plugin loads |
 | `build` | Array | Subprocess to run after install/update |
@@ -307,6 +308,15 @@ name = "host.nvim"
 [[plugins]]
 repo = "owner/extension.nvim"
 on_source = "host.nvim"
+```
+
+### Lua Autocmd Hooks
+
+`lua_{Event}` runs Lua code when a Neovim autocmd event fires:
+
+```toml
+[[plugins]]
+lua_User = "vim.g.rsplug_user_event = true"
 ```
 
 ### Post-Update Lua Hooks
