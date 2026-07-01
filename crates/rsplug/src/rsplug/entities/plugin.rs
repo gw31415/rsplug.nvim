@@ -92,7 +92,8 @@ impl RepoSource {
         }
     }
 
-    /// Such as [Given: ~/.cache/rsplug/]./repos/gitlab.com/owner/repo
+    /// Relative to the `repos` cache namespace.
+    /// GitHub: `github.com/owner/repo`; URL: `host/path`.
     pub(super) fn default_cachedir(&self) -> PathBuf {
         match self {
             RepoSource::GitHub { owner, repo, .. } => {
@@ -123,7 +124,7 @@ impl RepoSource {
                         .to_string()
                 };
                 let path_str = normalized.trim_end_matches(".git");
-                let mut result = PathBuf::from("repos");
+                let mut result = PathBuf::new();
                 for comp in path_str.split('/').filter(|s| !s.is_empty()) {
                     result.push(comp);
                 }
@@ -682,12 +683,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn git_url_default_cachedir_is_under_repos_namespace() {
+    fn git_url_default_cachedir_is_relative_to_repos_namespace() {
         let repo = RepoSource::from_str("https://gitlab.com/owner/plugin").unwrap();
 
         assert_eq!(
             repo.default_cachedir(),
-            PathBuf::from("repos/gitlab.com/owner/plugin")
+            PathBuf::from("gitlab.com/owner/plugin")
         );
     }
 
