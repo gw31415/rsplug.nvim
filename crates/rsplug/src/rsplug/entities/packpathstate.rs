@@ -42,7 +42,7 @@ pub struct LoadedPlugin {
     /// ID
     pub(super) id: PluginID,
     /// `on_source` から参照される設定上の名前
-    pub(super) source_name: String,
+    pub(super) source_name: Option<String>,
     /// プラグインの遅延実行タイプ
     pub lazy_type: LazyType,
     /// 配置するファイル

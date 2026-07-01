@@ -8,7 +8,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dag::DagNode;
 use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
 use git2::Oid;
 use once_cell::sync::Lazy;
@@ -22,7 +21,7 @@ use super::*;
 /// 設定を構成する基本単位
 pub struct Plugin {
     /// `on_source` から参照される設定上の名前
-    pub source_name: String,
+    pub source_name: Option<String>,
     /// 取得元
     pub cache: CacheConfig,
     /// Pluginに対応する読み込みタイプ
@@ -180,60 +179,31 @@ impl Plugin {
     pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, DagError> {
         let Config { plugins } = config;
 
-        // order を (depends_depth, config_index) の複合キーで計算する。
-        // depth = 依存チェーンの最長深さ。depends がないなら 0。
-        // tiebreak は config 出現順。
+        // order は (depth, config_index) の複合キー。depth と index は dag 側で
+        // 計算して map 関数に渡される。tiebreak は config 出現順。
         let total = plugins.len();
-        let id_to_index: hashbrown::HashMap<String, usize> = plugins
-            .iter()
-            .enumerate()
-            .map(|(index, plug)| (plug.id().to_string(), index))
-            .collect();
+        // 依存先の cachedir を（dep_name → index で）引くための表。
+        // 重複チェック・UnknownDependency 検出は dag 側に委譲する。
+        let mut id_to_index = hashbrown::HashMap::new();
+        for (index, plug) in plugins.iter().enumerate() {
+            if let Some(dep_name) = plug.dep_name() {
+                id_to_index.insert(dep_name.to_string(), index);
+            }
+        }
         let cachedirs = plugins
             .iter()
-            .map(|plug| plug.cache.repo.default_cachedir())
+            .map(|plug| plug.cache.repo.as_ref().map(RepoSource::default_cachedir))
             .collect::<Vec<_>>();
-        let deps_by_index = plugins
-            .iter()
-            .map(|plug| {
-                plug.depends
-                    .iter()
-                    .filter_map(|dep| id_to_index.get(dep).copied())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let mut depths = vec![None; total];
-        fn compute_depth(
-            index: usize,
-            deps_by_index: &[Vec<usize>],
-            depths: &mut [Option<usize>],
-        ) -> usize {
-            if let Some(depth) = depths[index] {
-                return depth;
-            }
-            let depth = deps_by_index[index]
-                .iter()
-                .map(|&dep| compute_depth(dep, deps_by_index, depths))
-                .max()
-                .map(|depth| depth + 1)
-                .unwrap_or(0);
-            depths[index] = Some(depth);
-            depth
-        }
-        for index in 0..total {
-            compute_depth(index, &deps_by_index, &mut depths);
-        }
 
         Ok(plugins.try_dag()?.into_map_iter(
             move |DagIteratorMapFuncArgs {
                       inner,
+                      index,
+                      depth,
                       dependents_iter,
                   }| {
-                let source_name = inner.id().to_string();
-                let order = id_to_index
-                    .get(source_name.as_str())
-                    .map(|&index| depths[index].unwrap_or(0) * (total + 1) + index)
-                    .unwrap_or(usize::MAX);
+                let order = depth * (total + 1) + index;
+                let source_name = inner.dep_name().map(str::to_string);
                 let PluginConfig {
                     cache,
                     lazy_type,
@@ -241,18 +211,20 @@ impl Plugin {
                     custom_name: _,
                     script,
                     merge,
+                    ..
                 } = inner;
                 // 依存元の lazy_type を集約
                 let lazy_type = dependents_iter
                     .flatten()
                     .fold(lazy_type, |dep, plug| dep & &plug.lazy_type);
+                // 依存先が script-only（リポジトリなし）の場合はキャッシュディレクトリが
+                // 存在しないため除外する（runtimepath に追加すべきパスがない）。
                 let dependency_cachedirs = depends
                     .into_iter()
-                    .map(|dep_id| {
-                        let dep_index = *id_to_index
+                    .filter_map(|dep_id| {
+                        id_to_index
                             .get(&dep_id)
-                            .expect("dependency id must be resolvable in DAG");
-                        cachedirs[dep_index].clone()
+                            .and_then(|&dep_index| cachedirs[dep_index].clone())
                     })
                     .collect();
                 let merge_enabled = merge.merge;
@@ -278,7 +250,7 @@ impl Plugin {
         update: bool,
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
-    ) -> Result<Option<(LoadedPlugin, (String, String))>, Error> {
+    ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
@@ -309,6 +281,27 @@ impl Plugin {
             lua_build,
             lua_post_update,
         } = cache;
+
+        let Some(repo) = repo else {
+            let mut id_data = Vec::new();
+            if let Some(source_name) = &source_name {
+                id_data.extend(source_name.as_bytes());
+            }
+            id_data.extend(format!("{:?}", lazy_type).as_bytes());
+            id_data.extend(format!("{:?}", script).as_bytes());
+            id_data.extend(order.to_ne_bytes());
+            let loaded = LoadedPlugin {
+                id: PluginID::new(id_data),
+                source_name,
+                files: HowToPlaceFiles::CopyEachFile(Default::default()),
+                lazy_type,
+                script,
+                order,
+                merge_enabled,
+                is_plugctl: false,
+            };
+            return Ok(Some((loaded, None)));
+        };
 
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
@@ -617,7 +610,7 @@ impl Plugin {
             merge_enabled,
             is_plugctl: false,
         };
-        let lock_info = (url.to_string(), head_rev_str);
+        let lock_info = Some((url.to_string(), head_rev_str));
 
         Ok(Some((loaded, lock_info)))
     }
@@ -779,5 +772,59 @@ mod tests {
         assert!(!out.contains("ipairs"));
         assert!(out.contains("local ok, err = xpcall(function()"));
         assert!(out.contains("do return end"));
+    }
+
+    #[test]
+    fn unnamed_script_only_plugin_is_not_source_addressable() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            name = "dep"
+            repo = "owner/plugin"
+
+            [[plugins]]
+            depends = ["dep"]
+            lua_start = "vim.g.script_only = true"
+            "#,
+        )
+        .unwrap();
+
+        let plugins = Plugin::new(config).unwrap().collect::<Vec<_>>();
+
+        let script_only = plugins
+            .iter()
+            .find(|plugin| plugin.cache.repo.is_none())
+            .unwrap();
+        assert_eq!(script_only.source_name, None);
+        assert_eq!(script_only.dependency_cachedirs.len(), 1);
+    }
+
+    #[test]
+    fn depending_on_named_script_only_plugin_is_excluded_from_cachedirs() {
+        // 依存先が名前付きの script-only（リポジトリなし）の場合、キャッシュディレクトリが
+        // 存在しない。依存元の dependency_cachedirs からは除外され、panic しない。
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            name = "script_only"
+            lua_start = "vim.g.script_only = true"
+
+            [[plugins]]
+            repo = "owner/repo"
+            depends = ["script_only"]
+            "#,
+        )
+        .unwrap();
+
+        let plugins = Plugin::new(config).unwrap().collect::<Vec<_>>();
+
+        let with_repo = plugins
+            .iter()
+            .find(|plugin| plugin.cache.repo.is_some())
+            .unwrap();
+        assert!(
+            with_repo.dependency_cachedirs.is_empty(),
+            "script-only dependency must not contribute a cache dir"
+        );
     }
 }

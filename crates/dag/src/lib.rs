@@ -52,6 +52,10 @@ pub mod iterator {
     pub struct DagIteratorMapFuncArgs<'a, D: DagNode> {
         /// Item itself
         pub inner: D,
+        /// Index of the node within the original input order
+        pub index: usize,
+        /// Longest dependency chain depth (0 if no dependencies)
+        pub depth: usize,
         /// References to dependents items
         pub dependents_iter: DagDependentsIterator<'a, D>,
     }
@@ -76,6 +80,8 @@ pub mod iterator {
                 };
                 map_func(DagIteratorMapFuncArgs {
                     inner: item.inner,
+                    index: item.original_index,
+                    depth: item.depth,
                     dependents_iter,
                 })
             })
@@ -85,7 +91,9 @@ pub mod iterator {
 
 /// Dag Node Trait
 pub trait DagNode {
-    fn id(&self) -> &str;
+    /// 名前。`None` のノードは重複チェック・被依存・cycle の対象外となり、
+    /// ID を持たない「末端」ノードとして扱われる。
+    fn id(&self) -> Option<&str>;
     fn depends(&self) -> impl IntoIterator<Item = &impl AsRef<str>>;
 }
 
@@ -94,8 +102,14 @@ pub trait DagNode {
 pub enum DagError {
     #[error("duplicate node: {0}")]
     DuplicateName(String),
-    #[error("unknown dependency: {dep} (referred by {by})")]
-    UnknownDependency { dep: String, by: String },
+    #[error(
+        "unknown dependency: {dep} (referred by {by})",
+        by = by.as_deref().unwrap_or("<unnamed>")
+    )]
+    UnknownDependency {
+        dep: String,
+        by: Option<String>,
+    },
     #[error("cycle detected; remaining: {0:?}")]
     CycleDetected(Vec<String>),
 }
@@ -110,6 +124,10 @@ pub mod tree {
 
     pub(super) struct DagItem<D: DagNode> {
         pub(super) inner: D,
+        /// Index within the original input order
+        pub(super) original_index: usize,
+        /// Longest dependency chain depth (0 if no dependencies)
+        pub(super) depth: usize,
         pub(super) dependents_indexes: Vec<usize>,
     }
 }
@@ -121,8 +139,11 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
         // 1) まず全ノードを集める（この段階では重複チェックしない）
         let mut nodes: Vec<DagItem<D>> = self
             .into_iter()
-            .map(|node| DagItem {
+            .enumerate()
+            .map(|(original_index, node)| DagItem {
                 inner: node,
+                original_index,
+                depth: 0,
                 dependents_indexes: Vec::new(),
             })
             .collect();
@@ -132,13 +153,15 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
         let mut waiting = Vec::with_capacity(n);
         let mut references: Vec<Vec<usize>> = vec![Vec::new(); n];
         {
-            // 2) &str をキーにした id → index マップを作成（ここで重複検出）
+            // 2) &str をキーにした id → index マップを作成（ここで重複検出）。
+            //    名前なしノード（id() == None）は登録せず、被依存にもならない。
             let mut id_to_index: HashMap<&str, usize> = HashMap::with_capacity(n);
             for (i, dag) in nodes.iter().enumerate() {
-                let id = dag.inner.id(); // &str
-                if id_to_index.insert(id, i).is_some() {
-                    // ここだけエラーメッセージ用に to_string()
-                    return Err(DagError::DuplicateName(id.to_string()));
+                if let Some(id) = dag.inner.id() {
+                    if id_to_index.insert(id, i).is_some() {
+                        // ここだけエラーメッセージ用に to_string()
+                        return Err(DagError::DuplicateName(id.to_string()));
+                    }
                 }
             }
 
@@ -152,7 +175,7 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
                             .get(dep)
                             .ok_or_else(|| DagError::UnknownDependency {
                                 dep: dep.to_string(),
-                                by: item.inner.id().to_string(),
+                                by: item.inner.id().map(str::to_string),
                             })?;
                     references[dep_idx].push(idx);
                 }
@@ -160,7 +183,9 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
             }
         }
 
-        // 4) Kahn法でトポロジカルソート
+        // 4) Kahn法でトポロジカルソート（ついでに依存の最深 depth を計算）。
+        //    i を処理する時点で nodes[i].depth は確定済み（依存先は全て先に処理される）ので、
+        //    1パスで正しい最深が入る。
         let mut q = Vec::new();
         for (i, &deg) in waiting.iter().enumerate() {
             if deg == 0 {
@@ -170,7 +195,13 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
         let mut topo = VecDeque::with_capacity(n); // VecDequeなのは先入れ先出しで取り出すため
         while let Some(i) = q.pop() {
             topo.push_front(i);
+            let depth_i = nodes[i].depth;
             for &to in &references[i] {
+                // depth[to] = max(depth[to], depth[i] + 1)
+                let next = depth_i + 1;
+                if next > nodes[to].depth {
+                    nodes[to].depth = next;
+                }
                 waiting[to] -= 1;
                 if waiting[to] == 0 {
                     q.push(to);
@@ -180,14 +211,16 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
         drop(q);
 
         if topo.len() != n {
-            // 残っているノードはサイクルの一部
+            // 残っているノードはサイクルの一部。
+            // 名前なしノードは被依存になれないためサイクルに含まれず、
+            // id() == Some のノードのみ文字列化する。
             return Err(DagError::CycleDetected(
                 waiting
                     .into_iter()
                     .enumerate()
                     .filter_map(|(i, deg)| {
                         if deg > 0 {
-                            Some(nodes[i].inner.id().to_string())
+                            nodes[i].inner.id().map(str::to_string)
                         } else {
                             None
                         }

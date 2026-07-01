@@ -28,6 +28,12 @@ adjusted for use inside `rsplug.nvim`:
 - Cargo package excludes generated/vendor artifacts that crates.io rejects;
 - dependency metadata may differ from the upstream release as required for the
   vendored build.
+- `test_data/` fixtures restored from upstream git (excluded from the crates.io
+  package, absent in the vendored source);
+- skeptic doc-tests disabled (`build.rs` no longer calls
+  `skeptic::generate_doc_tests`; `skeptic` removed from dev/build dependencies);
+  the workspace produces multiple rlib fingerprints for the `fts` crate name
+  causing E0464 in skeptic's `--extern` resolution.
 
 ## macOS note
 

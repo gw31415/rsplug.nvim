@@ -370,6 +370,10 @@ mod test {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    // Serialize tests that mutate test_data/dir2 permissions so they don't
+    // race each other under `cargo test`'s default parallel runner.
+    use crate::test_support::DIR2_LOCK;
+
     fn check_entry(entry: FtsEntry, is_logical: bool) {
         if entry.path == PathBuf::from("test_data") {
             assert!(entry.info == FtsInfo::IsDir || entry.info == FtsInfo::IsDirPost);
@@ -433,10 +437,16 @@ mod test {
 
     #[test]
     fn logical() {
-        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0));
+        let _guard = DIR2_LOCK.lock().unwrap();
+        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0o0));
 
         let paths = vec![String::from("test_data")];
-        let mut fts = Fts::new(paths, fts_option::Flags::LOGICAL, None).unwrap();
+        let mut fts = Fts::new(
+            paths,
+            fts_option::Flags::LOGICAL | fts_option::Flags::NOCHDIR,
+            None,
+        )
+        .unwrap();
 
         let mut ftsent = fts.read();
         let mut i = 0;
@@ -453,10 +463,16 @@ mod test {
 
     #[test]
     fn physical() {
-        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0));
+        let _guard = DIR2_LOCK.lock().unwrap();
+        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0o0));
 
         let paths = vec![String::from("test_data")];
-        let mut fts = Fts::new(paths, fts_option::Flags::PHYSICAL, None).unwrap();
+        let mut fts = Fts::new(
+            paths,
+            fts_option::Flags::PHYSICAL | fts_option::Flags::NOCHDIR,
+            None,
+        )
+        .unwrap();
 
         let mut ftsent = fts.read();
         let mut i = 0;
@@ -476,7 +492,7 @@ mod test {
         let paths = vec![String::from("test_data/sort")];
         let mut fts = Fts::new(
             paths,
-            fts_option::Flags::LOGICAL,
+            fts_option::Flags::LOGICAL | fts_option::Flags::NOCHDIR,
             Some(FtsComp::by_name_ascending),
         )
         .unwrap();

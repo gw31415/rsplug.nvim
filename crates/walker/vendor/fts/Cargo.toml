@@ -15,7 +15,6 @@ name = "rsplug-fts"
 edition = "2015"
 version = "0.3.0"
 authors = ["dalance <dalance@gmail.com>"]
-build = "build.rs"
 exclude = ["test_data/*", ".cargo_vcs_info.json", ".cargo-ok", "Cargo.toml.orig"]
 description = "Vendored fork of dalance/fts-rs for rsplug.nvim"
 readme = "README.md"
@@ -47,13 +46,10 @@ version = "0.2"
 
 [dependencies.num]
 version = "0.4"
-[dev-dependencies.skeptic]
-version = "0.13"
 
 [dev-dependencies.walkdir]
 version = "2"
-[build-dependencies.skeptic]
-version = "0.13"
+
 [badges.codecov]
 branch = "master"
 repository = "dalance/fts-rs"

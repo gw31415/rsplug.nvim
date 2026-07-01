@@ -149,7 +149,7 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Loade
     )]);
     LoadedPlugin {
         id,
-        source_name: format!("_rsplug:{path}"),
+        source_name: Some(format!("_rsplug:{path}")),
         lazy_type: LazyType::Start,
         files: HowToPlaceFiles::CopyEachFile(files),
         script: Default::default(),
@@ -282,7 +282,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             }
             plugs.push(LoadedPlugin {
                 id,
-                source_name: "_rsplug:init".to_string(),
+                source_name: Some("_rsplug:init".to_string()),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -349,7 +349,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             plugs.push({
                 LoadedPlugin {
                     id: on_event_setup_id + on_event_id,
-                    source_name: "_rsplug:on_event".to_string(),
+                    source_name: Some("_rsplug:on_event".to_string()),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
@@ -395,7 +395,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             ]);
             plugs.push(LoadedPlugin {
                 id: on_func_setup_id + on_func_id,
-                source_name: "_rsplug:on_func".to_string(),
+                source_name: Some("_rsplug:on_func".to_string()),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -440,7 +440,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 ]);
                 LoadedPlugin {
                     id: on_cmd_id + on_cmd_setup_id,
-                    source_name: "_rsplug:on_cmd".to_string(),
+                    source_name: Some("_rsplug:on_cmd".to_string()),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
@@ -481,7 +481,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             ]);
             plugs.push(LoadedPlugin {
                 id: plugin_on_lua_id + on_lua_id,
-                source_name: "_rsplug:on_lua".to_string(),
+                source_name: Some("_rsplug:on_lua".to_string()),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -534,7 +534,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             if !overwrite_copies.is_empty() {
                 plugs.push(LoadedPlugin {
                     id: overwrite_copies_id,
-                    source_name: DOC_PLUGIN_NAME.to_string(),
+                    source_name: Some(DOC_PLUGIN_NAME.to_string()),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(overwrite_copies),
                     script: Default::default(),
@@ -658,7 +658,7 @@ impl PlugCtl {
     /// その他必要な情報のみ引数に取る。
     pub(super) fn create(
         id: PluginID,
-        source_name: String,
+        source_name: Option<String>,
         lazy_type: LazyType,
         script: SetupScript,
         order: usize,
@@ -689,7 +689,9 @@ impl PlugCtl {
         };
 
         let id_str = id.as_str();
-        let source_target2pkgid = BTreeMap::from([(source_name, id_str.clone())]);
+        let source_target2pkgid = source_name
+            .map(|source_name| BTreeMap::from([(source_name, id_str.clone())]))
+            .unwrap_or_default();
 
         let LazyType::Opt(events) = lazy_type else {
             return Self {
