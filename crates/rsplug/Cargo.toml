@@ -19,7 +19,7 @@ walker.workspace = true
 clap = { version = "4.6", features = ["derive", "env"] }
 console = "0.16"
 indicatif = { version = "0.18", features = ["tokio"] }
-itertools = "0.14"
+itertools = "0.15"
 once_cell = "1.21"
 regex = "1.12"
 sailfish = "0.11"
