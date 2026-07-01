@@ -57,11 +57,16 @@ pub struct CacheConfig {
     pub build: Vec<String>,
     #[serde(default)]
     pub lua_build: Option<String>,
+    #[serde(default)]
+    pub lua_post_update: Option<String>,
 }
 
 impl CacheConfig {
     pub fn to_sym(&self) -> bool {
-        self.manually_to_sym || !self.build.is_empty() || self.lua_build.is_some()
+        self.manually_to_sym
+            || !self.build.is_empty()
+            || self.lua_build.is_some()
+            || self.lua_post_update.is_some()
     }
 }
 
@@ -315,6 +320,23 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, LoadEvent::VimFunc(_)))
+        );
+    }
+
+    #[test]
+    fn plugin_config_deserializes_lua_post_update() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "owner/plugin"
+            lua_post_update = "vim.g.updated = true"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.plugins[0].cache.lua_post_update.as_deref(),
+            Some("vim.g.updated = true")
         );
     }
     #[test]

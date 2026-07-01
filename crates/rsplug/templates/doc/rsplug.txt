@@ -475,6 +475,18 @@ lua_build~
 
     Build results are cached (see |rsplug-build-cache|).
 
+lua_post_update~
+    Type: String
+
+    Lua script executed under headless Neovim only when `--update` fetches a new
+    revision for an existing repository. The plugin and its `depends` chain are
+    added to `runtimepath` while the script runs.
+
+    Example:
+>toml
+        lua_post_update = "require('plugin').post_update()"
+<
+
 name~
     Type: String
     Default: Last component of repo path

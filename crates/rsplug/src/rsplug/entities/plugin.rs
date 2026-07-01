@@ -307,6 +307,7 @@ impl Plugin {
             manually_to_sym: _,
             build,
             lua_build,
+            lua_post_update,
         } = cache;
 
 
@@ -341,6 +342,7 @@ impl Plugin {
             path: proj_root.clone(),
         });
 
+        let mut did_update = false;
         let repository = 'repo: {
             if let Ok(mut repo) = git::open(proj_root.clone()).await {
                 // リポジトリが存在する場合
@@ -362,6 +364,7 @@ impl Plugin {
                     break 'repo repo;
                 };
                 repo.fetch(oid).await?;
+                did_update = update && locked_rev.is_none();
                 msg(Message::Cache("Updating:done", url.clone()));
                 repo
             } else if install {
@@ -405,6 +408,59 @@ impl Plugin {
                 "Locked revision mismatch for {}: expected {}, got {}",
                 url, locked_rev, head_rev_str
             )));
+        }
+
+        if did_update && let Some(lua_post_update) = lua_post_update.as_deref() {
+            let mut lua_runtimepaths = Vec::new();
+            let mut seen_runtimepaths = HashSet::new();
+            let mut add_runtimepath = |path: PathBuf| {
+                if seen_runtimepaths.insert(path.clone()) {
+                    lua_runtimepaths.push(path);
+                }
+            };
+            for dep_cachedir in &dependency_cachedirs {
+                let dep_path = cache_dir.as_ref().join(dep_cachedir);
+                if let Ok(dep_path) = tokio::fs::canonicalize(dep_path).await {
+                    add_runtimepath(dep_path);
+                }
+            }
+            add_runtimepath(proj_root.to_path_buf());
+
+            let id = Arc::new(format!("{logid} (lua_post_update)"));
+            let result: Result<(), Error> = {
+                let id = id.clone();
+                async {
+                    let lua_post_update_path =
+                        create_lua_build_script(lua_post_update, &lua_runtimepaths).await?;
+                    let code = execute(
+                        lua_build_nvim_command(lua_post_update_path.as_os_str()),
+                        proj_root.clone(),
+                        move |(stdtype, line)| {
+                            msg(Message::CacheBuildProgress {
+                                id: id.clone(),
+                                stdtype,
+                                line,
+                            });
+                        },
+                    )
+                    .await;
+                    let _ = tokio::fs::remove_file(&lua_post_update_path).await;
+                    let code = code?;
+                    if code != 0 {
+                        return Err(Error::BuildLuaScriptFailed {
+                            code,
+                            repo: repo_name.clone(),
+                        });
+                    }
+                    Ok(())
+                }
+            }
+            .await;
+            msg(Message::CacheBuildFinished {
+                id,
+                success: result.is_ok(),
+            });
+            result?;
         }
 
         let mut id =

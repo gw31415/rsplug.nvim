@@ -264,6 +264,7 @@ rsplug
 | `lua_after` | String | Lua code to run after plugin loads |
 | `build` | Array | Subprocess to run after install/update |
 | `lua_build` | String | Lua script to run after install/update |
+| `lua_post_update` | String | Lua script to run after a repository update |
 | `name` | String | Custom plugin name (default: repo name) |
 | `sym` | Boolean | Use symlink instead of file copy |
 | `ignore` | String | Gitignore-style patterns for files to exclude |
@@ -306,6 +307,16 @@ name = "host.nvim"
 [[plugins]]
 repo = "owner/extension.nvim"
 on_source = "host.nvim"
+```
+
+### Post-Update Lua Hooks
+
+`lua_post_update` runs Lua through headless Neovim only when `--update` fetches a new revision for an existing repository. The plugin and its `depends` chain are added to `runtimepath` while the script runs.
+
+```toml
+[[plugins]]
+repo = "owner/plugin"
+lua_post_update = "require('plugin').post_update()"
 ```
 
 ## Command-Line Interface
