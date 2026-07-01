@@ -312,6 +312,18 @@ on_cmd~
         on_cmd = ["Git", "Gitsigns"]
 <
 
+on_func~
+    Type: String or Array of Strings
+
+    Vim function name(s) that trigger plugin loading. This is useful for
+    plugins exposing autoload-style Vim functions.
+
+    Example:
+>toml
+        on_func = "MyFunc"
+        on_func = ["MyFunc", "autoload#Func"]
+<
+
 on_ft~
     Type: String or Array of Strings
     

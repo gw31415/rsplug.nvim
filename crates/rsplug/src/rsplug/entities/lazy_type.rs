@@ -108,6 +108,8 @@ pub enum LoadEvent {
     UserCmd(UserCmd),
     /// 起動ファイルタイプ
     FileType(FileType),
+    /// Vim function の呼び出し
+    VimFunc(VimFunc),
     /// Luaモジュールの読み込み
     LuaModule(LuaModule),
     /// on_map のキーパターン
@@ -162,6 +164,46 @@ impl FromStr for UserCmd {
 impl Render for UserCmd {
     fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
         self.0.render(b)
+    }
+}
+
+/// Vim function の文字列を表す型。
+#[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
+pub struct VimFunc(Arc<String>);
+
+impl VimFunc {
+    /// autoload 関数(名前に `#` を含む)かどうか。
+    /// autoload 関数は任意のスクリプトで `function!` 定義すると E746 になるため、
+    /// `on_func` では `FuncUndefined` で遅延させる必要がある。
+    pub fn is_autoload(&self) -> bool {
+        self.0.contains('#')
+    }
+}
+
+impl FromStr for VimFunc {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        static FUNC_REGEX: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_#]*$").unwrap());
+        if FUNC_REGEX.is_match(s) {
+            Ok(VimFunc(Arc::new(s.to_string())))
+        } else {
+            Err(
+                "Vim function name must start with an alphabetic character or underscore and contain only alphanumerics, underscores, or #",
+            )
+        }
+    }
+}
+
+impl Render for VimFunc {
+    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        self.0.render(b)
+    }
+}
+
+impl fmt::Display for VimFunc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 

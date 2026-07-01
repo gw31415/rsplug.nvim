@@ -255,6 +255,7 @@ rsplug
 | `on_event` | String/Array | Autocmd event(s) to trigger lazy-load |
 | `on_cmd` | String/Array | User command(s) to trigger lazy-load |
 | `on_ft` | String/Array | Filetype(s) to trigger lazy-load |
+| `on_func` | String/Array | Vim function(s) to trigger lazy-load |
 | `on_map` | String/Table | Keymap(s) to trigger lazy-load |
 | `depends` | Array | Plugin dependencies loaded simultaneously |
 | `lua_start` | String | Lua code to run at Neovim startup |
@@ -280,6 +281,16 @@ on_map = { nx = "<leader>f" }
 
 # Multiple keys
 on_map = { n = ["<leader>f", "<leader>g"] }
+```
+
+### Function Lazy Loading
+
+`on_func` defines Vim functions that trigger plugin loading on first call:
+
+```toml
+[[plugins]]
+repo = "owner/plugin"
+on_func = ["MyFunc", "autoload#Func"]
 ```
 
 ## Command-Line Interface

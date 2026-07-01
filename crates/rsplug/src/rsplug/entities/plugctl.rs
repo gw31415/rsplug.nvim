@@ -124,6 +124,7 @@ pub struct PlugCtl {
     event2pkgid: BTreeMap<Autocmd, Vec<PluginIDStr>>,
     cmd2pkgid: BTreeMap<UserCmd, Vec<PluginIDStr>>,
     ft2pkgid: BTreeMap<FileType, Vec<PluginIDStr>>,
+    func2pkgid: BTreeMap<VimFunc, Vec<PluginIDStr>>,
     luam2pkgid: BTreeMap<LuaModule, Vec<PluginIDStr>>,
     keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
     overwrite_files: BTreeMap<PluginID, HowToPlaceFiles>,
@@ -161,6 +162,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            func2pkgid,
             luam2pkgid,
             keypattern2pkgid,
             overwrite_files,
@@ -321,6 +323,51 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             });
         }
 
+        if !func2pkgid.is_empty() {
+            let funcs = func2pkgid.keys();
+            let on_func_setup = OnFuncSetupTemplate { funcs }
+                .render_once()
+                .unwrap()
+                .into_bytes()
+                .into();
+            let on_func_setup_id = PluginID::new(&on_func_setup);
+            let on_func = OnFuncTemplate {
+                func2pkgid: &func2pkgid,
+            }
+            .render_once()
+            .unwrap()
+            .into_bytes()
+            .into();
+            let on_func_id = PluginID::new(&on_func);
+            let files = HashMap::from([
+                (
+                    PathBuf::from("lua/_rsplug/on_func.lua"),
+                    FileItem {
+                        source: Arc::new(FileSource::File { data: on_func }),
+                        merge_type: MergeType::Overwrite,
+                    },
+                ),
+                (
+                    PathBuf::from(format!("plugin/{}.lua", on_func_setup_id.as_str())),
+                    FileItem {
+                        source: Arc::new(FileSource::File {
+                            data: on_func_setup,
+                        }),
+                        merge_type: MergeType::Overwrite,
+                    },
+                ),
+            ]);
+            plugs.push(LoadedPlugin {
+                id: on_func_setup_id + on_func_id,
+                lazy_type: LazyType::Start,
+                files: HowToPlaceFiles::CopyEachFile(files),
+                script: Default::default(),
+                order: usize::MAX,
+                merge_enabled: true,
+                is_plugctl: true,
+            });
+        }
+
         if !cmd2pkgid.is_empty() {
             // on_cmd setup
             plugs.push({
@@ -470,6 +517,7 @@ impl AddAssign for PlugCtl {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            func2pkgid,
             luam2pkgid,
             keypattern2pkgid,
             overwrite_files,
@@ -489,6 +537,12 @@ impl AddAssign for PlugCtl {
         }
         for (ft, ids) in ft2pkgid {
             self.ft2pkgid.entry(ft).or_default().extend(ids.into_iter());
+        }
+        for (func, ids) in func2pkgid {
+            self.func2pkgid
+                .entry(func)
+                .or_default()
+                .extend(ids.into_iter());
         }
         for (luam, ids) in luam2pkgid {
             self.luam2pkgid
@@ -531,6 +585,7 @@ impl PlugCtl {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            func2pkgid,
             luam2pkgid,
             keypattern2pkgid,
             overwrite_files,
@@ -539,6 +594,7 @@ impl PlugCtl {
             && scripts.is_empty()
             && cmd2pkgid.is_empty()
             && ft2pkgid.is_empty()
+            && func2pkgid.is_empty()
             && luam2pkgid.is_empty()
             && keypattern2pkgid.values().all(|v| v.is_empty())
             && overwrite_files.is_empty()
@@ -594,6 +650,7 @@ impl PlugCtl {
         let mut event2pkgid: BTreeMap<Autocmd, Vec<_>> = BTreeMap::new();
         let mut cmd2pkgid: BTreeMap<UserCmd, Vec<_>> = BTreeMap::new();
         let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
+        let mut func2pkgid: BTreeMap<VimFunc, Vec<_>> = BTreeMap::new();
         let mut luam2pkgid: BTreeMap<LuaModule, Vec<_>> = BTreeMap::new();
         let mut keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<_>>> =
             BTreeMap::new();
@@ -615,6 +672,9 @@ impl PlugCtl {
                 }
                 FileType(ft) => {
                     ft2pkgid.entry(ft).or_default().push(id.as_str());
+                }
+                VimFunc(func) => {
+                    func2pkgid.entry(func).or_default().push(id.as_str());
                 }
                 LuaModule(luam) => {
                     luam2pkgid.entry(luam).or_default().push(id.as_str());
@@ -640,6 +700,7 @@ impl PlugCtl {
             event2pkgid,
             cmd2pkgid,
             ft2pkgid,
+            func2pkgid,
             luam2pkgid,
             keypattern2pkgid,
             overwrite_files: overwrite_files(id),
@@ -693,6 +754,20 @@ struct OnCmdTemplate<'a> {
 }
 
 #[derive(TemplateSimple)]
+#[template(path = "plugin/on_func.stpl")]
+#[template(escape = false)]
+struct OnFuncSetupTemplate<'a> {
+    funcs: Keys<'a, VimFunc, Vec<PluginIDStr>>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "lua/_rsplug/on_func.stpl")]
+#[template(escape = false)]
+struct OnFuncTemplate<'a> {
+    func2pkgid: &'a BTreeMap<VimFunc, Vec<PluginIDStr>>,
+}
+
+#[derive(TemplateSimple)]
 #[template(path = "lua/_rsplug/on_lua.stpl")]
 #[template(escape = false)]
 struct OnLuaTemplate<'a> {
@@ -710,6 +785,39 @@ struct OnMapTemplate<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_func_template_uses_funcundefined_for_autoload_functions() {
+        let func = "foo#bar".parse::<VimFunc>().unwrap();
+        let mut func2pkgid = BTreeMap::new();
+        func2pkgid.insert(func, Vec::new());
+        let rendered = OnFuncSetupTemplate {
+            funcs: func2pkgid.keys(),
+        }
+        .render_once()
+        .unwrap();
+
+        assert!(rendered.contains("FuncUndefined"));
+        assert!(rendered.contains("autoload_handler('foo#bar')"));
+        assert!(!rendered.contains("function! foo#bar"));
+    }
+
+    #[test]
+    fn on_func_runtime_guards_nested_funcundefined_while_packadding_autoload() {
+        let func = "foo#bar".parse::<VimFunc>().unwrap();
+        let id = PluginID::new(b"foo-plugin").as_str();
+        let func2pkgid = BTreeMap::from([(func, vec![id])]);
+        let rendered = OnFuncTemplate {
+            func2pkgid: &func2pkgid,
+        }
+        .render_once()
+        .unwrap();
+
+        assert!(rendered.contains("called_autoload_prefix"));
+        assert!(rendered.contains("vim.o.eventignore = 'FuncUndefined'"));
+        assert!(rendered.contains("vim.o.eventignore = save_eventignore"));
+        assert!(rendered.contains("pcall(packadd_all, func)"));
+    }
 
     #[test]
     fn custom_packadd_template_runs_lua_start_before_startup_plugins() {
