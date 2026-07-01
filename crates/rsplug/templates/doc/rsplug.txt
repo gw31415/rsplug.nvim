@@ -324,6 +324,24 @@ on_func~
         on_func = ["MyFunc", "autoload#Func"]
 <
 
+on_source~
+    Type: String or Array of Strings
+
+    Plugin name(s) that trigger this plugin to load immediately after they have
+    been sourced by rsplug. Use the source plugin's `name` when it has one,
+    otherwise use its repository-derived name.
+
+    Example:
+>toml
+        [[plugins]]
+        repo = "owner/host.nvim"
+        name = "host.nvim"
+
+        [[plugins]]
+        repo = "owner/extension.nvim"
+        on_source = "host.nvim"
+<
+
 on_ft~
     Type: String or Array of Strings
     

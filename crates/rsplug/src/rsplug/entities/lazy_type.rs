@@ -110,6 +110,8 @@ pub enum LoadEvent {
     FileType(FileType),
     /// Vim function の呼び出し
     VimFunc(VimFunc),
+    /// 指定プラグインの読み込み直後
+    OnSource(String),
     /// Luaモジュールの読み込み
     LuaModule(LuaModule),
     /// on_map のキーパターン

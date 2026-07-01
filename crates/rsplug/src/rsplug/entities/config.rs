@@ -82,6 +82,9 @@ struct LazyTypeDeserializer {
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
     on_func: Vec<VimFunc>,
+    #[serde_as(as = "OneOrMany<_>")]
+    #[serde(default)]
+    on_source: Vec<String>,
     #[serde(default)]
     on_map: KeyPattern,
 }
@@ -94,6 +97,7 @@ impl From<LazyTypeDeserializer> for LazyType {
             on_cmd,
             on_ft,
             on_func,
+            on_source,
             on_map,
         } = val;
         if start {
@@ -106,6 +110,7 @@ impl From<LazyTypeDeserializer> for LazyType {
                     .chain(on_cmd.into_iter().map(LoadEvent::UserCmd))
                     .chain(on_ft.into_iter().map(LoadEvent::FileType))
                     .chain(on_func.into_iter().map(LoadEvent::VimFunc))
+                    .chain(on_source.into_iter().map(LoadEvent::OnSource))
                     .chain(once(LoadEvent::OnMap(on_map)))
                     .collect(),
             )
@@ -122,6 +127,7 @@ impl From<LazyType> for LazyTypeDeserializer {
                 on_cmd: Vec::new(),
                 on_ft: Vec::new(),
                 on_func: Vec::new(),
+                on_source: Vec::new(),
                 on_map: KeyPattern::default(),
             },
             LazyType::Opt(events) => {
@@ -129,6 +135,7 @@ impl From<LazyType> for LazyTypeDeserializer {
                 let mut on_cmd = Vec::new();
                 let mut on_ft = Vec::new();
                 let mut on_func = Vec::new();
+                let mut on_source = Vec::new();
                 let mut on_map = KeyPattern::default();
 
                 for event in events {
@@ -137,6 +144,7 @@ impl From<LazyType> for LazyTypeDeserializer {
                         LoadEvent::UserCmd(u) => on_cmd.push(u),
                         LoadEvent::FileType(f) => on_ft.push(f),
                         LoadEvent::VimFunc(f) => on_func.push(f),
+                        LoadEvent::OnSource(source) => on_source.push(source),
                         LoadEvent::OnMap(m) => on_map = m,
                         LoadEvent::LuaModule(_) => {
                             // LuaModule is auto-detected, not from config
@@ -150,6 +158,7 @@ impl From<LazyType> for LazyTypeDeserializer {
                     on_cmd,
                     on_ft,
                     on_func,
+                    on_source,
                     on_map,
                 }
             }
@@ -307,6 +316,27 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, LoadEvent::VimFunc(_)))
         );
+    }
+    #[test]
+    fn plugin_config_deserializes_on_source() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "owner/plugin"
+            on_source = "host.nvim"
+            "#,
+        )
+        .unwrap();
+
+        let LazyType::Opt(events) = &config.plugins[0].lazy_type else {
+            panic!("expected opt")
+        };
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, LoadEvent::OnSource(source) if source == "host.nvim"))
+        );
+        assert!(config.plugins[0].cache.to_sym());
     }
 }
 

@@ -21,6 +21,8 @@ use super::*;
 
 /// 設定を構成する基本単位
 pub struct Plugin {
+    /// `on_source` から参照される設定上の名前
+    pub source_name: String,
     /// 取得元
     pub cache: CacheConfig,
     /// Pluginに対応する読み込みタイプ
@@ -227,8 +229,9 @@ impl Plugin {
                       inner,
                       dependents_iter,
                   }| {
+                let source_name = inner.id().to_string();
                 let order = id_to_index
-                    .get(inner.id())
+                    .get(source_name.as_str())
                     .map(|&index| depths[index].unwrap_or(0) * (total + 1) + index)
                     .unwrap_or(usize::MAX);
                 let PluginConfig {
@@ -254,6 +257,7 @@ impl Plugin {
                     .collect();
                 let merge_enabled = merge.merge;
                 Plugin {
+                    source_name,
                     cache,
                     lazy_type,
                     script,
@@ -287,6 +291,7 @@ impl Plugin {
             |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
 
         let Plugin {
+            source_name,
             cache,
             lazy_type,
             script,
@@ -303,6 +308,7 @@ impl Plugin {
             build,
             lua_build,
         } = cache;
+
 
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
@@ -548,6 +554,7 @@ impl Plugin {
 
         let loaded = LoadedPlugin {
             id,
+            source_name,
             files,
             lazy_type,
             script: script.clone(),

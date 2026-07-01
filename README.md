@@ -256,6 +256,7 @@ rsplug
 | `on_cmd` | String/Array | User command(s) to trigger lazy-load |
 | `on_ft` | String/Array | Filetype(s) to trigger lazy-load |
 | `on_func` | String/Array | Vim function(s) to trigger lazy-load |
+| `on_source` | String/Array | Plugin name(s) after which this plugin should load |
 | `on_map` | String/Table | Keymap(s) to trigger lazy-load |
 | `depends` | Array | Plugin dependencies loaded simultaneously |
 | `lua_start` | String | Lua code to run at Neovim startup |
@@ -291,6 +292,20 @@ on_map = { n = ["<leader>f", "<leader>g"] }
 [[plugins]]
 repo = "owner/plugin"
 on_func = ["MyFunc", "autoload#Func"]
+```
+
+### Source Hooks
+
+`on_source` loads a plugin immediately after another configured plugin has been loaded:
+
+```toml
+[[plugins]]
+repo = "owner/host.nvim"
+name = "host.nvim"
+
+[[plugins]]
+repo = "owner/extension.nvim"
+on_source = "host.nvim"
 ```
 
 ## Command-Line Interface

@@ -41,6 +41,8 @@ impl Default for HowToPlaceFiles {
 pub struct LoadedPlugin {
     /// ID
     pub(super) id: PluginID,
+    /// `on_source` から参照される設定上の名前
+    pub(super) source_name: String,
     /// プラグインの遅延実行タイプ
     pub lazy_type: LazyType,
     /// 配置するファイル
@@ -186,6 +188,7 @@ impl Add for LoadedPlugin {
                 if mergeable {
                     let Self {
                         mut id,
+                        source_name,
                         lazy_type,
                         files: HowToPlaceFiles::CopyEachFile(mut files),
                         mut script,
@@ -198,6 +201,7 @@ impl Add for LoadedPlugin {
                     };
                     let Self {
                         id: rid,
+                        source_name: _,
                         lazy_type: _,
                         files: HowToPlaceFiles::CopyEachFile(rfiles),
                         script: rscript,
@@ -216,6 +220,7 @@ impl Add for LoadedPlugin {
                     return (
                         Self {
                             id,
+                            source_name,
                             lazy_type,
                             files: HowToPlaceFiles::CopyEachFile(files),
                             script,
@@ -422,6 +427,7 @@ impl PackPathState {
     pub fn insert(&mut self, loaded_plugin: LoadedPlugin) {
         let LoadedPlugin {
             id,
+            source_name,
             lazy_type,
             mut files,
             script,
@@ -438,7 +444,7 @@ impl PackPathState {
         let start_or_opt = "opt";
 
         if !is_plugctl {
-            self.ctl += PlugCtl::create(id, lazy_type, script, order, &mut files);
+            self.ctl += PlugCtl::create(id, source_name, lazy_type, script, order, &mut files);
         }
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {

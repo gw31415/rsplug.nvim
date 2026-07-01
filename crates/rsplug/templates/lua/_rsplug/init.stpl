@@ -2,6 +2,7 @@
 local pkgid2scripts = {<% for (id, script_set) in pkgid2scripts {%>['<%=id%>']={<% for (script_type, module_ids) in script_set {%>['<%=script_type%>']={<% for module_id in module_ids {%>'<%=module_id%>',<%}%>},<%}%>},<%}%>}
 local startup_plugins = {<% for id in startup_plugins {%>'<%=id%>',<%}%>}
 local startup_scripts = {<% for module_id in startup_scripts {%>'<%=module_id%>',<%}%>}
+local source2pkgid = {<% for (source, ids) in source2pkgid {%>['<%=source%>']={<% for id in ids { %>'<%=id%>',<%}%>},<%}%>}
 local loaded = {}
 return setmetatable({
 	loaded = loaded,
@@ -17,6 +18,9 @@ return setmetatable({
 		vim.cmd((startup and 'packadd! ' or 'packadd ') .. vim.fn.fnameescape(id))
 		for _, after in ipairs(setup_scripts.lua_after or {}) do
 			require(after)
+		end
+		for _, on_source_id in ipairs(source2pkgid[id] or {}) do
+			require('_rsplug').packadd(on_source_id)
 		end
 	end,
 	startup = function()

@@ -126,6 +126,8 @@ pub struct PlugCtl {
     ft2pkgid: BTreeMap<FileType, Vec<PluginIDStr>>,
     func2pkgid: BTreeMap<VimFunc, Vec<PluginIDStr>>,
     luam2pkgid: BTreeMap<LuaModule, Vec<PluginIDStr>>,
+    source_name2pkgid: BTreeMap<String, Vec<PluginIDStr>>,
+    source_target2pkgid: BTreeMap<String, PluginIDStr>,
     keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
     overwrite_files: BTreeMap<PluginID, HowToPlaceFiles>,
 }
@@ -143,6 +145,7 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Loade
     )]);
     LoadedPlugin {
         id,
+        source_name: format!("_rsplug:{path}"),
         lazy_type: LazyType::Start,
         files: HowToPlaceFiles::CopyEachFile(files),
         script: Default::default(),
@@ -164,6 +167,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             ft2pkgid,
             func2pkgid,
             luam2pkgid,
+            source_name2pkgid,
+            source_target2pkgid,
             keypattern2pkgid,
             overwrite_files,
         } = value;
@@ -249,6 +254,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     pkgid2scripts,
                     startup_plugins,
                     startup_scripts,
+                    source2pkgid: build_source2pkgid(source_name2pkgid, source_target2pkgid),
                 }
                 .render_once()
                 .unwrap()
@@ -313,6 +319,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             plugs.push({
                 LoadedPlugin {
                     id: on_event_setup_id + on_event_id,
+                    source_name: "_rsplug:on_event".to_string(),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
@@ -359,6 +366,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             ]);
             plugs.push(LoadedPlugin {
                 id: on_func_setup_id + on_func_id,
+                source_name: "_rsplug:on_func".to_string(),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -404,6 +412,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 ]);
                 LoadedPlugin {
                     id: on_cmd_id + on_cmd_setup_id,
+                    source_name: "_rsplug:on_cmd".to_string(),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
@@ -444,6 +453,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             ]);
             plugs.push(LoadedPlugin {
                 id: plugin_on_lua_id + on_lua_id,
+                source_name: "_rsplug:on_lua".to_string(),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -496,6 +506,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             if !overwrite_copies.is_empty() {
                 plugs.push(LoadedPlugin {
                     id: overwrite_copies_id,
+                    source_name: "_rsplug:doc".to_string(),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(overwrite_copies),
                     script: Default::default(),
@@ -519,6 +530,8 @@ impl AddAssign for PlugCtl {
             ft2pkgid,
             func2pkgid,
             luam2pkgid,
+            source_name2pkgid,
+            source_target2pkgid,
             keypattern2pkgid,
             overwrite_files,
         } = other;
@@ -550,6 +563,13 @@ impl AddAssign for PlugCtl {
                 .or_default()
                 .extend(ids.into_iter());
         }
+        for (source, ids) in source_name2pkgid {
+            self.source_name2pkgid
+                .entry(source)
+                .or_default()
+                .extend(ids.into_iter());
+        }
+        self.source_target2pkgid.extend(source_target2pkgid);
         for (key, pattern) in keypattern2pkgid {
             let mode_entry = self.keypattern2pkgid.entry(key).or_default();
             for (pattern, ids) in pattern {
@@ -587,17 +607,20 @@ impl PlugCtl {
             ft2pkgid,
             func2pkgid,
             luam2pkgid,
+            source_name2pkgid,
+            source_target2pkgid,
             keypattern2pkgid,
             overwrite_files,
         } = self;
         event2pkgid.is_empty()
-            && scripts.is_empty()
-            && cmd2pkgid.is_empty()
-            && ft2pkgid.is_empty()
-            && func2pkgid.is_empty()
-            && luam2pkgid.is_empty()
-            && keypattern2pkgid.values().all(|v| v.is_empty())
-            && overwrite_files.is_empty()
+        && scripts.is_empty()
+        && cmd2pkgid.is_empty()
+        && ft2pkgid.is_empty()
+        && func2pkgid.is_empty()
+        && luam2pkgid.is_empty()
+        && source_name2pkgid.is_empty()
+        && source_target2pkgid.is_empty()
+        && keypattern2pkgid.values().all(|v| v.is_empty())    && overwrite_files.is_empty()
     }
 
     /// パッケージ情報を読み込み、 PlugCtl を作成する。
@@ -606,6 +629,7 @@ impl PlugCtl {
     /// その他必要な情報のみ引数に取る。
     pub(super) fn create(
         id: PluginID,
+        source_name: String,
         lazy_type: LazyType,
         script: SetupScript,
         order: usize,
@@ -635,14 +659,18 @@ impl PlugCtl {
             .into()
         };
 
+        let id_str = id.as_str();
+        let source_target2pkgid = BTreeMap::from([(source_name, id_str.clone())]);
+
         let LazyType::Opt(events) = lazy_type else {
             return Self {
                 pkgid2scripts: vec![PkgId2ScriptsItem {
-                    pkgid: id.as_str(),
+                    pkgid: id_str,
                     script,
                     order,
                     start: true,
                 }],
+                source_target2pkgid,
                 overwrite_files: overwrite_files(id),
                 ..Default::default()
             };
@@ -652,11 +680,12 @@ impl PlugCtl {
         let mut ft2pkgid: BTreeMap<FileType, Vec<_>> = BTreeMap::new();
         let mut func2pkgid: BTreeMap<VimFunc, Vec<_>> = BTreeMap::new();
         let mut luam2pkgid: BTreeMap<LuaModule, Vec<_>> = BTreeMap::new();
+        let mut source_name2pkgid: BTreeMap<String, Vec<_>> = BTreeMap::new();
         let mut keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<_>>> =
             BTreeMap::new();
 
         let pkgid2scripts = vec![PkgId2ScriptsItem {
-            pkgid: id.as_str(),
+            pkgid: id_str.clone(),
             script,
             order,
             start: false,
@@ -674,10 +703,16 @@ impl PlugCtl {
                     ft2pkgid.entry(ft).or_default().push(id.as_str());
                 }
                 VimFunc(func) => {
-                    func2pkgid.entry(func).or_default().push(id.as_str());
+                    func2pkgid.entry(func).or_default().push(id_str.clone());
                 }
                 LuaModule(luam) => {
-                    luam2pkgid.entry(luam).or_default().push(id.as_str());
+                    luam2pkgid.entry(luam).or_default().push(id_str.clone());
+                }
+                OnSource(source_name) => {
+                    source_name2pkgid
+                        .entry(source_name)
+                        .or_default()
+                        .push(id_str.clone());
                 }
                 OnMap(pattern) => {
                     let KeyPattern(pattern) = pattern;
@@ -702,6 +737,8 @@ impl PlugCtl {
             ft2pkgid,
             func2pkgid,
             luam2pkgid,
+            source_name2pkgid,
+            source_target2pkgid,
             keypattern2pkgid,
             overwrite_files: overwrite_files(id),
         }
@@ -723,6 +760,21 @@ struct CustomPackaddTemplate {
     pkgid2scripts: Vec<(PluginIDStr, BTreeMap<AfterOrBefore, Vec<String>>)>,
     startup_plugins: Vec<PluginIDStr>,
     startup_scripts: Vec<String>,
+    source2pkgid: Vec<(PluginIDStr, Vec<PluginIDStr>)>,
+}
+
+fn build_source2pkgid(
+    source_name2pkgid: BTreeMap<String, Vec<PluginIDStr>>,
+    source_target2pkgid: BTreeMap<String, PluginIDStr>,
+) -> Vec<(PluginIDStr, Vec<PluginIDStr>)> {
+    let mut source2pkgid = Vec::new();
+    for (source_name, pkgids) in source_name2pkgid {
+        if let Some(source_pkgid) = source_target2pkgid.get(&source_name) {
+            source2pkgid.push((source_pkgid.clone(), pkgids));
+        }
+    }
+    source2pkgid.sort_by(|(l, _), (r, _)| l.cmp(r));
+    source2pkgid
 }
 
 #[derive(TemplateSimple)]
@@ -826,6 +878,7 @@ mod tests {
             pkgid2scripts: Vec::new(),
             startup_plugins: vec![startup_plugin.clone()],
             startup_scripts: vec!["lua_start_abc123".to_string()],
+            source2pkgid: Vec::new(),
         }
         .render_once()
         .unwrap();
