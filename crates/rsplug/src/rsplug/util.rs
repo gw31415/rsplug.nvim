@@ -8,16 +8,59 @@ use super::error::Error;
 pub mod hash {
     //! Utilities for hashing arbitrary data.
 
+    use std::hash::{Hash, Hasher};
     use std::mem::MaybeUninit;
 
-    use xxhash_rust::xxh3::xxh3_128;
+    use xxhash_rust::xxh3::Xxh3;
 
     const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
 
-    /// Calculate the 128-bit xxh3 digest for the given data.
+    /// [`std::hash::Hash`] values with xxh3 and return the 128-bit digest.
+    ///
+    /// Prefer this for structured inputs: define the data that must affect a hash in a
+    /// small `#[derive(Hash)]` type, then pass that value here. That keeps hash inputs
+    /// next to their data model instead of manually appending bytes at each call site.
     #[inline]
-    pub fn digest(data: impl AsRef<[u8]>) -> [u8; 16] {
-        xxh3_128(data.as_ref()).to_ne_bytes()
+    pub fn digest_hash<T: Hash + ?Sized>(value: &T) -> [u8; 16] {
+        let mut hasher = StableHasher::new();
+        value.hash(&mut hasher);
+        hasher.digest()
+    }
+
+    /// A deterministic 128-bit [`Hasher`] backed by xxh3.
+    pub struct StableHasher {
+        inner: Xxh3,
+    }
+
+    impl StableHasher {
+        #[inline]
+        pub fn new() -> Self {
+            Self { inner: Xxh3::new() }
+        }
+
+        #[inline]
+        pub fn digest(&self) -> [u8; 16] {
+            self.inner.digest128().to_ne_bytes()
+        }
+    }
+
+    impl Default for StableHasher {
+        #[inline]
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Hasher for StableHasher {
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.inner.digest()
+        }
+
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            self.inner.update(bytes);
+        }
     }
 
     /// Convert a raw digest into its hexadecimal representation.
@@ -38,16 +81,10 @@ pub mod hash {
         unsafe { std::mem::transmute::<[MaybeUninit<u8>; 32], [u8; 32]>(res) }
     }
 
-    /// Calculate the hexadecimal representation of the xxh3 digest for the given data.
+    /// Calculate the hexadecimal representation of a [`std::hash::Hash`] value.
     #[inline]
-    pub fn digest_hex_bytes(data: impl AsRef<[u8]>) -> [u8; 32] {
-        to_hex_bytes(digest(data))
-    }
-
-    /// Calculate the hexadecimal representation of the xxh3 digest as a [`String`].
-    #[inline]
-    pub fn digest_hex_string(data: impl AsRef<[u8]>) -> String {
-        unsafe { String::from_utf8_unchecked(digest_hex_bytes(data).to_vec()) }
+    pub fn digest_hash_hex_string<T: Hash + ?Sized>(value: &T) -> String {
+        unsafe { String::from_utf8_unchecked(to_hex_bytes(digest_hash(value)).to_vec()) }
     }
 }
 

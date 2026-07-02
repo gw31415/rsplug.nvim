@@ -283,15 +283,21 @@ impl Plugin {
         } = cache;
 
         let Some(repo) = repo else {
-            let mut id_data = Vec::new();
-            if let Some(source_name) = &source_name {
-                id_data.extend(source_name.as_bytes());
+            #[derive(std::hash::Hash)]
+            struct ScriptOnlyPluginId<'a> {
+                source_name: Option<&'a str>,
+                lazy_type: &'a LazyType,
+                script: &'a SetupScript,
+                order: usize,
             }
-            id_data.extend(format!("{:?}", lazy_type).as_bytes());
-            id_data.extend(format!("{:?}", script).as_bytes());
-            id_data.extend(order.to_ne_bytes());
+
             let loaded = LoadedPlugin {
-                id: PluginID::new(id_data),
+                id: PluginID::from_hash(&ScriptOnlyPluginId {
+                    source_name: source_name.as_deref(),
+                    lazy_type: &lazy_type,
+                    script: &script,
+                    order,
+                }),
                 source_name,
                 files: HowToPlaceFiles::CopyEachFile(Default::default()),
                 lazy_type,
@@ -648,24 +654,30 @@ fn extract_unique_lua_modules<'a>(
 
 async fn build_aware_plugin_id(
     repository: &util::git::Repository,
-    mut head_rev: Vec<u8>,
+    head_rev: Vec<u8>,
     build: &[String],
     lua_build: Option<&str>,
 ) -> Result<PluginID, Error> {
-    use crate::rsplug::util::hash;
+    #[derive(std::hash::Hash)]
+    struct BuildAwarePluginId<'a> {
+        head_rev: &'a [u8],
+        dirty_diff: Option<[u8; 16]>,
+        build: &'a [String],
+        lua_build: Option<&'a str>,
+    }
 
-    if repository.is_dirty().await? {
-        head_rev.extend(repository.diff_hash().await?);
-    }
-    for (i, comp) in build.iter().enumerate() {
-        head_rev.extend(i.to_ne_bytes());
-        head_rev.extend(comp.as_bytes());
-    }
-    if let Some(lua_build) = lua_build {
-        head_rev.extend(b"lua_build");
-        head_rev.extend(lua_build.as_bytes());
-    }
-    Ok(PluginID::new(hash::digest(&head_rev)))
+    let dirty_diff = if repository.is_dirty().await? {
+        Some(repository.diff_hash().await?)
+    } else {
+        None
+    };
+
+    Ok(PluginID::from_hash(&BuildAwarePluginId {
+        head_rev: &head_rev,
+        dirty_diff,
+        build,
+        lua_build,
+    }))
 }
 
 fn is_full_hex_hash(value: &str) -> bool {
@@ -797,6 +809,35 @@ mod tests {
             .unwrap();
         assert_eq!(script_only.source_name, None);
         assert_eq!(script_only.dependency_cachedirs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn script_only_plugin_load_derives_id_from_hash_input() {
+        async fn make_loaded(lua_start: &str) -> LoadedPlugin {
+            let config: Config = toml::from_str(&format!(
+                r#"
+                [[plugins]]
+                name = "script_only"
+                lua_start = {lua_start:?}
+                "#
+            ))
+            .unwrap();
+            let plugin = Plugin::new(config).unwrap().next().unwrap();
+
+            plugin
+                .load(false, false, std::env::temp_dir(), None)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+        }
+
+        let first = make_loaded("vim.g.script_only = true").await;
+        let same = make_loaded("vim.g.script_only = true").await;
+        let different_script = make_loaded("vim.g.script_only = false").await;
+
+        assert_eq!(first.id, same.id);
+        assert_ne!(first.id, different_script.id);
     }
 
     #[test]

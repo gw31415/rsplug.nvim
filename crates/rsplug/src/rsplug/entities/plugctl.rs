@@ -121,6 +121,16 @@ impl Render for AfterOrBefore {
     }
 }
 
+#[derive(Hash)]
+struct GeneratedFileId<'a> {
+    path: &'a str,
+    data: &'a [u8],
+}
+
+fn generated_file_id(path: &str, data: &[u8]) -> PluginID {
+    PluginID::from_hash(&GeneratedFileId { path, data })
+}
+
 /// プラグインの読み込み制御・ロード後の設定 (after_lua等)を行う構造体
 #[derive(Default)]
 pub struct PlugCtl {
@@ -139,7 +149,7 @@ pub struct PlugCtl {
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
 fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> LoadedPlugin {
     let data = data.into();
-    let id = PluginID::new(&data) + PluginID::new(path);
+    let id = generated_file_id(path, data.as_ref());
     let files = HashMap::from([(
         PathBuf::from(path),
         FileItem {
@@ -202,10 +212,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     let lua_before = lua_before.into_iter().map(|s| (AfterOrBefore::Before, s));
                     let mut script_set: BTreeMap<AfterOrBefore, Vec<String>> = Default::default();
                     for (script_type, content) in lua_after.chain(lua_before) {
-                        let module_id = format!(
-                            "{script_type}_{}",
-                            hash::digest_hex_string(content.as_bytes())
-                        );
+                        let module_id =
+                            format!("{script_type}_{}", hash::digest_hash_hex_string(&content));
                         plugs.push(instant_startup_pkg(
                             &format!("lua/{module_id}.lua"),
                             content.into_bytes(),
@@ -255,7 +263,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             .unwrap()
             .into_bytes()
             .into();
-            let mut id = PluginID::new(&init_data) + PluginID::new("lua/_rsplug/init.lua");
+            let mut id = generated_file_id("lua/_rsplug/init.lua", init_data.as_ref());
             let mut files = HashMap::from([(
                 PathBuf::from("lua/_rsplug/init.lua"),
                 FileItem {
@@ -271,7 +279,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 .unwrap()
                 .into_bytes()
                 .into();
-                id = id + PluginID::new(&data) + PluginID::new("plugin/lua_start.lua");
+                id += generated_file_id("plugin/lua_start.lua", data.as_ref());
                 files.insert(
                     PathBuf::from("plugin/lua_start.lua"),
                     FileItem {
@@ -304,7 +312,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     .render_once()
                     .unwrap()
                     .into_bytes();
-                path.push_str(&hash::digest_hex_string(&data));
+                path.push_str(&hash::digest_hash_hex_string(&data));
                 path.push_str(".lua");
 
                 plugs.push(instant_startup_pkg(&path, data));
@@ -314,20 +322,21 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
         if !event2pkgid.is_empty() {
             // on_event setup
             let events = event2pkgid.keys();
-            let on_event_setup = OnEventSetupTemplate { events }
+            let on_event_setup: Cow<'static, [u8]> = OnEventSetupTemplate { events }
                 .render_once()
                 .unwrap()
                 .into_bytes()
                 .into();
-            let on_event_setup_id = PluginID::new(&on_event_setup);
-            let on_event = OnEventTemplate {
+            let on_event_setup_id =
+                generated_file_id("plugin/on_event_setup.lua", on_event_setup.as_ref());
+            let on_event: Cow<'static, [u8]> = OnEventTemplate {
                 event2pkgid: &event2pkgid,
             }
             .render_once()
             .unwrap()
             .into_bytes()
             .into();
-            let on_event_id = PluginID::new(&on_event);
+            let on_event_id = generated_file_id("lua/_rsplug/on_event.lua", on_event.as_ref());
             let files = HashMap::from([
                 (
                     PathBuf::from("lua/_rsplug/on_event.lua"),
@@ -361,20 +370,21 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
         }
         if !func2pkgid.is_empty() {
             let funcs = func2pkgid.keys();
-            let on_func_setup = OnFuncSetupTemplate { funcs }
+            let on_func_setup: Cow<'static, [u8]> = OnFuncSetupTemplate { funcs }
                 .render_once()
                 .unwrap()
                 .into_bytes()
                 .into();
-            let on_func_setup_id = PluginID::new(&on_func_setup);
-            let on_func = OnFuncTemplate {
+            let on_func_setup_id =
+                generated_file_id("plugin/on_func_setup.lua", on_func_setup.as_ref());
+            let on_func: Cow<'static, [u8]> = OnFuncTemplate {
                 func2pkgid: &func2pkgid,
             }
             .render_once()
             .unwrap()
             .into_bytes()
             .into();
-            let on_func_id = PluginID::new(&on_func);
+            let on_func_id = generated_file_id("lua/_rsplug/on_func.lua", on_func.as_ref());
             let files = HashMap::from([
                 (
                     PathBuf::from("lua/_rsplug/on_func.lua"),
@@ -408,20 +418,21 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             // on_cmd setup
             plugs.push({
                 let cmds = cmd2pkgid.keys();
-                let on_cmd_setup = OnCmdSetupTemplate { cmds }
+                let on_cmd_setup: Cow<'static, [u8]> = OnCmdSetupTemplate { cmds }
                     .render_once()
                     .unwrap()
                     .into_bytes()
                     .into();
-                let on_cmd_setup_id = PluginID::new(&on_cmd_setup);
-                let on_cmd = OnCmdTemplate {
+                let on_cmd_setup_id =
+                    generated_file_id("plugin/on_cmd_setup.lua", on_cmd_setup.as_ref());
+                let on_cmd: Cow<'static, [u8]> = OnCmdTemplate {
                     cmd2pkgid: &cmd2pkgid,
                 }
                 .render_once()
                 .unwrap()
                 .into_bytes()
                 .into();
-                let on_cmd_id = PluginID::new(&on_cmd);
+                let on_cmd_id = generated_file_id("lua/_rsplug/on_cmd.lua", on_cmd.as_ref());
                 let files = HashMap::from([
                     (
                         PathBuf::from("lua/_rsplug/on_cmd.lua"),
@@ -452,15 +463,15 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
         }
         if !luam2pkgid.is_empty() {
             let plugin_on_lua = include_bytes!("../../../templates/plugin/on_lua.lua");
-            let plugin_on_lua_id = PluginID::new(plugin_on_lua);
-            let on_lua = OnLuaTemplate {
+            let plugin_on_lua_id = generated_file_id("plugin/on_lua.lua", plugin_on_lua);
+            let on_lua: Cow<'static, [u8]> = OnLuaTemplate {
                 luam2pkgid: &luam2pkgid,
             }
             .render_once()
             .unwrap()
             .into_bytes()
             .into();
-            let on_lua_id = PluginID::new(&on_lua);
+            let on_lua_id = generated_file_id("lua/_rsplug/on_lua.lua", on_lua.as_ref());
             let files = HashMap::from([
                 (
                     PathBuf::from("lua/_rsplug/on_lua.lua"),
@@ -493,7 +504,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
         if !keypattern2pkgid.is_empty() {
             let data = include_bytes!("../../../templates/plugin/on_map.lua");
             plugs.push(instant_startup_pkg(
-                &format!("plugin/{}.lua", hash::digest_hex_string(data)),
+                &format!("plugin/{}.lua", hash::digest_hash_hex_string(data)),
                 data,
             ));
             plugs.push(instant_startup_pkg(
@@ -517,7 +528,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
 
         // Processing overwrite_files
         {
-            let mut overwrite_copies_id: PluginID = PluginID::new(b"doc");
+            let mut overwrite_copies_id: PluginID = PluginID::from_hash(&DOC_PLUGIN_NAME);
             let mut overwrite_copies = HashMap::new();
             for (id, files) in overwrite_files {
                 match files {
@@ -564,47 +575,32 @@ impl AddAssign for PlugCtl {
             overwrite_files,
         } = other;
         for (event, ids) in event2pkgid {
-            self.event2pkgid
-                .entry(event)
-                .or_default()
-                .extend(ids.into_iter());
+            self.event2pkgid.entry(event).or_default().extend(ids);
         }
         self.pkgid2scripts.extend(pkgid2scripts);
         for (cmd, ids) in cmd2pkgid {
-            self.cmd2pkgid
-                .entry(cmd)
-                .or_default()
-                .extend(ids.into_iter());
+            self.cmd2pkgid.entry(cmd).or_default().extend(ids);
         }
         for (ft, ids) in ft2pkgid {
-            self.ft2pkgid.entry(ft).or_default().extend(ids.into_iter());
+            self.ft2pkgid.entry(ft).or_default().extend(ids);
         }
         for (func, ids) in func2pkgid {
-            self.func2pkgid
-                .entry(func)
-                .or_default()
-                .extend(ids.into_iter());
+            self.func2pkgid.entry(func).or_default().extend(ids);
         }
         for (luam, ids) in luam2pkgid {
-            self.luam2pkgid
-                .entry(luam)
-                .or_default()
-                .extend(ids.into_iter());
+            self.luam2pkgid.entry(luam).or_default().extend(ids);
         }
         for (source, ids) in source_name2pkgid {
             self.source_name2pkgid
                 .entry(source)
                 .or_default()
-                .extend(ids.into_iter());
+                .extend(ids);
         }
         self.source_target2pkgid.extend(source_target2pkgid);
         for (key, pattern) in keypattern2pkgid {
             let mode_entry = self.keypattern2pkgid.entry(key).or_default();
             for (pattern, ids) in pattern {
-                mode_entry
-                    .entry(pattern)
-                    .or_default()
-                    .extend(ids.into_iter());
+                mode_entry.entry(pattern).or_default().extend(ids);
             }
         }
         self.overwrite_files.extend(overwrite_files);
@@ -894,7 +890,7 @@ mod tests {
     #[test]
     fn on_func_runtime_guards_nested_funcundefined_while_packadding_autoload() {
         let func = "foo#bar".parse::<VimFunc>().unwrap();
-        let id = PluginID::new(b"foo-plugin").as_str();
+        let id = PluginID::from_hash(b"foo-plugin").as_str();
         let func2pkgid = BTreeMap::from([(func, vec![id])]);
         let rendered = OnFuncTemplate {
             func2pkgid: &func2pkgid,
@@ -910,7 +906,7 @@ mod tests {
 
     #[test]
     fn custom_packadd_template_packadds_startup_plugins() {
-        let startup_plugin = PluginID::new(b"startup-plugin").as_str();
+        let startup_plugin = PluginID::from_hash(b"startup-plugin").as_str();
         let rendered = CustomPackaddTemplate {
             pkgid2scripts: Vec::new(),
             startup_plugins: vec![startup_plugin.clone()],

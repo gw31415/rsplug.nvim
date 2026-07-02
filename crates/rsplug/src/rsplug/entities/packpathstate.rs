@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn init_template_packadds_control_packages() {
-        let control_id = PluginID::new(b"control-package").as_str();
+        let control_id = PluginID::from_hash(b"control-package").as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&control_id))).unwrap();
 
         assert!(script.contains(&format!("vim.cmd.packadd '{control_id}'")));
@@ -739,8 +739,8 @@ mod tests {
 
     #[test]
     fn init_template_emits_exact_packadd_block() {
-        let a = PluginID::new(b"aaaa").as_str();
-        let b = PluginID::new(b"bbbb").as_str();
+        let a = PluginID::from_hash(b"aaaa").as_str();
+        let b = PluginID::from_hash(b"bbbb").as_str();
         let script = String::from_utf8(render_init(&[a.clone(), b.clone()])).unwrap();
         // ponytail: locks in the exact packadd block shape; break whitespace here if the template changes.
         let actual = script
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn init_template_resolves_symlink_and_goes_up_two_levels() {
-        let id = PluginID::new(b"gen").as_str();
+        let id = PluginID::from_hash(b"gen").as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&id))).unwrap();
         // init.lua is a symlink into generations/; resolve + :h:h recovers ~/.cache/rsplug
         // whether loaded through the symlink or directly as a generation file.

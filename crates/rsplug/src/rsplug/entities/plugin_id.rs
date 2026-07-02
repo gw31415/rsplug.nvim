@@ -8,7 +8,6 @@ use std::{
 };
 
 use crate::rsplug::util::hash;
-use itertools::Itertools;
 use sailfish::runtime::Render;
 
 /// 固定されたプラグインのID(表示や書き込み用)。
@@ -88,15 +87,19 @@ impl PartialOrd for PluginID {
 }
 
 impl PluginID {
-    /// (内部用) 任意のデータからハッシュ利用し生成する。
-    pub(super) fn new(data: impl AsRef<[u8]>) -> Self {
-        Self(BTreeSet::from([hash::digest(data)]))
+    /// (内部用) [`std::hash::Hash`] 実装から生成する。
+    ///
+    /// 新しいID入力は `#[derive(Hash)]` した小さな入力型で表し、こちらを使う。
+    /// どのフィールドがIDに影響するかを型定義へ集約できるため、呼び出し側で
+    /// バイト列を手で連結する必要がなくなる。
+    pub(super) fn from_hash<T: std::hash::Hash + ?Sized>(value: &T) -> Self {
+        Self(BTreeSet::from([hash::digest_hash(value)]))
     }
+
     /// 文字列に変換
     pub fn as_str(&self) -> PluginIDStr {
         let PluginID(inner) = self;
-        let bytes = inner.iter().flat_map(ToOwned::to_owned).collect_vec();
-        PluginIDStr(hash::to_hex_bytes(hash::digest(bytes)))
+        PluginIDStr(hash::to_hex_bytes(hash::digest_hash(inner)))
     }
 }
 
@@ -123,5 +126,49 @@ impl Sum for PluginID {
 impl AddAssign for PluginID {
     fn add_assign(&mut self, rhs: Self) {
         self.0.extend(rhs.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Hash)]
+    struct GeneratedFileId<'a> {
+        path: &'a str,
+        data: &'a [u8],
+    }
+
+    #[test]
+    fn plugin_id_can_be_derived_from_hash_input_structs() {
+        let left = PluginID::from_hash(&GeneratedFileId {
+            path: "plugin/generated.lua",
+            data: b"vim.g.generated = true",
+        });
+        let right = PluginID::from_hash(&GeneratedFileId {
+            path: "plugin/generated.lua",
+            data: b"vim.g.generated = true",
+        });
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn derived_plugin_id_tracks_each_hashed_field() {
+        let baseline = PluginID::from_hash(&GeneratedFileId {
+            path: "plugin/generated.lua",
+            data: b"vim.g.generated = true",
+        });
+        let different_path = PluginID::from_hash(&GeneratedFileId {
+            path: "plugin/other.lua",
+            data: b"vim.g.generated = true",
+        });
+        let different_data = PluginID::from_hash(&GeneratedFileId {
+            path: "plugin/generated.lua",
+            data: b"vim.g.generated = false",
+        });
+
+        assert_ne!(baseline, different_path);
+        assert_ne!(baseline, different_data);
     }
 }

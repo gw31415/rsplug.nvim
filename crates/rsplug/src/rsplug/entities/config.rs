@@ -225,7 +225,7 @@ struct SetupScriptOne {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, Hash)]
 pub struct SetupScript {
     /// Neovim 起動時に実行される Lua スクリプト
     pub lua_start: BTreeSet<String>,
