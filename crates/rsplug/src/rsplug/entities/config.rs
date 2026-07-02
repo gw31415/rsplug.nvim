@@ -62,11 +62,12 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    pub fn to_sym(&self) -> bool {
+    pub fn to_sym(&self, lazy_type: &LazyType) -> bool {
         self.manually_to_sym
             || !self.build.is_empty()
             || self.lua_build.is_some()
             || self.lua_post_update.is_some()
+            || matches!(lazy_type, LazyType::Opt(events) if events.iter().any(|event| matches!(event, LoadEvent::OnSource(_))))
     }
 }
 
@@ -358,6 +359,7 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, LoadEvent::OnSource(source) if source == "host.nvim"))
         );
+        assert!(config.plugins[0].cache.to_sym(&config.plugins[0].lazy_type));
     }
 }
 

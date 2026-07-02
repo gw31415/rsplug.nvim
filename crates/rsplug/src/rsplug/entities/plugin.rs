@@ -301,7 +301,7 @@ impl Plugin {
             order,
         } = self;
 
-        let to_sym = cache.to_sym();
+        let to_sym = cache.to_sym(&lazy_type);
         let CacheConfig {
             repo,
             manually_to_sym: _,
