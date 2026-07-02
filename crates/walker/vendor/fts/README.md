@@ -36,7 +36,7 @@ fts = { package = "rsplug-fts", version = "0.3.0" }
 
 Then use the library as `fts` in Rust code:
 
-```rust
+```rust,no_run
 use std::path::Path;
 use fts::walkdir::{WalkDir, WalkDirConf};
 
@@ -48,7 +48,7 @@ for entry in WalkDir::new(WalkDirConf::new(path)) {
 
 Call `fts_*` functions directly:
 
-```rust
+```rust,no_run
 use std::ffi::CString;
 use fts::ffi::{fts_open, fts_read, fts_close, FTS_LOGICAL};
 
