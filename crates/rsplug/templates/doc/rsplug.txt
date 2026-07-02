@@ -52,9 +52,8 @@ External Binary Model~
 Pack System Integration~
     rsplug generates a standard Neovim |packages| directory structure. Plugins
     are placed in `pack/_gen/opt/` and loaded through rsplug's generated
-    runtime. rsplug's own generated control package is placed in
-    `pack/_gen/start/` so it can register lazy-loading triggers and perform
-    startup loads.
+    runtime. rsplug's own generated control package is also placed in
+    `pack/_gen/opt/` and explicitly loaded by `~/.cache/rsplug/init.lua`.
 
 Configuration-Driven~
     All plugin definitions live in TOML configuration files. Changes to your
@@ -231,9 +230,6 @@ Environment Variables:~
             rsplug --install
             rsplug --update
 <
-            rsplug --install
-            rsplug --update
-<
 
 Default Paths:~
 
@@ -261,9 +257,10 @@ order files are processed.
 5.1 Plugin Fields                                      *rsplug-plugin-fields*
 
 repo~
-    Type: String (required)
-    
-    GitHub repository in the format `owner/repo` or `owner/repo@version`.
+    Type: String
+
+    GitHub repository in the format `owner/repo` or `owner/repo@version`, or
+    any Git URL containing `://`. Omit `repo` for config-only script entries.
     See |rsplug-repo-format| for details.
     
     Examples:
@@ -378,8 +375,6 @@ on_map~
     Mode abbreviations: n (normal), v (visual), x (visual), i (insert),
     c (command), t (terminal), o (operator-pending)
     
-    Note: on_map is currently broken and being fixed.
-
 depends~
     Type: Array of Strings
     
@@ -503,10 +498,12 @@ name~
 
 sym~
     Type: Boolean
-    Default: `false` (or `true` if `build` or `lua_build` is specified)
+    Default: `false` (or `true` if `build`, `lua_build`, or
+    `lua_post_update` is specified)
     
     If `true`, creates a symbolic link to the repository instead of copying
-    files. Automatically set to `true` when `build` or `lua_build` is specified.
+    files. Automatically set to `true` when `build`, `lua_build`, or
+    `lua_post_update` is specified.
     
     Example:
 >toml
@@ -528,6 +525,20 @@ ignore~
         *.md
         .github/
         """
+<
+
+merge~
+    Type: Boolean
+    Default: `true`
+
+    If `false`, prevents a startup plugin from being merged with compatible
+    startup plugins.
+
+    Example:
+>toml
+        [[plugins]]
+        repo = "some/plugin"
+        merge = false
 <
 
 ------------------------------------------------------------------------------
@@ -559,6 +570,19 @@ With branch name:~
 <
     Uses the `main` branch instead of the default branch.
 
+General Git URL:~
+>toml
+    repo = "https://gitlab.com/owner/plugin"
+    repo = "https://codeberg.org/owner/plugin@v1.0"
+<
+    Any string containing `://` is treated as a Git URL. The optional `@rev`
+    suffix is split from the URL path, so userinfo like `https://user@host/...`
+    is preserved.
+
+Cache path for URL repositories:~
+    Scheme, authentication, port, and a trailing `.git` are stripped, leaving
+    `host/path` under `~/.cache/rsplug/repos/`.
+
 Version resolution happens during the fetch phase. The resolved commit SHA
 is stored in the lock file (see |rsplug-lockfile|).
 
@@ -574,8 +598,10 @@ Lazy-loading triggers:~
     1. Autocmd events (on_event)
     2. User commands (on_cmd)
     3. Filetypes (on_ft)
-    4. Key mappings (on_map)
-    5. Lua module require (automatic)
+    4. Vim functions (on_func)
+    5. Source hooks (on_source)
+    6. Key mappings (on_map)
+    7. Lua module require (automatic)
 
 Automatic Lua module detection:~
 
@@ -689,14 +715,14 @@ Example:
 ------------------------------------------------------------------------------
 5.5 Dependencies                                        *rsplug-dependencies*
 
-The `with` field declares plugins that should load simultaneously with the
+The `depends` field declares plugins that should load simultaneously with the
 current plugin.
 
 Basic dependency:~
 >toml
     [[plugins]]
     repo = "nvim-telescope/telescope.nvim"
-    with = ["plenary.nvim"]
+    depends = ["plenary.nvim"]
     on_cmd = "Telescope"
     
     [[plugins]]
@@ -722,7 +748,7 @@ Multiple dependencies:~
 >toml
     [[plugins]]
     repo = "some/plugin"
-    with = ["dep1", "dep2", "dep3"]
+    depends = ["dep1", "dep2", "dep3"]
 <
 
 ==============================================================================
@@ -953,8 +979,7 @@ plugin directory.
 
 Preventing merging:~
 
-Currently, there is no explicit way to prevent merging. If you encounter
-issues due to merging, please file an issue at the repository.
+Use `merge = false` on a startup plugin that must stay separate.
 
 ------------------------------------------------------------------------------
 10.2 Build Caching                                       *rsplug-build-cache*
@@ -1089,7 +1114,7 @@ Example 2: Telescope with dependencies~
     
     [[plugins]]
     repo = "nvim-telescope/telescope.nvim"
-    with = ["plenary.nvim"]
+    depends = ["plenary.nvim"]
     on_cmd = "Telescope"
     lua_after = '''
     require('telescope').setup{
