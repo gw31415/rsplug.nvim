@@ -213,13 +213,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                         script_set.entry(script_type).or_default().push(module_id);
                     }
                     for content in lua_start {
-                        let module_id =
-                            format!("lua_start_{}", hash::digest_hex_string(content.as_bytes()));
-                        plugs.push(instant_startup_pkg(
-                            &format!("lua/{module_id}.lua"),
-                            content.into_bytes(),
-                        ));
-                        scripts_startup.push((order, pkgid.clone(), module_id));
+                        scripts_startup.push((order, pkgid.clone(), content));
                     }
 
                     if start {
@@ -248,22 +242,54 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                         .then_with(|| l_module.cmp(r_module))
                 },
             );
-            let startup_scripts = startup_scripts
+            let startup_scripts: Vec<String> = startup_scripts
                 .into_iter()
-                .map(|(_, _, module_id)| module_id)
+                .map(|(_, _, content)| content)
                 .collect();
-            plugs.push(instant_startup_pkg(
-                "lua/_rsplug/init.lua",
-                CustomPackaddTemplate {
-                    pkgid2scripts,
-                    startup_plugins,
-                    startup_scripts,
-                    source2pkgid: build_source2pkgid(source_name2pkgid, source_target2pkgid),
+            let init_data: Cow<'static, [u8]> = CustomPackaddTemplate {
+                pkgid2scripts,
+                startup_plugins,
+                source2pkgid: build_source2pkgid(source_name2pkgid, source_target2pkgid),
+            }
+            .render_once()
+            .unwrap()
+            .into_bytes()
+            .into();
+            let mut id = PluginID::new(&init_data) + PluginID::new("lua/_rsplug/init.lua");
+            let mut files = HashMap::from([(
+                PathBuf::from("lua/_rsplug/init.lua"),
+                FileItem {
+                    source: Arc::new(FileSource::File { data: init_data }),
+                    merge_type: MergeType::Overwrite,
+                },
+            )]);
+            if !startup_scripts.is_empty() {
+                let data: Cow<'static, [u8]> = LuaStartPluginTemplate {
+                    startup_scripts: &startup_scripts,
                 }
                 .render_once()
                 .unwrap()
-                .into_bytes(),
-            ));
+                .into_bytes()
+                .into();
+                id = id + PluginID::new(&data) + PluginID::new("plugin/lua_start.lua");
+                files.insert(
+                    PathBuf::from("plugin/lua_start.lua"),
+                    FileItem {
+                        source: Arc::new(FileSource::File { data }),
+                        merge_type: MergeType::Overwrite,
+                    },
+                );
+            }
+            plugs.push(LoadedPlugin {
+                id,
+                source_name: "_rsplug:init".to_string(),
+                lazy_type: LazyType::Start,
+                files: HowToPlaceFiles::CopyEachFile(files),
+                script: Default::default(),
+                order: usize::MAX,
+                merge_enabled: true,
+                is_plugctl: true,
+            });
         }
 
         if !ft2pkgid.is_empty() {
@@ -615,14 +641,15 @@ impl PlugCtl {
             overwrite_files,
         } = self;
         event2pkgid.is_empty()
-        && scripts.is_empty()
-        && cmd2pkgid.is_empty()
-        && ft2pkgid.is_empty()
-        && func2pkgid.is_empty()
-        && luam2pkgid.is_empty()
-        && source_name2pkgid.is_empty()
-        && source_target2pkgid.is_empty()
-        && keypattern2pkgid.values().all(|v| v.is_empty())    && overwrite_files.is_empty()
+            && scripts.is_empty()
+            && cmd2pkgid.is_empty()
+            && ft2pkgid.is_empty()
+            && func2pkgid.is_empty()
+            && luam2pkgid.is_empty()
+            && source_name2pkgid.is_empty()
+            && source_target2pkgid.is_empty()
+            && keypattern2pkgid.values().all(|v| v.is_empty())
+            && overwrite_files.is_empty()
     }
 
     /// パッケージ情報を読み込み、 PlugCtl を作成する。
@@ -761,8 +788,14 @@ struct FtpluginTemplate {
 struct CustomPackaddTemplate {
     pkgid2scripts: Vec<(PluginIDStr, BTreeMap<AfterOrBefore, Vec<String>>)>,
     startup_plugins: Vec<PluginIDStr>,
-    startup_scripts: Vec<String>,
     source2pkgid: Vec<(PluginIDStr, Vec<PluginIDStr>)>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "plugin/lua_start.stpl")]
+#[template(escape = false)]
+struct LuaStartPluginTemplate<'a> {
+    startup_scripts: &'a [String],
 }
 
 fn build_source2pkgid(
@@ -874,24 +907,37 @@ mod tests {
     }
 
     #[test]
-    fn custom_packadd_template_runs_lua_start_before_startup_plugins() {
+    fn custom_packadd_template_packadds_startup_plugins() {
         let startup_plugin = PluginID::new(b"startup-plugin").as_str();
         let rendered = CustomPackaddTemplate {
             pkgid2scripts: Vec::new(),
             startup_plugins: vec![startup_plugin.clone()],
-            startup_scripts: vec!["lua_start_abc123".to_string()],
             source2pkgid: Vec::new(),
         }
         .render_once()
         .unwrap();
 
-        let lua_start_pos = rendered.find("require(module_id)").unwrap();
-        let packadd_pos = rendered
-            .find("require('_rsplug').packadd(id, true)")
-            .unwrap();
-
-        assert!(rendered.contains("local startup_scripts = {'lua_start_abc123',}"));
         assert!(rendered.contains(&format!("local startup_plugins = {{'{startup_plugin}',}}")));
-        assert!(lua_start_pos < packadd_pos);
+        assert!(!rendered.contains("startup_scripts"));
+        assert!(rendered.contains("require('_rsplug').packadd(id, true)"));
+    }
+
+    #[test]
+    fn lua_start_template_wraps_scripts_in_order() {
+        let rendered = LuaStartPluginTemplate {
+            startup_scripts: &[
+                "vim.g.first = true".to_string(),
+                "return vim.g.first".to_string(),
+            ],
+        }
+        .render_once()
+        .unwrap();
+
+        let first_pos = rendered.find("vim.g.first = true").unwrap();
+        let second_pos = rendered.find("return vim.g.first").unwrap();
+
+        assert!(rendered.starts_with("-- Auto generated by rsplug\n"));
+        assert!(first_pos < second_pos);
+        assert_eq!(rendered.matches("(function()\n").count(), 2);
     }
 }

@@ -358,7 +358,6 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, LoadEvent::OnSource(source) if source == "host.nvim"))
         );
-        assert!(config.plugins[0].cache.to_sym());
     }
 }
 

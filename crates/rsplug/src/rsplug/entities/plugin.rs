@@ -310,7 +310,6 @@ impl Plugin {
             lua_post_update,
         } = cache;
 
-
         let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
         let url: Arc<str> = Arc::from(repo.url());
 
