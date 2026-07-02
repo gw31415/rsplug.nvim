@@ -281,7 +281,6 @@ impl FileSource {
 }
 
 struct Files {
-    start_or_opt: &'static str,
     is_plugctl: bool,
     dir_type: DirectoryExtractionType,
 }
@@ -441,7 +440,6 @@ impl PackPathState {
         if already_installed {
             return;
         }
-        let start_or_opt = "opt";
 
         if !is_plugctl {
             self.ctl += PlugCtl::create(id, source_name, lazy_type, script, order, &mut files);
@@ -450,11 +448,9 @@ impl PackPathState {
             HowToPlaceFiles::CopyEachFile(files) => {
                 for (path, item) in files {
                     let Files {
-                        start_or_opt: _,
                         is_plugctl: _,
                         dir_type: DirectoryExtractionType::Files(tree),
                     } = self.files.entry(id_str.clone()).or_insert(Files {
-                        start_or_opt,
                         is_plugctl,
                         dir_type: DirectoryExtractionType::Files(Vec::new()),
                     })
@@ -468,7 +464,6 @@ impl PackPathState {
                 self.files.insert(
                     id_str.clone(),
                     Files {
-                        start_or_opt,
                         is_plugctl,
                         dir_type: DirectoryExtractionType::Symlink(dir),
                     },
@@ -479,7 +474,7 @@ impl PackPathState {
 
     /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
     /// NOTE: インストール後のディレクトリ構成は以下のようになる。
-    /// {packpath}/pack/_gen/{start_or_opt}/{id}/
+    /// {packpath}/pack/_gen/opt/{id}/
     pub async fn install(mut self, packpath: &Path) -> io::Result<()> {
         {
             // Load PlugCtl
@@ -502,10 +497,9 @@ impl PackPathState {
         } = self;
         let mut generation_entries: Vec<String> = files
             .iter()
-            .map(|(id, files)| {
-                let mut key = String::with_capacity(files.start_or_opt.len() + 1 + id.len());
-                key.push_str(files.start_or_opt);
-                key.push('/');
+            .map(|(id, _)| {
+                let mut key = String::with_capacity(4 + id.len());
+                key.push_str("opt/");
                 key.push_str(id);
                 key
             })
@@ -530,14 +524,13 @@ impl PackPathState {
         for (
             id,
             Files {
-                start_or_opt,
                 is_plugctl: _,
                 dir_type,
             },
         ) in files
         {
             let id: Arc<str> = id.into();
-            let dir = gen_root.join(start_or_opt).join(id.as_ref());
+            let dir = gen_root.join("opt").join(id.as_ref());
             let installed = {
                 let dir_is_symlink = dir.is_symlink();
                 match &dir_type {
@@ -553,33 +546,31 @@ impl PackPathState {
                     // Because multiple asynchronous starts do not work properly
                     let nvim = tokio::process::Command::new("nvim");
                     async move |dir: &Path| -> io::Result<()> {
-                        if start_or_opt == "start" {
-                            let mut nvim = nvim;
-                            let help_dir = dir.join("doc/");
-                            if help_dir.is_dir() {
-                                let cmd = format!("helptags {}", help_dir.to_string_lossy());
-                                msg(Message::InstallHelp { help_dir });
-                                nvim.arg("--headless")
-                                    .arg("-u")
-                                    .arg("NONE")
-                                    .arg("-c")
-                                    // TODO: escape help_dir properly
-                                    .arg(&cmd)
-                                    .arg("-c")
-                                    .arg("q")
-                                    .status()
-                                    .await
-                                    .and_then(|code| {
-                                        if code.success() {
-                                            Ok(())
-                                        } else {
-                                            Err(io::Error::other(format!(
-                                                "Failed to run nvim command: {}",
-                                                cmd
-                                            )))
-                                        }
-                                    })?;
-                            }
+                        let mut nvim = nvim;
+                        let help_dir = dir.join("doc/");
+                        if help_dir.is_dir() {
+                            let cmd = format!("helptags {}", help_dir.to_string_lossy());
+                            msg(Message::InstallHelp { help_dir });
+                            nvim.arg("--headless")
+                                .arg("-u")
+                                .arg("NONE")
+                                .arg("-c")
+                                // TODO: escape help_dir properly
+                                .arg(&cmd)
+                                .arg("-c")
+                                .arg("q")
+                                .status()
+                                .await
+                                .and_then(|code| {
+                                    if code.success() {
+                                        Ok(())
+                                    } else {
+                                        Err(io::Error::other(format!(
+                                            "Failed to run nvim command: {}",
+                                            cmd
+                                        )))
+                                    }
+                                })?;
                         }
                         Ok(())
                     }

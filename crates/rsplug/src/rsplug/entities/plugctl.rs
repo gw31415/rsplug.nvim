@@ -14,6 +14,10 @@ use sailfish::{TemplateSimple, runtime::Render};
 use super::*;
 use crate::rsplug::util::hash;
 
+/// docファイルを束ねたヘルプ専用プラグインの source_name。
+/// `pack/_gen/start/` への配置判定に使われる。
+pub(super) const DOC_PLUGIN_NAME: &str = "_rsplug:doc";
+
 struct PkgId2ScriptsItem {
     pkgid: PluginIDStr,
     script: SetupScript,
@@ -329,7 +333,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 }
             });
         }
-
         if !func2pkgid.is_empty() {
             let funcs = func2pkgid.keys();
             let on_func_setup = OnFuncSetupTemplate { funcs }
@@ -375,7 +378,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 is_plugctl: true,
             });
         }
-
         if !cmd2pkgid.is_empty() {
             // on_cmd setup
             plugs.push({
@@ -506,7 +508,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             if !overwrite_copies.is_empty() {
                 plugs.push(LoadedPlugin {
                     id: overwrite_copies_id,
-                    source_name: "_rsplug:doc".to_string(),
+                    source_name: DOC_PLUGIN_NAME.to_string(),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(overwrite_copies),
                     script: Default::default(),
