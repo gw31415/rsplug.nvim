@@ -250,7 +250,7 @@ rsplug
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `repo` | String | `owner/repo[@rev]` (GitHub) or any Git URL (`https://…[@rev]`) |
+| `repo` | String | `owner/repo[@rev]` (GitHub) or any Git URL (`https://...[@rev]`); optional for config-only scripts |
 | `start` | Boolean | If `true`, always load at startup (default: `false`) |
 | `on_event` | String/Array | Autocmd event(s) to trigger lazy-load |
 | `on_cmd` | String/Array | User command(s) to trigger lazy-load |
@@ -268,6 +268,7 @@ rsplug
 | `name` | String | Custom plugin name (default: repo name) |
 | `sym` | Boolean | Use symlink instead of file copy |
 | `ignore` | String | Gitignore-style patterns for files to exclude |
+| `merge` | Boolean | Allow compatible startup plugins to be merged (default: `true`) |
 
 ### Key Mapping Syntax
 

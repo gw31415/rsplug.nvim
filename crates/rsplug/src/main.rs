@@ -108,21 +108,28 @@ async fn app() -> Result<(), Error> {
             .map(|plugin| {
                 let locked_map = Arc::clone(&locked_map);
                 async move {
-                    let url = plugin.cache.repo.url();
-                    let locked_rev = if locked {
-                        if let Some(entry) = locked_map.get(&url) {
-                            if entry.kind != rsplug::LockedResourceType::Git {
+                    let locked_rev = if let Some(repo) = plugin.cache.repo.as_ref() {
+                        let url = repo.url();
+                        if locked {
+                            if let Some(entry) = locked_map.get(&url) {
+                                if entry.kind != rsplug::LockedResourceType::Git {
+                                    return Err(Error::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "Unsupported lock type for {}: {:?}",
+                                            url, entry.kind
+                                        ),
+                                    )));
+                                }
+                                Some(Arc::<str>::from(entry.rev.as_str()))
+                            } else {
                                 return Err(Error::Io(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
-                                    format!("Unsupported lock type for {}: {:?}", url, entry.kind),
+                                    format!("Missing locked revision for {}", url),
                                 )));
                             }
-                            Some(Arc::<str>::from(entry.rev.as_str()))
                         } else {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Missing locked revision for {}", url),
-                            )));
+                            None
                         }
                     } else {
                         None
@@ -144,7 +151,9 @@ async fn app() -> Result<(), Error> {
             |(mut plugins, mut locks), res| {
                 if let Some((loaded, lock_info)) = res? {
                     plugins.push(loaded);
-                    locks.push(lock_info);
+                    if let Some(lock_info) = lock_info {
+                        locks.push(lock_info);
+                    }
                 }
                 Ok::<_, Error>((plugins, locks))
             },

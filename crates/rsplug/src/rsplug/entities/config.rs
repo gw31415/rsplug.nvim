@@ -49,8 +49,8 @@ impl Sum for Config {
 
 #[derive(Deserialize)]
 pub struct CacheConfig {
-    #[serde(rename = "repo")]
-    pub repo: RepoSource,
+    #[serde(default, rename = "repo")]
+    pub repo: Option<RepoSource>,
     #[serde(default, rename = "sym")]
     pub manually_to_sym: bool,
     #[serde(default)]
@@ -191,15 +191,22 @@ pub(super) struct PluginConfig {
     pub merge: MergeConfig,
 }
 
+impl PluginConfig {
+    pub(super) fn dep_name(&self) -> Option<&str> {
+        if let Some(custom_name) = &self.custom_name {
+            return Some(custom_name);
+        }
+        match &self.cache.repo {
+            Some(RepoSource::GitHub { repo, .. }) => Some(repo.as_ref()),
+            Some(RepoSource::Git { url, .. }) => Some(url.as_ref()),
+            None => None,
+        }
+    }
+}
+
 impl DagNode for PluginConfig {
-    fn id(&self) -> &str {
-        self.custom_name.as_ref().map_or(
-            match &self.cache.repo {
-                RepoSource::GitHub { repo, .. } => repo.as_ref(),
-                RepoSource::Git { url, .. } => url.as_ref(),
-            },
-            |v| v,
-        )
+    fn id(&self) -> Option<&str> {
+        self.dep_name()
     }
     fn depends(&self) -> impl IntoIterator<Item = &impl AsRef<str>> {
         &self.depends
@@ -324,6 +331,26 @@ mod tests {
     }
 
     #[test]
+    fn plugin_config_allows_script_only_entry_without_repo() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            lua_start = "vim.g.rsplug_script_only = true"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.plugins[0].cache.repo.is_none());
+        assert_eq!(config.plugins[0].dep_name(), None);
+        assert!(
+            config.plugins[0]
+                .script
+                .lua_start
+                .contains("vim.g.rsplug_script_only = true")
+        );
+    }
+
+    #[test]
     fn plugin_config_deserializes_lua_post_update() {
         let config: Config = toml::from_str(
             r#"
@@ -338,6 +365,7 @@ mod tests {
             config.plugins[0].cache.lua_post_update.as_deref(),
             Some("vim.g.updated = true")
         );
+        assert!(config.plugins[0].cache.to_sym());
     }
     #[test]
     fn plugin_config_deserializes_on_source() {
