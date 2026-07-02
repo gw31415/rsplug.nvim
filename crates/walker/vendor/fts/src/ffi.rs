@@ -254,7 +254,7 @@ mod test {
         unsafe {
             let path = CString::new(".").unwrap();
             let paths = vec![path.as_ptr(), ptr::null()];
-            let fts = fts_open(paths.as_ptr(), 0, None);
+            let fts = fts_open(paths.as_ptr(), FTS_NOCHDIR, None);
             assert!(!fts.is_null());
 
             let mut ftsent = fts_read(fts);
@@ -273,7 +273,7 @@ mod test {
         unsafe {
             let path = CString::new(".").unwrap();
             let paths = vec![path.as_ptr(), ptr::null()];
-            let fts = fts_open(paths.as_ptr(), FTS_LOGICAL, None);
+            let fts = fts_open(paths.as_ptr(), FTS_LOGICAL | FTS_NOCHDIR, None);
             assert!(!fts.is_null());
 
             let _ = fts_read(fts);
