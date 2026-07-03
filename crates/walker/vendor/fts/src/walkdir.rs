@@ -48,7 +48,7 @@
 //! ```
 //!
 
-use fts::{Fts, FtsComp, FtsCompFunc, FtsEntry, FtsInfo, fts_option};
+use fts::{fts_option, Fts, FtsComp, FtsCompFunc, FtsEntry, FtsInfo};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::Metadata;
@@ -407,7 +407,7 @@ impl IntoIterator for WalkDir {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::fs::{Permissions, set_permissions};
+    use std::fs::{set_permissions, Permissions};
     use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;

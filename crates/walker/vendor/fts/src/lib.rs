@@ -1,3 +1,6 @@
+// This is a vendored fork of dalance/fts-rs. Suppress clippy for the vendored
+// source to keep it close to upstream and ease future re-merges.
+#![allow(clippy::all)]
 #![doc(html_root_url = "https://docs.rs/fts")]
 
 #[macro_use]

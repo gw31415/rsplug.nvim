@@ -174,8 +174,14 @@ fn get_recursive_dependents() {
 fn multiple_unnamed_nodes_coexist() {
     // 名前なしノードは複数共存できる（重複チェック対象外）。
     let nodes = vec![
-        Node { id: None, depends: &[] },
-        Node { id: None, depends: &[] },
+        Node {
+            id: None,
+            depends: &[],
+        },
+        Node {
+            id: None,
+            depends: &[],
+        },
     ];
     let res = nodes.try_dag();
     assert!(res.is_ok());
@@ -185,7 +191,10 @@ fn multiple_unnamed_nodes_coexist() {
 fn unnamed_node_is_not_dependency_target() {
     // 名前なしノードは被依存にならない。存在しない名前への依存は UnknownDependency。
     let nodes = vec![
-        Node { id: None, depends: &[] },
+        Node {
+            id: None,
+            depends: &[],
+        },
         Node {
             id: Some("A"),
             depends: &["__nonexistent__"],
@@ -203,7 +212,10 @@ fn unnamed_node_can_depend_on_named() {
             id: Some("base"),
             depends: &[],
         },
-        Node { id: None, depends: &["base"] },
+        Node {
+            id: None,
+            depends: &["base"],
+        },
     ];
     let res = nodes.try_dag().unwrap();
     let ids: Vec<_> = res.into_iter().map(|n| n.id).collect();

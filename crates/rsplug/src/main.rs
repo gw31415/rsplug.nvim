@@ -146,18 +146,21 @@ async fn app() -> Result<(), Error> {
         // Wait until all loading is complete.
         // NOTE: It does not abort if an error occurs (because of the build process).
         msg(Message::LoadDone);
-        let (plugins, locks) = res.into_iter().try_fold(
-            (BinaryHeap::new(), Vec::new()),
-            |(mut plugins, mut locks), res| {
-                if let Some((loaded, lock_info)) = res? {
-                    plugins.push(loaded);
-                    if let Some(lock_info) = lock_info {
-                        locks.push(lock_info);
+        let (plugins, locks) = res
+            .into_iter()
+            .try_fold(
+                (BinaryHeap::new(), Vec::new()),
+                |(mut plugins, mut locks), res| {
+                    if let Some((loaded, lock_info)) = res? {
+                        plugins.push(loaded);
+                        if let Some(lock_info) = lock_info {
+                            locks.push(lock_info);
+                        }
                     }
-                }
-                Ok::<_, Error>((plugins, locks))
-            },
-        )?;
+                    Ok::<_, Box<Error>>((plugins, locks))
+                },
+            )
+            .map_err(|e| *e)?;
         (plugins, locks)
     };
     let total_count = plugins.len();
@@ -255,6 +258,12 @@ fn format_toml_parse_error(
         .max(span_start_col);
     let caret_len = span_end_col.saturating_sub(span_start_col).max(1);
     let gutter = style("|").blue();
+    let line_no_styled = style(format!("{line_no:>2}")).blue();
+    let caret_msg = format!(
+        "{} {}",
+        style("^".repeat(caret_len)).red().bold(),
+        source.message()
+    );
     format!(
         "failed to parse config\n {} {}:{}:{}\n   {}\n{} {} {}\n   {} {}{}",
         style("-->").blue(),
@@ -262,16 +271,12 @@ fn format_toml_parse_error(
         line_no,
         col_no,
         gutter,
-        style(format!("{line_no:>2}")).blue(),
+        line_no_styled,
         gutter,
         highlight_toml_line(line, span_start_col, span_end_col),
         gutter,
         " ".repeat(span_start_col.saturating_sub(1)),
-        format!(
-            "{} {}",
-            style("^".repeat(caret_len)).red().bold(),
-            source.message()
-        )
+        caret_msg,
     )
 }
 
@@ -354,6 +359,15 @@ fn highlight_toml_line(line: &str, span_start_col: usize, span_end_col: usize) -
     rendered
 }
 
+#[tokio::main]
+async fn main() {
+    if let Err(e) = app().await {
+        msg(Message::Error(e.into()));
+        close(1).await;
+    }
+    close(0).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,8 +377,16 @@ mod tests {
         let cases: &[(&str, &str, &str)] = &[
             // input, expected snippet line, exact offending token
             ("[[plugins]]\nrepo = 1 #\"x\"\n", "repo = 1", "1"),
-            ("[[plugins]]\nrepo = \"badformat\"\n", "\"badformat\"", "\"badformat\""),
-            ("[[plugins]]\nrepo = \"owner/x\"\non_ft = 7\n", "on_ft = 7", "7"),
+            (
+                "[[plugins]]\nrepo = \"badformat\"\n",
+                "\"badformat\"",
+                "\"badformat\"",
+            ),
+            (
+                "[[plugins]]\nrepo = \"owner/x\"\non_ft = 7\n",
+                "on_ft = 7",
+                "7",
+            ),
         ];
         for (input, want_line, want_token) in cases {
             let err = match toml::from_str::<rsplug::Config>(input) {
@@ -379,9 +401,15 @@ mod tests {
             // Colorization is TTY-dependent (console emits ANSI under a terminal or
             // CLICOLOR_FORCE); assert against the plain-text structure only.
             let rendered = console::strip_ansi_codes(&rendered);
-            assert!(rendered.contains(want_line), "missing line {want_line:?} in:\n{rendered}");
+            assert!(
+                rendered.contains(want_line),
+                "missing line {want_line:?} in:\n{rendered}"
+            );
             // Header line must NOT be the one carrying the code snippet anymore.
-            assert!(!rendered.contains(" 1 | [[plugins]]"), "still pointing at header:\n{rendered}");
+            assert!(
+                !rendered.contains(" 1 | [[plugins]]"),
+                "still pointing at header:\n{rendered}"
+            );
         }
     }
 
@@ -410,13 +438,4 @@ mod tests {
             }
         }
     }
-}
-
-#[tokio::main]
-async fn main() {
-    if let Err(e) = app().await {
-        msg(Message::Error(e.into()));
-        close(1).await;
-    }
-    close(0).await;
 }

@@ -21,6 +21,11 @@ readme = "README.md"
 keywords = ["libc", "directory", "walk", "recursive", "iterator"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gw31415/rsplug.nvim"
+# The upstream bench (benches/fts.rs) requires the nightly-only `#![feature(test)]`.
+# rsplug.nvim pins a stable toolchain and does not run these benches, so disable
+# auto-discovery to keep `--all-target` builds (e.g. `cargo clippy --all-targets`)
+# green on stable.
+autobenches = false
 
 [lib]
 name = "fts"

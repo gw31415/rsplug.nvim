@@ -106,10 +106,7 @@ pub enum DagError {
         "unknown dependency: {dep} (referred by {by})",
         by = by.as_deref().unwrap_or("<unnamed>")
     )]
-    UnknownDependency {
-        dep: String,
-        by: Option<String>,
-    },
+    UnknownDependency { dep: String, by: Option<String> },
     #[error("cycle detected; remaining: {0:?}")]
     CycleDetected(Vec<String>),
 }
@@ -157,11 +154,11 @@ pub trait TryDag<D: DagNode>: IntoIterator<Item = D> + Sized {
             //    名前なしノード（id() == None）は登録せず、被依存にもならない。
             let mut id_to_index: HashMap<&str, usize> = HashMap::with_capacity(n);
             for (i, dag) in nodes.iter().enumerate() {
-                if let Some(id) = dag.inner.id() {
-                    if id_to_index.insert(id, i).is_some() {
-                        // ここだけエラーメッセージ用に to_string()
-                        return Err(DagError::DuplicateName(id.to_string()));
-                    }
+                if let Some(id) = dag.inner.id()
+                    && id_to_index.insert(id, i).is_some()
+                {
+                    // ここだけエラーメッセージ用に to_string()
+                    return Err(DagError::DuplicateName(id.to_string()));
                 }
             }
 

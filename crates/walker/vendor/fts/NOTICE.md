@@ -34,6 +34,10 @@ adjusted for use inside `rsplug.nvim`:
   `skeptic::generate_doc_tests`; `skeptic` removed from dev/build dependencies);
   the workspace produces multiple rlib fingerprints for the `fts` crate name
   causing E0464 in skeptic's `--extern` resolution.
+- upstream `benches/fts.rs` (nightly-only `#![feature(test)]`) excluded from
+  Cargo auto-discovery via `autobenches = false`, so stable `--all-target`
+  builds (e.g. `cargo clippy --all-targets`) succeed; rsplug.nvim does not run
+  these benches.
 
 ## macOS note
 
