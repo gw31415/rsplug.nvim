@@ -36,8 +36,6 @@ pub struct Plugin {
     pub merge_enabled: bool,
     /// DAGトポロジカル順。controlled startup の順序維持に使う。
     pub order: usize,
-    /// DAG 依存の深さ（依存先が先）。layer-parallel ロードで同 depth を並列化するために使う。
-    pub depth: usize,
 }
 
 /// プラグインの取得元
@@ -263,7 +261,6 @@ impl Plugin {
                     dependency_cachedirs,
                     merge_enabled,
                     order,
-                    depth,
                 }
             },
         ))
@@ -277,7 +274,6 @@ impl Plugin {
         update: bool,
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
-        dependency_snapshot_roots: Vec<Arc<Path>>,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         use super::{util::git, *};
         use crate::{
@@ -295,10 +291,9 @@ impl Plugin {
             lazy_type,
             script,
             merge,
-            dependency_cachedirs: _,
+            dependency_cachedirs,
             merge_enabled,
             order,
-            depth: _,
         } = self;
 
         let to_sym = cache.to_sym();
@@ -408,8 +403,20 @@ impl Plugin {
         // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
         tokio::fs::create_dir_all(&worktrees).await?;
         let has_build = !build.is_empty() || lua_build.is_some();
+        let pre_identity = RepoSnapshotIdentity::new(
+            cachedir.clone(),
+            head_rev_str.as_bytes().to_vec(),
+            None,
+            Arc::from(build.as_slice()),
+            lua_build.as_deref().map(Into::into),
+        );
+        let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &pre_identity.snapshot_key()));
 
-        let (snapshot_root_path, repository): (Arc<Path>, git::Repository) = if has_build {
+        let (snapshot_root_path, repository): (Arc<Path>, git::Repository) = if final_root.exists()
+        {
+            // 同一 key の snapshot が既存 → 再利用（build/lua_post_update をスキップ）
+            (final_root.clone(), git::open(final_root.clone()).await?)
+        } else if has_build {
             // build がある: 一時 worktree で build → dirty 計算 → final key → rename/reuse。
             // dirty_diff を snapshot_key に含めるため、build 後でないと最終 key が確定しない。
             let building = building_worktree_dir(&worktrees);
@@ -419,7 +426,7 @@ impl Plugin {
 
             // lua_post_update は update 検知時のみ building worktree で実行。
             if update && let Some(lua_post_update) = lua_post_update.as_deref() {
-                let rtp = collect_build_runtimepaths(building.clone(), &dependency_snapshot_roots);
+                let rtp = build_runtimepaths(&building, &cache_dir, &dependency_cachedirs).await;
                 let id = Arc::new(format!("{logid} (lua_post_update)"));
                 let result: Result<(), Error> = {
                     let id = id.clone();
@@ -456,7 +463,7 @@ impl Plugin {
                 result?;
             }
 
-            let rtp = collect_build_runtimepaths(building.clone(), &dependency_snapshot_roots);
+            let rtp = build_runtimepaths(&building, &cache_dir, &dependency_cachedirs).await;
             run_repo_build(
                 &build,
                 lua_build.as_deref(),
@@ -468,42 +475,15 @@ impl Plugin {
             .await?;
 
             // build 後 dirty を反映した最終 identity → key
-            let built_identity = build_repo_snapshot_identity(
-                &repo,
-                cachedir.clone(),
-                head_rev_str.as_bytes().to_vec(),
-                &build,
-                lua_build.as_deref(),
-            )
-            .await?;
-            let key = built_identity.snapshot_key();
-            let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &key));
+            // final_root（= pre_identity の key）へ原子リネーム。失敗しても final_root は作られない。
             drop(repo);
-            if final_root.exists() {
-                // 同一 key の既存 snapshot を再利用（building は破棄）
-                let _ = tokio::fs::remove_dir_all(building.as_ref()).await;
-            } else {
-                tokio::fs::rename(building.as_ref(), final_root.as_ref()).await?;
-            }
+            tokio::fs::rename(building.as_ref(), final_root.as_ref()).await?;
             let opened = git::open(final_root.clone()).await?;
             (final_root, opened)
         } else {
             // build 無し: key は確定（dirty=None）。final があれば再利用、なければ作成。
-            let pre_identity = RepoSnapshotIdentity::new(
-                cachedir.clone(),
-                head_rev_str.as_bytes().to_vec(),
-                None,
-                Arc::from(build.as_slice()),
-                lua_build.as_deref().map(Into::into),
-            );
-            let key = pre_identity.snapshot_key();
-            let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &key));
-            let repo = if final_root.exists() {
-                git::open(final_root.clone()).await?
-            } else {
-                git::init_snapshot(final_root.as_ref(), &source_git, oid).await?
-            };
-            (final_root, repo)
+            let repo = git::init_snapshot(final_root.as_ref(), &source_git, oid).await?;
+            (final_root.clone(), repo)
         };
 
         // --- 最終 identity と build 成功 marker (snapshot_root 単位, PLANS §11) ---
@@ -675,50 +655,73 @@ async fn run_repo_build(
 }
 
 /// build 用 runtimepath を組み立てる: 自 snapshot を先頭に、依存先 snapshot を重複なしで追加。
-fn collect_build_runtimepaths(own: Arc<Path>, deps: &[Arc<Path>]) -> Vec<PathBuf> {
+/// 依存先 snapshot は best-effort で各依存先 repo の `worktrees/` から最新を探す
+/// （DAG は build 順序を表さないため、ロード順に依存しない）。
+async fn build_runtimepaths(
+    own: &Path,
+    cache_dir: &Path,
+    dependency_cachedirs: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    let mut add = |p: PathBuf| {
-        if seen.insert(p.clone()) {
-            out.push(p);
+    seen.insert(own.to_path_buf());
+    out.push(own.to_path_buf());
+    for dep_cachedir in dependency_cachedirs {
+        let dep_worktrees = cache_dir.join(dep_cachedir).join("worktrees");
+        if let Some(dep_snap) = latest_snapshot_dir(&dep_worktrees).await
+            && seen.insert(dep_snap.clone())
+        {
+            out.push(dep_snap);
         }
-    };
-    add(own.to_path_buf());
-    for d in deps {
-        add(d.to_path_buf());
     }
     out
+}
+
+/// `worktrees/` 配下の snapshot のうち最新（mtime 順）の path を返す。
+/// hidden (`.building-*`) と先頭 40hex(commit) でない名前は無視する。
+async fn latest_snapshot_dir(worktrees: &Path) -> Option<PathBuf> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let Ok(mut rd) = tokio::fs::read_dir(worktrees).await else {
+        return None;
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(commit) = name.split("__").next() else {
+            continue;
+        };
+        if Oid::from_str(commit).is_err() {
+            continue;
+        }
+        let mtime = tokio::fs::metadata(entry.path())
+            .await
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        match &newest {
+            Some((t, _)) if *t >= mtime => {}
+            _ => newest = Some((mtime, entry.path())),
+        }
+    }
+    newest.map(|(_, p)| p)
 }
 
 /// 既存 snapshot worktree のうち最新（mtime 順）の commit を返す (PLANS §8 step 5 の
 /// install/update/locked 以外の case)。snapshot_dir 名の先頭 40hex を commit とみなす。
 async fn latest_snapshot_oid(worktrees: &Path) -> Result<Option<Oid>, Error> {
-    let mut newest: Option<(SystemTime, Oid)> = None;
-    if let Ok(mut rd) = tokio::fs::read_dir(worktrees).await {
-        while let Some(entry) = rd.next_entry().await? {
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if name.starts_with('.') {
-                continue; // hidden (.building-*)
-            }
-            let Some(commit) = name.split("__").next() else {
-                continue;
-            };
-            let Ok(oid) = Oid::from_str(commit) else {
-                continue;
-            };
-            let mtime = tokio::fs::metadata(entry.path())
-                .await
-                .and_then(|m| m.modified())
-                .unwrap_or(UNIX_EPOCH);
-            match &newest {
-                Some((t, _)) if *t >= mtime => {}
-                _ => newest = Some((mtime, oid)),
-            }
-        }
-    }
-    Ok(newest.map(|(_, o)| o))
+    let Some(dir) = latest_snapshot_dir(worktrees).await else {
+        return Ok(None);
+    };
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    let Some(commit) = name.split("__").next() else {
+        return Ok(None);
+    };
+    Ok(Oid::from_str(commit).ok())
 }
 
 fn extract_unique_lua_modules<'a>(
@@ -938,7 +941,7 @@ mod tests {
             let plugin = Plugin::new(config).unwrap().next().unwrap();
 
             plugin
-                .load(false, false, std::env::temp_dir(), None, Vec::new())
+                .load(false, false, std::env::temp_dir(), None)
                 .await
                 .unwrap()
                 .unwrap()
@@ -981,6 +984,8 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-q",
                 "-m",
@@ -1013,7 +1018,7 @@ mod tests {
         let cachedir = plugin.cache.repo.as_ref().unwrap().default_cachedir();
         let repo_root = cache.join(&cachedir);
         let (loaded, lock_info) = plugin
-            .load(true, false, &cache, None, Vec::new())
+            .load(true, false, &cache, None)
             .await
             .unwrap()
             .unwrap();
@@ -1048,7 +1053,7 @@ mod tests {
         .unwrap();
         let plugin2 = Plugin::new(config2).unwrap().next().unwrap();
         let (loaded2, _) = plugin2
-            .load(true, false, &cache, None, Vec::new())
+            .load(true, false, &cache, None)
             .await
             .unwrap()
             .unwrap();
@@ -1089,6 +1094,8 @@ mod tests {
                     "user.email=t@t",
                     "-c",
                     "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
                     "commit",
                     "-q",
                     "-m",
@@ -1128,7 +1135,7 @@ mod tests {
         .unwrap();
         let plugin = Plugin::new(config).unwrap().next().unwrap();
         let (loaded_a, _) = plugin
-            .load(true, false, &cache, None, Vec::new())
+            .load(true, false, &cache, None)
             .await
             .unwrap()
             .unwrap();
@@ -1156,7 +1163,7 @@ mod tests {
         .unwrap();
         let plugin2 = Plugin::new(config2).unwrap().next().unwrap();
         let (loaded_b, lock_b) = plugin2
-            .load(false, true, &cache, None, Vec::new())
+            .load(false, true, &cache, None)
             .await
             .unwrap()
             .unwrap();
@@ -1177,6 +1184,89 @@ mod tests {
             std::fs::read_to_string(snap_a.join("plugin/a.vim")).unwrap(),
             "\"A\n",
             "old snapshot content must not move on update"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn build_plugin_reuses_snapshot_and_skips_rebuild() {
+        // build 付き plugin を install し、再度 load すると snapshot を再利用して build を
+        // 再実行しないことを検証する（build 再利用の最適化）。
+        // build は監査用 log に行を追記するので、再利用なら log 行数は 1 のままになる。
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("rsplug-build-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let remote = dir.join("remote");
+        let cache = dir.join("cache");
+        let log = dir.join("build.log");
+        std::fs::create_dir_all(remote.join("plugin")).unwrap();
+        std::fs::write(remote.join("plugin/init.vim"), "\"x\n").unwrap();
+        let git = |args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(&remote)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let commit = Command::new("git")
+            .current_dir(&remote)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let url = format!("file://{}", remote.display());
+        let log_url = log.display();
+
+        let mk_cfg = || {
+            toml::from_str::<Config>(&format!(
+                r#"
+            [[plugins]]
+            repo = "{url}"
+            build = ["sh", "-c", "echo ran >> {log_url}"]
+            "#
+            ))
+            .unwrap()
+        };
+
+        // 1 回目: install → build 実行 → log に 1 行
+        let plugin = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let _ = plugin
+            .load(true, false, &cache, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let lines_after_first = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(
+            lines_after_first, 1,
+            "build should run once on first install"
+        );
+
+        // 2 回目: 同じ入力で再 load → snapshot 再利用 → build スキップ → log 行数は 1 のまま
+        let plugin2 = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let _ = plugin2
+            .load(true, false, &cache, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let lines_after_second = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(
+            lines_after_second, 1,
+            "re-load must reuse the snapshot and skip build"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

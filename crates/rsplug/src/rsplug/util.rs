@@ -634,6 +634,8 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-q",
                 "-m",

@@ -59,22 +59,23 @@ impl RepoSnapshotIdentity {
 
     /// `worktrees/<snapshot_key>` の directory 名を生成する (PLANS §7)。
     ///
-    /// `dirty_diff`・`build`・`lua_build` が全て無ければ `<head_rev>` のみ。
-    /// いずれかがあれば `<head_rev>__v1_<input_hash>`。`schema` byte を hash 入力に
-    /// 含めることで、key の意味を変える将来の変更に対して別 prefix で migration できる。
+    /// **`dirty_diff` は含めない**: key は commit + build/lua_build 入力のみで決まり、
+    /// build を実行する前に確定する。これにより「同じ入力の snapshot が既にあれば build を
+    /// スキップして再利用」できる。build 成果物の差（dirty）は `RepoSnapshotIdentity`
+    /// （ひいては `plugin_id`）に反映されるため、異なる成果物は別 `_gen` id になる。
+    /// `build`・`lua_build` が共に無ければ `<head_rev>` のみ、あれば `<head_rev>__v1_<hash>`。
     /// `repo_cache_dir` は key に含めない（`worktrees/` は repo ごとに分かれているため暗黙）。
     pub(super) fn snapshot_key(&self) -> String {
-        let input = SnapshotKeyInput {
-            schema: SNAPSHOT_KEY_SCHEMA,
-            head_rev: &self.head_rev,
-            dirty_diff: self.dirty_diff,
-            build: &self.build,
-            lua_build: self.lua_build.as_deref(),
-        };
         let head_rev = String::from_utf8_lossy(&self.head_rev);
-        if self.dirty_diff.is_none() && self.build.is_empty() && self.lua_build.is_none() {
+        if self.build.is_empty() && self.lua_build.is_none() {
             head_rev.into_owned()
         } else {
+            let input = SnapshotKeyInput {
+                schema: SNAPSHOT_KEY_SCHEMA,
+                head_rev: &self.head_rev,
+                build: &self.build,
+                lua_build: self.lua_build.as_deref(),
+            };
             format!(
                 "{head_rev}__v{}_{}",
                 SNAPSHOT_KEY_SCHEMA,
@@ -84,12 +85,11 @@ impl RepoSnapshotIdentity {
     }
 }
 
-/// `snapshot_key` の hash 入力 (PLANS §7)。絶対パスは含めない。
+/// `snapshot_key` の hash 入力 (PLANS §7)。絶対パス・`dirty_diff` は含めない。
 #[derive(Hash)]
 struct SnapshotKeyInput<'a> {
     schema: u8,
     head_rev: &'a [u8],
-    dirty_diff: Option<[u8; 16]>,
     build: &'a [String],
     lua_build: Option<&'a str>,
 }
@@ -209,8 +209,7 @@ impl LoadedPlugin {
     }
 
     /// 配置（runtime）用の snapshot root。repo 由来でなければ（script-only や生成ファイルのみ
-    /// なら）`None`。**配置情報であり `plugin_id` の hash には含まれない**。依存元 plugin の
-    /// build 用 runtimepath 解決に使う (PLANS §10.3)。
+    /// なら）`None`。**配置情報であり `plugin_id` の hash には含まれない** (PLANS §10.3)。
     pub fn snapshot_root(&self) -> Option<Arc<Path>> {
         match &self.files {
             HowToPlaceFiles::RepoSnapshotLink { target, .. } => Some(target.clone()),
@@ -1195,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_key_reflects_dirty_diff_and_lua_build() {
+    fn snapshot_key_ignores_dirty_but_reflects_lua_build() {
         let rev = b"0123456789012345678901234567890123456789";
         let mk = |dirty, lua| {
             RepoSnapshotIdentity::new(
@@ -1206,13 +1205,13 @@ mod tests {
                 lua,
             )
         };
+        // dirty_diff は snapshot_key に含まれない（build 前に key を確定し再利用を可能にするため）。
         let base = mk(None, None);
         let with_dirty = mk(Some([1u8; 16]), None);
+        assert_eq!(base.snapshot_key(), with_dirty.snapshot_key());
+        // lua_build が変われば key も変わる。
         let with_lua = mk(None, Some(Arc::from("vim.cmd('x')")));
-        assert_ne!(base.snapshot_key(), with_dirty.snapshot_key());
         assert_ne!(base.snapshot_key(), with_lua.snapshot_key());
-        // dirty と lua が両方違っても互いに違う
-        assert_ne!(with_dirty.snapshot_key(), with_lua.snapshot_key());
     }
 
     #[test]

@@ -130,6 +130,25 @@ The existing `generations/`, root `init.lua`, `pack/_gen/`, control plugin
   marker formula changes once and existing caches rebuild once on upgrade.
   Date/Author: 2026-07-03 / Claude.
 
+- Decision (2026-07-04): `snapshot_key` excludes `dirty_diff` (revising the earlier
+  "含める/rename flow" choice). The key is now commit + build/lua_build inputs only, so
+  it is known **before** build runs; a snapshot whose key already exists is reused and
+  build/lua_post_update are skipped (verified by a build-reuse integration test). The
+  rename/temp-worktree flow is dropped — build now runs directly in the final worktree
+  (created only when absent). `dirty_diff` still lives in `RepoSnapshotIdentity` and thus
+  in `plugin_id`, so build artifacts still affect the `_gen` id.
+  Rationale: the original choice forced a per-run rebuild for every build plugin, which
+  the maintainer rejected; build reuse requires the key to be deterministic from inputs.
+  Date/Author: 2026-07-04 / Claude.
+
+- Decision (2026-07-04): loading stays **fully parallel** (single `JoinSet`, original
+  behavior). The DAG expresses runtime load ordering, not build-order dependencies, so
+  layer-parallel serialization by depth was wrong. Dependency runtimepath is resolved
+  best-effort by scanning each dependency repo's `worktrees/` for its newest snapshot
+  (`latest_snapshot_dir`), independent of load order — matching the original best-effort
+  semantics.
+  Date/Author: 2026-07-04 / Claude.
+
 ## Outcomes & Retrospective
 
 ### Phase-1 (identity / hash safety, 2026-07-03) — DONE
