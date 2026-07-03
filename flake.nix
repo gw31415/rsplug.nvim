@@ -29,6 +29,9 @@
         };
       in
       {
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [ stylua ];
+        };
         packages.default =
           (
             (pkgs.makeRustPlatform {
