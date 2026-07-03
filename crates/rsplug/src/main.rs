@@ -376,6 +376,9 @@ mod tests {
             let bad = &input[span.start..span.end];
             assert_eq!(bad, *want_token, "for {input:?}");
             let rendered = format_toml_parse_error(std::path::Path::new("x"), input, &err);
+            // Colorization is TTY-dependent (console emits ANSI under a terminal or
+            // CLICOLOR_FORCE); assert against the plain-text structure only.
+            let rendered = console::strip_ansi_codes(&rendered);
             assert!(rendered.contains(want_line), "missing line {want_line:?} in:\n{rendered}");
             // Header line must NOT be the one carrying the code snippet anymore.
             assert!(!rendered.contains(" 1 | [[plugins]]"), "still pointing at header:\n{rendered}");
@@ -390,6 +393,9 @@ mod tests {
             Err(err) => err,
         };
         let rendered = format_toml_parse_error(std::path::Path::new("bad.toml"), input, &err);
+        // Colorization is TTY-dependent (console emits ANSI under a terminal or
+        // CLICOLOR_FORCE); assert against the plain-text structure only.
+        let rendered = console::strip_ansi_codes(&rendered);
 
         assert!(rendered.contains("failed to parse config"));
         assert!(rendered.contains("bad.toml:3:9"));
