@@ -384,12 +384,21 @@ impl Plugin {
         };
         let head_rev_str = oid.to_string();
 
-        // --- source.git の確保と fetch (PLANS §8 step 3-6) ---
+        // --- source.git の確保と fetch (PLANS §8 step 3-6, §15.10) ---
+        // 新 layout (source.git) が無い場合: install/update なら作成、locked なら cache 不足
+        // エラー、それ以外（通常起動）なら未インストールとしてスキップ。
+        // 旧 layout の可変 checkout は自動で読み飛ばす（install/update で新 layout に移行）。
         let mut source_repo = match git::open_source(&source_git).await {
             Ok(r) => r,
             Err(_) if install || update => {
                 msg(Message::Cache("Initializing", url.clone()));
                 git::init_source(&source_git, &url).await?
+            }
+            Err(_) if locked_rev.is_some() => {
+                return Err(invalid_data(format!(
+                    "Missing cached repository for locked revision: {}",
+                    url
+                )));
             }
             Err(_) => return Ok(None),
         };
@@ -1047,6 +1056,127 @@ mod tests {
             loaded2.snapshot_root(),
             Some(target),
             "re-load should reuse the same snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_creates_new_snapshot_without_moving_old_one() {
+        // install して commit A の snapshot を作り、remote を commit B に進めて --update すると:
+        // 古い snapshot (A) は別 commit に動かず、新しい snapshot (B) が別途作られる。
+        // これが本設計の主目的 (PLANS §15.11 item 4, §16.1)。
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("rsplug-load-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let remote = dir.join("remote");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(remote.join("plugin")).unwrap();
+        std::fs::write(remote.join("plugin/a.vim"), "\"A\n").unwrap();
+        let git = |args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(&remote)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {:?} failed", args);
+        };
+        let commit = || {
+            let s = Command::new("git")
+                .current_dir(&remote)
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "x",
+                ])
+                .status()
+                .unwrap();
+            assert!(s.success());
+        };
+        let head = || {
+            String::from_utf8(
+                Command::new("git")
+                    .current_dir(&remote)
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        commit();
+        let oid_a = head();
+        let url = format!("file://{}", remote.display());
+
+        // install → snapshot A
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [[plugins]]
+            repo = "{url}"
+            sym = true
+            "#
+        ))
+        .unwrap();
+        let plugin = Plugin::new(config).unwrap().next().unwrap();
+        let (loaded_a, _) = plugin
+            .load(true, false, &cache, None, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let snap_a = loaded_a.snapshot_root().expect("snapshot_root");
+        assert_eq!(
+            std::fs::read_to_string(snap_a.join("plugin/a.vim")).unwrap(),
+            "\"A\n"
+        );
+
+        // remote を commit B に進める
+        std::fs::write(remote.join("plugin/a.vim"), "\"B\n").unwrap();
+        git(&["add", "-A"]);
+        commit();
+        let oid_b = head();
+        assert_ne!(oid_a, oid_b);
+
+        // update → snapshot B（A とは別）
+        let config2: Config = toml::from_str(&format!(
+            r#"
+            [[plugins]]
+            repo = "{url}"
+            sym = true
+            "#
+        ))
+        .unwrap();
+        let plugin2 = Plugin::new(config2).unwrap().next().unwrap();
+        let (loaded_b, lock_b) = plugin2
+            .load(false, true, &cache, None, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let snap_b = loaded_b.snapshot_root().expect("snapshot_root");
+        assert_ne!(snap_b, snap_a, "update should produce a different snapshot");
+        assert_eq!(lock_b.expect("lock_info").1, oid_b);
+        assert_eq!(
+            std::fs::read_to_string(snap_b.join("plugin/a.vim")).unwrap(),
+            "\"B\n"
+        );
+
+        // 古い generation の snapshot (A) は別 commit に動いていない — 本設計の主目的
+        assert!(
+            snap_a.join("plugin/a.vim").is_file(),
+            "old generation snapshot must survive the update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snap_a.join("plugin/a.vim")).unwrap(),
+            "\"A\n",
+            "old snapshot content must not move on update"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

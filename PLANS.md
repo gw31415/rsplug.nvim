@@ -57,14 +57,22 @@ The existing `generations/`, root `init.lua`, `pack/_gen/`, control plugin
   install→snapshot + `RepoSnapshotLink` target + reuse.
 - [ ] Introduce repository source and snapshot worktree paths under
   `repos/<repo>/source.git` and `repos/<repo>/worktrees/<snapshot_key>/`.
-- [ ] Move build, file scan, copy, symlink, `lua_build`, and `lua_post_update`
+- [x] (2026-07-04) Phase-2 Step D: snapshot-stability integration test +
+  migration error. Real-git test proves install→snapshot, reuse, and that an
+  `--update` to a new commit leaves the old generation's snapshot worktree (and
+  its content) in place. `--locked` with no `source.git` now fails loudly
+  (cache-miss) instead of silently skipping. Deferred: reading the legacy
+  mutable checkout (§15.10.2) — a one-time `--install`/`--update` migrates to
+  the new layout; full-pipeline (PackPathState.install) and nvim
+  build-runtimepath integration coverage (§15.11 items 5-7).
+- [x] Move build, file scan, copy, symlink, `lua_build`, and `lua_post_update`
   operations to the resolved snapshot worktree.
-- [ ] Update dependency runtimepath handling to use resolved snapshot paths
+- [x] Update dependency runtimepath handling to use resolved snapshot paths
   instead of repository cache-relative paths.
-- [ ] Add unit and integration tests that prove snapshot stability, path
+- [x] Add unit and integration tests that prove snapshot stability, path
   independence, merge identity correctness, and compatibility with existing
   generation output.
-- [ ] Run formatting, tests, and relevant lint checks before considering the
+- [x] Run formatting, tests, and relevant lint checks before considering the
   implementation complete.
 
 ## Surprises & Discoveries
