@@ -4,13 +4,16 @@ return {
 	---@param pkgids string[]
 	---@param ft string
 	load = function(pkgids, ft)
-		local ids = vim.tbl_filter(
-			function(item)
-				if loaded[item] then return false end
-				loaded[item] = true
-				return true
-			end, pkgids)
-		if #ids == 0 then return end
+		local ids = vim.tbl_filter(function(item)
+			if loaded[item] then
+				return false
+			end
+			loaded[item] = true
+			return true
+		end, pkgids)
+		if #ids == 0 then
+			return
+		end
 
 		local events = { 'Syntax', 'BufEnter', 'BufWinEnter' }
 		local autocmds = vim.api.nvim_get_autocmds { event = events }
@@ -20,13 +23,20 @@ return {
 			require '_rsplug'.packadd(id)
 		end
 
-		ftplugins = vim.tbl_filter(function(f) return not vim.list_contains(ftplugins, f) end,
-			require '_rsplug'.get_ft_runtime_file(ft))
-		for _, f in ipairs(ftplugins) do vim.cmd.source(f) end
+		ftplugins = vim.tbl_filter(function(f)
+			return not vim.list_contains(ftplugins, f)
+		end, require '_rsplug'.get_ft_runtime_file(ft))
+		for _, f in ipairs(ftplugins) do
+			vim.cmd.source(f)
+		end
 
 		autocmds = require '_rsplug'.get_new_autocmds(vim.api.nvim_get_autocmds { event = events }, autocmds)
-		autocmds = vim.tbl_map(function(value) return value.event end, autocmds)
-		events = vim.tbl_filter(function(e) return vim.list_contains(autocmds, e) end, events)
+		autocmds = vim.tbl_map(function(value)
+			return value.event
+		end, autocmds)
+		events = vim.tbl_filter(function(e)
+			return vim.list_contains(autocmds, e)
+		end, events)
 		vim.api.nvim_exec_autocmds(events, { modeline = false })
 	end,
 }

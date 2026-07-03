@@ -95,11 +95,7 @@ return {
 						-- If plugin is already loaded, delete only this mapping and feed keys
 						if all_loaded(all_ids) then
 							pcall(vim.keymap.del, mode_char, pattern, {})
-							vim.api.nvim_feedkeys(
-								vim.api.nvim_replace_termcodes(pattern, true, false, true),
-								'imt',
-								true
-							)
+							vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
 							return ''
 						end
 
@@ -131,11 +127,7 @@ return {
 							id_patterns[id] = nil
 						end
 
-						vim.api.nvim_feedkeys(
-							vim.api.nvim_replace_termcodes(pattern, true, false, true),
-							'imt',
-							true
-						)
+						vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
 						return ''
 					end, { expr = true, silent = true })
 
@@ -143,5 +135,5 @@ return {
 				end
 			end
 		end
-	end
+	end,
 }
