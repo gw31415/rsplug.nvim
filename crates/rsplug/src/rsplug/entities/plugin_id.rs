@@ -1,11 +1,4 @@
-use std::{
-    cmp::Ordering,
-    collections::BTreeSet,
-    iter::Sum,
-    ops::{Add, AddAssign, Deref},
-    path::Path,
-    sync::Arc,
-};
+use std::{cmp::Ordering, ops::Deref, path::Path, sync::Arc};
 
 use crate::rsplug::util::hash;
 use sailfish::runtime::Render;
@@ -61,24 +54,10 @@ impl std::fmt::Display for PluginIDStr {
     }
 }
 
-/// パッケージID。ディレクトリ名として使用される。
-#[derive(Hash, PartialEq, Eq, Debug)]
-pub struct PluginID(pub(super) BTreeSet<[u8; 16]>);
-
-impl Ord for PluginID {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let cmp = self.0.len().cmp(&other.0.len());
-        if let Ordering::Equal = cmp {
-            for (a, b) in self.0.iter().zip(other.0.iter()) {
-                let cmp = a.cmp(b);
-                if !cmp.is_eq() {
-                    return cmp;
-                }
-            }
-        }
-        cmp
-    }
-}
+/// プラグインの128bit ID。
+/// `HasPluginId` trait 経由で `Hash` 実装を持つ任意の型から `.plugin_id()` で導出される。
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+pub struct PluginID([u8; 16]);
 
 impl PartialOrd for PluginID {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -86,46 +65,41 @@ impl PartialOrd for PluginID {
     }
 }
 
+impl Ord for PluginID {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl std::fmt::Debug for PluginID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PluginID({})", self.as_str())
+    }
+}
+
 impl PluginID {
-    /// (内部用) [`std::hash::Hash`] 実装から生成する。
-    ///
-    /// 新しいID入力は `#[derive(Hash)]` した小さな入力型で表し、こちらを使う。
-    /// どのフィールドがIDに影響するかを型定義へ集約できるため、呼び出し側で
-    /// バイト列を手で連結する必要がなくなる。
-    pub(super) fn from_hash<T: std::hash::Hash + ?Sized>(value: &T) -> Self {
-        Self(BTreeSet::from([hash::digest_hash(value)]))
-    }
-
-    /// 文字列に変換
+    /// 文字列表現を取得する。
     pub fn as_str(&self) -> PluginIDStr {
-        let PluginID(inner) = self;
-        PluginIDStr(hash::to_hex_bytes(hash::digest_hash(inner)))
+        PluginIDStr(hash::to_hex_bytes(self.0))
     }
 }
 
-impl Add for PluginID {
-    type Output = Self;
-    fn add(mut self, rhs: Self) -> Self::Output {
-        self += rhs;
-        self
-    }
+/// 自身の [`std::hash::Hash`] 実装から [`PluginID`] を生成する。
+///
+/// [`std::hash::Hash`] を実装する全ての型（タプル・スライス・構造体等）に対し
+/// ブランケット実装される。アドホックなID入力が必要な場合は、関連する値をタプルに
+/// まとめて `.plugin_id()` を呼ぶことで、使い捨て構造体を定義する必要がない。
+///
+/// 注意: `Vec<T>` は内部で長さプレフィックスをハッシュに書き込むが `[T]` は書き込まない。
+/// 同一性を保証するには、`Vec` に対して `.as_slice()` で `&[T]` を渡すこと。
+pub(super) trait HasPluginId {
+    fn plugin_id(&self) -> PluginID;
 }
 
-impl Sum for PluginID {
-    fn sum<I: Iterator<Item = Self>>(mut iter: I) -> Self {
-        let mut id0 = iter
-            .next()
-            .expect("PluginID's Sum Implementation requires at least one element");
-        for id in iter {
-            id0 += id;
-        }
-        id0
-    }
-}
-
-impl AddAssign for PluginID {
-    fn add_assign(&mut self, rhs: Self) {
-        self.0.extend(rhs.0);
+impl<T: std::hash::Hash + ?Sized> HasPluginId for T {
+    #[inline]
+    fn plugin_id(&self) -> PluginID {
+        PluginID(hash::digest_hash(self))
     }
 }
 
@@ -133,40 +107,19 @@ impl AddAssign for PluginID {
 mod tests {
     use super::*;
 
-    #[derive(Hash)]
-    struct GeneratedFileId<'a> {
-        path: &'a str,
-        data: &'a [u8],
-    }
-
     #[test]
-    fn plugin_id_can_be_derived_from_hash_input_structs() {
-        let left = PluginID::from_hash(&GeneratedFileId {
-            path: "plugin/generated.lua",
-            data: b"vim.g.generated = true",
-        });
-        let right = PluginID::from_hash(&GeneratedFileId {
-            path: "plugin/generated.lua",
-            data: b"vim.g.generated = true",
-        });
+    fn plugin_id_can_be_derived_from_hash_input_tuples() {
+        let left = ("plugin/generated.lua", b"vim.g.generated = true").plugin_id();
+        let right = ("plugin/generated.lua", b"vim.g.generated = true").plugin_id();
 
         assert_eq!(left, right);
     }
 
     #[test]
     fn derived_plugin_id_tracks_each_hashed_field() {
-        let baseline = PluginID::from_hash(&GeneratedFileId {
-            path: "plugin/generated.lua",
-            data: b"vim.g.generated = true",
-        });
-        let different_path = PluginID::from_hash(&GeneratedFileId {
-            path: "plugin/other.lua",
-            data: b"vim.g.generated = true",
-        });
-        let different_data = PluginID::from_hash(&GeneratedFileId {
-            path: "plugin/generated.lua",
-            data: b"vim.g.generated = false",
-        });
+        let baseline = ("plugin/generated.lua", b"vim.g.generated = true").plugin_id();
+        let different_path = ("plugin/other.lua", b"vim.g.generated = true").plugin_id();
+        let different_data = ("plugin/generated.lua", b"vim.g.generated = false").plugin_id();
 
         assert_ne!(baseline, different_path);
         assert_ne!(baseline, different_data);

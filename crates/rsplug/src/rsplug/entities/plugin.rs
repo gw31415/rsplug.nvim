@@ -283,21 +283,7 @@ impl Plugin {
         } = cache;
 
         let Some(repo) = repo else {
-            #[derive(std::hash::Hash)]
-            struct ScriptOnlyPluginId<'a> {
-                source_name: Option<&'a str>,
-                lazy_type: &'a LazyType,
-                script: &'a SetupScript,
-                order: usize,
-            }
-
             let loaded = LoadedPlugin {
-                id: PluginID::from_hash(&ScriptOnlyPluginId {
-                    source_name: source_name.as_deref(),
-                    lazy_type: &lazy_type,
-                    script: &script,
-                    order,
-                }),
                 source_name,
                 files: HowToPlaceFiles::CopyEachFile(Default::default()),
                 lazy_type,
@@ -305,6 +291,7 @@ impl Plugin {
                 order,
                 merge_enabled,
                 is_plugctl: false,
+                repo_meta: None,
             };
             return Ok(Some((loaded, None)));
         };
@@ -461,8 +448,8 @@ impl Plugin {
             result?;
         }
 
-        let mut id =
-            build_aware_plugin_id(&repository, head_rev, &build, lua_build.as_deref()).await?;
+        let mut repo_meta =
+            build_repo_meta(&repository, head_rev, &build, lua_build.as_deref()).await?;
 
         // ビルド実行
         if !build.is_empty() || lua_build.is_some() {
@@ -481,7 +468,7 @@ impl Plugin {
                 }
             }
 
-            let next_build_success_id = id.as_str();
+            let next_build_success_id = repo_meta.plugin_id().as_str();
             let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
             if let Some(ref prev_build_success_id) =
                 tokio::fs::read(&rsplug_build_success_file).await.ok()
@@ -566,14 +553,18 @@ impl Plugin {
                     Ok::<_, Error>(())
                 };
                 exec.await?;
-                id = build_aware_plugin_id(
+                repo_meta = build_repo_meta(
                     &repository,
                     repository.head_hash().await?,
                     &build,
                     lua_build.as_deref(),
                 )
                 .await?;
-                tokio::fs::write(rsplug_build_success_file, id.as_str().as_bytes()).await?;
+                tokio::fs::write(
+                    rsplug_build_success_file,
+                    repo_meta.plugin_id().as_str().as_bytes(),
+                )
+                .await?;
             }
         }
 
@@ -607,7 +598,6 @@ impl Plugin {
         };
 
         let loaded = LoadedPlugin {
-            id,
             source_name,
             files,
             lazy_type,
@@ -615,6 +605,7 @@ impl Plugin {
             order,
             merge_enabled,
             is_plugctl: false,
+            repo_meta: Some(repo_meta),
         };
         let lock_info = Some((url.to_string(), head_rev_str));
 
@@ -652,32 +643,24 @@ fn extract_unique_lua_modules<'a>(
     })
 }
 
-async fn build_aware_plugin_id(
+async fn build_repo_meta(
     repository: &util::git::Repository,
     head_rev: Vec<u8>,
     build: &[String],
     lua_build: Option<&str>,
-) -> Result<PluginID, Error> {
-    #[derive(std::hash::Hash)]
-    struct BuildAwarePluginId<'a> {
-        head_rev: &'a [u8],
-        dirty_diff: Option<[u8; 16]>,
-        build: &'a [String],
-        lua_build: Option<&'a str>,
-    }
-
+) -> Result<RepoMeta, Error> {
     let dirty_diff = if repository.is_dirty().await? {
         Some(repository.diff_hash().await?)
     } else {
         None
     };
 
-    Ok(PluginID::from_hash(&BuildAwarePluginId {
-        head_rev: &head_rev,
+    Ok(RepoMeta::new(
+        head_rev,
         dirty_diff,
-        build,
-        lua_build,
-    }))
+        Arc::<[String]>::from(build),
+        lua_build.map(Into::into),
+    ))
 }
 
 fn is_full_hex_hash(value: &str) -> bool {
@@ -836,8 +819,8 @@ mod tests {
         let same = make_loaded("vim.g.script_only = true").await;
         let different_script = make_loaded("vim.g.script_only = false").await;
 
-        assert_eq!(first.id, same.id);
-        assert_ne!(first.id, different_script.id);
+        assert_eq!(first.plugin_id(), same.plugin_id());
+        assert_ne!(first.plugin_id(), different_script.plugin_id());
     }
 
     #[test]

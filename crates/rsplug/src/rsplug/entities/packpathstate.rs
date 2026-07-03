@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
     cmp::Ordering,
-    collections::BinaryHeap,
+    collections::{BTreeMap, BinaryHeap},
     ffi::OsString,
+    hash::{Hash, Hasher},
     io,
     ops::Add,
     path::{Path, PathBuf},
@@ -22,25 +23,65 @@ use super::*;
 /// プラグインファイルの配置方法。
 // TODO: HowToPlaceFilesをenum { Root, Tree(HashMap<PathBuf, FileItem>) }にする。SymlinkDirectoryはFileItemに含める
 // その方がマージもでき、SymlinkなPluginのdocにも対応できるため。
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub(super) enum HowToPlaceFiles {
-    CopyEachFile(HashMap<PathBuf, FileItem>),
+    CopyEachFile(BTreeMap<PathBuf, FileItem>),
     SymlinkDirectory(Arc<Path>),
 }
 
 impl Default for HowToPlaceFiles {
     fn default() -> Self {
-        HowToPlaceFiles::CopyEachFile(HashMap::new())
+        HowToPlaceFiles::CopyEachFile(BTreeMap::new())
+    }
+}
+
+/// Git リポジトリのメタデータ。PluginID の決定に影響する「外部依存」を明示的に保持する。
+///
+/// `head_rev`・`dirty_diff`・`build`・`lua_build` のいずれかが変化すると Hash が変わり、
+/// ひいては PluginID が変わる。これらを構造体に集約することで、フィールド追加・変更が
+/// コンパイラによって検出される。
+#[derive(Hash, PartialEq, Eq, Clone)]
+pub struct RepoMeta {
+    /// HEAD コミットハッシュ
+    head_rev: Box<[u8]>,
+    /// 作業ツリーに未コミット変更がある場合の差分ハッシュ。クリーンなら None。
+    dirty_diff: Option<[u8; 16]>,
+    /// TOML設定の build コマンド
+    build: Arc<[String]>,
+    /// TOML設定の lua_build スクリプト
+    lua_build: Option<Arc<str>>,
+}
+
+impl RepoMeta {
+    pub(super) fn new(
+        head_rev: Vec<u8>,
+        dirty_diff: Option<[u8; 16]>,
+        build: Arc<[String]>,
+        lua_build: Option<Arc<str>>,
+    ) -> Self {
+        Self {
+            head_rev: head_rev.into_boxed_slice(),
+            dirty_diff,
+            build,
+            lua_build,
+        }
+    }
+}
+
+impl std::fmt::Debug for RepoMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepoMeta")
+            .field("head_rev", &String::from_utf8_lossy(&self.head_rev))
+            .field("dirty_diff", &self.dirty_diff)
+            .finish_non_exhaustive()
     }
 }
 
 /// インストール単位となるプラグイン。
 /// NOTE: 遅延実行されるプラグイン等は、インストール後に PlugCtl が生成される。PlugCtlはまとめて
 /// PluginLoadedに変換する。
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct LoadedPlugin {
-    /// ID
-    pub(super) id: PluginID,
     /// `on_source` から参照される設定上の名前
     pub(super) source_name: Option<String>,
     /// プラグインの遅延実行タイプ
@@ -55,21 +96,23 @@ pub struct LoadedPlugin {
     pub(super) merge_enabled: bool,
     /// PlugCtlを元に作成されたかどうか
     pub(super) is_plugctl: bool,
+    /// git リポジトリのメタデータ。script-only プラグイン等では None。
+    pub(super) repo_meta: Option<RepoMeta>,
 }
 
-#[derive(Debug)]
+impl LoadedPlugin {
+    /// 全フィールドの [`Hash`] から [`PluginID`] を導出する。
+    /// フィールド追加・変更は自動的に PluginID に反映される。
+    pub fn plugin_id(&self) -> PluginID {
+        <Self as HasPluginId>::plugin_id(self)
+    }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub(super) struct FileItem {
     pub source: Arc<FileSource>,
     pub merge_type: MergeType,
 }
-
-impl PartialEq for LoadedPlugin {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for LoadedPlugin {}
 
 impl PartialOrd for LoadedPlugin {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -98,7 +141,7 @@ impl LoadedPlugin {
             .cmp(&other.lazy_type)
             .then_with(|| self.order.cmp(&other.order))
             .then_with(|| self.is_plugctl.cmp(&other.is_plugctl))
-            .then_with(|| self.id.cmp(&other.id))
+            .then_with(|| self.plugin_id().cmp(&other.plugin_id()))
     }
 
     /// BinaryHeap に保存された PluginLoaded 群を可能な範囲でマージする。
@@ -156,11 +199,6 @@ impl Add for LoadedPlugin {
         if self.lazy_type != rhs.lazy_type {
             return (self, Some(rhs));
         }
-        if self.id.0.is_superset(&rhs.id.0) {
-            return (self, None);
-        } else if rhs.id.0.is_superset(&self.id.0) {
-            return (rhs, None);
-        }
         if self.lazy_type.is_start()
             && (self.is_plugctl != rhs.is_plugctl || !(self.merge_enabled && rhs.merge_enabled))
         {
@@ -187,7 +225,6 @@ impl Add for LoadedPlugin {
                 };
                 if mergeable {
                     let Self {
-                        mut id,
                         source_name,
                         lazy_type,
                         files: HowToPlaceFiles::CopyEachFile(mut files),
@@ -195,12 +232,12 @@ impl Add for LoadedPlugin {
                         order,
                         merge_enabled,
                         is_plugctl,
+                        repo_meta,
                     } = self
                     else {
                         unreachable!() // SAFETY: Because self.files is verified to be a CopyEachFile
                     };
                     let Self {
-                        id: rid,
                         source_name: _,
                         lazy_type: _,
                         files: HowToPlaceFiles::CopyEachFile(rfiles),
@@ -208,18 +245,17 @@ impl Add for LoadedPlugin {
                         order: r_order,
                         merge_enabled: _,
                         is_plugctl: r_is_plugctl,
+                        repo_meta: r_repo_meta,
                     } = rhs
                     else {
                         unreachable!() // SAFETY: Because rhs.files is verified to be a CopyEachFile
                     };
                     files.extend(rfiles);
-                    id += rid;
                     script += rscript;
                     let order = order.min(r_order);
 
                     return (
                         Self {
-                            id,
                             source_name,
                             lazy_type,
                             files: HowToPlaceFiles::CopyEachFile(files),
@@ -227,6 +263,7 @@ impl Add for LoadedPlugin {
                             order,
                             merge_enabled,
                             is_plugctl: is_plugctl || r_is_plugctl,
+                            repo_meta: repo_meta.or(r_repo_meta),
                         },
                         None,
                     );
@@ -245,6 +282,32 @@ impl Add for LoadedPlugin {
 pub(super) enum FileSource {
     Directory { path: Arc<Path> },
     File { data: Cow<'static, [u8]> },
+}
+
+impl PartialEq for FileSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Directory { path: l }, Self::Directory { path: r }) => l == r,
+            (Self::File { data: l }, Self::File { data: r }) => l == r,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FileSource {}
+
+impl Hash for FileSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            // 絶対パスはマシン固有なのでハッシュに含めない。
+            // 同一性は RepoMeta (head_rev / dirty_diff) が担保する。
+            FileSource::Directory { .. } => 0u8.hash(state),
+            FileSource::File { data } => {
+                1u8.hash(state);
+                data.hash(state);
+            }
+        }
+    }
 }
 
 impl FileSource {
@@ -424,8 +487,14 @@ impl PackPathState {
     }
     /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な PlugCtl を返す。
     pub fn insert(&mut self, loaded_plugin: LoadedPlugin) {
+        let id = loaded_plugin.plugin_id();
+        let id_str = id.as_str();
+        let already_installed = !self.installing.insert(id_str.clone().into());
+        if already_installed {
+            return;
+        }
+
         let LoadedPlugin {
-            id,
             source_name,
             lazy_type,
             mut files,
@@ -433,13 +502,8 @@ impl PackPathState {
             order,
             merge_enabled: _,
             is_plugctl,
+            repo_meta: _,
         } = loaded_plugin;
-
-        let id_str = id.as_str();
-        let already_installed = !self.installing.insert(id_str.clone().into());
-        if already_installed {
-            return;
-        }
 
         if !is_plugctl {
             self.ctl += PlugCtl::create(id, source_name, lazy_type, script, order, &mut files);
@@ -730,7 +794,7 @@ mod tests {
 
     #[test]
     fn init_template_packadds_control_packages() {
-        let control_id = PluginID::from_hash(b"control-package").as_str();
+        let control_id = b"control-package".plugin_id().as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&control_id))).unwrap();
 
         assert!(script.contains(&format!("vim.cmd.packadd '{control_id}'")));
@@ -739,8 +803,8 @@ mod tests {
 
     #[test]
     fn init_template_emits_exact_packadd_block() {
-        let a = PluginID::from_hash(b"aaaa").as_str();
-        let b = PluginID::from_hash(b"bbbb").as_str();
+        let a = b"aaaa".plugin_id().as_str();
+        let b = b"bbbb".plugin_id().as_str();
         let script = String::from_utf8(render_init(&[a.clone(), b.clone()])).unwrap();
         // ponytail: locks in the exact packadd block shape; break whitespace here if the template changes.
         let actual = script
@@ -756,7 +820,7 @@ mod tests {
 
     #[test]
     fn init_template_resolves_symlink_and_goes_up_two_levels() {
-        let id = PluginID::from_hash(b"gen").as_str();
+        let id = b"gen".plugin_id().as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&id))).unwrap();
         // init.lua is a symlink into generations/; resolve + :h:h recovers ~/.cache/rsplug
         // whether loaded through the symlink or directly as a generation file.
