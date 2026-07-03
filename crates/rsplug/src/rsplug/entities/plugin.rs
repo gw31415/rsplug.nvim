@@ -36,6 +36,9 @@ pub struct Plugin {
     pub merge_enabled: bool,
     /// DAGトポロジカル順。controlled startup の順序維持に使う。
     pub order: usize,
+    /// DAG 依存の深さ（依存先が先）。layer-parallel ロードで同 depth を並列化するために使う。
+    #[allow(dead_code)]
+    pub depth: usize,
 }
 
 /// プラグインの取得元
@@ -133,6 +136,35 @@ impl RepoSource {
             }
         }
     }
+}
+
+/// 新しい cache layout のパスヘルパ群 (PLANS §5, §15.2)。
+/// `repos/<repo>/source.git`（fetch 用 object store）と
+/// `repos/<repo>/worktrees/<snapshot_key>/`（plugin 実体として読む固定 worktree）を基準にする。
+///
+/// NOTE: これらは `Plugin::load` の snapshot 化リライト（次コミット）で使われる。
+#[allow(dead_code)]
+/// repo cache の root: `<cache_dir>/<repo.default_cachedir()>`。
+pub(super) fn repo_root(cache_dir: &Path, repo: &RepoSource) -> PathBuf {
+    cache_dir.join(repo.default_cachedir())
+}
+
+#[allow(dead_code)]
+/// fetch 対象の Git object store: `<repo_root>/source.git`。
+pub(super) fn source_git_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join("source.git")
+}
+
+#[allow(dead_code)]
+/// snapshot worktree の親 directory: `<repo_root>/worktrees`。
+pub(super) fn worktrees_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join("worktrees")
+}
+
+#[allow(dead_code)]
+/// plugin 実体として読む固定 worktree: `<repo_root>/worktrees/<snapshot_key>`。
+pub(super) fn snapshot_root(repo_root: &Path, snapshot_key: &str) -> PathBuf {
+    worktrees_dir(repo_root).join(snapshot_key)
 }
 
 /// URL末尾の `@rev` を分離する。authority部（`://` 〜 最初の `/`）内の `@` は無視する。
@@ -237,6 +269,7 @@ impl Plugin {
                     dependency_cachedirs,
                     merge_enabled,
                     order,
+                    depth,
                 }
             },
         ))
@@ -271,6 +304,7 @@ impl Plugin {
             dependency_cachedirs,
             merge_enabled,
             order,
+            depth: _,
         } = self;
 
         let to_sym = cache.to_sym();
@@ -628,6 +662,122 @@ impl Plugin {
     }
 }
 
+/// build 中の一時 worktree: `worktrees/.building-<pid>-<nonce>` (PLANS §7)。
+/// `worktrees/` 内の hidden directory なので scan 対象にならない（先頭 `.`）。
+#[allow(dead_code)]
+fn building_worktree_dir(worktrees: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    worktrees.join(format!(".building-{}-{}", std::process::id(), nonce))
+}
+
+/// repo の `build`(sh) と `lua_build` を `workdir` で実行する。
+/// `runtimepaths` は lua_build 実行時に nvim の runtimepath に追加する（依存先 snapshot 含む）。
+#[allow(dead_code)]
+async fn run_repo_build(
+    build: &[String],
+    lua_build: Option<&str>,
+    workdir: Arc<Path>,
+    runtimepaths: Vec<PathBuf>,
+    logid: &str,
+    repo_name: &Arc<str>,
+) -> Result<(), Error> {
+    use crate::{
+        log::{Message, msg},
+        rsplug::util::execute,
+    };
+
+    if !build.is_empty() {
+        let id = Arc::new(format!("{logid} (sh)"));
+        let result: Result<(), Error> = {
+            let id = id.clone();
+            let build = build.to_vec();
+            async {
+                let code = execute(build.iter(), workdir.clone(), move |(stdtype, line)| {
+                    msg(Message::CacheBuildProgress {
+                        id: id.clone(),
+                        stdtype,
+                        line,
+                    });
+                })
+                .await?;
+                if code != 0 {
+                    return Err(Error::BuildScriptFailed {
+                        code,
+                        build,
+                        repo: repo_name.clone(),
+                    });
+                }
+                Ok(())
+            }
+        }
+        .await;
+        msg(Message::CacheBuildFinished {
+            id,
+            success: result.is_ok(),
+        });
+        result?;
+    }
+
+    if let Some(lua_build) = lua_build {
+        let id = Arc::new(format!("{logid} (lua)"));
+        let result: Result<(), Error> = {
+            let id = id.clone();
+            async {
+                let lua_build_path = create_lua_build_script(lua_build, &runtimepaths).await?;
+                let code = execute(
+                    lua_build_nvim_command(lua_build_path.as_os_str()),
+                    workdir.clone(),
+                    move |(stdtype, line)| {
+                        msg(Message::CacheBuildProgress {
+                            id: id.clone(),
+                            stdtype,
+                            line,
+                        });
+                    },
+                )
+                .await;
+                let _ = tokio::fs::remove_file(&lua_build_path).await;
+                let code = code?;
+                if code != 0 {
+                    return Err(Error::BuildLuaScriptFailed {
+                        code,
+                        repo: repo_name.clone(),
+                    });
+                }
+                Ok(())
+            }
+        }
+        .await;
+        msg(Message::CacheBuildFinished {
+            id,
+            success: result.is_ok(),
+        });
+        result?;
+    }
+
+    Ok(())
+}
+
+/// build 用 runtimepath を組み立てる: 自 snapshot を先頭に、依存先 snapshot を重複なしで追加。
+#[allow(dead_code)]
+fn collect_build_runtimepaths(own: Arc<Path>, deps: &[Arc<Path>]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut add = |p: PathBuf| {
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    };
+    add(own.to_path_buf());
+    for d in deps {
+        add(d.to_path_buf());
+    }
+    out
+}
+
 fn extract_unique_lua_modules<'a>(
     files: impl Iterator<Item = &'a PathBuf> + 'a,
 ) -> impl Iterator<Item = String> + 'a {
@@ -756,6 +906,26 @@ mod tests {
         assert_eq!(
             repo.default_cachedir(),
             PathBuf::from("gitlab.com/owner/plugin")
+        );
+    }
+
+    #[test]
+    fn path_helpers_lay_out_source_git_and_worktrees() {
+        let repo = RepoSource::from_str("owner/repo").unwrap();
+        let cache_dir = Path::new("cache");
+        let root = repo_root(cache_dir, &repo);
+        assert_eq!(root, PathBuf::from("cache/github.com/owner/repo"));
+        assert_eq!(
+            source_git_dir(&root),
+            PathBuf::from("cache/github.com/owner/repo/source.git")
+        );
+        assert_eq!(
+            worktrees_dir(&root),
+            PathBuf::from("cache/github.com/owner/repo/worktrees")
+        );
+        assert_eq!(
+            snapshot_root(&root, "deadbeef"),
+            PathBuf::from("cache/github.com/owner/repo/worktrees/deadbeef")
         );
     }
 

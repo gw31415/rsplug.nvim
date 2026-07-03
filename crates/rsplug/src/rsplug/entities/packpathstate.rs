@@ -56,7 +56,49 @@ impl RepoSnapshotIdentity {
             lua_build,
         }
     }
+
+    /// `worktrees/<snapshot_key>` の directory 名を生成する (PLANS §7)。
+    ///
+    /// `dirty_diff`・`build`・`lua_build` が全て無ければ `<head_rev>` のみ。
+    /// いずれかがあれば `<head_rev>__v1_<input_hash>`。`schema` byte を hash 入力に
+    /// 含めることで、key の意味を変える将来の変更に対して別 prefix で migration できる。
+    /// `repo_cache_dir` は key に含めない（`worktrees/` は repo ごとに分かれているため暗黙）。
+    #[allow(dead_code)]
+    pub(super) fn snapshot_key(&self) -> String {
+        let input = SnapshotKeyInput {
+            schema: SNAPSHOT_KEY_SCHEMA,
+            head_rev: &self.head_rev,
+            dirty_diff: self.dirty_diff,
+            build: &self.build,
+            lua_build: self.lua_build.as_deref(),
+        };
+        let head_rev = String::from_utf8_lossy(&self.head_rev);
+        if self.dirty_diff.is_none() && self.build.is_empty() && self.lua_build.is_none() {
+            head_rev.into_owned()
+        } else {
+            format!(
+                "{head_rev}__v{}_{}",
+                SNAPSHOT_KEY_SCHEMA,
+                crate::rsplug::util::hash::digest_hash_hex_string(&input)
+            )
+        }
+    }
 }
+
+/// `snapshot_key` の hash 入力 (PLANS §7)。絶対パスは含めない。
+#[allow(dead_code)]
+#[derive(Hash)]
+struct SnapshotKeyInput<'a> {
+    schema: u8,
+    head_rev: &'a [u8],
+    dirty_diff: Option<[u8; 16]>,
+    build: &'a [String],
+    lua_build: Option<&'a str>,
+}
+
+/// `snapshot_key` の schema 版。意味を変える変更時のみ上げる。
+#[allow(dead_code)]
+const SNAPSHOT_KEY_SCHEMA: u8 = 1;
 
 impl std::fmt::Debug for RepoSnapshotIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -167,6 +209,25 @@ impl LoadedPlugin {
     /// フィールド追加・変更は自動的に PluginID に反映される。
     pub fn plugin_id(&self) -> PluginID {
         <Self as HasPluginId>::plugin_id(self)
+    }
+
+    /// 配置（runtime）用の snapshot root。repo 由来でなければ（script-only や生成ファイルのみ
+    /// なら）`None`。**配置情報であり `plugin_id` の hash には含まれない**。依存元 plugin の
+    /// build 用 runtimepath 解決に使う (PLANS §10.3)。
+    #[allow(dead_code)]
+    pub fn snapshot_root(&self) -> Option<Arc<Path>> {
+        match &self.files {
+            HowToPlaceFiles::RepoSnapshotLink { target, .. } => Some(target.clone()),
+            HowToPlaceFiles::CopyEachFile(files) => {
+                files
+                    .values()
+                    .next()
+                    .and_then(|item| match item.source.as_ref() {
+                        FileSource::Directory { path } => Some(path.clone()),
+                        FileSource::File { .. } => None,
+                    })
+            }
+        }
     }
 }
 
@@ -1096,6 +1157,87 @@ mod tests {
             .plugin_id(),
             "merged id must differ from repo-b-only id"
         );
+    }
+
+    #[test]
+    fn snapshot_key_is_plain_rev_when_no_build_inputs() {
+        let id = snap(
+            "github.com/o/r",
+            b"0123456789012345678901234567890123456789",
+        );
+        // build/lua_build/dirty_diff が全て無ければ head_rev のみ。
+        assert_eq!(
+            id.snapshot_key(),
+            "0123456789012345678901234567890123456789"
+        );
+    }
+
+    #[test]
+    fn snapshot_key_has_v1_suffix_and_tracks_build_inputs() {
+        let rev = b"0123456789012345678901234567890123456789";
+        let with_build = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/r"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from(["make".to_string()]),
+            None,
+        );
+        let key = with_build.snapshot_key();
+        assert!(
+            key.starts_with("0123456789012345678901234567890123456789__v1_"),
+            "got {key}"
+        );
+        // build が変わると suffix が変わる
+        let with_other_build = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/r"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from(["cmake".to_string()]),
+            None,
+        );
+        assert_ne!(key, with_other_build.snapshot_key());
+    }
+
+    #[test]
+    fn snapshot_key_reflects_dirty_diff_and_lua_build() {
+        let rev = b"0123456789012345678901234567890123456789";
+        let mk = |dirty, lua| {
+            RepoSnapshotIdentity::new(
+                PathBuf::from("r"),
+                rev.to_vec(),
+                dirty,
+                Arc::<[String]>::from(["make".to_string()]),
+                lua,
+            )
+        };
+        let base = mk(None, None);
+        let with_dirty = mk(Some([1u8; 16]), None);
+        let with_lua = mk(None, Some(Arc::from("vim.cmd('x')")));
+        assert_ne!(base.snapshot_key(), with_dirty.snapshot_key());
+        assert_ne!(base.snapshot_key(), with_lua.snapshot_key());
+        // dirty と lua が両方違っても互いに違う
+        assert_ne!(with_dirty.snapshot_key(), with_lua.snapshot_key());
+    }
+
+    #[test]
+    fn snapshot_key_ignores_repo_cache_dir() {
+        // worktrees/ は repo ごとに分かれるため、key 自体は repo_cache_dir に依存しない。
+        let rev = b"0123456789012345678901234567890123456789";
+        let a = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/a"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let b = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/b"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        assert_eq!(a.snapshot_key(), b.snapshot_key());
     }
 
     #[test]

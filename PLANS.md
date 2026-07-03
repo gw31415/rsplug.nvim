@@ -37,6 +37,15 @@ The existing `generations/`, root `init.lua`, `pack/_gen/`, control plugin
   絶対パス不変・merge 全 repo 反映の unit test を追加。`cargo fmt` / `cargo clippy
   --workspace --all-targets -- -D warnings` / `cargo test` 全て通過。
 - [ ] Introduce repository source and snapshot worktree paths under
+- [x] (2026-07-03) Phase-2 Step A+B: snapshot infra landed (not yet wired into
+  `Plugin::load`). Path helpers (`repo_root`/`source_git_dir`/`worktrees_dir`/
+  `snapshot_root`) and `RepoSnapshotIdentity::snapshot_key()` (§15.2, §15.3) +
+  unit tests. `util::git` source/worktree split (§15.4): bare `source.git`
+  (`init_source`/`open_source`/`has_object`/`fetch_oid`) and snapshot worktree
+  (`init_snapshot` = local clone + detached checkout, validated by a git2
+  integration test). `LoadedPlugin::snapshot_root()` and `Plugin.depth` added
+  for the upcoming DAG-ordered load. Items are `#[allow(dead_code)]` until the
+  load rewrite consumes them.
 - [ ] Introduce repository source and snapshot worktree paths under
   `repos/<repo>/source.git` and `repos/<repo>/worktrees/<snapshot_key>/`.
 - [ ] Move build, file scan, copy, symlink, `lua_build`, and `lua_post_update`

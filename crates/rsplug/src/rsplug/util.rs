@@ -150,7 +150,37 @@ pub mod git {
             .unwrap()
         }
 
-        /// リポジトリ同期処理
+        /// source.git が既に oid を持っているか。
+        #[allow(dead_code)]
+        pub async fn has_object(&self, oid: Oid) -> bool {
+            let repo = self.0.clone();
+            spawn_blocking(move || repo.lock().unwrap().find_object(oid, None).is_ok())
+                .await
+                .unwrap()
+        }
+
+        /// source.git に指定 oid を fetch する（HEAD も作業ツリーも変えない）。
+        #[allow(dead_code)]
+        pub async fn fetch_oid(&mut self, oid: Oid) -> Result<(), Error> {
+            let repo = self.0.clone();
+            spawn_blocking(move || {
+                let repo = repo.lock().unwrap();
+                if repo.find_object(oid, None).is_ok() {
+                    return Ok(());
+                }
+                let mut remote = repo.find_remote("origin")?;
+                remote.fetch(
+                    &[oid.to_string()],
+                    Some(&mut build_fetch_options(oid)),
+                    None,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap()
+        }
+
+        /// リポジトリ同期処理（fetch + checkout）。旧 layout 互換。
         pub async fn fetch(&mut self, rev: Oid) -> Result<(), Error> {
             let repo = self.0.clone();
             spawn_blocking(move || {
@@ -161,43 +191,7 @@ pub mod git {
                     if let Ok(mut remote) = repo.find_remote("origin") {
                         remote.fetch(
                             &[rev.to_string()],
-                            Some(&mut {
-                                let mut cbs = RemoteCallbacks::new();
-                                let last_reported = Cell::new(0usize);
-                                let last_tick = Cell::new(Instant::now());
-                                cbs.transfer_progress(move |progress| {
-                                    let total_objs_count = progress.total_objects();
-                                    let received_objs_count = progress.received_objects();
-                                    if received_objs_count == 0
-                                        || received_objs_count == last_reported.get()
-                                    {
-                                        return true;
-                                    }
-                                    let now = Instant::now();
-                                    let enough_increment = received_objs_count
-                                        .saturating_sub(last_reported.get())
-                                        >= 32;
-                                    let enough_time = now.duration_since(last_tick.get())
-                                        >= Duration::from_millis(120);
-                                    let is_done = received_objs_count >= total_objs_count
-                                        && total_objs_count != 0;
-                                    if enough_increment || enough_time || is_done {
-                                        last_reported.set(received_objs_count);
-                                        last_tick.set(now);
-                                        log::msg(Message::CacheFetchObjectsProgress {
-                                            id: rev.to_string(),
-                                            total_objs_count,
-                                            received_objs_count,
-                                        });
-                                    }
-                                    true
-                                });
-                                let mut ops = FetchOptions::new();
-                                ops.download_tags(git2::AutotagOption::None)
-                                    .depth(1)
-                                    .remote_callbacks(cbs);
-                                ops
-                            }),
+                            Some(&mut build_fetch_options(rev)),
                             None,
                         )?;
                     }
@@ -285,6 +279,39 @@ pub mod git {
         }
     }
 
+    /// fetch 進捗をログ出力する FetchOptions を構築する。
+    fn build_fetch_options(rev: Oid) -> FetchOptions<'static> {
+        let mut cbs = RemoteCallbacks::new();
+        let last_reported = Cell::new(0usize);
+        let last_tick = Cell::new(Instant::now());
+        cbs.transfer_progress(move |progress| {
+            let total_objs_count = progress.total_objects();
+            let received_objs_count = progress.received_objects();
+            if received_objs_count == 0 || received_objs_count == last_reported.get() {
+                return true;
+            }
+            let now = Instant::now();
+            let enough_increment = received_objs_count.saturating_sub(last_reported.get()) >= 32;
+            let enough_time = now.duration_since(last_tick.get()) >= Duration::from_millis(120);
+            let is_done = received_objs_count >= total_objs_count && total_objs_count != 0;
+            if enough_increment || enough_time || is_done {
+                last_reported.set(received_objs_count);
+                last_tick.set(now);
+                log::msg(Message::CacheFetchObjectsProgress {
+                    id: rev.to_string(),
+                    total_objs_count,
+                    received_objs_count,
+                });
+            }
+            true
+        });
+        let mut ops = FetchOptions::new();
+        ops.download_tags(git2::AutotagOption::None)
+            .depth(1)
+            .remote_callbacks(cbs);
+        ops
+    }
+
     /// リポジトリを開く
     pub async fn open(dir: impl AsRef<Path> + Send + 'static) -> Result<Repository, Error> {
         let repo = spawn_blocking(move || git2::Repository::open(dir))
@@ -304,6 +331,73 @@ pub mod git {
         spawn_blocking(move || {
             r.remote("origin", repo.as_ref())?;
             Ok(Repository::from(r))
+        })
+        .await
+        .unwrap()
+    }
+
+    /// fetch 用の bare repository (`source.git`) を初期化し origin を設定する (PLANS §9)。
+    /// runtime はこの repository の作業ツリーを読まない（bare だから持たない）。
+    #[allow(dead_code)]
+    pub async fn init_source(
+        dir: impl AsRef<Path> + Send + 'static,
+        repo: impl AsRef<str> + Send + 'static,
+    ) -> Result<Repository, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        let r = spawn_blocking(move || git2::Repository::init_bare(&dir))
+            .await
+            .unwrap()?;
+        spawn_blocking(move || {
+            r.remote("origin", repo.as_ref())?;
+            Ok(Repository::from(r))
+        })
+        .await
+        .unwrap()
+    }
+
+    /// 既存の `source.git` を開く。
+    #[allow(dead_code)]
+    pub async fn open_source(dir: impl AsRef<Path> + Send + 'static) -> Result<Repository, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        spawn_blocking(move || git2::Repository::open_bare(&dir))
+            .await
+            .unwrap()
+            .map(Repository::from)
+            .map_err(Into::into)
+    }
+
+    /// `snapshot_root` に `source_git_dir` の object store を共有する固定 worktree を作る
+    /// (PLANS §8, §9)。commit `oid` を detached HEAD として checkout する。
+    /// runtime symlink の参照先（不変 snapshot）となる。
+    /// local clone で object は hardlink 共有されるため disk 使用量は抑えられる。
+    #[allow(dead_code)]
+    pub async fn init_snapshot(
+        snapshot_root: impl AsRef<Path> + Send,
+        source_git_dir: impl AsRef<Path> + Send,
+        oid: Oid,
+    ) -> Result<Repository, Error> {
+        let snapshot_root = snapshot_root.as_ref().to_path_buf();
+        let source_git_dir = source_git_dir.as_ref().to_path_buf();
+        spawn_blocking(move || {
+            let source_url = source_git_dir
+                .to_str()
+                .ok_or_else(|| git2::Error::from_str("source.git path is not UTF-8"))?;
+            // local path なら libgit2 が自動で hardlink clone する（object 重複なし）
+            let repo = git2::Repository::clone(source_url, &snapshot_root)?;
+            repo.set_head_detached(oid)?;
+            {
+                let obj = repo.find_object(oid, None)?;
+                repo.checkout_tree(
+                    &obj,
+                    Some(
+                        CheckoutBuilder::new()
+                            .force()
+                            .use_theirs(true)
+                            .allow_conflicts(true),
+                    ),
+                )?;
+            }
+            Ok(Repository::from(repo))
         })
         .await
         .unwrap()
@@ -578,5 +672,74 @@ mod tests {
         assert_eq!(truncate(&"ééééabcd", 8), "ééééabcd");
         assert_eq!(truncate(&"aあいうえ", 8), "aあ……");
         assert_eq!(truncate(&"🙂🙂abcdef", 8), "🙂🙂……");
+    }
+
+    #[tokio::test]
+    async fn init_snapshot_checks_out_commit_into_a_detached_worktree() {
+        // git2 の local clone + detached checkout で固定 snapshot worktree が作れるか検証。
+        use git2::Oid;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("rsplug-init-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let origin = dir.join("origin");
+        let snap = dir.join("snap");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("README.md"), "hello\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&origin)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q"]);
+        git(&["add", "README.md"]);
+        let commit = Command::new("git")
+            .current_dir(&origin)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let oid_str = String::from_utf8(
+            Command::new("git")
+                .current_dir(&origin)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let oid_str = oid_str.trim();
+        let oid = Oid::from_str(oid_str).unwrap();
+
+        let repo = super::git::init_snapshot(&snap, &origin, oid)
+            .await
+            .unwrap();
+
+        // worktree に commit 内容が checkout されている
+        let content = tokio::fs::read_to_string(snap.join("README.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "hello\n");
+        // HEAD は detached で oid に一致
+        let head = repo.head_hash().await.unwrap();
+        assert_eq!(String::from_utf8(head).unwrap().trim(), oid_str);
+        // ls_files が tracked file を返す
+        let files = repo.ls_files().await.unwrap();
+        assert!(files.iter().any(|p| p == std::path::Path::new("README.md")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
