@@ -1,12 +1,12 @@
 local ok, err = xpcall(function()
 <% if !runtimepaths.is_empty() { %>for _, rtp in ipairs({
-<% for rtp in &runtimepaths { %>  <%= rtp %>,
+<% for rtp in &runtimepaths { %>	<%= rtp %>,
 <% } %>}) do
-  vim.opt.runtimepath:prepend(rtp)
+	vim.opt.runtimepath:prepend(rtp)
 end
 <% } %><%= lua_script %>
 end, debug.traceback)
 if not ok then
-  vim.api.nvim_err_writeln(err)
-  os.exit(1)
+	vim.api.nvim_err_writeln(err)
+	os.exit(1)
 end
