@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git branch*)",
+      "Bash(git log*)",
+      "Bash(cargo check*)",
+      "Bash(cargo test*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo build*)",
+      "Bash(neowright *)"
+    ],
+    "ask": [
+      "Edit",
+      "Write",
+      "Bash(git commit*)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf *)",
+      "Read(.env*)"
+    ]
+  }
+}
