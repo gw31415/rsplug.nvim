@@ -24,7 +24,10 @@ struct PkgId2ScriptsItem {
     start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
 }
 
-fn collect_doc_files_from_root(root: &Path) -> BTreeMap<PathBuf, FileItem> {
+fn collect_doc_files_from_root(
+    root: &Path,
+    snapshot: RepoSnapshotIdentity,
+) -> BTreeMap<PathBuf, FileItem> {
     let doc_root = root.join("doc");
     if !doc_root.is_dir() {
         return BTreeMap::new();
@@ -83,6 +86,10 @@ fn collect_doc_files_from_root(root: &Path) -> BTreeMap<PathBuf, FileItem> {
                 rel_path.to_path_buf(),
                 FileItem {
                     source: source.clone(),
+                    identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                        snapshot.clone(),
+                        rel_path.to_path_buf(),
+                    )),
                     merge_type: MergeType::Overwrite,
                 },
             );
@@ -135,25 +142,35 @@ pub struct PlugCtl {
     overwrite_files: BTreeMap<PluginID, HowToPlaceFiles>,
 }
 
+/// 生成ファイル（`FileSource::File`）の `(install_path, FileItem)` を作る。
+/// 内容の `data_hash` を identity に含めることで、生成内容の変更が id に反映される。
+fn generated_file_item(path: impl Into<PathBuf>, data: Cow<'static, [u8]>) -> (PathBuf, FileItem) {
+    let path = path.into();
+    let data_hash = hash::digest_hash(&data);
+    let item = FileItem {
+        source: Arc::new(FileSource::File { data }),
+        identity: FileIdentity::GeneratedFile {
+            path: path.clone(),
+            data_hash,
+        },
+        merge_type: MergeType::Overwrite,
+    };
+    (path, item)
+}
+
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
 fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> LoadedPlugin {
-    let data = data.into();
-    let files = BTreeMap::from([(
-        PathBuf::from(path),
-        FileItem {
-            source: Arc::new(FileSource::File { data }),
-            merge_type: MergeType::Overwrite,
-        },
-    )]);
+    let source_name = Some(format!("_rsplug:{path}"));
+    let (path, item) = generated_file_item(PathBuf::from(path), data.into());
+    let files = BTreeMap::from([(path, item)]);
     LoadedPlugin {
-        source_name: Some(format!("_rsplug:{path}")),
+        source_name,
         lazy_type: LazyType::Start,
         files: HowToPlaceFiles::CopyEachFile(files),
         script: Default::default(),
         order: usize::MAX,
         merge_enabled: true,
         is_plugctl: true,
-        repo_meta: None,
     }
 }
 
@@ -251,12 +268,9 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             .unwrap()
             .into_bytes()
             .into();
-            let mut files = BTreeMap::from([(
+            let mut files = BTreeMap::from([generated_file_item(
                 PathBuf::from("lua/_rsplug/init.lua"),
-                FileItem {
-                    source: Arc::new(FileSource::File { data: init_data }),
-                    merge_type: MergeType::Overwrite,
-                },
+                init_data,
             )]);
             if !startup_scripts.is_empty() {
                 let data: Cow<'static, [u8]> = LuaStartPluginTemplate {
@@ -266,13 +280,9 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 .unwrap()
                 .into_bytes()
                 .into();
-                files.insert(
-                    PathBuf::from("plugin/lua_start.lua"),
-                    FileItem {
-                        source: Arc::new(FileSource::File { data }),
-                        merge_type: MergeType::Overwrite,
-                    },
-                );
+                let (ls_path, ls_item) =
+                    generated_file_item(PathBuf::from("plugin/lua_start.lua"), data);
+                files.insert(ls_path, ls_item);
             }
             plugs.push(LoadedPlugin {
                 source_name: Some("_rsplug:init".to_string()),
@@ -282,7 +292,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 order: usize::MAX,
                 merge_enabled: true,
                 is_plugctl: true,
-                repo_meta: None,
             });
         }
 
@@ -320,26 +329,13 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             .unwrap()
             .into_bytes()
             .into();
+            let on_event_setup_path = PathBuf::from(format!(
+                "plugin/{}.lua",
+                hash::digest_hash_hex_string(&on_event_setup)
+            ));
             let files = BTreeMap::from([
-                (
-                    PathBuf::from("lua/_rsplug/on_event.lua"),
-                    FileItem {
-                        source: Arc::new(FileSource::File { data: on_event }),
-                        merge_type: MergeType::Overwrite,
-                    },
-                ),
-                (
-                    PathBuf::from(format!(
-                        "plugin/{}.lua",
-                        hash::digest_hash_hex_string(&on_event_setup)
-                    )),
-                    FileItem {
-                        source: Arc::new(FileSource::File {
-                            data: on_event_setup,
-                        }),
-                        merge_type: MergeType::Overwrite,
-                    },
-                ),
+                generated_file_item(PathBuf::from("lua/_rsplug/on_event.lua"), on_event),
+                generated_file_item(on_event_setup_path, on_event_setup),
             ]);
             plugs.push({
                 LoadedPlugin {
@@ -350,7 +346,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     order: usize::MAX,
                     merge_enabled: true,
                     is_plugctl: true,
-                    repo_meta: None,
                 }
             });
         }
@@ -368,26 +363,13 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             .unwrap()
             .into_bytes()
             .into();
+            let on_func_setup_path = PathBuf::from(format!(
+                "plugin/{}.lua",
+                hash::digest_hash_hex_string(&on_func_setup)
+            ));
             let files = BTreeMap::from([
-                (
-                    PathBuf::from("lua/_rsplug/on_func.lua"),
-                    FileItem {
-                        source: Arc::new(FileSource::File { data: on_func }),
-                        merge_type: MergeType::Overwrite,
-                    },
-                ),
-                (
-                    PathBuf::from(format!(
-                        "plugin/{}.lua",
-                        hash::digest_hash_hex_string(&on_func_setup)
-                    )),
-                    FileItem {
-                        source: Arc::new(FileSource::File {
-                            data: on_func_setup,
-                        }),
-                        merge_type: MergeType::Overwrite,
-                    },
-                ),
+                generated_file_item(PathBuf::from("lua/_rsplug/on_func.lua"), on_func),
+                generated_file_item(on_func_setup_path, on_func_setup),
             ]);
             plugs.push(LoadedPlugin {
                 source_name: Some("_rsplug:on_func".to_string()),
@@ -397,7 +379,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 order: usize::MAX,
                 merge_enabled: true,
                 is_plugctl: true,
-                repo_meta: None,
             });
         }
         if !cmd2pkgid.is_empty() {
@@ -416,24 +397,13 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 .unwrap()
                 .into_bytes()
                 .into();
+                let on_cmd_setup_path = PathBuf::from(format!(
+                    "plugin/{}.lua",
+                    hash::digest_hash_hex_string(&on_cmd_setup)
+                ));
                 let files = BTreeMap::from([
-                    (
-                        PathBuf::from("lua/_rsplug/on_cmd.lua"),
-                        FileItem {
-                            source: Arc::new(FileSource::File { data: on_cmd }),
-                            merge_type: MergeType::Overwrite,
-                        },
-                    ),
-                    (
-                        PathBuf::from(format!(
-                            "plugin/{}.lua",
-                            hash::digest_hash_hex_string(&on_cmd_setup)
-                        )),
-                        FileItem {
-                            source: Arc::new(FileSource::File { data: on_cmd_setup }),
-                            merge_type: MergeType::Overwrite,
-                        },
-                    ),
+                    generated_file_item(PathBuf::from("lua/_rsplug/on_cmd.lua"), on_cmd),
+                    generated_file_item(on_cmd_setup_path, on_cmd_setup),
                 ]);
                 LoadedPlugin {
                     source_name: Some("_rsplug:on_cmd".to_string()),
@@ -443,7 +413,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     order: usize::MAX,
                     merge_enabled: true,
                     is_plugctl: true,
-                    repo_meta: None,
                 }
             });
         }
@@ -456,26 +425,13 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             .unwrap()
             .into_bytes()
             .into();
+            let plugin_on_lua_path = PathBuf::from(format!(
+                "plugin/{}.lua",
+                hash::digest_hash_hex_string(plugin_on_lua)
+            ));
             let files = BTreeMap::from([
-                (
-                    PathBuf::from("lua/_rsplug/on_lua.lua"),
-                    FileItem {
-                        source: Arc::new(FileSource::File { data: on_lua }),
-                        merge_type: MergeType::Overwrite,
-                    },
-                ),
-                (
-                    PathBuf::from(format!(
-                        "plugin/{}.lua",
-                        hash::digest_hash_hex_string(plugin_on_lua)
-                    )),
-                    FileItem {
-                        source: Arc::new(FileSource::File {
-                            data: plugin_on_lua.into(),
-                        }),
-                        merge_type: MergeType::Overwrite,
-                    },
-                ),
+                generated_file_item(PathBuf::from("lua/_rsplug/on_lua.lua"), on_lua),
+                generated_file_item(plugin_on_lua_path, plugin_on_lua.into()),
             ]);
             plugs.push(LoadedPlugin {
                 source_name: Some("_rsplug:on_lua".to_string()),
@@ -485,7 +441,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 order: usize::MAX,
                 merge_enabled: true,
                 is_plugctl: true,
-                repo_meta: None,
             });
         }
         if !keypattern2pkgid.is_empty() {
@@ -522,8 +477,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                         // If CopyEachFile then merge
                         overwrite_copies.extend(files);
                     }
-                    HowToPlaceFiles::SymlinkDirectory(_) => {
-                        panic!("SymlinkDirectory is not supported for overwrite_files in PlugCtl");
+                    HowToPlaceFiles::RepoSnapshotLink { .. } => {
+                        panic!("RepoSnapshotLink is not supported for overwrite_files in PlugCtl");
                     }
                 }
             }
@@ -536,7 +491,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     order: usize::MAX,
                     merge_enabled: true,
                     is_plugctl: true,
-                    repo_meta: None,
                 });
             }
         }
@@ -665,8 +619,11 @@ impl PlugCtl {
                         }
                         HowToPlaceFiles::CopyEachFile(extracted)
                     }
-                    HowToPlaceFiles::SymlinkDirectory(path) => {
-                        HowToPlaceFiles::CopyEachFile(collect_doc_files_from_root(path))
+                    HowToPlaceFiles::RepoSnapshotLink { target, identity } => {
+                        HowToPlaceFiles::CopyEachFile(collect_doc_files_from_root(
+                            target,
+                            identity.clone(),
+                        ))
                     }
                 },
             )])

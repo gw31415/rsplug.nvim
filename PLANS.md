@@ -30,8 +30,13 @@ The existing `generations/`, root `init.lua`, `pack/_gen/`, control plugin
   document by adding purpose, progress, discoveries, decision log,
   implementation plan, concrete steps, validation, recovery, artifacts, and
   interface sections.
-- [ ] Implement identity and hashing changes so absolute cache paths do not
-  affect `LoadedPlugin::plugin_id()`.
+- [x] (2026-07-03) Phase-1 milestone: identity / hash 安全化 + 配置/identity 分離
+  (PLANS §15.1). `RepoSnapshotIdentity` / `RepoFileIdentity` / `FileIdentity` を導入し、
+  `HowToPlaceFiles::SymlinkDirectory(Arc<Path>)` → `RepoSnapshotLink { target, identity }`
+  （`target` を hash/eq から除外）、`FileItem.identity` 追加、`LoadedPlugin.repo_meta` 削除。
+  絶対パス不変・merge 全 repo 反映の unit test を追加。`cargo fmt` / `cargo clippy
+  --workspace --all-targets -- -D warnings` / `cargo test` 全て通過。
+- [ ] Introduce repository source and snapshot worktree paths under
 - [ ] Introduce repository source and snapshot worktree paths under
   `repos/<repo>/source.git` and `repos/<repo>/worktrees/<snapshot_key>/`.
 - [ ] Move build, file scan, copy, symlink, `lua_build`, and `lua_post_update`
@@ -84,12 +89,54 @@ The existing `generations/`, root `init.lua`, `pack/_gen/`, control plugin
   `rsplug.lock.json`, and generation retention by existing `_gen` manifests.
   Date/Author: 2026-07-03 / Codex.
 
+- Decision (Phase-1, 2026-07-03): Unify `RepoMeta` into `RepoSnapshotIdentity`
+  (adds relative `repo_cache_dir`) and **remove the `LoadedPlugin.repo_meta`
+  field** entirely, moving logical identity into `FileItem.identity`
+  (`RepoFile` / `GeneratedFile`) and `RepoSnapshotLink.identity`.
+  Rationale: PLANS §2.2 permits unifying the two types, and per-file/per-link
+  identity is the principled carrier. Because `Add for LoadedPlugin` unions the
+  file maps, merging two CopyEachFile plugins now preserves **both** repos'
+  identities automatically — no separate `repo_metas: BTreeSet` field is needed
+  (this both implements and subsumes §12 / §15.1.9). `HowToPlaceFiles` gains a
+  custom `Hash`/`PartialEq`/`Eq` that excludes the absolute `target`, mirroring
+  the existing `FileSource` precedent. The build-success marker id is now derived
+  from `RepoSnapshotIdentity` (superset of the old `RepoMeta` inputs), so the
+  marker formula changes once and existing caches rebuild once on upgrade.
+  Date/Author: 2026-07-03 / Claude.
+
 ## Outcomes & Retrospective
 
-Not implemented yet. This ExecPlan currently records the intended design and
-acceptance criteria. At completion, update this section with what changed, which
-tests were added or adjusted, any deviations from the design, and any remaining
-follow-up such as garbage collection for old `worktrees/`.
+### Phase-1 (identity / hash safety, 2026-07-03) — DONE
+
+Implemented §15.1 as a standalone, compiling, tested milestone. Files changed:
+`crates/rsplug/src/rsplug/entities/{packpathstate,plugin,plugctl}.rs`.
+
+- `RepoMeta` removed; replaced by `RepoSnapshotIdentity` (with relative
+  `repo_cache_dir`), plus `RepoFileIdentity` and `FileIdentity`.
+- `HowToPlaceFiles::SymlinkDirectory(Arc<Path>)` →
+  `RepoSnapshotLink { target, identity }` with manual `Hash`/`Eq` that ignore the
+  absolute `target`. `FileItem` gained `identity`. `LoadedPlugin.repo_meta` removed.
+- `Plugin::load` builds one `RepoSnapshotIdentity` and threads it into the link
+  and each CopyEachFile `RepoFileIdentity`; the build marker id uses the same.
+- `plugctl.rs` routes all generated files through a `generated_file_item` helper
+  (`GeneratedFile` identity from `data_hash`), and `collect_doc_files_from_root`
+  carries the snapshot identity for doc extraction.
+- New tests (all passing): absolute-path invariance for CopyEachFile and
+  RepoSnapshotLink, `repo_cache_dir`/`head_rev` sensitivity, merged-CopyEachFile
+  reflects all repos (merge-bug regression), `GeneratedFile` path/data sensitivity.
+
+Validation: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test` all green.
+
+### Remaining (Phase-2 and beyond) — NOT STARTED
+
+§15.2 (path model), §15.3 (snapshot key + rename flow), §15.4 (`util::git`
+source/worktree split, **bare** `source.git`), §15.5 (`Plugin::load` split onto
+`source.git`/`snapshot_root`), §15.6-15.8 (link/copy/marker point at
+`snapshot_root`), §15.9 (dependency runtimepath via **DAG-ordered loading**),
+§15.10 (migration fallback), §15.11 (integration tests). User-confirmed
+directions (§19): dirty_diff included in `snapshot_key` (rename flow), bare
+`source.git`, DAG-ordered dependency runtimepath.
 
 ## Context and Orientation
 

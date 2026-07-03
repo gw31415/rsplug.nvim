@@ -291,12 +291,14 @@ impl Plugin {
                 order,
                 merge_enabled,
                 is_plugctl: false,
-                repo_meta: None,
             };
             return Ok(Some((loaded, None)));
         };
 
-        let proj_root = cache_dir.as_ref().join(repo.default_cachedir());
+        // `repo` は直後の match で move されるため、論理 identity に使う相対 cachedir を先に捕捉する。
+        // 絶対パス (`proj_root`) は配置用であり identity には含めない。
+        let cachedir = repo.default_cachedir();
+        let proj_root = cache_dir.as_ref().join(&cachedir);
         let url: Arc<str> = Arc::from(repo.url());
 
         // バリアント固有のフィールドを抽出（ログ・エラー表示用）
@@ -448,8 +450,14 @@ impl Plugin {
             result?;
         }
 
-        let mut repo_meta =
-            build_repo_meta(&repository, head_rev, &build, lua_build.as_deref()).await?;
+        let mut identity = build_repo_snapshot_identity(
+            &repository,
+            cachedir.clone(),
+            head_rev,
+            &build,
+            lua_build.as_deref(),
+        )
+        .await?;
 
         // ビルド実行
         if !build.is_empty() || lua_build.is_some() {
@@ -468,7 +476,7 @@ impl Plugin {
                 }
             }
 
-            let next_build_success_id = repo_meta.plugin_id().as_str();
+            let next_build_success_id = identity.plugin_id().as_str();
             let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
             if let Some(ref prev_build_success_id) =
                 tokio::fs::read(&rsplug_build_success_file).await.ok()
@@ -553,8 +561,9 @@ impl Plugin {
                     Ok::<_, Error>(())
                 };
                 exec.await?;
-                repo_meta = build_repo_meta(
+                identity = build_repo_snapshot_identity(
                     &repository,
+                    cachedir.clone(),
                     repository.head_hash().await?,
                     &build,
                     lua_build.as_deref(),
@@ -562,7 +571,7 @@ impl Plugin {
                 .await?;
                 tokio::fs::write(
                     rsplug_build_success_file,
-                    repo_meta.plugin_id().as_str().as_bytes(),
+                    identity.plugin_id().as_str().as_bytes(),
                 )
                 .await?;
             }
@@ -574,7 +583,10 @@ impl Plugin {
             lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
         }
         let files: HowToPlaceFiles = if to_sym {
-            HowToPlaceFiles::SymlinkDirectory(proj_root.clone())
+            HowToPlaceFiles::RepoSnapshotLink {
+                target: proj_root.clone(),
+                identity: identity.clone(),
+            }
         } else {
             HowToPlaceFiles::CopyEachFile(
                 files
@@ -583,9 +595,13 @@ impl Plugin {
                         let ignored = merge.ignore.matched(&path);
                         if !ignored && proj_root.join(&path).is_file() {
                             Some((
-                                path,
+                                path.clone(),
                                 FileItem {
                                     source: filesource.clone(),
+                                    identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                                        identity.clone(),
+                                        path,
+                                    )),
                                     merge_type: MergeType::Conflict,
                                 },
                             ))
@@ -605,7 +621,6 @@ impl Plugin {
             order,
             merge_enabled,
             is_plugctl: false,
-            repo_meta: Some(repo_meta),
         };
         let lock_info = Some((url.to_string(), head_rev_str));
 
@@ -643,19 +658,21 @@ fn extract_unique_lua_modules<'a>(
     })
 }
 
-async fn build_repo_meta(
+async fn build_repo_snapshot_identity(
     repository: &util::git::Repository,
+    repo_cache_dir: PathBuf,
     head_rev: Vec<u8>,
     build: &[String],
     lua_build: Option<&str>,
-) -> Result<RepoMeta, Error> {
+) -> Result<RepoSnapshotIdentity, Error> {
     let dirty_diff = if repository.is_dirty().await? {
         Some(repository.diff_hash().await?)
     } else {
         None
     };
 
-    Ok(RepoMeta::new(
+    Ok(RepoSnapshotIdentity::new(
+        repo_cache_dir,
         head_rev,
         dirty_diff,
         Arc::<[String]>::from(build),
