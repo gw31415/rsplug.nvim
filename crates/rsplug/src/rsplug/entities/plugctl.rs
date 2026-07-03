@@ -905,7 +905,7 @@ mod tests {
 
         assert!(rendered.contains(&format!("local startup_plugins = {{'{startup_plugin}',}}")));
         assert!(!rendered.contains("startup_scripts"));
-        assert!(rendered.contains("require('_rsplug').packadd(id, true)"));
+        assert!(rendered.contains("require '_rsplug'.packadd(id, true)"));
     }
 
     #[test]
