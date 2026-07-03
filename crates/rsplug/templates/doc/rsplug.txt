@@ -72,7 +72,7 @@ Neovim Configuration:~
 
 First, add this line to your Neovim configuration (`init.lua`):
 >lua
-    dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
+    dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
 <
 
 Binary Installation:~
@@ -122,7 +122,7 @@ Create `~/.config/nvim/rsplug.toml`:
     [[plugins]]
     repo = "neovim/nvim-lspconfig"
     on_event = "BufReadPre"
-    lua_after = "require('lspconfig').rust_analyzer.setup{}"
+    lua_after = "require 'lspconfig'.rust_analyzer.setup {}"
 <
 
 Step 2: Synchronize plugins~
@@ -428,9 +428,9 @@ lua_after~
     
     Example:
 >toml
-        lua_after = "require('lualine').setup{}"
+        lua_after = "require 'lualine'.setup {}"
         lua_after = '''
-        require('telescope').setup{
+        require 'telescope'.setup {
             defaults = {
                 file_ignore_patterns = {"node_modules"}
             }
@@ -479,7 +479,7 @@ lua_post_update~
 
     Example:
 >toml
-        lua_post_update = "require('plugin').post_update()"
+        lua_post_update = "require 'plugin'.post_update()"
 <
 
 name~
@@ -607,13 +607,13 @@ Automatic Lua module detection:~
 
 If a plugin contains files like `lua/modulename.lua` or
 `lua/modulename/init.lua`, rsplug automatically creates a lazy-load trigger
-for `require('modulename')`. No configuration needed.
+for `require 'modulename'`. No configuration needed.
 
 Example:
 >toml
     [[plugins]]
     repo = "nvim-lua/plenary.nvim"
-    # No on_* specified, but will load on require('plenary')
+    # No on_* specified, but will load on require 'plenary'
 <
 
 Loading behavior:~
@@ -674,8 +674,8 @@ Example:
     [[plugins]]
     repo = "hrsh7th/nvim-cmp"
     lua_after = '''
-    local cmp = require('cmp')
-    cmp.setup{
+    local cmp = require 'cmp'
+    cmp.setup {
         mapping = cmp.mapping.preset.insert({
             ['<C-Space>'] = cmp.mapping.complete(),
         })
@@ -868,7 +868,7 @@ into Neovim.
 
 Basic setup in init.lua:~
 >lua
-    dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
+    dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
 <
 
 What happens:~
@@ -898,7 +898,7 @@ Custom packpath:~
 If you use a custom lock file location or output directory, adjust
 accordingly:
 >lua
-    dofile(vim.fn.expand("~/my-custom-path/init.lua"))
+    dofile(vim.fn.expand '~/my-custom-path/init.lua')
 <
 
 Checking loaded plugins:~
@@ -925,15 +925,15 @@ v0.2.0 Breaking Change~
 rsplug v0.2.0 changes the Neovim bootstrap line and the generated package
 layout so `start = true` plugins can run `lua_before` and `lua_after`
 deterministically.
-
 Update your `init.lua` from:
 >lua
-    vim.opt.packpath:prepend("~/.cache/rsplug")
+    vim.opt.packpath:prepend '~/.cache/rsplug'
 <
 
 to:
+
 >lua
-    dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
+    dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
 <
 
 Managed plugins, including `start = true` plugins, are now placed under
@@ -1097,14 +1097,14 @@ Example 1: Basic LSP setup~
     repo = "neovim/nvim-lspconfig"
     on_event = "BufReadPre"
     lua_after = '''
-    require('lspconfig').rust_analyzer.setup{}
-    require('lspconfig').lua_ls.setup{}
+    require 'lspconfig'.rust_analyzer.setup {}
+    require 'lspconfig'.lua_ls.setup {}
     '''
     
     [[plugins]]
     repo = "hrsh7th/nvim-cmp"
     on_event = "InsertEnter"
-    lua_after = "require('cmp').setup{}"
+    lua_after = "require 'cmp'.setup {}"
 <
 
 Example 2: Telescope with dependencies~
@@ -1117,7 +1117,7 @@ Example 2: Telescope with dependencies~
     depends = ["plenary.nvim"]
     on_cmd = "Telescope"
     lua_after = '''
-    require('telescope').setup{
+    require 'telescope'.setup {
         defaults = {
             file_ignore_patterns = {"node_modules", ".git/"}
         }
@@ -1131,7 +1131,7 @@ Example 3: Plugin with build subprocess~
     repo = "yetone/avante.nvim"
     on_event = "BufReadPost"
     build = ["make"]
-    lua_after = "require('avante').setup{}"
+    lua_after = "require 'avante'.setup {}"
 <
 
 Example 3.1: Plugin with lua_build~
@@ -1140,7 +1140,7 @@ Example 3.1: Plugin with lua_build~
     repo = "yetone/avante.nvim"
     on_event = "BufReadPost"
     lua_build = "vim.fn.system({'make'})"
-    lua_after = "require('avante').setup{}"
+    lua_after = "require 'avante'.setup {}"
 <
 
 Example 4: Color scheme~
@@ -1148,7 +1148,7 @@ Example 4: Color scheme~
     [[plugins]]
     repo = "folke/tokyonight.nvim"
     start = true
-    lua_after = "vim.cmd.colorscheme('tokyonight')"
+    lua_after = "vim.cmd.colorscheme 'tokyonight'"
 <
 
 Example 5: Git signs with version pinning~
@@ -1156,7 +1156,7 @@ Example 5: Git signs with version pinning~
     [[plugins]]
     repo = "lewis6991/gitsigns.nvim@v0.7"
     on_event = "BufReadPre"
-    lua_after = "require('gitsigns').setup{}"
+    lua_after = "require 'gitsigns'.setup {}"
 <
 
 Example 6: Multiple lazy-load triggers~
@@ -1165,7 +1165,7 @@ Example 6: Multiple lazy-load triggers~
     repo = "kyazdani42/nvim-tree.lua"
     on_event = "VimEnter"
     on_cmd = ["NvimTreeToggle", "NvimTreeFocus"]
-    lua_after = "require('nvim-tree').setup{}"
+    lua_after = "require 'nvim-tree'.setup {}"
 <
 
 Example 7: Build with multiple arguments~
@@ -1191,7 +1191,7 @@ Example 9: Using wildcard version~
     [[plugins]]
     repo = "j-hui/fidget.nvim@v*"
     on_event = "LspAttach"
-    lua_after = "require('fidget').setup{}"
+    lua_after = "require 'fidget'.setup {}"
 <
 
 Example 10: Complex keymapping~
@@ -1199,8 +1199,8 @@ Example 10: Complex keymapping~
     [[plugins]]
     repo = "numToStr/Comment.nvim"
     lua_after = '''
-    require('Comment').setup()
-    local api = require('Comment.api')
+    require 'Comment'.setup()
+    local api = require 'Comment.api'
     vim.keymap.set('n', '<leader>c', api.toggle.linewise.current)
     vim.keymap.set('x', '<leader>c', api.toggle.linewise)
     '''

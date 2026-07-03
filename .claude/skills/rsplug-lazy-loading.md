@@ -34,8 +34,8 @@ Use this skill when the task involves `on_event`, `on_ft`, `on_cmd`, `on_map`, L
    - event: `neowright exec --name <name> 'doautocmd <Event>'`
    - filetype: `neowright exec --name <name> 'setfiletype <ft>'`
    - mapping: `neowright keys --name <name> '<key>'`
-   - Lua require: `neowright eval --name <name> "return require('<module>')"`
-9. Assert structured state with `neowright eval`, not only screenshots. Check `require('_rsplug').loaded`, global marker variables, commands, keymaps, and messages.
+   - Lua require: `neowright eval --name <name> "return require '<module>'"`
+9. Assert structured state with `neowright eval`, not only screenshots. Check `require '_rsplug'.loaded`, global marker variables, commands, keymaps, and messages.
 10. Close the Neowright session at the end.
 
 ## Verification expectations

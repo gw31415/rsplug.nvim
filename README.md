@@ -69,13 +69,13 @@ repo = "nvim-lua/plenary.nvim"
 repo = "neovim/nvim-lspconfig"
 on_event = "BufReadPre"
 lua_after = """
-require('lspconfig').rust_analyzer.setup{}
+require 'lspconfig'.rust_analyzer.setup {}
 """
 
 [[plugins]]
 repo = "hrsh7th/nvim-cmp"
 on_event = ["InsertEnter", "CmdlineEnter"]
-lua_after = "require('cmp').setup{}"
+lua_after = "require 'cmp'.setup {}"
 ```
 
 2. **Synchronize plugins from the TOML file**:
@@ -140,7 +140,7 @@ Lua modules are automatically detected and loaded on `require`:
 ```toml
 [[plugins]]
 repo = "nvim-lua/plenary.nvim"
-# Will auto-load when you call require('plenary')
+# Will auto-load when you call require 'plenary'
 ```
 
 ### Lifecycle Hooks
@@ -151,7 +151,7 @@ Execute Lua code / subprocess before/after plugin load or install:
 [[plugins]]
 repo = "folke/which-key.nvim"
 lua_before = "vim.g.which_key_timeout = 300"  # Before plugin loads
-lua_after = "require('which-key').setup{}"    # After plugin loads
+lua_after = "require 'which-key'.setup {}"    # After plugin loads
 
 [[plugins]]
 repo = "yetone/avante.nvim"
@@ -317,7 +317,7 @@ on_source = "host.nvim"
 ```toml
 [[plugins]]
 repo = "owner/plugin"
-lua_post_update = "require('plugin').post_update()"
+lua_post_update = "require 'plugin'.post_update()"
 ```
 
 ## Command-Line Interface
@@ -374,13 +374,13 @@ so `start = true` plugins can run `lua_before` and `lua_after` deterministically
 Update your `init.lua` from:
 
 ```lua
-vim.opt.packpath:prepend("~/.cache/rsplug")
+vim.opt.packpath:prepend '~/.cache/rsplug'
 ```
 
 to:
 
 ```lua
-dofile(vim.fn.expand("~/.cache/rsplug/init.lua"))
+dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
 ```
 
 Managed plugins, including `start = true` plugins, are now placed under
