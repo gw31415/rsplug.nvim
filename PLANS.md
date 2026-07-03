@@ -46,6 +46,15 @@ The existing `generations/`, root `init.lua`, `pack/_gen/`, control plugin
   integration test). `LoadedPlugin::snapshot_root()` and `Plugin.depth` added
   for the upcoming DAG-ordered load. Items are `#[allow(dead_code)]` until the
   load rewrite consumes them.
+- [x] (2026-07-04) Phase-2 Step C: `Plugin::load` snapshot rewrite + DAG-ordered
+  load. Fetch/resolve onto bare `source.git`; build/scan/copy/symlink/marker onto
+  a per-snapshot worktree (`worktrees/<snapshot_key>/`). dirty_diff is included in
+  `snapshot_key` via a temp building-worktree → build → final-key → atomic-rename
+  flow (reuse existing key if present). `main.rs` now loads layer-by-layer (same
+  DAG depth in parallel) and passes each dependency's resolved `snapshot_root`
+  into dependents' build runtimepath. Local-transport fetches go full (libgit2
+  has no shallow over `file://`). Real-git integration test covers
+  install→snapshot + `RepoSnapshotLink` target + reuse.
 - [ ] Introduce repository source and snapshot worktree paths under
   `repos/<repo>/source.git` and `repos/<repo>/worktrees/<snapshot_key>/`.
 - [ ] Move build, file scan, copy, symlink, `lua_build`, and `lua_post_update`

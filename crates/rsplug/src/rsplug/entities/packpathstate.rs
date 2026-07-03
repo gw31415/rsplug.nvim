@@ -63,7 +63,6 @@ impl RepoSnapshotIdentity {
     /// いずれかがあれば `<head_rev>__v1_<input_hash>`。`schema` byte を hash 入力に
     /// 含めることで、key の意味を変える将来の変更に対して別 prefix で migration できる。
     /// `repo_cache_dir` は key に含めない（`worktrees/` は repo ごとに分かれているため暗黙）。
-    #[allow(dead_code)]
     pub(super) fn snapshot_key(&self) -> String {
         let input = SnapshotKeyInput {
             schema: SNAPSHOT_KEY_SCHEMA,
@@ -86,7 +85,6 @@ impl RepoSnapshotIdentity {
 }
 
 /// `snapshot_key` の hash 入力 (PLANS §7)。絶対パスは含めない。
-#[allow(dead_code)]
 #[derive(Hash)]
 struct SnapshotKeyInput<'a> {
     schema: u8,
@@ -97,7 +95,6 @@ struct SnapshotKeyInput<'a> {
 }
 
 /// `snapshot_key` の schema 版。意味を変える変更時のみ上げる。
-#[allow(dead_code)]
 const SNAPSHOT_KEY_SCHEMA: u8 = 1;
 
 impl std::fmt::Debug for RepoSnapshotIdentity {
@@ -214,7 +211,6 @@ impl LoadedPlugin {
     /// 配置（runtime）用の snapshot root。repo 由来でなければ（script-only や生成ファイルのみ
     /// なら）`None`。**配置情報であり `plugin_id` の hash には含まれない**。依存元 plugin の
     /// build 用 runtimepath 解決に使う (PLANS §10.3)。
-    #[allow(dead_code)]
     pub fn snapshot_root(&self) -> Option<Arc<Path>> {
         match &self.files {
             HowToPlaceFiles::RepoSnapshotLink { target, .. } => Some(target.clone()),

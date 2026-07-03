@@ -37,7 +37,6 @@ pub struct Plugin {
     /// DAGトポロジカル順。controlled startup の順序維持に使う。
     pub order: usize,
     /// DAG 依存の深さ（依存先が先）。layer-parallel ロードで同 depth を並列化するために使う。
-    #[allow(dead_code)]
     pub depth: usize,
 }
 
@@ -98,7 +97,7 @@ impl RepoSource {
 
     /// Relative to the `repos` cache namespace.
     /// GitHub: `github.com/owner/repo`; URL: `host/path`.
-    pub(super) fn default_cachedir(&self) -> PathBuf {
+    pub(crate) fn default_cachedir(&self) -> PathBuf {
         match self {
             RepoSource::GitHub { owner, repo, .. } => {
                 let mut path = PathBuf::new();
@@ -138,30 +137,25 @@ impl RepoSource {
     }
 }
 
-/// 新しい cache layout のパスヘルパ群 (PLANS §5, §15.2)。
-/// `repos/<repo>/source.git`（fetch 用 object store）と
-/// `repos/<repo>/worktrees/<snapshot_key>/`（plugin 実体として読む固定 worktree）を基準にする。
-///
-/// NOTE: これらは `Plugin::load` の snapshot 化リライト（次コミット）で使われる。
-#[allow(dead_code)]
+// 新しい cache layout のパスヘルパ群 (PLANS §5, §15.2)。
+// `repos/<repo>/source.git`（fetch 用 object store）と
+// `repos/<repo>/worktrees/<snapshot_key>/`（plugin 実体として読む固定 worktree）を基準にする。
+
 /// repo cache の root: `<cache_dir>/<repo.default_cachedir()>`。
 pub(super) fn repo_root(cache_dir: &Path, repo: &RepoSource) -> PathBuf {
     cache_dir.join(repo.default_cachedir())
 }
 
-#[allow(dead_code)]
 /// fetch 対象の Git object store: `<repo_root>/source.git`。
 pub(super) fn source_git_dir(repo_root: &Path) -> PathBuf {
     repo_root.join("source.git")
 }
 
-#[allow(dead_code)]
 /// snapshot worktree の親 directory: `<repo_root>/worktrees`。
 pub(super) fn worktrees_dir(repo_root: &Path) -> PathBuf {
     repo_root.join("worktrees")
 }
 
-#[allow(dead_code)]
 /// plugin 実体として読む固定 worktree: `<repo_root>/worktrees/<snapshot_key>`。
 pub(super) fn snapshot_root(repo_root: &Path, snapshot_key: &str) -> PathBuf {
     worktrees_dir(repo_root).join(snapshot_key)
@@ -283,13 +277,13 @@ impl Plugin {
         update: bool,
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
+        dependency_snapshot_roots: Vec<Arc<Path>>,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         use super::{util::git, *};
         use crate::{
             log::{Message, msg},
             rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, truncate},
         };
-        use std::sync::Arc;
         use unicode_width::UnicodeWidthStr;
 
         let invalid_data =
@@ -301,7 +295,7 @@ impl Plugin {
             lazy_type,
             script,
             merge,
-            dependency_cachedirs,
+            dependency_cachedirs: _,
             merge_enabled,
             order,
             depth: _,
@@ -332,7 +326,10 @@ impl Plugin {
         // `repo` は直後の match で move されるため、論理 identity に使う相対 cachedir を先に捕捉する。
         // 絶対パス (`proj_root`) は配置用であり identity には含めない。
         let cachedir = repo.default_cachedir();
-        let proj_root = cache_dir.as_ref().join(&cachedir);
+        let cache_dir = cache_dir.as_ref().to_path_buf();
+        let r_root = repo_root(&cache_dir, &repo);
+        let source_git = source_git_dir(&r_root);
+        let worktrees = worktrees_dir(&r_root);
         let url: Arc<str> = Arc::from(repo.url());
 
         // バリアント固有のフィールドを抽出（ログ・エラー表示用）
@@ -357,260 +354,169 @@ impl Plugin {
             }
         };
 
-        tokio::fs::create_dir_all(&proj_root).await?;
-        let proj_root: Arc<Path> = tokio::fs::canonicalize(&proj_root).await?.into();
-        let filesource = Arc::new(FileSource::Directory {
-            path: proj_root.clone(),
-        });
-
-        let mut did_update = false;
-        let repository = 'repo: {
-            if let Ok(mut repo) = git::open(proj_root.clone()).await {
-                // リポジトリが存在する場合
-
-                // アップデート処理
-                let oid = if let Some(locked_rev) = locked_rev.as_deref() {
-                    // locked モード
-                    if !is_full_hex_hash(locked_rev) {
-                        return Err(invalid_data(format!(
-                            "Locked revision must be full hash for {}: got {}",
-                            url, locked_rev
-                        )));
-                    }
-                    Oid::from_str(locked_rev).map_err(Error::Git2)?
-                } else if update {
+        // --- target commit 解決 (PLANS §8 step 5) ---
+        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+            if !is_full_hex_hash(locked_rev) {
+                return Err(invalid_data(format!(
+                    "Locked revision must be full hash for {}: got {}",
+                    url, locked_rev
+                )));
+            }
+            Oid::from_str(locked_rev).map_err(Error::Git2)?
+        } else if update {
+            msg(Message::Cache("Updating", url.clone()));
+            let oid = git::ls_remote(url.clone(), rev.clone()).await?;
+            msg(Message::Cache("Updating:done", url.clone()));
+            oid
+        } else {
+            // install/update/locked 以外: 既存 snapshot から最新 commit を読む。
+            // 既存が無ければ install 時は ls_remote、それ以外は未インストールとしてスキップ。
+            match latest_snapshot_oid(&worktrees).await? {
+                Some(oid) => oid,
+                None if install => {
                     msg(Message::Cache("Updating", url.clone()));
-                    git::ls_remote(url.clone(), rev.clone()).await?
-                } else {
-                    break 'repo repo;
-                };
-                repo.fetch(oid).await?;
-                did_update = update && locked_rev.is_none();
-                msg(Message::Cache("Updating:done", url.clone()));
-                repo
-            } else if install {
-                // リポジトリがない場合のインストール処理
-                msg(Message::Cache("Initializing", url.clone()));
-                let mut repo = git::init(proj_root.clone(), url.clone()).await?;
-                msg(Message::Cache("Fetching", url.clone()));
-                let oid = if let Some(locked_rev) = locked_rev.as_deref() {
-                    // locked モード
-                    if !is_full_hex_hash(locked_rev) {
-                        return Err(invalid_data(format!(
-                            "Locked revision must be full hash for {}: got {}",
-                            url, locked_rev
-                        )));
-                    }
-                    Oid::from_str(locked_rev).map_err(Error::Git2)?
-                } else {
-                    git::ls_remote(url.clone(), rev).await?
-                };
-                repo.fetch(oid).await?;
-                repo
-            } else {
-                if locked_rev.is_some() {
-                    return Err(invalid_data(format!(
-                        "Missing cached repository for locked revision: {}",
-                        url
-                    )));
+                    let oid = git::ls_remote(url.clone(), rev.clone()).await?;
+                    msg(Message::Cache("Updating:done", url.clone()));
+                    oid
                 }
-                // 見つからない場合はスキップ
-                return Ok(None);
+                None => return Ok(None),
             }
         };
+        let head_rev_str = oid.to_string();
 
-        let head_rev = repository.head_hash().await?;
-        let head_rev_str = String::from_utf8_lossy(&head_rev).to_string();
-
-        if let Some(locked_rev) = locked_rev.as_deref()
-            && head_rev_str != locked_rev
-        {
-            return Err(invalid_data(format!(
-                "Locked revision mismatch for {}: expected {}, got {}",
-                url, locked_rev, head_rev_str
-            )));
-        }
-
-        if did_update && let Some(lua_post_update) = lua_post_update.as_deref() {
-            let mut lua_runtimepaths = Vec::new();
-            let mut seen_runtimepaths = HashSet::new();
-            let mut add_runtimepath = |path: PathBuf| {
-                if seen_runtimepaths.insert(path.clone()) {
-                    lua_runtimepaths.push(path);
-                }
-            };
-            for dep_cachedir in &dependency_cachedirs {
-                let dep_path = cache_dir.as_ref().join(dep_cachedir);
-                if let Ok(dep_path) = tokio::fs::canonicalize(dep_path).await {
-                    add_runtimepath(dep_path);
-                }
+        // --- source.git の確保と fetch (PLANS §8 step 3-6) ---
+        let mut source_repo = match git::open_source(&source_git).await {
+            Ok(r) => r,
+            Err(_) if install || update => {
+                msg(Message::Cache("Initializing", url.clone()));
+                git::init_source(&source_git, &url).await?
             }
-            add_runtimepath(proj_root.to_path_buf());
+            Err(_) => return Ok(None),
+        };
+        msg(Message::Cache("Fetching", url.clone()));
+        source_repo.fetch_oid(oid).await?;
 
-            let id = Arc::new(format!("{logid} (lua_post_update)"));
-            let result: Result<(), Error> = {
-                let id = id.clone();
-                async {
-                    let lua_post_update_path =
-                        create_lua_build_script(lua_post_update, &lua_runtimepaths).await?;
-                    let code = execute(
-                        lua_build_nvim_command(lua_post_update_path.as_os_str()),
-                        proj_root.clone(),
-                        move |(stdtype, line)| {
-                            msg(Message::CacheBuildProgress {
-                                id: id.clone(),
-                                stdtype,
-                                line,
+        // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
+        tokio::fs::create_dir_all(&worktrees).await?;
+        let has_build = !build.is_empty() || lua_build.is_some();
+
+        let (snapshot_root_path, repository): (Arc<Path>, git::Repository) = if has_build {
+            // build がある: 一時 worktree で build → dirty 計算 → final key → rename/reuse。
+            // dirty_diff を snapshot_key に含めるため、build 後でないと最終 key が確定しない。
+            let building = building_worktree_dir(&worktrees);
+            let _ = tokio::fs::remove_dir_all(&building).await;
+            let building: Arc<Path> = Arc::from(building);
+            let repo = git::init_snapshot(building.clone(), &source_git, oid).await?;
+
+            // lua_post_update は update 検知時のみ building worktree で実行。
+            if update && let Some(lua_post_update) = lua_post_update.as_deref() {
+                let rtp = collect_build_runtimepaths(building.clone(), &dependency_snapshot_roots);
+                let id = Arc::new(format!("{logid} (lua_post_update)"));
+                let result: Result<(), Error> = {
+                    let id = id.clone();
+                    async {
+                        let path = create_lua_build_script(lua_post_update, &rtp).await?;
+                        let code = execute(
+                            lua_build_nvim_command(path.as_os_str()),
+                            building.clone(),
+                            move |(stdtype, line)| {
+                                msg(Message::CacheBuildProgress {
+                                    id: id.clone(),
+                                    stdtype,
+                                    line,
+                                });
+                            },
+                        )
+                        .await;
+                        let _ = tokio::fs::remove_file(&path).await;
+                        let code = code?;
+                        if code != 0 {
+                            return Err(Error::BuildLuaScriptFailed {
+                                code,
+                                repo: repo_name.clone(),
                             });
-                        },
-                    )
-                    .await;
-                    let _ = tokio::fs::remove_file(&lua_post_update_path).await;
-                    let code = code?;
-                    if code != 0 {
-                        return Err(Error::BuildLuaScriptFailed {
-                            code,
-                            repo: repo_name.clone(),
-                        });
+                        }
+                        Ok(())
                     }
-                    Ok(())
                 }
+                .await;
+                msg(Message::CacheBuildFinished {
+                    id,
+                    success: result.is_ok(),
+                });
+                result?;
             }
-            .await;
-            msg(Message::CacheBuildFinished {
-                id,
-                success: result.is_ok(),
-            });
-            result?;
-        }
 
-        let mut identity = build_repo_snapshot_identity(
+            let rtp = collect_build_runtimepaths(building.clone(), &dependency_snapshot_roots);
+            run_repo_build(
+                &build,
+                lua_build.as_deref(),
+                building.clone(),
+                rtp,
+                &logid,
+                &repo_name,
+            )
+            .await?;
+
+            // build 後 dirty を反映した最終 identity → key
+            let built_identity = build_repo_snapshot_identity(
+                &repo,
+                cachedir.clone(),
+                head_rev_str.as_bytes().to_vec(),
+                &build,
+                lua_build.as_deref(),
+            )
+            .await?;
+            let key = built_identity.snapshot_key();
+            let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &key));
+            drop(repo);
+            if final_root.exists() {
+                // 同一 key の既存 snapshot を再利用（building は破棄）
+                let _ = tokio::fs::remove_dir_all(building.as_ref()).await;
+            } else {
+                tokio::fs::rename(building.as_ref(), final_root.as_ref()).await?;
+            }
+            let opened = git::open(final_root.clone()).await?;
+            (final_root, opened)
+        } else {
+            // build 無し: key は確定（dirty=None）。final があれば再利用、なければ作成。
+            let pre_identity = RepoSnapshotIdentity::new(
+                cachedir.clone(),
+                head_rev_str.as_bytes().to_vec(),
+                None,
+                Arc::from(build.as_slice()),
+                lua_build.as_deref().map(Into::into),
+            );
+            let key = pre_identity.snapshot_key();
+            let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &key));
+            let repo = if final_root.exists() {
+                git::open(final_root.clone()).await?
+            } else {
+                git::init_snapshot(final_root.as_ref(), &source_git, oid).await?
+            };
+            (final_root, repo)
+        };
+
+        // --- 最終 identity と build 成功 marker (snapshot_root 単位, PLANS §11) ---
+        let identity = build_repo_snapshot_identity(
             &repository,
             cachedir.clone(),
-            head_rev,
+            head_rev_str.as_bytes().to_vec(),
             &build,
             lua_build.as_deref(),
         )
         .await?;
-
-        // ビルド実行
-        if !build.is_empty() || lua_build.is_some() {
-            let mut lua_runtimepaths = Vec::new();
-            let mut seen_runtimepaths = HashSet::new();
-            let mut add_runtimepath = |path: PathBuf| {
-                if seen_runtimepaths.insert(path.clone()) {
-                    lua_runtimepaths.push(path);
-                }
-            };
-            add_runtimepath(proj_root.to_path_buf());
-            for dep_cachedir in &dependency_cachedirs {
-                let dep_path = cache_dir.as_ref().join(dep_cachedir);
-                if let Ok(dep_path) = tokio::fs::canonicalize(dep_path).await {
-                    add_runtimepath(dep_path);
-                }
-            }
-
-            let next_build_success_id = identity.plugin_id().as_str();
-            let rsplug_build_success_file = proj_root.join(RSPLUG_BUILD_SUCCESS_FILE);
-            if let Some(ref prev_build_success_id) =
-                tokio::fs::read(&rsplug_build_success_file).await.ok()
-                && prev_build_success_id == next_build_success_id.as_bytes()
-            {
-                // ビルド成功の痕跡があればビルドをスキップ
-            } else {
-                let exec = async {
-                    let _ = tokio::fs::remove_file(&rsplug_build_success_file).await;
-
-                    if !build.is_empty() {
-                        let id = Arc::new(format!("{logid} (sh)"));
-                        let result: Result<(), Error> = {
-                            let id = id.clone();
-                            async {
-                                let code = execute(build.iter(), proj_root.clone(), {
-                                    move |(stdtype, line)| {
-                                        msg(Message::CacheBuildProgress {
-                                            id: id.clone(),
-                                            stdtype,
-                                            line,
-                                        });
-                                    }
-                                })
-                                .await?;
-                                if code != 0 {
-                                    return Err(Error::BuildScriptFailed {
-                                        code,
-                                        build: build.clone(),
-                                        repo: repo_name.clone(),
-                                    });
-                                }
-                                Ok(())
-                            }
-                        }
-                        .await;
-                        msg(Message::CacheBuildFinished {
-                            id,
-                            success: result.is_ok(),
-                        });
-                        result?;
-                    }
-
-                    if let Some(lua_build) = lua_build.as_deref() {
-                        let id = Arc::new(format!("{logid} (lua)"));
-                        let result: Result<(), Error> = {
-                            let id = id.clone();
-                            async {
-                                let lua_build_path =
-                                    create_lua_build_script(lua_build, &lua_runtimepaths).await?;
-                                let code = execute(
-                                    lua_build_nvim_command(lua_build_path.as_os_str()),
-                                    proj_root.clone(),
-                                    move |(stdtype, line)| {
-                                        msg(Message::CacheBuildProgress {
-                                            id: id.clone(),
-                                            stdtype,
-                                            line,
-                                        });
-                                    },
-                                )
-                                .await;
-                                let _ = tokio::fs::remove_file(&lua_build_path).await;
-                                let code = code?;
-                                if code != 0 {
-                                    return Err(Error::BuildLuaScriptFailed {
-                                        code,
-                                        repo: repo_name.clone(),
-                                    });
-                                }
-                                Ok(())
-                            }
-                        }
-                        .await;
-                        msg(Message::CacheBuildFinished {
-                            id,
-                            success: result.is_ok(),
-                        });
-                        result?;
-                    }
-
-                    Ok::<_, Error>(())
-                };
-                exec.await?;
-                identity = build_repo_snapshot_identity(
-                    &repository,
-                    cachedir.clone(),
-                    repository.head_hash().await?,
-                    &build,
-                    lua_build.as_deref(),
-                )
-                .await?;
-                tokio::fs::write(
-                    rsplug_build_success_file,
-                    identity.plugin_id().as_str().as_bytes(),
-                )
-                .await?;
-            }
+        if has_build {
+            tokio::fs::write(
+                snapshot_root_path.join(RSPLUG_BUILD_SUCCESS_FILE),
+                identity.plugin_id().as_str().as_bytes(),
+            )
+            .await?;
         }
 
+        let filesource = Arc::new(FileSource::Directory {
+            path: snapshot_root_path.clone(),
+        });
         let files = repository.ls_files().await?;
         let mut lazy_type = lazy_type.clone();
         for luam in extract_unique_lua_modules(files.iter()) {
@@ -618,7 +524,7 @@ impl Plugin {
         }
         let files: HowToPlaceFiles = if to_sym {
             HowToPlaceFiles::RepoSnapshotLink {
-                target: proj_root.clone(),
+                target: snapshot_root_path.clone(),
                 identity: identity.clone(),
             }
         } else {
@@ -627,7 +533,7 @@ impl Plugin {
                     .into_iter()
                     .filter_map(|path| {
                         let ignored = merge.ignore.matched(&path);
-                        if !ignored && proj_root.join(&path).is_file() {
+                        if !ignored && snapshot_root_path.join(&path).is_file() {
                             Some((
                                 path.clone(),
                                 FileItem {
@@ -651,7 +557,7 @@ impl Plugin {
             source_name,
             files,
             lazy_type,
-            script: script.clone(),
+            script,
             order,
             merge_enabled,
             is_plugctl: false,
@@ -664,7 +570,6 @@ impl Plugin {
 
 /// build 中の一時 worktree: `worktrees/.building-<pid>-<nonce>` (PLANS §7)。
 /// `worktrees/` 内の hidden directory なので scan 対象にならない（先頭 `.`）。
-#[allow(dead_code)]
 fn building_worktree_dir(worktrees: &Path) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -675,7 +580,6 @@ fn building_worktree_dir(worktrees: &Path) -> PathBuf {
 
 /// repo の `build`(sh) と `lua_build` を `workdir` で実行する。
 /// `runtimepaths` は lua_build 実行時に nvim の runtimepath に追加する（依存先 snapshot 含む）。
-#[allow(dead_code)]
 async fn run_repo_build(
     build: &[String],
     lua_build: Option<&str>,
@@ -762,7 +666,6 @@ async fn run_repo_build(
 }
 
 /// build 用 runtimepath を組み立てる: 自 snapshot を先頭に、依存先 snapshot を重複なしで追加。
-#[allow(dead_code)]
 fn collect_build_runtimepaths(own: Arc<Path>, deps: &[Arc<Path>]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -776,6 +679,37 @@ fn collect_build_runtimepaths(own: Arc<Path>, deps: &[Arc<Path>]) -> Vec<PathBuf
         add(d.to_path_buf());
     }
     out
+}
+
+/// 既存 snapshot worktree のうち最新（mtime 順）の commit を返す (PLANS §8 step 5 の
+/// install/update/locked 以外の case)。snapshot_dir 名の先頭 40hex を commit とみなす。
+async fn latest_snapshot_oid(worktrees: &Path) -> Result<Option<Oid>, Error> {
+    let mut newest: Option<(SystemTime, Oid)> = None;
+    if let Ok(mut rd) = tokio::fs::read_dir(worktrees).await {
+        while let Some(entry) = rd.next_entry().await? {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue; // hidden (.building-*)
+            }
+            let Some(commit) = name.split("__").next() else {
+                continue;
+            };
+            let Ok(oid) = Oid::from_str(commit) else {
+                continue;
+            };
+            let mtime = tokio::fs::metadata(entry.path())
+                .await
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            match &newest {
+                Some((t, _)) if *t >= mtime => {}
+                _ => newest = Some((mtime, oid)),
+            }
+        }
+    }
+    Ok(newest.map(|(_, o)| o))
 }
 
 fn extract_unique_lua_modules<'a>(
@@ -995,7 +929,7 @@ mod tests {
             let plugin = Plugin::new(config).unwrap().next().unwrap();
 
             plugin
-                .load(false, false, std::env::temp_dir(), None)
+                .load(false, false, std::env::temp_dir(), None, Vec::new())
                 .await
                 .unwrap()
                 .unwrap()
@@ -1008,6 +942,114 @@ mod tests {
 
         assert_eq!(first.plugin_id(), same.plugin_id());
         assert_ne!(first.plugin_id(), different_script.plugin_id());
+    }
+
+    #[tokio::test]
+    async fn load_creates_snapshot_worktree_and_reuses_it() {
+        // 実 git で install → source.git + worktrees/<key> を作り、RepoSnapshotLink target が
+        // snapshot を指し、再実行で同じ snapshot を再利用することを検証する (PLANS §15.11)。
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("rsplug-load-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let remote = dir.join("remote");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(remote.join("plugin")).unwrap();
+        std::fs::write(remote.join("plugin/init.vim"), "\"x\n").unwrap();
+        let git = |args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(&remote)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let commit = Command::new("git")
+            .current_dir(&remote)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let oid = String::from_utf8(
+            Command::new("git")
+                .current_dir(&remote)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let oid = oid.trim().to_string();
+        let url = format!("file://{}", remote.display());
+
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [[plugins]]
+            repo = "{url}"
+            sym = true
+            "#
+        ))
+        .unwrap();
+        let plugin = Plugin::new(config).unwrap().next().unwrap();
+        let cachedir = plugin.cache.repo.as_ref().unwrap().default_cachedir();
+        let repo_root = cache.join(&cachedir);
+        let (loaded, lock_info) = plugin
+            .load(true, false, &cache, None, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // source.git と worktrees/<key> が作られる
+        assert!(
+            repo_root.join("source.git").is_dir(),
+            "source.git missing at {}",
+            repo_root.join("source.git").display()
+        );
+        // to_sym なので RepoSnapshotLink。target は worktrees/ 配下の固定 snapshot。
+        let target = loaded
+            .snapshot_root()
+            .expect("repo plugin has snapshot_root");
+        assert!(
+            target.starts_with(repo_root.join("worktrees")),
+            "target {} not under worktrees",
+            target.display()
+        );
+        assert!(target.join("plugin/init.vim").is_file());
+        // lock_info に full commit SHA
+        assert_eq!(lock_info.expect("lock_info").1, oid);
+
+        // 同じ入力で再 load すると同じ snapshot を再利用する（key が一致）
+        let config2: Config = toml::from_str(&format!(
+            r#"
+            [[plugins]]
+            repo = "{url}"
+            sym = true
+            "#
+        ))
+        .unwrap();
+        let plugin2 = Plugin::new(config2).unwrap().next().unwrap();
+        let (loaded2, _) = plugin2
+            .load(true, false, &cache, None, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded2.snapshot_root(),
+            Some(target),
+            "re-load should reuse the same snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

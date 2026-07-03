@@ -150,17 +150,7 @@ pub mod git {
             .unwrap()
         }
 
-        /// source.git が既に oid を持っているか。
-        #[allow(dead_code)]
-        pub async fn has_object(&self, oid: Oid) -> bool {
-            let repo = self.0.clone();
-            spawn_blocking(move || repo.lock().unwrap().find_object(oid, None).is_ok())
-                .await
-                .unwrap()
-        }
-
         /// source.git に指定 oid を fetch する（HEAD も作業ツリーも変えない）。
-        #[allow(dead_code)]
         pub async fn fetch_oid(&mut self, oid: Oid) -> Result<(), Error> {
             let repo = self.0.clone();
             spawn_blocking(move || {
@@ -169,63 +159,14 @@ pub mod git {
                     return Ok(());
                 }
                 let mut remote = repo.find_remote("origin")?;
+                // local transport (file://, bare path) は shallow fetch 非対応なので full fetch する。
+                let shallow = remote.url().map(|u| !is_local_transport(u)).unwrap_or(true);
                 remote.fetch(
                     &[oid.to_string()],
-                    Some(&mut build_fetch_options(oid)),
+                    Some(&mut build_fetch_options(oid, shallow)),
                     None,
                 )?;
                 Ok(())
-            })
-            .await
-            .unwrap()
-        }
-
-        /// リポジトリ同期処理（fetch + checkout）。旧 layout 互換。
-        pub async fn fetch(&mut self, rev: Oid) -> Result<(), Error> {
-            let repo = self.0.clone();
-            spawn_blocking(move || {
-                let repo = repo.lock().unwrap();
-                let obj = if let Ok(obj) = repo.find_object(rev, None) {
-                    obj
-                } else {
-                    if let Ok(mut remote) = repo.find_remote("origin") {
-                        remote.fetch(
-                            &[rev.to_string()],
-                            Some(&mut build_fetch_options(rev)),
-                            None,
-                        )?;
-                    }
-                    repo.find_object(rev, None)?
-                };
-
-                repo.set_head_detached(rev)?;
-                repo.checkout_tree(
-                    &obj,
-                    Some(
-                        CheckoutBuilder::new()
-                            .force()
-                            .use_theirs(true)
-                            .allow_conflicts(true),
-                    ),
-                )?;
-
-                Ok(())
-            })
-            .await
-            .unwrap()
-        }
-
-        /// HEAD のハッシュ
-        pub async fn head_hash(&self) -> Result<Vec<u8>, Error> {
-            let repo = self.0.clone();
-            spawn_blocking(move || {
-                let oid = repo
-                    .lock()
-                    .unwrap()
-                    .head()?
-                    .target()
-                    .ok_or_else(|| git2::Error::from_str("HEAD is not a direct reference"))?;
-                Ok(oid.to_string().into_bytes())
             })
             .await
             .unwrap()
@@ -280,7 +221,12 @@ pub mod git {
     }
 
     /// fetch 進捗をログ出力する FetchOptions を構築する。
-    fn build_fetch_options(rev: Oid) -> FetchOptions<'static> {
+    /// `file://` URL や scheme 無しの bare path は local transport（shallow fetch 非対応）。
+    fn is_local_transport(url: &str) -> bool {
+        url.starts_with("file://") || !url.contains("://")
+    }
+
+    fn build_fetch_options(rev: Oid, shallow: bool) -> FetchOptions<'static> {
         let mut cbs = RemoteCallbacks::new();
         let last_reported = Cell::new(0usize);
         let last_tick = Cell::new(Instant::now());
@@ -307,8 +253,10 @@ pub mod git {
         });
         let mut ops = FetchOptions::new();
         ops.download_tags(git2::AutotagOption::None)
-            .depth(1)
             .remote_callbacks(cbs);
+        if shallow {
+            ops.depth(1);
+        }
         ops
     }
 
@@ -320,30 +268,14 @@ pub mod git {
         Ok(Repository::from(repo))
     }
 
-    /// リポジトリ初期化処理
-    pub async fn init(
-        dir: impl AsRef<Path> + Send + 'static,
-        repo: impl AsRef<str> + Send + 'static,
-    ) -> Result<Repository, Error> {
-        let r = spawn_blocking(move || git2::Repository::init(dir))
-            .await
-            .unwrap()?;
-        spawn_blocking(move || {
-            r.remote("origin", repo.as_ref())?;
-            Ok(Repository::from(r))
-        })
-        .await
-        .unwrap()
-    }
-
     /// fetch 用の bare repository (`source.git`) を初期化し origin を設定する (PLANS §9)。
     /// runtime はこの repository の作業ツリーを読まない（bare だから持たない）。
-    #[allow(dead_code)]
     pub async fn init_source(
-        dir: impl AsRef<Path> + Send + 'static,
-        repo: impl AsRef<str> + Send + 'static,
+        dir: impl AsRef<Path> + Send,
+        repo: impl AsRef<str> + Send,
     ) -> Result<Repository, Error> {
         let dir = dir.as_ref().to_path_buf();
+        let repo = repo.as_ref().to_string();
         let r = spawn_blocking(move || git2::Repository::init_bare(&dir))
             .await
             .unwrap()?;
@@ -356,8 +288,7 @@ pub mod git {
     }
 
     /// 既存の `source.git` を開く。
-    #[allow(dead_code)]
-    pub async fn open_source(dir: impl AsRef<Path> + Send + 'static) -> Result<Repository, Error> {
+    pub async fn open_source(dir: impl AsRef<Path> + Send) -> Result<Repository, Error> {
         let dir = dir.as_ref().to_path_buf();
         spawn_blocking(move || git2::Repository::open_bare(&dir))
             .await
@@ -370,7 +301,6 @@ pub mod git {
     /// (PLANS §8, §9)。commit `oid` を detached HEAD として checkout する。
     /// runtime symlink の参照先（不変 snapshot）となる。
     /// local clone で object は hardlink 共有されるため disk 使用量は抑えられる。
-    #[allow(dead_code)]
     pub async fn init_snapshot(
         snapshot_root: impl AsRef<Path> + Send,
         source_git_dir: impl AsRef<Path> + Send,
@@ -734,8 +664,16 @@ mod tests {
             .unwrap();
         assert_eq!(content, "hello\n");
         // HEAD は detached で oid に一致
-        let head = repo.head_hash().await.unwrap();
-        assert_eq!(String::from_utf8(head).unwrap().trim(), oid_str);
+        let head = String::from_utf8(
+            Command::new("git")
+                .current_dir(&snap)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(head.trim(), oid_str);
         // ls_files が tracked file を返す
         let files = repo.ls_files().await.unwrap();
         assert!(files.iter().any(|p| p == std::path::Path::new("README.md")));

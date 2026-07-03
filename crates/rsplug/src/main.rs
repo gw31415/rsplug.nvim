@@ -7,8 +7,8 @@ use console::style;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use std::{
-    collections::{BTreeMap, BinaryHeap},
-    path::PathBuf,
+    collections::{BTreeMap, BinaryHeap, HashMap},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::task::JoinSet;
@@ -99,71 +99,89 @@ async fn app() -> Result<(), Error> {
         BTreeMap::new()
     };
 
-    let plugins = rsplug::Plugin::new(config)?;
+    let plugins: Vec<rsplug::Plugin> = rsplug::Plugin::new(config)?.collect();
+    let total_count = plugins.len();
 
-    // Load plugins through Cache based on the Units
+    // Load plugins through Cache based on the Units.
+    // layer-parallel: 同じ DAG depth 内は並列に load し、依存先 (depth が小さい) が先に完了する。
+    // 依存先 plugin の snapshot_root を依存元の build 用 runtimepath に渡すため、
+    // repo の相対 cachedir → snapshot_root を depth ごとに蓄積する (PLANS §10.3, §15.9)。
     let locked_map = Arc::new(locked_map);
-    let (mut plugins, lock_infos) = {
-        let res = plugins
-            .map(|plugin| {
-                let locked_map = Arc::clone(&locked_map);
-                async move {
-                    let locked_rev = if let Some(repo) = plugin.cache.repo.as_ref() {
-                        let url = repo.url();
-                        if locked {
-                            if let Some(entry) = locked_map.get(&url) {
-                                if entry.kind != rsplug::LockedResourceType::Git {
-                                    return Err(Error::Io(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        format!(
-                                            "Unsupported lock type for {}: {:?}",
-                                            url, entry.kind
-                                        ),
-                                    )));
-                                }
-                                Some(Arc::<str>::from(entry.rev.as_str()))
-                            } else {
+    let mut loaded_plugins: BinaryHeap<rsplug::LoadedPlugin> = BinaryHeap::new();
+    let mut lock_infos: Vec<(String, String)> = Vec::new();
+    let mut cachedir_to_snapshot: HashMap<PathBuf, Arc<Path>> = HashMap::new();
+
+    let max_depth = plugins.iter().map(|p| p.depth).max().unwrap_or(0);
+    let mut layers: Vec<Vec<rsplug::Plugin>> = (0..=max_depth).map(|_| Vec::new()).collect();
+    for plugin in plugins {
+        layers[plugin.depth].push(plugin);
+    }
+
+    for layer in layers {
+        let mut tasks = JoinSet::new();
+        for plugin in layer {
+            let locked_map = Arc::clone(&locked_map);
+            let dep_roots: Vec<Arc<Path>> = plugin
+                .dependency_cachedirs
+                .iter()
+                .filter_map(|dc| cachedir_to_snapshot.get(dc).cloned())
+                .collect();
+            let own_cachedir = plugin.cache.repo.as_ref().map(|r| r.default_cachedir());
+            tasks.spawn(async move {
+                let locked_rev = if let Some(repo) = plugin.cache.repo.as_ref() {
+                    let url = repo.url();
+                    if locked {
+                        if let Some(entry) = locked_map.get(&url) {
+                            if entry.kind != rsplug::LockedResourceType::Git {
                                 return Err(Error::Io(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
-                                    format!("Missing locked revision for {}", url),
+                                    format!("Unsupported lock type for {}: {:?}", url, entry.kind),
                                 )));
                             }
+                            Some(Arc::<str>::from(entry.rev.as_str()))
                         } else {
-                            None
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Missing locked revision for {}", url),
+                            )));
                         }
                     } else {
                         None
-                    };
-                    let loaded = plugin
-                        .load(install, update, DEFAULT_REPOCACHE_DIR.as_path(), locked_rev)
-                        .await?;
-                    Ok(loaded)
-                }
-            })
-            .collect::<JoinSet<_>>()
-            .join_all()
-            .await;
-        // Wait until all loading is complete.
-        // NOTE: It does not abort if an error occurs (because of the build process).
-        msg(Message::LoadDone);
-        let (plugins, locks) = res
-            .into_iter()
-            .try_fold(
-                (BinaryHeap::new(), Vec::new()),
-                |(mut plugins, mut locks), res| {
-                    if let Some((loaded, lock_info)) = res? {
-                        plugins.push(loaded);
-                        if let Some(lock_info) = lock_info {
-                            locks.push(lock_info);
-                        }
                     }
-                    Ok::<_, Box<Error>>((plugins, locks))
-                },
-            )
-            .map_err(|e| *e)?;
-        (plugins, locks)
-    };
-    let total_count = plugins.len();
+                } else {
+                    None
+                };
+                let loaded = plugin
+                    .load(
+                        install,
+                        update,
+                        DEFAULT_REPOCACHE_DIR.as_path(),
+                        locked_rev,
+                        dep_roots,
+                    )
+                    .await?;
+                Ok::<_, Error>((loaded, own_cachedir))
+            });
+        }
+        // Wait until the whole layer completes before moving on (dependents are in later layers).
+        // NOTE: It does not abort sibling tasks if one errors (because of the build process).
+        while let Some(res) = tasks.join_next().await {
+            let (loaded_opt, own_cachedir) = res.unwrap()?;
+            if let Some((lp, lock_info)) = loaded_opt {
+                if let Some(root) = lp.snapshot_root()
+                    && let Some(cd) = own_cachedir
+                {
+                    cachedir_to_snapshot.insert(cd, root);
+                }
+                if let Some(li) = lock_info {
+                    lock_infos.push(li);
+                }
+                loaded_plugins.push(lp);
+            }
+        }
+    }
+    msg(Message::LoadDone);
+    let mut plugins = loaded_plugins;
 
     if !locked {
         let mut merged_locked =
