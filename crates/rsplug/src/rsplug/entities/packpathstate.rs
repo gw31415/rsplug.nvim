@@ -20,28 +20,16 @@ use tokio::task::JoinSet;
 
 use super::*;
 
-/// プラグインファイルの配置方法。
-// TODO: HowToPlaceFilesをenum { Root, Tree(HashMap<PathBuf, FileItem>) }にする。SymlinkDirectoryはFileItemに含める
-// その方がマージもでき、SymlinkなPluginのdocにも対応できるため。
-#[derive(Debug, Hash, PartialEq, Eq)]
-pub(super) enum HowToPlaceFiles {
-    CopyEachFile(BTreeMap<PathBuf, FileItem>),
-    SymlinkDirectory(Arc<Path>),
-}
-
-impl Default for HowToPlaceFiles {
-    fn default() -> Self {
-        HowToPlaceFiles::CopyEachFile(BTreeMap::new())
-    }
-}
-
-/// Git リポジトリのメタデータ。PluginID の決定に影響する「外部依存」を明示的に保持する。
+/// Git リポジトリ snapshot の論理 identity。
 ///
-/// `head_rev`・`dirty_diff`・`build`・`lua_build` のいずれかが変化すると Hash が変わり、
-/// ひいては PluginID が変わる。これらを構造体に集約することで、フィールド追加・変更が
-/// コンパイラによって検出される。
-#[derive(Hash, PartialEq, Eq, Clone)]
-pub struct RepoMeta {
+/// **絶対配置パス（cache root や `snapshot_root`）は含めない。** identity は
+/// `repo_cache_dir`(相対)・`head_rev`・`dirty_diff`・`build`・`lua_build` のみで決まり、
+/// `LoadedPlugin::plugin_id()` を通じて `_gen` id を決める。これらを構造体に集約することで、
+/// identity に影響する入力の追加・変更がコンパイラによって検出される。
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub(super) struct RepoSnapshotIdentity {
+    /// `repos/` からの相対 repo パス（例: `github.com/owner/repo`）。どの repo かを識別する。
+    repo_cache_dir: PathBuf,
     /// HEAD コミットハッシュ
     head_rev: Box<[u8]>,
     /// 作業ツリーに未コミット変更がある場合の差分ハッシュ。クリーンなら None。
@@ -52,28 +40,143 @@ pub struct RepoMeta {
     lua_build: Option<Arc<str>>,
 }
 
-impl RepoMeta {
+impl RepoSnapshotIdentity {
     pub(super) fn new(
+        repo_cache_dir: PathBuf,
         head_rev: Vec<u8>,
         dirty_diff: Option<[u8; 16]>,
         build: Arc<[String]>,
         lua_build: Option<Arc<str>>,
     ) -> Self {
         Self {
+            repo_cache_dir,
             head_rev: head_rev.into_boxed_slice(),
             dirty_diff,
             build,
             lua_build,
         }
     }
+
+    /// `worktrees/<snapshot_key>` の directory 名を生成する (PLANS §7)。
+    ///
+    /// **`dirty_diff` は含めない**: key は commit + build/lua_build 入力のみで決まり、
+    /// build を実行する前に確定する。これにより「同じ入力の snapshot が既にあれば build を
+    /// スキップして再利用」できる。build 成果物の差（dirty）は `RepoSnapshotIdentity`
+    /// （ひいては `plugin_id`）に反映されるため、異なる成果物は別 `_gen` id になる。
+    /// `build`・`lua_build` が共に無ければ `<head_rev>` のみ、あれば `<head_rev>__v1_<hash>`。
+    /// `repo_cache_dir` は key に含めない（`worktrees/` は repo ごとに分かれているため暗黙）。
+    pub(super) fn snapshot_key(&self) -> String {
+        let head_rev = String::from_utf8_lossy(&self.head_rev);
+        if self.build.is_empty() && self.lua_build.is_none() {
+            head_rev.into_owned()
+        } else {
+            let input = SnapshotKeyInput {
+                schema: SNAPSHOT_KEY_SCHEMA,
+                head_rev: &self.head_rev,
+                build: &self.build,
+                lua_build: self.lua_build.as_deref(),
+            };
+            format!(
+                "{head_rev}__v{}_{}",
+                SNAPSHOT_KEY_SCHEMA,
+                crate::rsplug::util::hash::digest_hash_hex_string(&input)
+            )
+        }
+    }
 }
 
-impl std::fmt::Debug for RepoMeta {
+/// `snapshot_key` の hash 入力 (PLANS §7)。絶対パス・`dirty_diff` は含めない。
+#[derive(Hash)]
+struct SnapshotKeyInput<'a> {
+    schema: u8,
+    head_rev: &'a [u8],
+    build: &'a [String],
+    lua_build: Option<&'a str>,
+}
+
+/// `snapshot_key` の schema 版。意味を変える変更時のみ上げる。
+const SNAPSHOT_KEY_SCHEMA: u8 = 1;
+
+impl std::fmt::Debug for RepoSnapshotIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RepoMeta")
+        f.debug_struct("RepoSnapshotIdentity")
+            .field("repo_cache_dir", &self.repo_cache_dir)
             .field("head_rev", &String::from_utf8_lossy(&self.head_rev))
             .field("dirty_diff", &self.dirty_diff)
             .finish_non_exhaustive()
+    }
+}
+
+/// repo snapshot 内の個別ファイルの identity。`relative_path` も identity に含む。
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+pub(super) struct RepoFileIdentity {
+    snapshot: RepoSnapshotIdentity,
+    relative_path: PathBuf,
+}
+
+impl RepoFileIdentity {
+    pub(super) fn new(snapshot: RepoSnapshotIdentity, relative_path: PathBuf) -> Self {
+        Self {
+            snapshot,
+            relative_path,
+        }
+    }
+}
+
+/// ファイルの論理 identity。repo 由来か生成ファイルかを区別する。
+/// 絶対配置パスは含まず、生成ファイルは内容の `data_hash` で同一性を決める。
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+pub(super) enum FileIdentity {
+    RepoFile(RepoFileIdentity),
+    GeneratedFile { path: PathBuf, data_hash: [u8; 16] },
+}
+
+/// プラグインファイルの配置方法。
+#[derive(Debug)]
+pub(super) enum HowToPlaceFiles {
+    CopyEachFile(BTreeMap<PathBuf, FileItem>),
+    /// Git repo snapshot への symlink。`target` は配置用の絶対 runtime path、
+    /// `identity` が論理 identity。下記 `Hash`/`PartialEq`/`Eq` は `target` を除外し
+    /// `identity` のみで同一性を決める（cache root が違っても同じ snapshot なら同じ id）。
+    RepoSnapshotLink {
+        target: Arc<Path>,
+        identity: RepoSnapshotIdentity,
+    },
+}
+
+impl Default for HowToPlaceFiles {
+    fn default() -> Self {
+        HowToPlaceFiles::CopyEachFile(BTreeMap::new())
+    }
+}
+
+impl PartialEq for HowToPlaceFiles {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::CopyEachFile(a), Self::CopyEachFile(b)) => a == b,
+            (
+                Self::RepoSnapshotLink { identity: la, .. },
+                Self::RepoSnapshotLink { identity: lb, .. },
+            ) => la == lb,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for HowToPlaceFiles {}
+
+impl Hash for HowToPlaceFiles {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::CopyEachFile(map) => {
+                0u8.hash(state);
+                map.hash(state);
+            }
+            Self::RepoSnapshotLink { identity, .. } => {
+                1u8.hash(state);
+                identity.hash(state);
+            }
+        }
     }
 }
 
@@ -96,8 +199,6 @@ pub struct LoadedPlugin {
     pub(super) merge_enabled: bool,
     /// PlugCtlを元に作成されたかどうか
     pub(super) is_plugctl: bool,
-    /// git リポジトリのメタデータ。script-only プラグイン等では None。
-    pub(super) repo_meta: Option<RepoMeta>,
 }
 
 impl LoadedPlugin {
@@ -106,11 +207,30 @@ impl LoadedPlugin {
     pub fn plugin_id(&self) -> PluginID {
         <Self as HasPluginId>::plugin_id(self)
     }
+
+    /// 配置（runtime）用の snapshot root。repo 由来でなければ（script-only や生成ファイルのみ
+    /// なら）`None`。**配置情報であり `plugin_id` の hash には含まれない** (PLANS §10.3)。
+    pub fn snapshot_root(&self) -> Option<Arc<Path>> {
+        match &self.files {
+            HowToPlaceFiles::RepoSnapshotLink { target, .. } => Some(target.clone()),
+            HowToPlaceFiles::CopyEachFile(files) => {
+                files
+                    .values()
+                    .next()
+                    .and_then(|item| match item.source.as_ref() {
+                        FileSource::Directory { path } => Some(path.clone()),
+                        FileSource::File { .. } => None,
+                    })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub(super) struct FileItem {
     pub source: Arc<FileSource>,
+    /// ファイルの論理 identity。絶対配置パスは含まず、repo 由来か生成かで決まる。
+    pub identity: FileIdentity,
     pub merge_type: MergeType,
 }
 
@@ -232,7 +352,6 @@ impl Add for LoadedPlugin {
                         order,
                         merge_enabled,
                         is_plugctl,
-                        repo_meta,
                     } = self
                     else {
                         unreachable!() // SAFETY: Because self.files is verified to be a CopyEachFile
@@ -245,7 +364,6 @@ impl Add for LoadedPlugin {
                         order: r_order,
                         merge_enabled: _,
                         is_plugctl: r_is_plugctl,
-                        repo_meta: r_repo_meta,
                     } = rhs
                     else {
                         unreachable!() // SAFETY: Because rhs.files is verified to be a CopyEachFile
@@ -263,15 +381,17 @@ impl Add for LoadedPlugin {
                             order,
                             merge_enabled,
                             is_plugctl: is_plugctl || r_is_plugctl,
-                            repo_meta: repo_meta.or(r_repo_meta),
                         },
                         None,
                     );
                 }
             }
-            (HowToPlaceFiles::CopyEachFile(_), HowToPlaceFiles::SymlinkDirectory(_))
-            | (HowToPlaceFiles::SymlinkDirectory(_), HowToPlaceFiles::CopyEachFile(_))
-            | (HowToPlaceFiles::SymlinkDirectory(_), HowToPlaceFiles::SymlinkDirectory(_)) => {}
+            (HowToPlaceFiles::CopyEachFile(_), HowToPlaceFiles::RepoSnapshotLink { .. })
+            | (HowToPlaceFiles::RepoSnapshotLink { .. }, HowToPlaceFiles::CopyEachFile(_))
+            | (
+                HowToPlaceFiles::RepoSnapshotLink { .. },
+                HowToPlaceFiles::RepoSnapshotLink { .. },
+            ) => {}
         };
         (self, Some(rhs))
     }
@@ -300,7 +420,7 @@ impl Hash for FileSource {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             // 絶対パスはマシン固有なのでハッシュに含めない。
-            // 同一性は RepoMeta (head_rev / dirty_diff) が担保する。
+            // 同一性は FileItem.identity (RepoSnapshotIdentity 等) が担保する。
             FileSource::Directory { .. } => 0u8.hash(state),
             FileSource::File { data } => {
                 1u8.hash(state);
@@ -502,7 +622,6 @@ impl PackPathState {
             order,
             merge_enabled: _,
             is_plugctl,
-            repo_meta: _,
         } = loaded_plugin;
 
         if !is_plugctl {
@@ -524,12 +643,12 @@ impl PackPathState {
                     tree.push((path, item.source));
                 }
             }
-            HowToPlaceFiles::SymlinkDirectory(dir) => {
+            HowToPlaceFiles::RepoSnapshotLink { target, .. } => {
                 self.files.insert(
                     id_str.clone(),
                     Files {
                         is_plugctl,
-                        dir_type: DirectoryExtractionType::Symlink(dir),
+                        dir_type: DirectoryExtractionType::Symlink(target),
                     },
                 );
             }
@@ -863,5 +982,296 @@ mod tests {
 
         assert!(parsed.contains("opt/22222222222222222222222222222222".as_bytes()));
         assert!(parsed.contains("opt/11111111111111111111111111111111".as_bytes()));
+    }
+
+    // ---- identity / hash 安全性 (PLANS §15.1) ----
+
+    fn snap(repo: &str, rev: &[u8]) -> RepoSnapshotIdentity {
+        RepoSnapshotIdentity::new(
+            PathBuf::from(repo),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        )
+    }
+
+    /// `(install_path, FileItem)` を repo 由来ファイルとして組み立てる。`dir` は
+    /// `FileSource::Directory` の絶対パス（identity には含まれないはずの配置パス）。
+    fn repo_file(snapshot: RepoSnapshotIdentity, rel: &str, dir: &str) -> (PathBuf, FileItem) {
+        (
+            PathBuf::from(rel),
+            FileItem {
+                source: Arc::new(FileSource::Directory {
+                    path: Arc::from(PathBuf::from(dir)),
+                }),
+                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                    snapshot,
+                    PathBuf::from(rel),
+                )),
+                merge_type: MergeType::Conflict,
+            },
+        )
+    }
+
+    fn synth(files: HowToPlaceFiles) -> LoadedPlugin {
+        LoadedPlugin {
+            source_name: None,
+            lazy_type: LazyType::Start,
+            files,
+            script: SetupScript::default(),
+            order: 0,
+            merge_enabled: true,
+            is_plugctl: false,
+        }
+    }
+
+    #[test]
+    fn copy_plugin_id_is_independent_of_absolute_cache_path() {
+        let snapshot = snap(
+            "github.com/owner/repo",
+            b"0123456789012345678901234567890123456789",
+        );
+        let id_a = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot.clone(),
+            "plugin/init.lua",
+            "/machineA/cache/owner/repo",
+        )])))
+        .plugin_id();
+        let id_b = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot,
+            "plugin/init.lua",
+            "/machineB/cache/owner/repo",
+        )])))
+        .plugin_id();
+        assert_eq!(id_a, id_b, "absolute cache path must not affect plugin_id");
+    }
+
+    #[test]
+    fn snapshot_link_id_is_independent_of_absolute_target() {
+        let identity = snap(
+            "github.com/owner/repo",
+            b"0123456789012345678901234567890123456789",
+        );
+        let make = |target: &str| {
+            synth(HowToPlaceFiles::RepoSnapshotLink {
+                target: Arc::from(PathBuf::from(target)),
+                identity: identity.clone(),
+            })
+            .plugin_id()
+        };
+        assert_eq!(make("/A/repos/owner/repo"), make("/B/repos/owner/repo"));
+
+        // 同一 identity で target だけ違うなら == でも等しい（identity のみで同一性を判定する）
+        let a = synth(HowToPlaceFiles::RepoSnapshotLink {
+            target: Arc::from(PathBuf::from("/A/r")),
+            identity: identity.clone(),
+        });
+        let b = synth(HowToPlaceFiles::RepoSnapshotLink {
+            target: Arc::from(PathBuf::from("/B/r")),
+            identity,
+        });
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn copy_plugin_id_reflects_repo_cache_dir_and_head_rev() {
+        let make = |repo: &str, rev: &[u8]| {
+            let snapshot = snap(repo, rev);
+            synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+                snapshot,
+                "plugin/init.lua",
+                "/cache",
+            )])))
+            .plugin_id()
+        };
+        let base = make(
+            "github.com/owner/repo",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        // repo_cache_dir が違うと id が変わる
+        assert_ne!(
+            base,
+            make(
+                "github.com/owner/other",
+                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+        );
+        // head_rev が違うと id が変わる
+        assert_ne!(
+            base,
+            make(
+                "github.com/owner/repo",
+                b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            )
+        );
+    }
+
+    #[test]
+    fn merged_copy_plugin_id_reflects_all_repos() {
+        // 異なる 2 repo の CopyEachFile を merge すると、両 repo の identity が反映される。
+        // 旧設計 (repo_meta: Option で merge 時 .or()) だと片方しか残らず、
+        // merged id が単独 repo の id に一致してしまっていた（回帰テスト）。
+        let snap_a = snap(
+            "github.com/owner/a",
+            b"revAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let snap_b = snap(
+            "github.com/owner/b",
+            b"revBbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        let both = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([
+            repo_file(snap_a.clone(), "plugin/a.lua", "/cache/a"),
+            repo_file(snap_b.clone(), "plugin/b.lua", "/cache/b"),
+        ])));
+
+        let mut heap = BinaryHeap::new();
+        heap.push(synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([
+            repo_file(snap_a.clone(), "plugin/a.lua", "/cache/a"),
+        ]))));
+        heap.push(synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([
+            repo_file(snap_b.clone(), "plugin/b.lua", "/cache/b"),
+        ]))));
+        LoadedPlugin::merge(&mut heap);
+
+        let merged: Vec<_> = heap.into_iter().collect();
+        assert_eq!(
+            merged.len(),
+            1,
+            "two mergeable start plugins should merge into one"
+        );
+        let merged_id = merged[0].plugin_id();
+
+        assert_eq!(
+            merged_id,
+            both.plugin_id(),
+            "merged id must equal the directly-constructed both-files plugin"
+        );
+        assert_ne!(
+            merged_id,
+            synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+                snap_a,
+                "plugin/a.lua",
+                "/cache/a",
+            )])))
+            .plugin_id(),
+            "merged id must differ from repo-a-only id"
+        );
+        assert_ne!(
+            merged_id,
+            synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+                snap_b,
+                "plugin/b.lua",
+                "/cache/b",
+            )])))
+            .plugin_id(),
+            "merged id must differ from repo-b-only id"
+        );
+    }
+
+    #[test]
+    fn snapshot_key_is_plain_rev_when_no_build_inputs() {
+        let id = snap(
+            "github.com/o/r",
+            b"0123456789012345678901234567890123456789",
+        );
+        // build/lua_build/dirty_diff が全て無ければ head_rev のみ。
+        assert_eq!(
+            id.snapshot_key(),
+            "0123456789012345678901234567890123456789"
+        );
+    }
+
+    #[test]
+    fn snapshot_key_has_v1_suffix_and_tracks_build_inputs() {
+        let rev = b"0123456789012345678901234567890123456789";
+        let with_build = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/r"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from(["make".to_string()]),
+            None,
+        );
+        let key = with_build.snapshot_key();
+        assert!(
+            key.starts_with("0123456789012345678901234567890123456789__v1_"),
+            "got {key}"
+        );
+        // build が変わると suffix が変わる
+        let with_other_build = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/r"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from(["cmake".to_string()]),
+            None,
+        );
+        assert_ne!(key, with_other_build.snapshot_key());
+    }
+
+    #[test]
+    fn snapshot_key_ignores_dirty_but_reflects_lua_build() {
+        let rev = b"0123456789012345678901234567890123456789";
+        let mk = |dirty, lua| {
+            RepoSnapshotIdentity::new(
+                PathBuf::from("r"),
+                rev.to_vec(),
+                dirty,
+                Arc::<[String]>::from(["make".to_string()]),
+                lua,
+            )
+        };
+        // dirty_diff は snapshot_key に含まれない（build 前に key を確定し再利用を可能にするため）。
+        let base = mk(None, None);
+        let with_dirty = mk(Some([1u8; 16]), None);
+        assert_eq!(base.snapshot_key(), with_dirty.snapshot_key());
+        // lua_build が変われば key も変わる。
+        let with_lua = mk(None, Some(Arc::from("vim.cmd('x')")));
+        assert_ne!(base.snapshot_key(), with_lua.snapshot_key());
+    }
+
+    #[test]
+    fn snapshot_key_ignores_repo_cache_dir() {
+        // worktrees/ は repo ごとに分かれるため、key 自体は repo_cache_dir に依存しない。
+        let rev = b"0123456789012345678901234567890123456789";
+        let a = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/a"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let b = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/b"),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        assert_eq!(a.snapshot_key(), b.snapshot_key());
+    }
+
+    #[test]
+    fn generated_file_id_reflects_path_and_data() {
+        let make = |path: &'static str, data: &'static [u8]| {
+            let data_hash = crate::rsplug::util::hash::digest_hash(data);
+            synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([(
+                PathBuf::from(path),
+                FileItem {
+                    source: Arc::new(FileSource::File {
+                        data: Cow::Borrowed(data),
+                    }),
+                    identity: FileIdentity::GeneratedFile {
+                        path: PathBuf::from(path),
+                        data_hash,
+                    },
+                    merge_type: MergeType::Overwrite,
+                },
+            )])))
+            .plugin_id()
+        };
+        assert_ne!(make("plugin/a.lua", b"x"), make("plugin/b.lua", b"x")); // path 違い
+        assert_ne!(make("plugin/a.lua", b"x"), make("plugin/a.lua", b"y")); // data 違い
+        assert_eq!(make("plugin/a.lua", b"x"), make("plugin/a.lua", b"x")); // 同一
     }
 }

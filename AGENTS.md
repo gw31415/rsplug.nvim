@@ -90,6 +90,13 @@ Supported lazy-loading triggers and scripts:
 - Dedicated `ftplugin` configuration field support is intentionally deferred
   for now (workaround: put files under `after/ftplugin` directly).
 
+## ExecPlans
+
+When writing complex features, multi-step bug fixes, or significant refactors,
+use an ExecPlan as described in `PLANS.md` from design through implementation.
+Keep the ExecPlan current as discoveries, decisions, validation results, and
+remaining work change.
+
 ## Notes
 
 - Don't run `cargo check -q`

@@ -50,6 +50,13 @@ async fn app() -> Result<(), Error> {
     } = Args::parse();
     let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));
 
+    // Ensure the app cache dir exists up front. `Plugin::load` creates it as a
+    // side effect of `--install`/`--update` (via `init_source`), but a flagless
+    // run that skips every plugin (fresh cache, nothing to reuse) would never
+    // touch the dir and then fail with ENOENT when writing the lockfile or the
+    // packpath below.
+    tokio::fs::create_dir_all(DEFAULT_APP_DIR.as_path()).await?;
+
     // Parse config files in deterministic path order.
     // `order` uses config_index, so walker receive order must not affect config order.
     let config = {
@@ -100,11 +107,18 @@ async fn app() -> Result<(), Error> {
     };
 
     let plugins = rsplug::Plugin::new(config)?;
+    let plugins: Vec<_> = plugins.collect();
+    msg(Message::LoadBegin {
+        total: plugins.len(),
+    });
 
-    // Load plugins through Cache based on the Units
+    // Load plugins through Cache based on the Units.
+    // 全 plugin を並列に load/build する（DAG は runtime 読み込み順であり build 依存順ではない）。
+    // 依存先 snapshot は各依存先 repo の worktrees/ から best-effort で解決する (PLANS §10.3)。
     let locked_map = Arc::new(locked_map);
     let (mut plugins, lock_infos) = {
         let res = plugins
+            .into_iter()
             .map(|plugin| {
                 let locked_map = Arc::clone(&locked_map);
                 async move {
@@ -134,10 +148,11 @@ async fn app() -> Result<(), Error> {
                     } else {
                         None
                     };
-                    let loaded = plugin
+                    let result = plugin
                         .load(install, update, DEFAULT_REPOCACHE_DIR.as_path(), locked_rev)
-                        .await?;
-                    Ok(loaded)
+                        .await;
+                    msg(Message::LoadPluginDone);
+                    Ok(result?)
                 }
             })
             .collect::<JoinSet<_>>()
