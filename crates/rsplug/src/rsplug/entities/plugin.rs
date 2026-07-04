@@ -350,6 +350,12 @@ impl Plugin {
         };
 
         // --- target commit 解決 (PLANS §8 step 5) ---
+        // まずインストール状態（= 既存 snapshot worktree の有無）で分岐する。
+        //   - locked : lockfile の rev をそのまま使う（cache 不足は後段でエラー）。
+        //   - update : インストール済みならリモートの最新を fetch して更新する。
+        //              ※未インストールは対象外（スキップ）。`-u` 単独で新規 install はしない。
+        //   - install: 未インストールならリモートから新規 fetch する。
+        //   - それ以外(通常起動): 既存 snapshot の commit をそのまま使い、無ければスキップ。
         let oid = if let Some(locked_rev) = locked_rev.as_deref() {
             if !is_full_hex_hash(locked_rev) {
                 return Err(invalid_data(format!(
@@ -358,16 +364,15 @@ impl Plugin {
                 )));
             }
             Oid::from_str(locked_rev).map_err(Error::Git2)?
-        } else if update {
-            msg(Message::Cache("Updating", url.clone()));
-            let oid = git::ls_remote(url.clone(), rev.clone()).await?;
-            msg(Message::Cache("Updating:done", url.clone()));
-            oid
         } else {
-            // install/update/locked 以外: 既存 snapshot から最新 commit を読む。
-            // 既存が無ければ install 時は ls_remote、それ以外は未インストールとしてスキップ。
             match latest_snapshot_oid(&worktrees).await? {
-                Some(oid) => oid,
+                Some(_) if update => {
+                    msg(Message::Cache("Updating", url.clone()));
+                    let oid = git::ls_remote(url.clone(), rev.clone()).await?;
+                    msg(Message::Cache("Updating:done", url.clone()));
+                    oid
+                }
+                Some(existing) => existing,
                 None if install => {
                     msg(Message::Cache("Updating", url.clone()));
                     let oid = git::ls_remote(url.clone(), rev.clone()).await?;
@@ -375,6 +380,7 @@ impl Plugin {
                     oid
                 }
                 None => {
+                    // 未インストール。install も update(既存更新) も対象外なのでスキップ。
                     msg(Message::PluginNotInstalled(Arc::from(logid.as_str())));
                     return Ok(None);
                 }
@@ -1191,6 +1197,96 @@ mod tests {
             "\"A\n",
             "old snapshot content must not move on update"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_alone_does_not_install_uninstalled_repo() {
+        // 未インストールの repo に対し install=false, update=true で load すると:
+        // 新規 install せず Ok(None) を返し、source.git も snapshot も作らない。
+        // `-u` は既存(インストール済み)対象の更新のみで、新規 install は `-i` の役割。
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("rsplug-update-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let remote = dir.join("remote");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(remote.join("plugin")).unwrap();
+        std::fs::write(remote.join("plugin/init.vim"), "\"x\n").unwrap();
+        let git = |args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(&remote)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let commit = Command::new("git")
+            .current_dir(&remote)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let url = format!("file://{}", remote.display());
+
+        let mk_cfg = || {
+            toml::from_str::<Config>(&format!(
+                r#"
+            [[plugins]]
+            repo = "{url}"
+            sym = true
+            "#
+            ))
+            .unwrap()
+        };
+
+        // repo_root は load ごとに変化しないので先に算出（Config は Clone できない）。
+        let repo_root = {
+            let p = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+            cache.join(p.cache.repo.as_ref().unwrap().default_cachedir())
+        };
+
+        // (1) 未インストール + update 単独 → スキップ。キャッシュは一切作らない。
+        let plugin = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let result = plugin.load(false, true, &cache, None).await.unwrap();
+        assert!(
+            result.is_none(),
+            "update alone must skip an uninstalled repo, got {result:?}"
+        );
+        assert!(
+            !repo_root.join("source.git").exists(),
+            "update alone must not create source.git"
+        );
+        assert!(
+            !repo_root.join("worktrees").exists(),
+            "update alone must not create any snapshot"
+        );
+
+        // (2) 念のため `-u -i`（install+update）なら未インストールでも install する。
+        let plugin2 = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let (loaded, _) = plugin2
+            .load(true, true, &cache, None)
+            .await
+            .unwrap()
+            .expect("install+update should install an uninstalled repo");
+        assert!(
+            loaded.snapshot_root().is_some(),
+            "install+update should produce a snapshot"
+        );
+        assert!(repo_root.join("source.git").is_dir());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
