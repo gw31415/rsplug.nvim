@@ -374,7 +374,10 @@ impl Plugin {
                     msg(Message::Cache("Updating:done", url.clone()));
                     oid
                 }
-                None => return Ok(None),
+                None => {
+                    msg(Message::PluginNotInstalled(Arc::from(logid.as_str())));
+                    return Ok(None);
+                }
             }
         };
         let head_rev_str = oid.to_string();
@@ -395,7 +398,10 @@ impl Plugin {
                     url
                 )));
             }
-            Err(_) => return Ok(None),
+            Err(_) => {
+                msg(Message::PluginNotInstalled(Arc::from(logid.as_str())));
+                return Ok(None);
+            }
         };
         msg(Message::Cache("Fetching", url.clone()));
         source_repo.fetch_oid(oid).await?;

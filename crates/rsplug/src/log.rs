@@ -37,6 +37,8 @@ pub enum Message {
     },
     LoadPluginDone,
     LoadDone,
+    /// フラグなし実行でキャッシュが無くロードできなかった（未インストール）。
+    PluginNotInstalled(Arc<str>),
     MergeFinished {
         total: usize,
         merged: usize,
@@ -255,6 +257,7 @@ struct ProgressManager {
     progress_bars: HashMap<String, BarState>,
     installskipped_count: usize,
     yankfile_count: usize,
+    not_installed: Vec<Arc<str>>,
     cachefetching_oids: HashMap<String, usize>,
     cache_updating_fetching: HashMap<String, ()>,
     cache_updating_current: Option<String>,
@@ -342,6 +345,7 @@ impl ProgressManager {
             progress_bars: HashMap::from([("config_files".to_string(), barstate)]),
             installskipped_count: 0,
             yankfile_count: 0,
+            not_installed: Vec::new(),
             cachefetching_oids: HashMap::new(),
             cache_updating_fetching: HashMap::new(),
             cache_updating_current: None,
@@ -370,6 +374,31 @@ impl ProgressManager {
         }
     }
 
+    /// フラグなし実行でキャッシュが無くロードできなかったプラグインの警告を印字。
+    fn warn_not_installed(&self) {
+        let n = self.not_installed.len();
+        let header = format!(
+            "{} {} plugins not installed (run with -i to install)",
+            style("⚠").yellow().bold(),
+            n
+        );
+        let shown: Vec<&Arc<str>> = self.not_installed.iter().take(3).collect();
+        let mut body = shown
+            .iter()
+            .map(|s| s.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if n > shown.len() {
+            body.push_str(" …");
+        }
+        let block = if body.is_empty() {
+            header
+        } else {
+            format!("{header}\n    {}", style(body).dim())
+        };
+        self.multipb.println(block).unwrap();
+    }
+
     fn process(&mut self, msg: Message) {
         match msg {
             Message::ConfigFound(path) => {
@@ -391,12 +420,18 @@ impl ProgressManager {
                 self.multipb.println(display.to_string()).unwrap();
             }
             Message::MergeFinished { total, merged } => {
-                let message = format!(
-                    "plugins {}",
-                    style(format!("(total:{total} merged:{merged})"))
-                        .green()
-                        .dim()
-                );
+                // total = ロード成功プラグイン数、merged = マージ後のパッケージ数。
+                // 統合（merged < total）のときだけ 📦 で結果パッケージ数を併記。
+                let message = if total == merged {
+                    format!("{} plugins", style(total).green().bold())
+                } else {
+                    format!(
+                        "{} plugins {} {}",
+                        style(total).green().bold(),
+                        style("·").dim(),
+                        style(format!("📦 {}", merged)).green().bold(),
+                    )
+                };
                 if let Some(pb) = self.progress_bars.remove("loading") {
                     pb.bar.set_style(self.pb_style_summary.clone());
                     pb.bar.set_prefix(summary_prefix("Loaded", true));
@@ -575,15 +610,20 @@ impl ProgressManager {
                         self.progress_bars.insert(key, pb);
                         continue;
                     }
-                    pb.bar.set_style(self.pb_style.clone());
-                    pb.bar.finish_with_message("done");
+                    pb.bar.finish_and_clear();
                 }
+                if !self.not_installed.is_empty() {
+                    self.warn_not_installed();
+                }
+            }
+            Message::PluginNotInstalled(id) => {
+                self.not_installed.push(id);
             }
             Message::DetectLockFile(path) => {
                 self.multipb
                     .println(format!(
                         "{} {}",
-                        style("LockFile:").blue().dim(),
+                        summary_prefix("Lockfile", true),
                         style(path.to_string_lossy()).dim()
                     ))
                     .unwrap();
@@ -597,7 +637,7 @@ impl ProgressManager {
                         let bar = self.multipb.add(
                             ProgressBar::no_length()
                                 .with_style(self.pb_style.clone())
-                                .with_prefix("Skipped"),
+                                .with_prefix("Up to date"),
                         );
                         BarState::new(bar)
                     });
@@ -642,9 +682,9 @@ impl ProgressManager {
             Message::InstallDone => {
                 drop(self.osc94.take());
                 if let Some(pb) = self.progress_bars.remove("install_skipped") {
-                    pb.bar.set_style(self.pb_style.clone());
+                    pb.bar.set_style(self.pb_style_summary.clone());
                     if self.installskipped_count != 0 {
-                        pb.bar.set_prefix("Skipped");
+                        pb.bar.set_prefix(summary_prefix("Up to date", true));
                         pb.bar
                             .finish_with_message(format!("{} packages", self.installskipped_count));
                     } else {
