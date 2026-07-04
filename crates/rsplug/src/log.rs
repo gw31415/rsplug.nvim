@@ -32,6 +32,10 @@ pub enum Message {
         id: Arc<String>,
         success: bool,
     },
+    LoadBegin {
+        total: usize,
+    },
+    LoadPluginDone,
     LoadDone,
     MergeFinished {
         total: usize,
@@ -108,6 +112,17 @@ fn config_n_files_string(n: usize) -> String {
         n,
         if n == 1 { "" } else { "s" }
     )
+}
+
+/// 持続サマリー行の prefix（`✓ Loaded` / `✗ Build` など）。
+/// ネスト ANSI を避けるため `pb_style_summary`（prefix 無修飾）と組み合わせる。
+fn summary_prefix(label: &str, ok: bool) -> String {
+    let mark = if ok {
+        style("✓").green().bold().to_string()
+    } else {
+        style("✗").red().bold().to_string()
+    };
+    format!("{} {}", mark, style(label).blue().bold())
 }
 
 struct ConfigList {
@@ -233,6 +248,8 @@ struct ProgressManager {
     pb_style: ProgressStyle,
     pb_style_spinner: ProgressStyle,
     pb_style_bar: ProgressStyle,
+    pb_style_loading: ProgressStyle,
+    pb_style_summary: ProgressStyle,
 
     // State
     progress_bars: HashMap<String, BarState>,
@@ -242,7 +259,6 @@ struct ProgressManager {
     cache_updating_fetching: HashMap<String, ()>,
     cache_updating_current: Option<String>,
     updating_bar: Option<BarState>,
-    cache_fetch_stage: Option<&'static str>,
     config_files: Vec<Arc<Path>>,
     osc94: Option<OSC94>,
 }
@@ -298,6 +314,13 @@ impl ProgressManager {
         )
         .unwrap()
         .progress_chars("■□ ");
+        let pb_style_loading = ProgressStyle::with_template(
+            "{spinner} {prefix:.blue.bold} {wide_bar:.cyan/blue} {pos}/{len}",
+        )
+        .unwrap()
+        .progress_chars("■□ ");
+        // prefix を自前で色付けする（✓/✗ 付きの持続サマリー行用）。テキストはそのまま通る。
+        let pb_style_summary = ProgressStyle::with_template("{prefix} {wide_msg}").unwrap();
 
         let multipb = MultiProgress::new();
         multipb.set_draw_target(ProgressDrawTarget::stderr());
@@ -314,6 +337,8 @@ impl ProgressManager {
             pb_style,
             pb_style_spinner,
             pb_style_bar,
+            pb_style_loading,
+            pb_style_summary,
             progress_bars: HashMap::from([("config_files".to_string(), barstate)]),
             installskipped_count: 0,
             yankfile_count: 0,
@@ -321,7 +346,6 @@ impl ProgressManager {
             cache_updating_fetching: HashMap::new(),
             cache_updating_current: None,
             updating_bar: None,
-            cache_fetch_stage: None,
             config_files: Vec::new(),
             osc94: None,
         }
@@ -338,16 +362,10 @@ impl ProgressManager {
             });
         bar_state.bar.set_prefix(stage);
         bar_state.set_message_if_changed(url.to_string());
-        self.cache_fetch_stage = Some(stage);
     }
 
-    fn finish_fetch_stage(&mut self) {
+    fn clear_fetch_stage(&mut self) {
         if let Some(pb) = self.progress_bars.remove(CACHE_FETCH_STAGE_ID) {
-            self.cache_fetch_stage = None;
-            self.multipb
-                .println(format!("{} all packages", style("Fetched").blue().bold()))
-                .unwrap();
-            pb.bar.set_style(self.pb_style.clone());
             pb.bar.finish_and_clear();
         }
     }
@@ -380,12 +398,12 @@ impl ProgressManager {
                         .dim()
                 );
                 if let Some(pb) = self.progress_bars.remove("loading") {
-                    pb.bar.set_style(self.pb_style.clone());
-                    pb.bar.set_prefix("Loaded");
+                    pb.bar.set_style(self.pb_style_summary.clone());
+                    pb.bar.set_prefix(summary_prefix("Loaded", true));
                     pb.bar.finish_with_message(message);
                 } else {
                     self.multipb
-                        .println(format!("{} {message}", style("Loaded").blue().bold()))
+                        .println(format!("{} {message}", summary_prefix("Loaded", true)))
                         .unwrap();
                 }
             }
@@ -394,7 +412,6 @@ impl ProgressManager {
                     self.ensure_fetch_stage(r#type, url.as_ref());
                     return;
                 }
-                self.finish_fetch_stage();
 
                 match r#type {
                     "Updating" | "Updating:done" => {
@@ -456,9 +473,6 @@ impl ProgressManager {
                 total_objs_count,
                 received_objs_count,
             } => {
-                self.osc94
-                    .get_or_insert_with(OSC94::new)
-                    .progress(Some(received_objs_count * 100 / total_objs_count));
                 let style = self.pb_style_bar.clone();
                 let pb = self
                     .progress_bars
@@ -476,9 +490,20 @@ impl ProgressManager {
                 let increment = received_objs_count.saturating_sub(*prev);
                 *prev = received_objs_count;
                 pb.bar.inc(increment as u64);
+                // OSC 9;4: フェッチ中は全体オブジェクト比(受信/総数)、完了時は Loading(不定)。
+                let pos = pb.bar.position();
+                let len = pb.bar.length().unwrap_or(pos).max(1);
+                if pos < len {
+                    self.osc94
+                        .get_or_insert_with(OSC94::new)
+                        .progress(Some((pos * 100 / len).min(100) as u8));
+                } else {
+                    self.osc94
+                        .get_or_insert_with(OSC94::new)
+                        .progress::<u8>(None);
+                }
             }
             Message::CacheBuildProgress { id, stdtype, line } => {
-                self.finish_fetch_stage();
                 if let Some(sanitized) = sanitize_build_line(&line) {
                     let prefix = {
                         let mut prefix = format!("Building [{id}]");
@@ -509,17 +534,32 @@ impl ProgressManager {
             }
             Message::CacheBuildFinished { id, success } => {
                 if let Some(pb_state) = self.progress_bars.remove(id.as_str()) {
-                    pb_state.bar.set_style(self.pb_style.clone());
-                    pb_state.bar.set_prefix("Build");
+                    pb_state.bar.set_style(self.pb_style_summary.clone());
+                    pb_state.bar.set_prefix(summary_prefix("Build", success));
                     if success {
-                        pb_state.bar.finish_with_message(format!("success [{id}]"));
+                        pb_state.bar.finish_with_message(format!("[{id}]"));
                     } else {
-                        pb_state.bar.finish_with_message(format!("failed [{id}]"));
+                        pb_state.bar.finish_with_message(format!("[{id}] failed"));
                     }
                 }
             }
+            Message::LoadBegin { total } => {
+                let pb = ProgressBar::new(total as u64).with_style(self.pb_style_loading.clone());
+                pb.enable_steady_tick(Duration::from_millis(120));
+                let bar = BarState::new(self.multipb.add(pb));
+                self.progress_bars.insert("loading".to_string(), bar);
+                // Loading フェーズは OSC 9;4 を不定(割合なし)にする。
+                self.osc94
+                    .get_or_insert_with(OSC94::new)
+                    .progress::<u8>(None);
+            }
+            Message::LoadPluginDone => {
+                if let Some(state) = self.progress_bars.get_mut("loading") {
+                    state.bar.inc(1);
+                }
+            }
             Message::LoadDone => {
-                self.finish_fetch_stage();
+                self.clear_fetch_stage();
                 drop(self.osc94.take());
                 let mut pbs = std::mem::take(&mut self.progress_bars);
                 if let Some(pb) = pbs.remove(CACHE_FETCH_PROGRESS_ID) {
@@ -529,7 +569,12 @@ impl ProgressManager {
                 if let Some(pb) = self.updating_bar.take() {
                     pb.bar.finish_and_clear();
                 }
-                for (_, pb) in pbs {
+                for (key, pb) in pbs {
+                    // "loading" は MergeFinished が確定するまで残す。
+                    if key == "loading" {
+                        self.progress_bars.insert(key, pb);
+                        continue;
+                    }
                     pb.bar.set_style(self.pb_style.clone());
                     pb.bar.finish_with_message("done");
                 }
@@ -607,9 +652,9 @@ impl ProgressManager {
                     }
                 }
                 if let Some(pb) = self.progress_bars.remove("install_yank") {
-                    pb.bar.set_style(self.pb_style.clone());
+                    pb.bar.set_style(self.pb_style_summary.clone());
                     if self.yankfile_count != 0 {
-                        pb.bar.set_prefix("Copied");
+                        pb.bar.set_prefix(summary_prefix("Copied", true));
                         pb.bar
                             .finish_with_message(format!("{} files", self.yankfile_count));
                     } else {
