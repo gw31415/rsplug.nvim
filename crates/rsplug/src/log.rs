@@ -321,7 +321,8 @@ impl ProgressManager {
             "{spinner} {prefix:.blue.bold} {wide_bar:.cyan/blue} {pos}/{len}",
         )
         .unwrap()
-        .progress_chars("■□ ");
+        .progress_chars("■□ ")
+        .tick_strings(&["◒", "◐", "◓", "◑", " "]);
         // prefix を自前で色付けする（✓/✗ 付きの持続サマリー行用）。テキストはそのまま通る。
         let pb_style_summary = ProgressStyle::with_template("{prefix} {wide_msg}").unwrap();
 
@@ -433,14 +434,15 @@ impl ProgressManager {
                     )
                 };
                 if let Some(pb) = self.progress_bars.remove("loading") {
-                    pb.bar.set_style(self.pb_style_summary.clone());
-                    pb.bar.set_prefix(summary_prefix("Loaded", true));
-                    pb.bar.finish_with_message(message);
-                } else {
-                    self.multipb
-                        .println(format!("{} {message}", summary_prefix("Loaded", true)))
-                        .unwrap();
+                    // finish_with_message は steady_tick と競合して直前のバーフレームが
+                    // 画面に残ることがある（"-u" で多発）。steady_tick を止めて消去し、
+                    // サマリーは println で1行出す。
+                    pb.bar.disable_steady_tick();
+                    pb.bar.finish_and_clear();
                 }
+                self.multipb
+                    .println(format!("{} {message}", summary_prefix("Loaded", true)))
+                    .unwrap();
             }
             Message::Cache(r#type, url) => {
                 if r#type == "Fetching" || r#type == "Initializing" {
@@ -579,7 +581,9 @@ impl ProgressManager {
                 }
             }
             Message::LoadBegin { total } => {
-                let pb = ProgressBar::new(total as u64).with_style(self.pb_style_loading.clone());
+                let pb = ProgressBar::new(total as u64)
+                    .with_style(self.pb_style_loading.clone())
+                    .with_prefix("Loading");
                 pb.enable_steady_tick(Duration::from_millis(120));
                 let bar = BarState::new(self.multipb.add(pb));
                 self.progress_bars.insert("loading".to_string(), bar);
