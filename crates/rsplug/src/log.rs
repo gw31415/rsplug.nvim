@@ -307,6 +307,16 @@ fn sanitize_build_line(line: &str) -> Option<String> {
 
 impl ProgressManager {
     fn new() -> Self {
+        Self::build(ProgressDrawTarget::stderr())
+    }
+
+    /// 描画先を注入可能にしたコンストラクタ（検証用）。本番は new() → stderr。
+    #[cfg(test)]
+    fn with_draw_target(draw_target: ProgressDrawTarget) -> Self {
+        Self::build(draw_target)
+    }
+
+    fn build(draw_target: ProgressDrawTarget) -> Self {
         let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
         let pb_style_spinner =
             ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}")
@@ -327,7 +337,7 @@ impl ProgressManager {
         let pb_style_summary = ProgressStyle::with_template("{prefix} {wide_msg}").unwrap();
 
         let multipb = MultiProgress::new();
-        multipb.set_draw_target(ProgressDrawTarget::stderr());
+        multipb.set_draw_target(draw_target);
         let mut barstate = BarState::new(
             multipb.add(
                 ProgressBar::no_length()
@@ -434,10 +444,8 @@ impl ProgressManager {
                     )
                 };
                 if let Some(pb) = self.progress_bars.remove("loading") {
-                    // finish_with_message は steady_tick と競合して直前のバーフレームが
-                    // 画面に残ることがある（"-u" で多発）。steady_tick を止めて消去し、
-                    // サマリーは println で1行出す。
-                    pb.bar.disable_steady_tick();
+                    // steady_tick は LoadDone（描画責務）で停止済み。ここはサマリー確定の
+                    // 責務としてバーを消去し、サマリー行を println で1行出す。
                     pb.bar.finish_and_clear();
                 }
                 self.multipb
@@ -609,8 +617,14 @@ impl ProgressManager {
                     pb.bar.finish_and_clear();
                 }
                 for (key, pb) in pbs {
-                    // "loading" は MergeFinished が確定するまで残す。
+                    // "loading" は MergeFinished でサマリーに差し替えるまで残す。
                     if key == "loading" {
+                        // 描画(アニメーション)の責務は loading フェーズの完了(LoadDone)で終わり。
+                        // ここで steady_tick を止め、バーは最終進捗を表示したまま残す。
+                        // MergeFinished との間に lockfile 書き出し + merge が挟まるため、
+                        // この時点で ticker スレッドは確実に停止し、MergeFinished での
+                        // finish_and_clear が競合しない（"Loading 0/len" の初期フレーム残存を防ぐ）。
+                        pb.bar.disable_steady_tick();
                         self.progress_bars.insert(key, pb);
                         continue;
                     }
@@ -751,5 +765,227 @@ pub async fn close(code: i32) -> ! {
         LOGGER.1.lock().await.recv().await;
         std::io::stdout().flush().unwrap();
         std::process::exit(code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indicatif::TermLike;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    /// 画面モデルを模倣し、indicatif のカーソル操作を再現して最終画面状態を得る TermLike。
+    /// 行(row)追跡は正確に行い、`finish_and_clear`+`println` で "Loading" 行が残留しないか検証する。
+    #[derive(Debug)]
+    struct Screen {
+        rows: Vec<String>,
+        row: usize,
+        col: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ScreenTermLike {
+        screen: Arc<Mutex<Screen>>,
+        width: u16,
+    }
+
+    impl ScreenTermLike {
+        fn new(width: u16) -> (Self, Arc<Mutex<Screen>>) {
+            let screen = Arc::new(Mutex::new(Screen {
+                rows: Vec::new(),
+                row: 0,
+                col: 0,
+            }));
+            (
+                Self {
+                    screen: screen.clone(),
+                    width,
+                },
+                screen,
+            )
+        }
+    }
+
+    impl TermLike for ScreenTermLike {
+        fn width(&self) -> u16 {
+            self.width
+        }
+        fn height(&self) -> u16 {
+            200
+        }
+        fn move_cursor_up(&self, n: usize) -> io::Result<()> {
+            let mut s = self.screen.lock().unwrap();
+            s.row = s.row.saturating_sub(n);
+            Ok(())
+        }
+        fn move_cursor_down(&self, n: usize) -> io::Result<()> {
+            let mut s = self.screen.lock().unwrap();
+            s.row += n;
+            while s.rows.len() <= s.row {
+                s.rows.push(String::new());
+            }
+            Ok(())
+        }
+        fn move_cursor_right(&self, n: usize) -> io::Result<()> {
+            self.screen.lock().unwrap().col += n;
+            Ok(())
+        }
+        fn move_cursor_left(&self, n: usize) -> io::Result<()> {
+            let mut s = self.screen.lock().unwrap();
+            s.col = s.col.saturating_sub(n);
+            Ok(())
+        }
+        fn write_str(&self, text: &str) -> io::Result<()> {
+            let mut s = self.screen.lock().unwrap();
+            for c in text.chars() {
+                match c {
+                    '\r' => s.col = 0,
+                    '\n' => {
+                        s.row += 1;
+                        s.col = 0;
+                        while s.rows.len() <= s.row {
+                            s.rows.push(String::new());
+                        }
+                    }
+                    _ => {
+                        let (row, col) = (s.row, s.col);
+                        while s.rows.len() <= row {
+                            s.rows.push(String::new());
+                        }
+                        let r = &mut s.rows[row];
+                        while r.chars().count() < col {
+                            r.push(' ');
+                        }
+                        // col を文字数で管理する（ANSI 幅は無視: 残留検出には行位置で十分）
+                        let mut chars: Vec<char> = r.chars().collect();
+                        while chars.len() <= col {
+                            chars.push(' ');
+                        }
+                        chars[col] = c;
+                        *r = chars.into_iter().collect();
+                        s.col += 1;
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn write_line(&self, text: &str) -> io::Result<()> {
+            self.write_str(text)?;
+            let mut s = self.screen.lock().unwrap();
+            s.row += 1;
+            s.col = 0;
+            while s.rows.len() <= s.row {
+                s.rows.push(String::new());
+            }
+            Ok(())
+        }
+        fn clear_line(&self) -> io::Result<()> {
+            let mut s = self.screen.lock().unwrap();
+            let row = s.row;
+            while s.rows.len() <= row {
+                s.rows.push(String::new());
+            }
+            s.rows[row].clear();
+            s.col = 0;
+            Ok(())
+        }
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Loading bar のライフサイクル（責務分離）: LoadBegin で生成→LoadDone で frozen
+    /// （steady_tick 停止・未 finish）→MergeFinished で消去。
+    #[test]
+    fn loading_bar_freezes_at_load_done_and_clears_at_merge_finished() {
+        let mut m = ProgressManager::new();
+
+        m.process(Message::LoadBegin { total: 2 });
+        let loading = m
+            .progress_bars
+            .get("loading")
+            .expect("LoadBegin creates the loading bar");
+        assert!(!loading.bar.is_finished());
+
+        m.process(Message::LoadPluginDone);
+        m.process(Message::LoadPluginDone);
+
+        m.process(Message::LoadDone);
+        let loading = m
+            .progress_bars
+            .get("loading")
+            .expect("LoadDone must keep the loading bar for MergeFinished");
+        // frozen だが未 finish: MergeFinished で消去されるまでは表示し続ける。
+        assert!(!loading.bar.is_finished());
+
+        m.process(Message::MergeFinished {
+            total: 2,
+            merged: 1,
+        });
+        assert!(
+            !m.progress_bars.contains_key("loading"),
+            "MergeFinished must remove the loading bar"
+        );
+    }
+
+    /// `-u` 相当のメッセージ列を流した最終画面に "Loading" が残留しないか検証する。
+    /// LoadDone→MergeFinished の間（lockfile 書き出し+merge に相当）に steady_tick が
+    /// 回り続けると finish_and_clear と競合して初期フレームが残るため、責務分離で
+    /// LoadDone 時点で steady_tick を止める。このテストはその最終画面がクリーンであることを保証する。
+    #[test]
+    fn loading_bar_does_not_remain_on_screen_after_update_run() {
+        let (term, screen) = ScreenTermLike::new(80);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        m.process(Message::ConfigWalkFinish);
+
+        m.process(Message::LoadBegin { total: 2 });
+
+        let mk = |s: &str| Arc::<str>::from(s);
+        // plugin 1: update + fetch + done
+        let u1 = mk("file:///x/a");
+        m.process(Message::Cache("Updating", u1.clone()));
+        m.process(Message::Cache("Updating:done", u1.clone()));
+        m.process(Message::Cache("Fetching", u1.clone()));
+        m.process(Message::CacheFetchObjectsProgress {
+            id: "a".into(),
+            total_objs_count: 1,
+            received_objs_count: 1,
+        });
+        m.process(Message::LoadPluginDone);
+        // plugin 2
+        let u2 = mk("file:///x/b");
+        m.process(Message::Cache("Updating", u2.clone()));
+        m.process(Message::Cache("Updating:done", u2.clone()));
+        m.process(Message::LoadPluginDone);
+
+        // lockfile 書き出し + merge に相当する時間（steady_tick が回る窓を再現）
+        std::thread::sleep(Duration::from_millis(160));
+
+        m.process(Message::LoadDone);
+        // MergeFinished 直前も steady_tick 窓がありうる
+        std::thread::sleep(Duration::from_millis(40));
+        m.process(Message::MergeFinished {
+            total: 2,
+            merged: 1,
+        });
+
+        // 残存 ticker の非同期 tick が落ち着くまで待つ
+        std::thread::sleep(Duration::from_millis(160));
+
+        let rendered = {
+            let s = screen.lock().unwrap();
+            s.rows
+                .iter()
+                .map(|r| console::strip_ansi_codes(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !rendered.contains("Loading"),
+            "loading bar must be cleared after the run; got:\n{rendered}"
+        );
     }
 }
