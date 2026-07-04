@@ -12,7 +12,9 @@ table.insert(package.loaders, 1, function(mod_name)
 	end
 	if package.loaded[mod_name] ~= nil then
 		local m = package.loaded[mod_name]
-		return function() return m end
+		return function()
+			return m
+		end
 	end
 	return nil
 end)

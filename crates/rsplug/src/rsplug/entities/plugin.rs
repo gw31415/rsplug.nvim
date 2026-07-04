@@ -897,8 +897,8 @@ mod tests {
         assert!(out.starts_with("local ok, err = xpcall(function()\n"));
         assert!(out.contains("for _, rtp in ipairs({"));
         // single-quote escaping applied to runtimepath entries
-        assert!(out.contains("  '/path/with\\'quote',\n"));
-        assert!(out.contains("  '/normal',\n"));
+        assert!(out.contains("\t'/path/with\\'quote',\n"));
+        assert!(out.contains("\t'/normal',\n"));
         // the user script body is embedded verbatim
         assert!(out.contains("vim.cmd('echo hi')"));
         assert!(out.contains("end, debug.traceback)"));

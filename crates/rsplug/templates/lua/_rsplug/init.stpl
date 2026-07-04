@@ -19,12 +19,12 @@ return setmetatable({
 			require(after)
 		end
 		for _, on_source_id in ipairs(source2pkgid[id] or {}) do
-			require('_rsplug').packadd(on_source_id)
+			require '_rsplug'.packadd(on_source_id)
 		end
 	end,
 	startup = function()
 		for _, id in ipairs(startup_plugins) do
-			require('_rsplug').packadd(id, true)
+			require '_rsplug'.packadd(id, true)
 		end
 	end,
 	---@param ft string
