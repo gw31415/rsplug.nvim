@@ -29,6 +29,7 @@ serde_with = { version = "3.21", features = [
 	"macros",
 	"hashbrown_0_17",
 ], default-features = false }
+tempfile = "3"
 toml = "1.1"
 toml_edit = "0.23"
 unicode-width = "0.2"

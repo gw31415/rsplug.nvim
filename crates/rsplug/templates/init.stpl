@@ -13,9 +13,10 @@ vim.opt.packpath:prepend(root)
 
 <% for id in control_ids {%>vim.cmd.packadd '<%= id %>'
 <%}%>
-local ok, rsplug = pcall(require, '_rsplug')
+<% if !control_ids.is_empty() { %>local ok, rsplug = pcall(require, '_rsplug')
 if not ok then
 	error('[rsplug] failed to load generated runtime: ' .. tostring(rsplug))
 end
 
 rsplug.startup()
+<% } %>

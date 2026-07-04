@@ -835,6 +835,22 @@ mod tests {
     }
 
     #[test]
+    fn init_template_empty_control_ids_is_safe_without_rsplug_runtime() {
+        // control_ids が空（プラグイン0件）のとき _rsplug ランタイムモジュールは
+        // 生成されない。init.lua が無条件で require('_rsplug') すると nvim 起動が
+        // クラッシュするため、require/startup ブロックを出力しない。
+        let script = String::from_utf8(render_init(&[])).unwrap();
+        assert!(
+            !script.contains("require, '_rsplug'"),
+            "empty control_ids must not require _rsplug: {script:?}"
+        );
+        assert!(
+            !script.contains("rsplug.startup()"),
+            "empty control_ids must not call startup: {script:?}"
+        );
+    }
+
+    #[test]
     fn manifest_entries_are_parsed_from_json_model() {
         let manifest = GenerationManifest {
             version: 1,
