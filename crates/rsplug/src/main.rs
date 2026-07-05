@@ -116,11 +116,20 @@ async fn app() -> Result<(), Error> {
     // 全 plugin を並列に load/build する（DAG は runtime 読み込み順であり build 依存順ではない）。
     // 依存先 snapshot は各依存先 repo の worktrees/ から best-effort で解決する (PLANS §10.3)。
     let locked_map = Arc::new(locked_map);
+    // 全 plugin のネットワークフェッチ並列度を制限する。
+    // 初期値8、min=1、max=256。エラー率上昇時に自動的に並列度を半減させる。
+    let fetch_semaphore = adaptive_semaphore::AdaptiveSemaphore::with_limits(
+        8,
+        1,
+        256,
+        std::time::Duration::from_millis(64),
+    );
     let (mut plugins, lock_infos) = {
         let res = plugins
             .into_iter()
             .map(|plugin| {
                 let locked_map = Arc::clone(&locked_map);
+                let fetch_semaphore = fetch_semaphore.clone();
                 async move {
                     let locked_rev = if let Some(repo) = plugin.cache.repo.as_ref() {
                         let url = repo.url();
@@ -149,7 +158,13 @@ async fn app() -> Result<(), Error> {
                         None
                     };
                     let result = plugin
-                        .load(install, update, DEFAULT_REPOCACHE_DIR.as_path(), locked_rev)
+                        .load(
+                            install,
+                            update,
+                            DEFAULT_REPOCACHE_DIR.as_path(),
+                            locked_rev,
+                            fetch_semaphore,
+                        )
                         .await;
                     msg(Message::LoadPluginDone);
                     Ok(result?)
