@@ -381,7 +381,10 @@ impl Plugin {
                 }
                 None => {
                     // 未インストール。install も update(既存更新) も対象外なのでスキップ。
-                    msg(Message::PluginNotInstalled(Arc::from(logid.as_str())));
+                    msg(Message::PluginNotInstalled(display_name(
+                        &source_name,
+                        &logid,
+                    )));
                     return Ok(None);
                 }
             }
@@ -405,7 +408,10 @@ impl Plugin {
                 )));
             }
             Err(_) => {
-                msg(Message::PluginNotInstalled(Arc::from(logid.as_str())));
+                msg(Message::PluginNotInstalled(display_name(
+                    &source_name,
+                    &logid,
+                )));
                 return Ok(None);
             }
         };
@@ -577,6 +583,15 @@ fn building_worktree_dir(worktrees: &Path) -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     worktrees.join(format!(".building-{}-{}", std::process::id(), nonce))
+}
+
+/// 未インストール警告の表示名。`source_name`（`dep_name` 由来）を優先し、
+/// script-only プラグインなどで `None` の場合は logid にフォールバックする。
+fn display_name(source_name: &Option<String>, logid: &str) -> Arc<str> {
+    match source_name {
+        Some(name) => Arc::from(name.as_str()),
+        None => Arc::from(logid),
+    }
 }
 
 /// repo の `build`(sh) と `lua_build` を `workdir` で実行する。
