@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthStr;
 
 use crate::osc94::OSC94;
+use crate::rsplug::util::truncate;
 
 pub enum Message {
     ConfigFound(PathBuf),
@@ -386,6 +387,8 @@ impl ProgressManager {
     }
 
     /// フラグなし実行でキャッシュが無くロードできなかったプラグインの警告を印字。
+    /// 各 name は logid のような共通 truncate ではなく、**個別に** 20字超のときだけ
+    /// truncate する。これにより複数プラグインを並べても何が未インストールか判読できる。
     fn warn_not_installed(&self) {
         let n = self.not_installed.len();
         let header = format!(
@@ -393,12 +396,14 @@ impl ProgressManager {
             style("⚠").yellow().bold(),
             n
         );
-        let shown: Vec<&Arc<str>> = self.not_installed.iter().take(3).collect();
-        let mut body = shown
+        const NAME_DISPLAY_LIMIT: usize = 20;
+        let shown: Vec<String> = self
+            .not_installed
             .iter()
-            .map(|s| s.as_ref().to_string())
-            .collect::<Vec<_>>()
-            .join(" · ");
+            .take(3)
+            .map(|s| truncate(s, NAME_DISPLAY_LIMIT))
+            .collect();
+        let mut body = shown.join(" · ");
         if n > shown.len() {
             body.push_str(" …");
         }
@@ -986,6 +991,85 @@ mod tests {
         assert!(
             !rendered.contains("Loading"),
             "loading bar must be cleared after the run; got:\n{rendered}"
+        );
+    }
+
+    /// 未インストール警告で各 name が**個別に** truncate されることを検証する。
+    /// logid のような共通切り詰めだと複数プラグインで判読不能になるため、
+    /// 長い name（20字超）だけ `……` 付きで切り詰め、短い name は崩さない。
+    #[test]
+    fn warn_not_installed_truncates_each_name_individually() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        // 1 つ目は20字超の name（truncate 対象）、2 つ目は短い name（そのまま表示）
+        m.process(Message::PluginNotInstalled(Arc::from(
+            "abcdefghijklmnopqrstuvwxyz",
+        )));
+        m.process(Message::PluginNotInstalled(Arc::from("short")));
+
+        m.process(Message::LoadDone);
+
+        let rendered = {
+            let s = screen.lock().unwrap();
+            s.rows
+                .iter()
+                .map(|r| console::strip_ansi_codes(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // 長い name は個別に truncate されて `……` を含む
+        assert!(
+            rendered.contains("……"),
+            "long name should be truncated individually; got:\n{rendered}"
+        );
+        // 短い name は崩れずそのまま表示される
+        assert!(
+            rendered.contains("short"),
+            "short name should be shown as-is; got:\n{rendered}"
+        );
+        // 2 件は ` · ` で結合され、件数ヘッダが付く
+        assert!(
+            rendered.contains("2 plugins not installed"),
+            "header should report the count; got:\n{rendered}"
+        );
+    }
+
+    /// 4 件以上の未インストールは先頭 3 件を個別 truncate して表示し、
+    /// 残りを ` …` で省略することを検証する。
+    #[test]
+    fn warn_not_installed_ellipsis_when_more_than_three() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        for s in ["aaaa", "bbbb", "cccc", "dddd"] {
+            m.process(Message::PluginNotInstalled(Arc::from(s)));
+        }
+        m.process(Message::LoadDone);
+
+        let rendered = {
+            let s = screen.lock().unwrap();
+            s.rows
+                .iter()
+                .map(|r| console::strip_ansi_codes(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            rendered.contains("4 plugins not installed"),
+            "header should report 4; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(" …"),
+            "remaining plugins should be elided; got:\n{rendered}"
+        );
+        // 先頭3件は表示され、4件目は表示されない
+        assert!(rendered.contains("aaaa"), "got:\n{rendered}");
+        assert!(
+            !rendered.contains("dddd"),
+            "4th should be hidden; got:\n{rendered}"
         );
     }
 }
