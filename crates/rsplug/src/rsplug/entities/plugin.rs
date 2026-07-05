@@ -133,6 +133,16 @@ impl RepoSource {
             }
         }
     }
+
+    /// token 認証の対象となる GitHub HTTPS URL かどうか。
+    /// `GitHub` バリアントは常に true（`github::url()` が HTTPS を生成）。
+    /// `Git` バリアントは `https://github.com/` で始まる場合 true。
+    pub fn is_github_https(&self) -> bool {
+        match self {
+            RepoSource::GitHub { .. } => true,
+            RepoSource::Git { url, .. } => url.starts_with("https://github.com/"),
+        }
+    }
 }
 
 // 新しい cache layout のパスヘルパ群 (PLANS §5, §15.2)。
@@ -274,6 +284,7 @@ impl Plugin {
         update: bool,
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
+        semaphore: adaptive_semaphore::AdaptiveSemaphore,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         use super::{util::git, *};
         use crate::{
@@ -327,6 +338,22 @@ impl Plugin {
         let worktrees = worktrees_dir(&r_root);
         let url: Arc<str> = Arc::from(repo.url());
 
+        // GitHub HTTPS URL かつ環境変数に token があれば認証フェッチする。
+        let token = if repo.is_github_https() {
+            match util::github::token() {
+                Some(s) => Some(Arc::<str>::from(s)),
+                None => {
+                    msg(Message::Cache(
+                        "Warning: anonymous GitHub fetch (set GITHUB_TOKEN to avoid rate limits)",
+                        url.clone(),
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // バリアント固有のフィールドを抽出（ログ・エラー表示用）
         let (rev, logid, repo_name): (Option<Arc<str>>, String, Arc<str>) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
@@ -367,15 +394,17 @@ impl Plugin {
         } else {
             match latest_snapshot_oid(&worktrees).await? {
                 Some(_) if update => {
+                    let _permit = semaphore.acquire().await;
                     msg(Message::Cache("Updating", url.clone()));
-                    let oid = git::ls_remote(url.clone(), rev.clone()).await?;
+                    let oid = git::ls_remote(url.clone(), rev.clone(), token.clone()).await?;
                     msg(Message::Cache("Updating:done", url.clone()));
                     oid
                 }
                 Some(existing) => existing,
                 None if install => {
+                    let _permit = semaphore.acquire().await;
                     msg(Message::Cache("Updating", url.clone()));
-                    let oid = git::ls_remote(url.clone(), rev.clone()).await?;
+                    let oid = git::ls_remote(url.clone(), rev.clone(), token.clone()).await?;
                     msg(Message::Cache("Updating:done", url.clone()));
                     oid
                 }
@@ -398,6 +427,7 @@ impl Plugin {
         let mut source_repo = match git::open_source(&source_git).await {
             Ok(r) => r,
             Err(_) if install || update => {
+                let _permit = semaphore.acquire().await;
                 msg(Message::Cache("Initializing", url.clone()));
                 git::init_source(&source_git, &url).await?
             }
@@ -415,8 +445,11 @@ impl Plugin {
                 return Ok(None);
             }
         };
-        msg(Message::Cache("Fetching", url.clone()));
-        source_repo.fetch_oid(oid).await?;
+        {
+            let _permit = semaphore.acquire().await;
+            msg(Message::Cache("Fetching", url.clone()));
+            source_repo.fetch_oid(oid, token.clone()).await?;
+        }
 
         // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
         tokio::fs::create_dir_all(&worktrees).await?;
@@ -883,6 +916,42 @@ mod tests {
     }
 
     #[test]
+    fn is_github_https_classifies_correctly() {
+        // GitHub shorthand — always HTTPS
+        assert!(
+            RepoSource::from_str("owner/repo")
+                .unwrap()
+                .is_github_https()
+        );
+        assert!(
+            RepoSource::from_str("owner/repo@v1.0")
+                .unwrap()
+                .is_github_https()
+        );
+
+        // Git variant — HTTPS GitHub URL
+        assert!(
+            RepoSource::from_str("https://github.com/owner/repo.git")
+                .unwrap()
+                .is_github_https()
+        );
+
+        // Git variant — non-GitHub HTTPS
+        assert!(
+            !RepoSource::from_str("https://gitlab.com/owner/repo.git")
+                .unwrap()
+                .is_github_https()
+        );
+
+        // Git variant — SSH (not HTTPS, even if GitHub)
+        assert!(
+            !RepoSource::from_str("ssh://git@github.com/owner/repo.git")
+                .unwrap()
+                .is_github_https()
+        );
+    }
+
+    #[test]
     fn path_helpers_lay_out_source_git_and_worktrees() {
         let repo = RepoSource::from_str("owner/repo").unwrap();
         let cache_dir = Path::new("cache");
@@ -968,7 +1037,13 @@ mod tests {
             let plugin = Plugin::new(config).unwrap().next().unwrap();
 
             plugin
-                .load(false, false, std::env::temp_dir(), None)
+                .load(
+                    false,
+                    false,
+                    std::env::temp_dir(),
+                    None,
+                    adaptive_semaphore::AdaptiveSemaphore::new(),
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -1045,7 +1120,13 @@ mod tests {
         let cachedir = plugin.cache.repo.as_ref().unwrap().default_cachedir();
         let repo_root = cache.join(&cachedir);
         let (loaded, lock_info) = plugin
-            .load(true, false, &cache, None)
+            .load(
+                true,
+                false,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1080,7 +1161,13 @@ mod tests {
         .unwrap();
         let plugin2 = Plugin::new(config2).unwrap().next().unwrap();
         let (loaded2, _) = plugin2
-            .load(true, false, &cache, None)
+            .load(
+                true,
+                false,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1162,7 +1249,13 @@ mod tests {
         .unwrap();
         let plugin = Plugin::new(config).unwrap().next().unwrap();
         let (loaded_a, _) = plugin
-            .load(true, false, &cache, None)
+            .load(
+                true,
+                false,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1190,7 +1283,13 @@ mod tests {
         .unwrap();
         let plugin2 = Plugin::new(config2).unwrap().next().unwrap();
         let (loaded_b, lock_b) = plugin2
-            .load(false, true, &cache, None)
+            .load(
+                false,
+                true,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1276,7 +1375,16 @@ mod tests {
 
         // (1) 未インストール + update 単独 → スキップ。キャッシュは一切作らない。
         let plugin = Plugin::new(mk_cfg()).unwrap().next().unwrap();
-        let result = plugin.load(false, true, &cache, None).await.unwrap();
+        let result = plugin
+            .load(
+                false,
+                true,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
+            .await
+            .unwrap();
         assert!(
             result.is_none(),
             "update alone must skip an uninstalled repo, got {result:?}"
@@ -1293,7 +1401,13 @@ mod tests {
         // (2) 念のため `-u -i`（install+update）なら未インストールでも install する。
         let plugin2 = Plugin::new(mk_cfg()).unwrap().next().unwrap();
         let (loaded, _) = plugin2
-            .load(true, true, &cache, None)
+            .load(
+                true,
+                true,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
             .await
             .unwrap()
             .expect("install+update should install an uninstalled repo");
@@ -1363,7 +1477,13 @@ mod tests {
         // 1 回目: install → build 実行 → log に 1 行
         let plugin = Plugin::new(mk_cfg()).unwrap().next().unwrap();
         let _ = plugin
-            .load(true, false, &cache, None)
+            .load(
+                true,
+                false,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1376,7 +1496,13 @@ mod tests {
         // 2 回目: 同じ入力で再 load → snapshot 再利用 → build スキップ → log 行数は 1 のまま
         let plugin2 = Plugin::new(mk_cfg()).unwrap().next().unwrap();
         let _ = plugin2
-            .load(true, false, &cache, None)
+            .load(
+                true,
+                false,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+            )
             .await
             .unwrap()
             .unwrap();

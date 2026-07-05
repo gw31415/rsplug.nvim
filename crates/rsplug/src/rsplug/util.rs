@@ -151,7 +151,7 @@ pub mod git {
         }
 
         /// source.git に指定 oid を fetch する（HEAD も作業ツリーも変えない）。
-        pub async fn fetch_oid(&mut self, oid: Oid) -> Result<(), Error> {
+        pub async fn fetch_oid(&mut self, oid: Oid, token: Option<Arc<str>>) -> Result<(), Error> {
             let repo = self.0.clone();
             spawn_blocking(move || {
                 let repo = repo.lock().unwrap();
@@ -163,7 +163,7 @@ pub mod git {
                 let shallow = remote.url().map(|u| !is_local_transport(u)).unwrap_or(true);
                 remote.fetch(
                     &[oid.to_string()],
-                    Some(&mut build_fetch_options(oid, shallow)),
+                    Some(&mut build_fetch_options(oid, shallow, token)),
                     None,
                 )?;
                 Ok(())
@@ -226,7 +226,11 @@ pub mod git {
         url.starts_with("file://") || !url.contains("://")
     }
 
-    fn build_fetch_options(rev: Oid, shallow: bool) -> FetchOptions<'static> {
+    fn build_fetch_options(
+        rev: Oid,
+        shallow: bool,
+        token: Option<Arc<str>>,
+    ) -> FetchOptions<'static> {
         let mut cbs = RemoteCallbacks::new();
         let last_reported = Cell::new(0usize);
         let last_tick = Cell::new(Instant::now());
@@ -251,6 +255,13 @@ pub mod git {
             }
             true
         });
+        // token が利用可能な場合のみ credentials コールバックを設定。
+        // GitHub は x-access-token をユーザー名として token をパスワードにする規約。
+        if let Some(token) = token {
+            cbs.credentials(move |_url, _username_from_url, _allowed_types| {
+                git2::Cred::userpass_plaintext("x-access-token", &token)
+            });
+        }
         let mut ops = FetchOptions::new();
         ops.download_tags(git2::AutotagOption::None)
             .remote_callbacks(cbs);
@@ -415,10 +426,23 @@ pub mod git {
     pub async fn ls_remote(
         url: Arc<str>,
         rev: Option<impl Deref<Target = str> + Send + 'static>,
+        token: Option<Arc<str>>,
     ) -> Result<Oid, Error> {
         spawn_blocking(move || {
             let mut remote = git2::Remote::create_detached(url.to_string()).unwrap();
-            let connection = remote.connect_auth(git2::Direction::Fetch, None, None)?;
+
+            // token が利用可能な場合のみ credentials コールバックを設定。
+            let cbs = if let Some(token) = token {
+                let mut cbs = git2::RemoteCallbacks::new();
+                cbs.credentials(move |_url, _username_from_url, _allowed_types| {
+                    git2::Cred::userpass_plaintext("x-access-token", &token)
+                });
+                Some(cbs)
+            } else {
+                None
+            };
+
+            let connection = remote.connect_auth(git2::Direction::Fetch, cbs, None)?;
             let references = connection.list().unwrap();
             let latest = if let Some(rev) = rev.as_deref() {
                 let rev = wildmatch::WildMatch::new(rev);
@@ -468,6 +492,18 @@ pub mod github {
         url.push('/');
         url.push_str(repo);
         url
+    }
+
+    /// GitHub 認証 token を環境変数から取得する。
+    /// `GITHUB_TOKEN` → `GH_TOKEN` の順でチェック（gh CLI と同じ規約）。
+    /// どちらもなければ `None`（anonymous フォールバック）。
+    pub fn token() -> Option<&'static str> {
+        let val = std::env::var("GITHUB_TOKEN")
+            .or_else(|_| std::env::var("GH_TOKEN"))
+            .ok()?;
+        // Box::leak は &'static mut str を返すが、関数シグネチャに合わせて
+        // &'static str にキャストする（所有権は放棄、プロセス終了まで生存）。
+        Some(Box::leak(val.into_boxed_str()))
     }
 }
 
@@ -602,6 +638,25 @@ mod tests {
         assert_eq!(truncate(&"ééééabcd", 8), "ééééabcd");
         assert_eq!(truncate(&"aあいうえ", 8), "aあ……");
         assert_eq!(truncate(&"🙂🙂abcdef", 8), "🙂🙂……");
+    }
+
+    #[test]
+    fn github_token_prefers_github_token_over_gh_token() {
+        // SAFETY: テストは直列実行される。環境変数を設定・復元する。
+        unsafe {
+            // GITHUB_TOKEN があればそちらを優先
+            std::env::set_var("GITHUB_TOKEN", "primary-token");
+            std::env::set_var("GH_TOKEN", "secondary-token");
+            assert_eq!(github::token(), Some("primary-token"));
+
+            // GITHUB_TOKEN がなければ GH_TOKEN
+            std::env::remove_var("GITHUB_TOKEN");
+            assert_eq!(github::token(), Some("secondary-token"));
+
+            // どちらもなければ None
+            std::env::remove_var("GH_TOKEN");
+        }
+        assert_eq!(github::token(), None);
     }
 
     #[tokio::test]
