@@ -340,16 +340,7 @@ impl Plugin {
 
         // GitHub HTTPS URL かつ環境変数に token があれば認証フェッチする。
         let token = if repo.is_github_https() {
-            match util::github::token() {
-                Some(s) => Some(Arc::<str>::from(s)),
-                None => {
-                    msg(Message::Cache(
-                        "Warning: anonymous GitHub fetch (set GITHUB_TOKEN to avoid rate limits)",
-                        url.clone(),
-                    ));
-                    None
-                }
-            }
+            util::github::token().map(Arc::<str>::from)
         } else {
             None
         };
@@ -445,11 +436,16 @@ impl Plugin {
                 return Ok(None);
             }
         };
-        {
+        // fetch 許可取得後〜load() 戻りまでを「稼働中」とする。permit は fetch
+        // ブロック内だけで離す（build は semaphore 外で並列に走らせるため）が、
+        // ガードはブロックの戻り値として外側に移動し、関数の終わりまで残す。
+        let _running_guard = {
             let _permit = semaphore.acquire().await;
             msg(Message::Cache("Fetching", url.clone()));
+            let guard = RunningGuard::new();
             source_repo.fetch_oid(oid, token.clone()).await?;
-        }
+            guard
+        };
 
         // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
         tokio::fs::create_dir_all(&worktrees).await?;
@@ -624,6 +620,31 @@ fn display_name(source_name: &Option<String>, logid: &str) -> Arc<str> {
     match source_name {
         Some(name) => Arc::from(name.as_str()),
         None => Arc::from(logid),
+    }
+}
+
+/// Loading 全体進捗バーの「稼働中」区間を +1 / -1 する RAII ガード。
+///
+/// fetch 許可を取得してネットワーク実作業に入った時点で `new()` が +1 し
+/// （`LoadPluginRunning`）、`load()` の戻りとともに `Drop` が -1 する
+/// （`LoadPluginRunningDone`）。成功・エラー全経路で対になる。
+///
+/// 従来は完了時の `LoadPluginDone` だけで全体バーが進んだため、パイプライン
+/// 充填中や並列度立ち上がり時にバーが長く 0% で止まり、最後に一気に進んで見えた。
+/// このガードの区間を「稼働中」としてバーに □ で可視化することで、作業中の
+/// 実体を逐次反映する。
+struct RunningGuard;
+
+impl RunningGuard {
+    fn new() -> Self {
+        crate::log::msg(crate::log::Message::LoadPluginRunning);
+        RunningGuard
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        crate::log::msg(crate::log::Message::LoadPluginRunningDone);
     }
 }
 

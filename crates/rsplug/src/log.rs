@@ -1,13 +1,19 @@
 use console::style;
 use hashbrown::{HashMap, hash_map::Entry};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{
+    MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle,
+    style::ProgressTracker,
+};
 use once_cell::sync::Lazy;
 use std::{
     fmt::{Display, Formatter, Result as FmtResult},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthStr;
@@ -37,6 +43,11 @@ pub enum Message {
         total: usize,
     },
     LoadPluginDone,
+    /// プラグインが fetch 許可を取得し、ネットワーク実作業に入った（=稼働中 +1）。
+    /// `LoadPluginRunningDone` と対で用い、load() の戻りまでを「稼働中」とする。
+    LoadPluginRunning,
+    /// 稼働中プラグインの完了（=稼働中 -1）。`RunningGuard` の Drop で送出される。
+    LoadPluginRunningDone,
     LoadDone,
     /// フラグなし実行でキャッシュが無くロードできなかった（未インストール）。
     PluginNotInstalled(Arc<str>),
@@ -246,12 +257,26 @@ impl Display for ConfigList {
     }
 }
 
+/// レベル1子バー（Fetching / Updating / Building）の追加順を追跡するキー。
+/// 最後の子に `└─`、それ以外に `├─` を割り当てるために使う。
+/// MultiProgress は挿入順に描画するため、追加順＝表示順に依存できる。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChildKey {
+    /// Fetching / Initializing ステージ行（`progress_bars[CACHE_FETCH_STAGE_ID]`）。
+    FetchStage,
+    /// Updating 行（`self.updating_bar`）。
+    Updating,
+    /// ビルド行（`progress_bars[id]`）。
+    Building(Arc<String>),
+}
+
 struct ProgressManager {
     multipb: MultiProgress,
     pb_style: ProgressStyle,
-    pb_style_spinner: ProgressStyle,
-    pb_style_bar: ProgressStyle,
-    pb_style_loading: ProgressStyle,
+    pb_style_spinner_mid: ProgressStyle,
+    pb_style_spinner_last: ProgressStyle,
+    pb_style_bar_last: ProgressStyle,
+    pb_style_bar_last_nolead: ProgressStyle,
     pb_style_summary: ProgressStyle,
 
     // State
@@ -263,8 +288,13 @@ struct ProgressManager {
     cache_updating_fetching: HashMap<String, ()>,
     cache_updating_current: Option<String>,
     updating_bar: Option<BarState>,
+    /// レベル1子バーの追加順。最後の子の罫線を `└─` に切り替えるために使う。
+    child_order: Vec<ChildKey>,
     config_files: Vec<Arc<Path>>,
     osc94: Option<OSC94>,
+    /// Loading バーの「稼働中」計数。LoadBegin でバー生成時に作り、
+    /// `dualbar`/`active` トラッカーと共有する。LoadDone で破棄。
+    loading_running: Option<Arc<AtomicUsize>>,
 }
 
 struct BarState {
@@ -306,6 +336,91 @@ fn sanitize_build_line(line: &str) -> Option<String> {
     Some(trimmed.replace('\n', " "))
 }
 
+/// Loading 全体進捗バーの固定セル幅。
+/// `wide_bar` と違いカスタムトラッカーで自前描画するため、`ProgressState` からは
+/// 端末幅が取れない（描画幅はトラッカーに渡されない）。よって固定幅とし、
+/// `dual_bar_cells` で確定的に計算してテスト可能にする。
+const LOADING_BAR_CELLS: usize = 40;
+
+/// `width` セルのバーを (Done, 稼働中, 未実行) に配分する。
+/// 端数は切り捨てて Done→稼働中の順に確保し、合計が常に `width` になるよう
+/// 未実行で調整する（稼働中が Done の右隣に連続して描かれる）。
+fn dual_bar_cells(done: u64, running: u64, len: u64, width: usize) -> (usize, usize, usize) {
+    let width = width as u64;
+    let len = len.max(1);
+    let done_cells = (done * width / len).min(width) as usize;
+    let running_cells = ((running * width / len).min(width - done_cells as u64)) as usize;
+    let idle_cells = width as usize - done_cells - running_cells;
+    (done_cells, running_cells, idle_cells)
+}
+
+/// Loading バー本体: `■`(Done=cyan) + `□`(稼働中=yellow) + (空白=未実行)。
+#[derive(Clone)]
+struct DualBarTracker {
+    running: Arc<AtomicUsize>,
+}
+
+impl ProgressTracker for DualBarTracker {
+    fn clone_box(&self) -> Box<dyn ProgressTracker> {
+        Box::new(self.clone())
+    }
+    fn tick(&mut self, _state: &ProgressState, _now: Instant) {}
+    fn reset(&mut self, _state: &ProgressState, _now: Instant) {}
+    fn write(&self, state: &ProgressState, w: &mut dyn std::fmt::Write) {
+        let done = state.pos();
+        let len = state.len().unwrap_or(done).max(1);
+        let running = self.running.load(Ordering::Relaxed) as u64;
+        let (done_cells, running_cells, idle_cells) =
+            dual_bar_cells(done, running, len, LOADING_BAR_CELLS);
+        let _ = write!(
+            w,
+            "{}{}{}",
+            style("■".repeat(done_cells)).cyan(),
+            style("□".repeat(running_cells)).yellow(),
+            " ".repeat(idle_cells),
+        );
+    }
+}
+
+/// Loading バーの注釈: 稼働中 repo 数（`pos/len` に続けて `N active`）。
+#[derive(Clone)]
+struct ActiveTracker {
+    running: Arc<AtomicUsize>,
+}
+
+impl ProgressTracker for ActiveTracker {
+    fn clone_box(&self) -> Box<dyn ProgressTracker> {
+        Box::new(self.clone())
+    }
+    fn tick(&mut self, _state: &ProgressState, _now: Instant) {}
+    fn reset(&mut self, _state: &ProgressState, _now: Instant) {}
+    fn write(&self, _state: &ProgressState, w: &mut dyn std::fmt::Write) {
+        let running = self.running.load(Ordering::Relaxed);
+        // 先頭の区切り空白はテンプレート側 ({pos}/{len} {active}) が持つ。
+        let _ = write!(
+            w,
+            "{} {}",
+            style(running).yellow().bold(),
+            style("active").dim(),
+        );
+    }
+}
+
+/// Loading バーの ProgressStyle。`dualbar`(本体) と `active`(稼働中数) を
+/// 共有の稼働中計数 `running` に束ねる。spinner / prefix は既存スタイルを維持。
+fn loading_style(running: Arc<AtomicUsize>) -> ProgressStyle {
+    ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {dualbar} {pos}/{len} {active}")
+        .unwrap()
+        .with_key(
+            "dualbar",
+            DualBarTracker {
+                running: running.clone(),
+            },
+        )
+        .with_key("active", ActiveTracker { running })
+        .tick_strings(&["◒", "◐", "◓", "◑", " "])
+}
+
 impl ProgressManager {
     fn new() -> Self {
         Self::build(ProgressDrawTarget::stderr())
@@ -318,18 +433,30 @@ impl ProgressManager {
     }
 
     fn build(draw_target: ProgressDrawTarget) -> Self {
+        // ツリー罫線で階層を表現する:
+        //   Loading は親（レベル0）、Fetching/Building/Updating は子（レベル1）、
+        //   フェッチオブジェクト進捗は孫（レベル2）。
         let pb_style = ProgressStyle::with_template("{prefix:.blue.bold} {wide_msg}").unwrap();
-        let pb_style_spinner =
-            ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {wide_msg}")
+        // レベル1 子バー。中間は ├─、最後の子は └─（refresh_connectors で切替）。
+        let pb_style_spinner_mid =
+            ProgressStyle::with_template("{spinner}  ├─ {prefix:.blue.bold} {wide_msg}")
                 .unwrap()
                 .tick_strings(&["◒", "◐", "◓", "◑", " "]);
-        let pb_style_bar = ProgressStyle::with_template(
-            "{spinner} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
+        let pb_style_spinner_last =
+            ProgressStyle::with_template("{spinner}  └─ {prefix:.blue.bold} {wide_msg}")
+                .unwrap()
+                .tick_strings(&["◒", "◐", "◓", "◑", " "]);
+        // レベル2 孫バー（フェッチオブジェクト進捗、単一）。常に └─。
+        // 先頭の │ は親(FetchStage)が最後の子でないときだけ出す。
+        let pb_style_bar_last = ProgressStyle::with_template(
+            "{spinner}  │  └─ [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
         )
         .unwrap()
-        .progress_chars("■□ ");
-        let pb_style_loading = ProgressStyle::with_template(
-            "{spinner} {prefix:.blue.bold} {wide_bar:.cyan/blue} {pos}/{len}",
+        .progress_chars("■□ ")
+        .tick_strings(&["◒", "◐", "◓", "◑", " "]);
+        // 親(FetchStage)が最後の子のときは │ を空白で段揃え（`  │  `=5セル → 空白5つ）。
+        let pb_style_bar_last_nolead = ProgressStyle::with_template(
+            "{spinner}     └─ [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
         )
         .unwrap()
         .progress_chars("■□ ")
@@ -350,9 +477,10 @@ impl ProgressManager {
         Self {
             multipb,
             pb_style,
-            pb_style_spinner,
-            pb_style_bar,
-            pb_style_loading,
+            pb_style_spinner_mid,
+            pb_style_spinner_last,
+            pb_style_bar_last,
+            pb_style_bar_last_nolead,
             pb_style_summary,
             progress_bars: HashMap::from([("config_files".to_string(), barstate)]),
             installskipped_count: 0,
@@ -362,27 +490,88 @@ impl ProgressManager {
             cache_updating_fetching: HashMap::new(),
             cache_updating_current: None,
             updating_bar: None,
+            child_order: Vec::new(),
             config_files: Vec::new(),
             osc94: None,
+            loading_running: None,
         }
     }
 
+    /// 子キーから対応するアクティブな BarState を引く。
+    /// バーが既に除去されている（Map/Option に無い）場合は None。
+    fn child_bar(&self, key: &ChildKey) -> Option<&BarState> {
+        match key {
+            ChildKey::FetchStage => self.progress_bars.get(CACHE_FETCH_STAGE_ID),
+            ChildKey::Updating => self.updating_bar.as_ref(),
+            ChildKey::Building(id) => self.progress_bars.get(id.as_str()),
+        }
+    }
+
+    /// 子バーの追加/除去後に呼び、追加順に従い最後の子に └─・それ以外に ├─ を当て直す。
+    /// 併せて孫バー(cache_fetch_progress)の罫線も、親(FetchStage)が最後か否かで切り替える。
+    /// set_style 自体は即時描画しないが各バーは steady_tick(100ms) で再描画され、
+    /// prefix/message は保持される（indicatif 0.18 で確認）。
+    fn refresh_connectors(&self) {
+        let last = self.child_order.last();
+        for key in &self.child_order {
+            let Some(bs) = self.child_bar(key) else {
+                continue;
+            };
+            let style = if Some(key) == last {
+                self.pb_style_spinner_last.clone()
+            } else {
+                self.pb_style_spinner_mid.clone()
+            };
+            bs.bar.set_style(style);
+        }
+        // 孫バー。親(FetchStage)が最後の子のときだけ先頭の │ を消して段揃えする。
+        if let Some(gc) = self.progress_bars.get(CACHE_FETCH_PROGRESS_ID) {
+            let fetch_is_last = last == Some(&ChildKey::FetchStage);
+            let style = if fetch_is_last {
+                self.pb_style_bar_last_nolead.clone()
+            } else {
+                self.pb_style_bar_last.clone()
+            };
+            gc.bar.set_style(style);
+        }
+    }
+
+    /// 新しいレベル1子バーを追加順の末尾に登録し、罫線を再計算する。
+    /// 既に同じキーが登録済みなら何もしない（二重 add 防止）。
+    fn register_child(&mut self, key: ChildKey) {
+        if !self.child_order.contains(&key) {
+            self.child_order.push(key);
+        }
+        self.refresh_connectors();
+    }
+
+    /// レベル1子バーを登録から外し、罫線を再計算する。
+    fn unregister_child(&mut self, key: &ChildKey) {
+        self.child_order.retain(|k| k != key);
+        self.refresh_connectors();
+    }
+
     fn ensure_fetch_stage(&mut self, stage: &'static str, url: &str) {
+        let existed = self.progress_bars.contains_key(CACHE_FETCH_STAGE_ID);
         let bar_state = self
             .progress_bars
             .entry(CACHE_FETCH_STAGE_ID.to_string())
             .or_insert_with(|| {
-                let pb = ProgressBar::new_spinner().with_style(self.pb_style_spinner.clone());
+                let pb = ProgressBar::new_spinner().with_style(self.pb_style_spinner_mid.clone());
                 pb.enable_steady_tick(Duration::from_millis(100));
                 BarState::new(self.multipb.add(pb))
             });
         bar_state.bar.set_prefix(stage);
         bar_state.set_message_if_changed(url.to_string());
+        if !existed {
+            self.register_child(ChildKey::FetchStage);
+        }
     }
 
     fn clear_fetch_stage(&mut self) {
         if let Some(pb) = self.progress_bars.remove(CACHE_FETCH_STAGE_ID) {
             pb.bar.finish_and_clear();
+            self.unregister_child(&ChildKey::FetchStage);
         }
     }
 
@@ -466,9 +655,10 @@ impl ProgressManager {
                 match r#type {
                     "Updating" | "Updating:done" => {
                         let url = url.to_string();
+                        let existed = self.updating_bar.is_some();
                         let pb = self.updating_bar.get_or_insert_with(|| {
                             let bar = ProgressBar::new_spinner()
-                                .with_style(self.pb_style_spinner.clone())
+                                .with_style(self.pb_style_spinner_mid.clone())
                                 .with_prefix("Updating");
                             bar.enable_steady_tick(Duration::from_millis(100));
                             BarState::new(self.multipb.add(bar))
@@ -498,6 +688,9 @@ impl ProgressManager {
                             }
                             _ => {}
                         }
+                        if !existed {
+                            self.register_child(ChildKey::Updating);
+                        }
                     }
                     _ => {
                         let pb = {
@@ -523,7 +716,14 @@ impl ProgressManager {
                 total_objs_count,
                 received_objs_count,
             } => {
-                let style = self.pb_style_bar.clone();
+                // 孫バー（単一）は常に └─。先頭の │ は親(FetchStage)が最後の子でない
+                // ときだけ出す。親位置がその後変われば register/unregister の
+                // refresh_connectors が追従する。
+                let style = if self.child_order.last() == Some(&ChildKey::FetchStage) {
+                    self.pb_style_bar_last_nolead.clone()
+                } else {
+                    self.pb_style_bar_last.clone()
+                };
                 let pb = self
                     .progress_bars
                     .entry(CACHE_FETCH_PROGRESS_ID.to_string())
@@ -562,8 +762,9 @@ impl ProgressManager {
                             .push_str(&" ".repeat(MAX_PREFIX_WIDTH.saturating_sub(prefix.width())));
                         prefix
                     };
+                    let existed = self.progress_bars.contains_key(id.as_str());
                     let bar = self.progress_bars.entry(id.to_string()).or_insert_with(|| {
-                        let style = self.pb_style_spinner.clone();
+                        let style = self.pb_style_spinner_mid.clone();
                         let pb = ProgressBar::new_spinner().with_style(style);
                         pb.enable_steady_tick(Duration::from_millis(100));
                         BarState::new(self.multipb.add(pb.with_prefix(prefix.clone())))
@@ -580,6 +781,9 @@ impl ProgressManager {
                     );
                     bar.set_message_if_changed(message);
                     bar.bar.set_prefix(prefix);
+                    if !existed {
+                        self.register_child(ChildKey::Building(id));
+                    }
                 }
             }
             Message::CacheBuildFinished { id, success } => {
@@ -592,18 +796,37 @@ impl ProgressManager {
                         pb_state.bar.finish_with_message(format!("[{id}] failed"));
                     }
                 }
+                // 終了したビルド行をツリーから外し、残りの最後の子を └─ に再計算する。
+                self.unregister_child(&ChildKey::Building(id));
             }
             Message::LoadBegin { total } => {
+                // 全体進捗バーは「稼働中」を可視化するため二色セルで描画する:
+                //   ■ Done(=pos) / □ 稼働中(=running) / (空白) 未実行
+                // 従来は完了数(pos)のみで進んだため、パイプライン充填中や
+                // 並列度立ち上がり時にバーが長く 0% で止まり、最後に一気に進んで見えた。
+                // 稼働中セルと注釈の「N active」で、作業中の実体を逐次反映する。
+                let running = Arc::new(AtomicUsize::new(0));
                 let pb = ProgressBar::new(total as u64)
-                    .with_style(self.pb_style_loading.clone())
+                    .with_style(loading_style(running.clone()))
                     .with_prefix("Loading");
                 pb.enable_steady_tick(Duration::from_millis(120));
                 let bar = BarState::new(self.multipb.add(pb));
                 self.progress_bars.insert("loading".to_string(), bar);
+                self.loading_running = Some(running);
                 // Loading フェーズは OSC 9;4 を不定(割合なし)にする。
                 self.osc94
                     .get_or_insert_with(OSC94::new)
                     .progress::<u8>(None);
+            }
+            Message::LoadPluginRunning => {
+                if let Some(running) = self.loading_running.as_ref() {
+                    running.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Message::LoadPluginRunningDone => {
+                if let Some(running) = self.loading_running.as_ref() {
+                    running.fetch_sub(1, Ordering::Relaxed);
+                }
             }
             Message::LoadPluginDone => {
                 if let Some(state) = self.progress_bars.get_mut("loading") {
@@ -613,6 +836,8 @@ impl ProgressManager {
             Message::LoadDone => {
                 self.clear_fetch_stage();
                 drop(self.osc94.take());
+                // これ以降稼働中計数は更新されない（バーは MergeFinished まで残留表示）。
+                self.loading_running = None;
                 let mut pbs = std::mem::take(&mut self.progress_bars);
                 if let Some(pb) = pbs.remove(CACHE_FETCH_PROGRESS_ID) {
                     pb.bar.set_style(self.pb_style.clone());
@@ -620,6 +845,7 @@ impl ProgressManager {
                 }
                 if let Some(pb) = self.updating_bar.take() {
                     pb.bar.finish_and_clear();
+                    self.unregister_child(&ChildKey::Updating);
                 }
                 for (key, pb) in pbs {
                     // "loading" は MergeFinished でサマリーに差し替えるまで残す。
@@ -635,6 +861,8 @@ impl ProgressManager {
                     }
                     pb.bar.finish_and_clear();
                 }
+                // 全レベル1子バー(Fetching/Updating/Building)を破棄したので追加順も空にする。
+                self.child_order.clear();
                 if !self.not_installed.is_empty() {
                     self.warn_not_installed();
                 }
@@ -1070,6 +1298,95 @@ mod tests {
         assert!(
             !rendered.contains("dddd"),
             "4th should be hidden; got:\n{rendered}"
+        );
+    }
+
+    fn screen_rendered(screen: &Arc<Mutex<Screen>>) -> String {
+        let s = screen.lock().unwrap();
+        s.rows
+            .iter()
+            .map(|r| console::strip_ansi_codes(r))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 二色バーのセル配分: ■(Done) → □(稼働中) → (空白=未実行) の順に確保し、
+    /// 常に合計 = width になること。稼働中は Done の右隣に連続して描かれる。
+    #[test]
+    fn dual_bar_cells_allocates_done_then_running_then_idle() {
+        // 1 cell per plugin (len=10, width=10).
+        let (done, running, idle) = dual_bar_cells(3, 2, 10, 10);
+        assert_eq!((done, running, idle), (3, 2, 5));
+        assert_eq!(done + running + idle, 10);
+
+        // 稼働中が Done の領域を侵さない（Done 優先、残りを稼働中に clamp）。
+        let (done, running, idle) = dual_bar_cells(8, 5, 10, 10);
+        assert_eq!((done, running, idle), (8, 2, 0));
+
+        // 端数は切り捨て。130 plugins, width 40: done=65 -> 20, running=8 -> 2.
+        let (done, running, idle) = dual_bar_cells(65, 8, 130, LOADING_BAR_CELLS);
+        assert_eq!((done, running, idle), (20, 2, 18));
+
+        // len=0 でも安全（分母を max(1) で護る）。
+        let (done, running, idle) = dual_bar_cells(0, 0, 0, LOADING_BAR_CELLS);
+        assert_eq!((done, running, idle), (0, 0, LOADING_BAR_CELLS));
+    }
+
+    /// 完了 0 のときでも稼働中 □ と「N active」が見えること＝本修正の目的。
+    /// 従来は完了時の inc だけでバーが進み、パイプライン充填中は 0/len で止まった。
+    /// その後プラグインが完了すると ■ も現れ、両領域が同時に見える。
+    #[test]
+    fn loading_bar_shows_running_region_even_at_zero_done() {
+        let (term, screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        m.process(Message::LoadBegin { total: 10 });
+        // 3 プラグインが fetch を開始（稼働中）。完了はまだ 0。
+        for _ in 0..3 {
+            m.process(Message::LoadPluginRunning);
+        }
+        // 稼働中の更新は inc を伴わないため steady_tick(120ms) の描画を待つ。
+        std::thread::sleep(Duration::from_millis(180));
+
+        let rendered = screen_rendered(&screen);
+        assert!(
+            rendered.contains('□'),
+            "running region must show before any completion; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("0/10"),
+            "pos/len at zero done; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("3 active"),
+            "running count in annotation; got:\n{rendered}"
+        );
+
+        // 2 プラグイン完了 → ■(Done) と □(稼働中) が両方見える。
+        m.process(Message::LoadPluginDone);
+        m.process(Message::LoadPluginDone);
+        std::thread::sleep(Duration::from_millis(180));
+
+        let rendered = screen_rendered(&screen);
+        assert!(rendered.contains('■'), "done region; got:\n{rendered}");
+        assert!(rendered.contains('□'), "running region; got:\n{rendered}");
+        assert!(
+            rendered.contains("2/10"),
+            "pos/len after completions; got:\n{rendered}"
+        );
+
+        // 後片付け: LoadDone -> MergeFinished で Loading 行は消える。
+        m.process(Message::LoadDone);
+        m.process(Message::MergeFinished {
+            total: 2,
+            merged: 1,
+        });
+        std::thread::sleep(Duration::from_millis(180));
+        let rendered = screen_rendered(&screen);
+        assert!(
+            !rendered.contains("Loading"),
+            "loading bar must be cleared after merge; got:\n{rendered}"
         );
     }
 }
