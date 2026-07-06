@@ -24,6 +24,7 @@ CONTENTS                                                      *rsplug-contents*
     10. Advanced Topics ....................... |rsplug-advanced|
         10.1 Plugin Merging ................... |rsplug-merging|
         10.2 Build Caching .................... |rsplug-build-cache|
+        10.3 GitHub Authentication ............ |rsplug-github-auth|
     11. Troubleshooting ....................... |rsplug-troubleshooting|
     12. Examples .............................. |rsplug-examples|
 
@@ -178,7 +179,7 @@ CLI Options:~
 
 Synopsis:~
 >
-    Vim plugin manager written in Rust
+    A blazingly fast Neovim plugin manager written in Rust
     
     Usage: rsplug [OPTIONS] <CONFIG_FILES>...
 <
@@ -1013,6 +1014,36 @@ Manual cache clearing:~
     # Remove all build caches
     find ~/.cache/rsplug/repos -name ".rsplug_build_success" -delete
 <
+
+------------------------------------------------------------------------------
+10.3 GitHub Authentication                                *rsplug-github-auth*
+
+GitHub API and Git requests are anonymous by default, which may hit GitHub's
+rate limits (60 requests per hour per IP). Setting a token avoids this.
+
+Token environment variables:~
+
+    rsplug checks the following environment variables, in order:
+
+    1. GITHUB_TOKEN  (checked first; takes precedence)
+    2. GH_TOKEN      (used if GITHUB_TOKEN is unset)
+
+    This is the same convention used by the `gh` CLI.
+
+    Example:
+>bash
+        export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+<
+
+    If neither variable is set, rsplug falls back to anonymous access.
+
+Tarball fetch fallback:~
+
+    When a Git fetch fails due to GitHub rate limiting, rsplug automatically
+    downloads the GitHub tarball archive for the resolved commit instead.
+    This keeps installs working even when the anonymous rate limit is
+    exhausted, though setting a token (above) is recommended to avoid the
+    fallback path entirely.
 
 ==============================================================================
 11. Troubleshooting                                   *rsplug-troubleshooting*

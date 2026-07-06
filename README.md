@@ -323,7 +323,7 @@ lua_post_update = "require 'plugin'.post_update()"
 ## Command-Line Interface
 
 ```
-Vim plugin manager written in Rust
+A blazingly fast Neovim plugin manager written in Rust
 
 Usage: rsplug [OPTIONS] <CONFIG_FILES>...
 
@@ -337,6 +337,29 @@ Options:
       --lockfile <LOCKFILE>  Specify the lockfile path
   -h, --help                 Print help
 ```
+
+### GitHub Authentication
+
+rsplug accesses GitHub for repository metadata and Git operations. By default,
+these requests are anonymous and subject to GitHub's rate limits (60 requests
+per hour per IP). To avoid rate-limit errors, set a GitHub token via either of
+these environment variables (same convention as the `gh` CLI):
+
+- `GITHUB_TOKEN` — checked first (takes precedence)
+- `GH_TOKEN` — used if `GITHUB_TOKEN` is unset
+
+```bash
+export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+```
+
+If neither variable is set, rsplug falls back to anonymous access.
+
+### Tarball Fallback
+
+When a Git fetch fails due to GitHub rate limiting, rsplug automatically falls
+back to downloading the GitHub tarball archive for the resolved commit. This
+keeps installs working even when the anonymous rate limit is exhausted, though
+setting a token (above) is recommended to avoid the fallback path entirely.
 
 ## How It Works
 
