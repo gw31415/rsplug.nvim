@@ -1,6 +1,6 @@
 [package]
 name = "rsplug-walker"
-version = "0.2.0"
+version = "0.2.4"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
