@@ -58,6 +58,13 @@ Cache directory for URL sources: scheme, auth, port, and `.git` suffix are strip
   - fetch stage/progress reporting,
   - build output progress lines,
   - improved install/yank/help log cleanup and formatting.
+- Fast download path for GitHub HTTPS + token:
+  - REST API rev resolution (`api.github.com`) with rate-limit-aware fallback
+    to Git smart-HTTP `ls-remote`.
+  - Tarball download from `codeload.github.com` (CDN, outside API rate limit)
+    with `flate2` (zlib-ng) decompression.
+  - Shared `reqwest::Client` with connection pooling and HTTP/2 multiplexing.
+  - Adaptive concurrency (initial 32, max 512, auto-halved on errors).
 
 ## Lazy-loading model
 

@@ -117,19 +117,36 @@ async fn app() -> Result<(), Error> {
     // 依存先 snapshot は各依存先 repo の worktrees/ から best-effort で解決する (PLANS §10.3)。
     let locked_map = Arc::new(locked_map);
     // 全 plugin のネットワークフェッチ並列度を制限する。
-    // 初期値8、min=1、max=256。エラー率上昇時に自動的に並列度を半減させる。
+    // 初期値32、min=1、max=512。tarball (codeload CDN) はレート制限の対象外なので高めに設定。
+    // エラー率上昇時に自動的に並列度を半減させる。
     let fetch_semaphore = adaptive_semaphore::AdaptiveSemaphore::with_limits(
-        8,
+        32,
         1,
-        256,
+        512,
         std::time::Duration::from_millis(64),
     );
+
+    // プロセス全体で共有する HTTP クライアント（接続プール・HTTP/2 再利用）。
+    let http_client = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(64)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "failed to build HTTP client: {e}"
+            )))
+        })?;
+    // reqwest::Client は内部が Arc なので clone は安価。FnMut closure 内に move するため先に clone。
+    let http_client = http_client.clone();
     let (mut plugins, lock_infos) = {
         let res = plugins
             .into_iter()
             .map(|plugin| {
                 let locked_map = Arc::clone(&locked_map);
                 let fetch_semaphore = fetch_semaphore.clone();
+                let http_client = http_client.clone();
                 async move {
                     let locked_rev = if let Some(repo) = plugin.cache.repo.as_ref() {
                         let url = repo.url();
@@ -164,6 +181,7 @@ async fn app() -> Result<(), Error> {
                             DEFAULT_REPOCACHE_DIR.as_path(),
                             locked_rev,
                             fetch_semaphore,
+                            http_client.clone(),
                         )
                         .await;
                     msg(Message::LoadPluginDone);
