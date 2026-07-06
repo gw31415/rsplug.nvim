@@ -41,15 +41,15 @@ fallback features are completely undocumented.
   CLI description mismatch, missing GitHub token docs, missing tarball fallback
   mention.
 - [x] (2026-07-06) Drafted the curated release notes body (see Artifacts).
-- [ ] Task 1 — Fix CLI description in README and help template; add GitHub
+- [x] Task 1 — Fix CLI description in README and help template; add GitHub
   token auth + tarball fallback documentation.
-- [ ] Task 2 — Bump workspace and internal crate versions to `0.2.4`.
-- [ ] Task 3 — Run `cargo fmt`/`clippy`/`test` and `cargo publish --dry-run`
+- [x] Task 2 — Bump workspace and internal crate versions to `0.2.4`.
+- [x] Task 3 — Run `cargo fmt`/`clippy`/`test` and `cargo publish --dry-run`
   for all six crates in dependency order.
-- [ ] Task 4 — Confirm the release notes body is ready for Task 6.
-- [ ] Task 5 — Create the `v0.2.4` annotated tag, push `main` and the tag,
+- [x] Task 4 — Confirm the release notes body is ready for Task 6.
+- [x] Task 5 — Create the `v0.2.4` annotated tag, push `main` and the tag,
   watch the release workflow to completion.
-- [ ] Task 6 — Replace the auto-generated GitHub Release notes with the
+- [x] Task 6 — Replace the auto-generated GitHub Release notes with the
   curated body via `gh release edit`.
 
 
@@ -77,6 +77,28 @@ fallback features are completely undocumented.
   touch it. It stays at `0.3.0` for this release.
   Evidence: `crates/walker/vendor/fts/Cargo.toml` lines 1-2 and 32-64; the
   workflow `publish-crates` step passes `--no-verify --allow-dirty`.
+
+- Discovery (during release): The Windows (x86_64-pc-windows-msvc) CI build
+  failed because the workspace layout changed between v0.2.3 and v0.2.4.
+  v0.2.3's root `Cargo.toml` was a real package (`members = [".", ...]` with
+  a `[package]` table), so a bare `cargo build` compiled only the root `rsplug`
+  crate. v0.2.4 switched to a virtual workspace (`members = ["crates/*", ...]`
+  with no root `[package]`), so `cargo build` tried to compile every member
+  including `rsplug-fts`, which uses Unix-only APIs (`std::os::unix`,
+  `nlink_t`, `OsStr::from_bytes`) and cannot build on Windows.
+  Fix: added `-p rsplug` to the CI build command in `release.yml` so the
+  workspace root crate is built explicitly, independent of workspace layout.
+
+- Discovery (during release): The `publish-crates` CI job skipped all library
+  crates and failed when publishing `rsplug`. Root cause: `Cargo.lock` was
+  committed with stale versions (0.2.3 / 0.2.0) after `set-version.sh` bumped
+  only the `Cargo.toml` files. The CI version check uses `cargo pkgid`, which
+  reads `Cargo.lock`, so it saw the old versions, found them already on
+  crates.io, and skipped every dependency. `rsplug 0.2.4` then failed because
+  its `0.2.4` internal dependencies were absent from crates.io.
+  Fix: regenerate and commit `Cargo.lock` after `set-version.sh`.
+  Lesson: `set-version.sh` should update `Cargo.lock` itself, or the release
+  checklist must include a `cargo update -w` step before committing.
 
 
 ## Decision Log
@@ -121,10 +143,20 @@ fallback features are completely undocumented.
 
 ## Outcomes & Retrospective
 
-(To be filled at completion. Record whether all three CI jobs succeeded, whether
-crates.io showed `0.2.4`, whether the five binary assets appeared, and whether
-the curated release notes were applied cleanly. Note any per-platform build
-failures and how they were resolved.)
+All acceptance criteria met. The v0.2.4 release shipped successfully after
+resolving two CI failures discovered during the release process (documented
+in Surprises & Discoveries):
+
+- All five platform builds passed (aarch64/x86_64 macOS, aarch64/x86_64 Linux,
+  x86_64 Windows). The Windows build initially failed due to the virtual
+  workspace compiling Unix-only `rsplug-fts`; fixed by adding `-p rsplug` to
+  the CI build command.
+- All six crates published to crates.io (`rsplug` now at `0.2.4`,
+  `rsplug-fts` remains `0.3.0`). Publishing initially failed because the
+  committed `Cargo.lock` had stale versions; fixed by regenerating it.
+- The GitHub Release `v0.2.4` has five binary assets (4× tar.gz, 1× zip).
+- The curated release notes (Features / Bug Fixes / Internal / Full Changelog)
+  were applied cleanly via `gh release edit --notes-file`.
 
 
 ## Context and Orientation
