@@ -198,10 +198,22 @@ impl PluginConfig {
         }
         match &self.cache.repo {
             Some(RepoSource::GitHub { repo, .. }) => Some(repo.as_ref()),
-            Some(RepoSource::Git { url, .. }) => Some(url.as_ref()),
+            Some(RepoSource::Git { url, .. }) => Some(repo_basename(url.as_ref())),
             None => None,
         }
     }
+}
+
+/// Git URL のクローン時に作成されるディレクトリ名（最後のパスセグメント）を返す。
+/// `git clone` と同じく末尾の `.git` と末尾スラッシュを取り除いてから最後の `/` 以降を取る。
+/// 例: `https://gitlab.com/foo/bar.nvim.git` → `bar.nvim`
+fn repo_basename(url: &str) -> &str {
+    // 末尾の `.git` と `/` を（どちらの順序で現れても）取り除く。
+    let mut s = url;
+    while let Some(stripped) = s.strip_suffix(".git").or_else(|| s.strip_suffix('/')) {
+        s = stripped;
+    }
+    s.rsplit('/').next().unwrap_or(s)
 }
 
 impl DagNode for PluginConfig {
@@ -386,6 +398,50 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, LoadEvent::OnSource(source) if source == "host.nvim"))
         );
+    }
+
+    #[test]
+    fn repo_basename_extracts_clone_directory_name() {
+        assert_eq!(
+            repo_basename("https://gitlab.com/foo/bar.nvim.git"),
+            "bar.nvim"
+        );
+        assert_eq!(repo_basename("https://gitlab.com/foo/bar.nvim"), "bar.nvim");
+        assert_eq!(
+            repo_basename("https://gitlab.com/foo/bar.nvim/"),
+            "bar.nvim"
+        );
+        assert_eq!(
+            repo_basename("https://gitlab.com/foo/bar.nvim.git/"),
+            "bar.nvim"
+        );
+        assert_eq!(repo_basename("git@gitlab.com:foo/bar.nvim.git"), "bar.nvim");
+        assert_eq!(repo_basename("https://gitlab.com"), "gitlab.com");
+    }
+
+    #[test]
+    fn dep_name_uses_repo_basename_for_git_url() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "https://gitlab.com/owner/plugin.nvim.git"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.plugins[0].dep_name(), Some("plugin.nvim"));
+    }
+
+    #[test]
+    fn dep_name_custom_name_overrides_repo_basename() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "https://gitlab.com/owner/plugin.nvim.git"
+            name = "my-plugin"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.plugins[0].dep_name(), Some("my-plugin"));
     }
 }
 
