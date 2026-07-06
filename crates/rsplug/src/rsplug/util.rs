@@ -529,6 +529,131 @@ pub mod github {
         }
         Some((owner, repo))
     }
+
+    /// REST API で rev 解決を試みた結果のエラー種別。
+    /// 呼出元は `RateLimited` と `Other` のどちらでも git protocol へフォールバックする。
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub enum ApiError {
+        /// API rate limit 残量が少ない（閾値以下）。
+        RateLimited,
+        /// その他のエラー（ネットワーク・HTTP 4xx/5xx・パース失敗等）。
+        Other(String),
+    }
+
+    /// GitHub REST API でコミットハッシュを解決する。
+    /// - `rev = Some(ref)`: `GET /repos/{o}/{r}/commits/{ref}` → `.sha`
+    /// - `rev = None`: `GET /repos/{o}/{r}` → `.default_branch` → そのブランチの SHA
+    ///
+    /// レートリミット残量 (`X-RateLimit-Remaining`) が閾値 (50) 未満の場合は
+    /// ダウンロードを消費せず `ApiError::RateLimited` を返す。
+    /// 認証済み (token 有り) が前提。匿名の場合は呼出側でフォールバックする。
+    pub async fn resolve_rev_via_api(
+        client: &reqwest::Client,
+        url: &str,
+        rev: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<String, ApiError> {
+        const API_BASE: &str = "https://api.github.com";
+        const RATE_LIMIT_THRESHOLD: u64 = 50;
+
+        let (owner, repo) = parse_github_url(url)
+            .ok_or_else(|| ApiError::Other(format!("not a GitHub HTTPS URL: {url}")))?;
+
+        let mut req = client.get(format!("{API_BASE}/repos/{owner}/{repo}"));
+        if let Some(token) = token {
+            req = req
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28");
+        }
+        // GitHub REST API は JSON を返す。`reqwest` に `json` feature が必要だが、
+        // default-features = false なので手動でヘッダを付ける。
+        req = req.header("Accept", "application/vnd.github+json");
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+
+        // rate limit チェック
+        if let Some(remaining) = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            && remaining < RATE_LIMIT_THRESHOLD {
+                return Err(ApiError::RateLimited);
+            }
+
+        if !resp.status().is_success() {
+            return Err(ApiError::Other(format!(
+                "GitHub API HTTP {} for {url}",
+                resp.status()
+            )));
+        }
+
+        // JSON を手動パースして sha を取り出す（serde_json 依存を避けるため最小限の抽出）。
+        // `/repos/{o}/{r}` は default_branch を返し、それを解決するために2段階になる。
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+        let default_branch = super::json_extract_string(&body, "default_branch")
+            .ok_or_else(|| ApiError::Other("missing default_branch in API response".into()))?;
+
+        let target_ref = rev.unwrap_or(&default_branch);
+
+        // commits/{ref} で SHA を取得
+        let mut req2 = client.get(format!(
+            "{API_BASE}/repos/{owner}/{repo}/commits/{target_ref}"
+        ));
+        if let Some(token) = token {
+            req2 = req2
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28");
+        }
+        req2 = req2.header("Accept", "application/vnd.github+json");
+        let resp2 = req2
+            .send()
+            .await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+
+        // 2回目のリクエストでも rate limit をチェック
+        if let Some(remaining) = resp2
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            && remaining < RATE_LIMIT_THRESHOLD {
+                return Err(ApiError::RateLimited);
+            }
+
+        if !resp2.status().is_success() {
+            return Err(ApiError::Other(format!(
+                "GitHub API HTTP {} for commits/{target_ref}",
+                resp2.status()
+            )));
+        }
+
+        let body2 = resp2
+            .text()
+            .await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+        super::json_extract_string(&body2, "sha")
+            .ok_or_else(|| ApiError::Other("missing sha in API response".into()))
+    }
+}
+
+/// 最小限の JSON 文字列値抽出。
+/// `"key": "value"` パターンを探して value 部を返す。エスケープは未対応（SHA とブランチ名のみ想定）。
+fn json_extract_string(body: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":");
+    let idx = body.find(&pattern)?;
+    let after = &body[idx + pattern.len()..];
+    let trimmed = after.trim_start();
+    let quote_pos = trimmed.find('"')?;
+    let rest = &trimmed[quote_pos + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 pub mod fetch {
@@ -555,6 +680,7 @@ pub mod fetch {
         /// ここで作るローカルコミットのハッシュとは無関係（互換性維持）。
         pub async fn fetch_to_snapshot(
             &self,
+            client: &reqwest::Client,
             url: &str,
             oid: &str,
             snapshot_root: &Path,
@@ -568,7 +694,7 @@ pub mod fetch {
             let tarball_url = github::tarball_url(&owner, &repo, oid);
 
             tokio::fs::create_dir_all(snapshot_root).await?;
-            Self::download_and_extract(&tarball_url, snapshot_root, token).await?;
+            Self::download_and_extract(client, &tarball_url, snapshot_root, token).await?;
 
             // git2 互換の作業ツリーを作る（後段の is_dirty / diff_hash / ls_files 用）
             let snapshot_root = snapshot_root.to_path_buf();
@@ -582,17 +708,14 @@ pub mod fetch {
             Ok(())
         }
 
-        /// tarball を HTTP GET でダウンロードし、dest にストリーミング展開する。
+        /// tarball を共有 `Client` でダウンロードし、gzip 展開 + tar 展開を1回の
+        /// `spawn_blocking` で行う。temp file を使わずメモリ上で展開する。
         async fn download_and_extract(
+            client: &reqwest::Client,
             url: &str,
             dest: &Path,
             token: Option<&str>,
         ) -> Result<(), Error> {
-            use async_compression::tokio::bufread::GzipDecoder;
-            use futures_util::StreamExt;
-            use tokio::io::AsyncWriteExt;
-
-            let client = reqwest::Client::new();
             let mut req = client.get(url);
             if let Some(token) = token {
                 req = req.header("Authorization", format!("Bearer {token}"));
@@ -609,27 +732,20 @@ pub mod fetch {
                 ))));
             }
 
-            // bytes_stream → AsyncRead → GzipDecoder
-            let stream = response
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
-            let async_read = tokio_util::io::StreamReader::new(stream);
-            let mut gzip_decoder = GzipDecoder::new(async_read);
+            // レスポンス全体を bytes::Bytes として受信（reqwest が再エクスポート）。
+            let body = response.bytes().await.map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "tarball read body failed: {e}"
+                )))
+            })?;
 
-            // gzip 展開結果を一時ファイルに書き出し、tar 展開は spawn_blocking で行う
-            let tmp = tempfile::tempdir().map_err(Error::Io)?;
-            let tmp_path = tmp.path().join("tarball.tar");
-            {
-                let mut file = tokio::fs::File::create(&tmp_path).await?;
-                tokio::io::copy(&mut gzip_decoder, &mut file).await?;
-                file.flush().await?;
-            }
-
-            // tar 展開（spawn_blocking）
+            // gzip 展開 + tar 展開を1回の spawn_blocking で実行。
+            // flate2 (zlib-ng) は純 Rust の async-compression より高速。
             let dest = dest.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&tmp_path)?;
-                let mut archive = tar::Archive::new(file);
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let cursor = std::io::Cursor::new(body);
+                let decoder = flate2::read::GzDecoder::new(cursor);
+                let mut archive = tar::Archive::new(decoder);
                 for entry in archive.entries()? {
                     let mut entry = entry?;
                     let path = entry.path()?.into_owned();
@@ -644,7 +760,7 @@ pub mod fetch {
                     }
                     entry.unpack(&dest_path)?;
                 }
-                Ok::<(), std::io::Error>(())
+                Ok(())
             })
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("join error: {e}"))))??;

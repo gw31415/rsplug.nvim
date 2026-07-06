@@ -285,6 +285,7 @@ impl Plugin {
         cache_dir: impl AsRef<Path>,
         locked_rev: Option<Arc<str>>,
         semaphore: adaptive_semaphore::AdaptiveSemaphore,
+        http_client: reqwest::Client,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         use super::util::git;
         use crate::{
@@ -387,7 +388,7 @@ impl Plugin {
                 Some(_) if update => {
                     let _permit = semaphore.acquire().await;
                     msg(Message::Cache("Updating", url.clone()));
-                    let oid = git::ls_remote(url.clone(), rev.clone(), token.clone()).await?;
+                    let oid = resolve_remote_oid(&http_client, &url, &rev, &token).await?;
                     msg(Message::Cache("Updating:done", url.clone()));
                     oid
                 }
@@ -395,7 +396,7 @@ impl Plugin {
                 None if install => {
                     let _permit = semaphore.acquire().await;
                     msg(Message::Cache("Updating", url.clone()));
-                    let oid = git::ls_remote(url.clone(), rev.clone(), token.clone()).await?;
+                    let oid = resolve_remote_oid(&http_client, &url, &rev, &token).await?;
                     msg(Message::Cache("Updating:done", url.clone()));
                     oid
                 }
@@ -427,6 +428,7 @@ impl Plugin {
             token: &token,
             source_name: &source_name,
             semaphore: &semaphore,
+            http_client: &http_client,
             install,
             update,
             locked,
@@ -612,13 +614,50 @@ struct FetchCtx<'a> {
     token: &'a Option<Arc<str>>,
     source_name: &'a Option<String>,
     semaphore: &'a adaptive_semaphore::AdaptiveSemaphore,
+    http_client: &'a reqwest::Client,
     install: bool,
     update: bool,
     locked: bool,
     logid: &'a str,
 }
 
-/// source.git を（必要なら作成して）開き、`oid` を fetch する（GitFetch 相当）。
+/// リモートの最新コミットハッシュを解決する。
+/// GitHub HTTPS + token の場合は REST API（軽量・1リクエスト）を試行し、
+/// 失敗・ワイルドカード ref・レートリミット残量不足時は git protocol にフォールバックする。
+/// それ以外は常に git protocol (`ls_remote`) を使う。
+async fn resolve_remote_oid(
+    http_client: &reqwest::Client,
+    url: &Arc<str>,
+    rev: &Option<Arc<str>>,
+    token: &Option<Arc<str>>,
+) -> Result<Oid, Error> {
+    use super::util::{git, github};
+
+    // GitHub HTTPS + token なら REST API を試行
+    if github::supports_tarball(url) && token.is_some() {
+        // ワイルドカード ref（`*` を含む）は REST API で解決できない → git protocol
+        let is_wildcard = rev.as_deref().is_some_and(|r| r.contains('*'));
+        if !is_wildcard {
+            match github::resolve_rev_via_api(http_client, url, rev.as_deref(), token.as_deref())
+                .await
+            {
+                Ok(oid_str) => {
+                    return Oid::from_str(&oid_str).map_err(Error::Git2);
+                }
+                Err(github::ApiError::RateLimited) => {
+                    // レートリミット残量不足 → git protocol にフォールバック
+                }
+                Err(github::ApiError::Other(_)) => {
+                    // API エラー（404, ネットワーク等）→ git protocol にフォールバック
+                }
+            }
+        }
+    }
+
+    // フォールバック: git smart HTTP protocol (ls_remote)
+    git::ls_remote(url.clone(), rev.clone(), token.clone()).await
+}
+
 /// 戻り値 `Ok(true)` = source.git に oid を fetch 済み、`Ok(false)` = 未インストールなのでスキップ。
 /// `Err` = locked で cache 不足、または fetch 失敗。
 async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
@@ -673,7 +712,13 @@ async fn materialize(
             msg(Message::Cache("Fetching", ctx.url.clone()));
             let head_rev = ctx.oid.to_string();
             match TarballFetch
-                .fetch_to_snapshot(ctx.url.as_ref(), &head_rev, dest, ctx.token.as_deref())
+                .fetch_to_snapshot(
+                    ctx.http_client,
+                    ctx.url.as_ref(),
+                    &head_rev,
+                    dest,
+                    ctx.token.as_deref(),
+                )
                 .await
             {
                 Ok(()) => {
@@ -1152,6 +1197,7 @@ mod tests {
                     std::env::temp_dir(),
                     None,
                     adaptive_semaphore::AdaptiveSemaphore::new(),
+                    reqwest::Client::new(),
                 )
                 .await
                 .unwrap()
@@ -1235,6 +1281,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap()
@@ -1276,6 +1323,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap()
@@ -1364,6 +1412,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap()
@@ -1398,6 +1447,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap()
@@ -1491,6 +1541,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap();
@@ -1516,6 +1567,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap()
@@ -1592,6 +1644,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap()
@@ -1611,6 +1664,7 @@ mod tests {
                 &cache,
                 None,
                 adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
             )
             .await
             .unwrap()

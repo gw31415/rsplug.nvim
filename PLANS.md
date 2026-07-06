@@ -1,82 +1,55 @@
-# rsplug v0.2.4 リリース
+# GitHub Fetch 高速化 ExecPlan
 
-This ExecPlan is a living document. The sections `Progress`, `Surprises &
-Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to
-date as work proceeds.
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document follows the repository-level `PLANS.md` convention described in
-`AGENTS.md` and supersedes the previous snapshot-cache design plan, which has
-been fully implemented and released.
+This document follows the repository-level `PLANS.md` convention described in `AGENTS.md` (ExecPlans section).
 
 
 ## Purpose / Big Picture
 
-The goal is to cut the `v0.2.4` release of rsplug: tag the current `main`
-branch, push the tag so the GitHub Actions `release.yml` workflow builds five
-platform binaries, publishes six crates to crates.io via trusted publishing, and
-creates a GitHub Release with binary assets, then replace the auto-generated
-release notes with a curated changelog.
+rsplug.nvim is an external Rust binary that installs Neovim plugins by fetching Git repositories into a cache directory. When the repository is on GitHub and a token is available (`GITHUB_TOKEN` / `GH_TOKEN`), rsplug downloads a tarball from `codeload.github.com` instead of using the Git smart-HTTP protocol. This tarball path is the "GitHub mode" that this plan targets.
 
-A maintainer can see the release succeed by watching the Actions tab for all
-three jobs (`build`, `publish-crates`, `github-release`) turning green, checking
-`https://crates.io/crates/rsplug` for version `0.2.4`, and confirming the
-GitHub Release page lists five binary assets and a readable changelog.
+The problem: GitHub-mode fetch is slower than it needs to be. The user wants to push against the GitHub rate limit ceiling and use every available technique — connection pooling, higher parallelism, faster decompression libraries, and protocol-level optimizations — to minimize download time.
 
-Before tagging, this plan also closes documentation drift discovered during
-preparation: the README and help template still call rsplug a "Vim plugin
-manager" while the actual `--help` says "A blazingly fast Neovim plugin manager
-written in Rust", and the newly added GitHub token authentication and tarball
-fallback features are completely undocumented.
+After this plan is fully implemented, the user will observe:
+
+- Installing a fresh set of 30+ plugins completes noticeably faster than before (target: 2-4x improvement on cold install).
+- Re-running `rsplug --update` with no upstream changes returns quickly because unchanged tarballs are skipped via conditional requests.
+- The `--install` log shows many plugins fetching concurrently without errors, and no spurious rate-limit failures.
+
+Success is demonstrated by a before/after timing comparison on a fixed plugin set, plus passing the existing test suite.
 
 
 ## Progress
 
-- [x] (2026-07-06) Captured the repository state: current workspace version is
-  `0.2.3`, last tag is `v0.2.3`, all six crates are published on crates.io at
-  their current versions, and `main` is 51 commits ahead of `v0.2.3`.
-- [x] (2026-07-06) Confirmed `scripts/set-version.sh` bumps the workspace
-  version and internal crate dependency versions together; `rsplug-fts` stays
-  at `0.3.0` (out of scope for the script).
-- [x] (2026-07-06) Identified documentation drift to fix before tagging:
-  CLI description mismatch, missing GitHub token docs, missing tarball fallback
-  mention.
-- [x] (2026-07-06) Drafted the curated release notes body (see Artifacts).
-- [x] Task 1 — Fix CLI description in README and help template; add GitHub
-  token auth + tarball fallback documentation.
-- [x] Task 2 — Bump workspace and internal crate versions to `0.2.4`.
-- [x] Task 3 — Run `cargo fmt`/`clippy`/`test` and `cargo publish --dry-run`
-  for all six crates in dependency order.
-- [x] Task 4 — Confirm the release notes body is ready for Task 6.
-- [x] Task 5 — Create the `v0.2.4` annotated tag, push `main` and the tag,
-  watch the release workflow to completion.
-- [x] Task 6 — Replace the auto-generated GitHub Release notes with the
-  curated body via `gh release edit`.
+- [x] (2025-07-07) Analyzed current fetch implementation across `plugin.rs`, `util.rs`, `main.rs`.
+- [x] (2025-07-07) Identified six bottlenecks (per-call Client creation, two-stage gzip, pure-Rust decompressor, git-protocol rev resolution, no conditional requests, low initial parallelism).
+- [x] (2025-07-07) Confirmed GitHub rate-limit landscape: codeload tarballs are CDN-served and outside the core API quota; git smart-HTTP and REST API are rate-limited but generous with a token.
+- [x] (2025-07-07) Phase 1.1: Shared `reqwest::Client` with pool/HTTP/2 settings, threaded through `FetchCtx` and `Plugin::load`.
+- [x] (2025-07-07) Phase 1.2: Eliminated temp-file staging; gzip+tar extraction in single `spawn_blocking` via `bytes::Bytes` → `Cursor`.
+- [x] (2025-07-07) Phase 2.1: Replaced `async-compression` with `flate2` (zlib-ng backend). Removed `async-compression`, `futures-util`, `tokio-util` deps.
+- [x] (2025-07-07) Phase 3.1: Added `github::resolve_rev_via_api` (REST API rev resolution with `X-RateLimit-Remaining` threshold and wildcard fallback). `resolve_remote_oid` dispatches API-first, git-protocol-fallback.
+- [x] (2025-07-07) Phase 4.1: Raised fetch semaphore from 8→32 initial, 256→512 max.
+- [x] (2025-07-07) `cargo fmt`, `cargo test --workspace` (140 tests, 0 failed), `cargo clippy --workspace --all-targets` (0 warnings) — all clean.
+- [x] Phase 5.1: Run before/after benchmarks on a fixed plugin set.
 
 
 ## Surprises & Discoveries
 
-- Observation: The README CLI section (line 326) and the help template
-  (`crates/rsplug/templates/doc/rsplug.txt` line 181) both say "Vim plugin
-  manager written in Rust", but the actual `rsplug --help` prints "A blazingly
-  fast Neovim plugin manager written in Rust". The clap derive description in
-  `main.rs` drifted from the documentation.
-  Evidence: `cargo run --quiet -- --help 2>&1 | head -1` prints the Neovim
-  tagline; `sed -n '326p' README.md` prints the old Vim tagline.
+- Observation: `TarballFetch::download_and_extract` calls `reqwest::Client::new()` on every invocation (`util.rs` line ~595). This defeats connection pooling, keep-alive, and HTTP/2 multi-streaming entirely. Every plugin pays a fresh TCP + TLS handshake to `codeload.github.com`.
+  Evidence: `crates/rsplug/src/rsplug/util.rs`, `download_and_extract` method.
 
-- Observation: The GitHub token authentication feature added in the rate-limit
-  work (`util.rs:500`, `GitHubSource::token()`) checks `GITHUB_TOKEN` then
-  `GH_TOKEN` (same convention as the `gh` CLI), but neither README nor the help
-  template mention this feature or the tarball fetch fallback.
-  Evidence: `grep -rn 'GITHUB_TOKEN' crates/rsplug/src/` shows the env var
-  lookup; `grep -ni 'token' README.md` returns no documentation hits.
+- Observation: The gzip decompression pipeline writes the decompressed tar to a temp file (`tempfile::tempdir()`) before extracting in `spawn_blocking`. This doubles the disk I/O for no benefit.
+  Evidence: `util.rs` lines ~619-650.
 
-- Observation: `rsplug-fts` has a `Cargo.toml` generated by Cargo (the file
-  header says `THIS FILE IS AUTOMATICALLY GENERATED BY CARGO`) and retains
-  upstream `[package.metadata.release]` and `[badges.*]` tables. The release
-  workflow publishes it with `--allow-dirty`, and `set-version.sh` does not
-  touch it. It stays at `0.3.0` for this release.
-  Evidence: `crates/walker/vendor/fts/Cargo.toml` lines 1-2 and 32-64; the
-  workflow `publish-crates` step passes `--no-verify --allow-dirty`.
+- Observation: `async-compression` is a pure-Rust gzip implementation. The C-based `zlib-ng` (via `flate2`) is typically 1.5-3x faster for decompression.
+  Evidence: `Cargo.toml` dependency list; `flate2` feature flags documentation.
+
+- Observation: The fetch semaphore starts at 8 concurrent operations (`main.rs` line ~121). GitHub codeload is a Fastly CDN with effectively unlimited throughput for tarballs, so this is overly conservative.
+  Evidence: `crates/rsplug/src/main.rs`, `AdaptiveSemaphore::with_limits(8, 1, 256, ...)`.
+
+- Observation: `ls_remote` uses git smart-HTTP (`/info/refs` ref advertisement), which transfers the full ref list and requires protocol negotiation. A single GitHub REST API call (`/repos/{owner}/{repo}/commits/{ref}`) returns just the SHA and is lighter on the wire.
+  Evidence: `util.rs`, `git::ls_remote` function.
 
 - Discovery (during release): The Windows (x86_64-pc-windows-msvc) CI build
   failed because the workspace layout changed between v0.2.3 and v0.2.4.
@@ -103,42 +76,25 @@ fallback features are completely undocumented.
 
 ## Decision Log
 
-- Decision: Release version is `0.2.4` (patch bump from `0.2.3`).
-  Rationale: `main` contains 51 commits since `v0.2.3`, including user-visible
-  features (GitHub token auth, tarball fallback, dynamic loading bar, improved
-  fetch UI) and bug fixes (`-u` no longer installs, repo basename for git deps).
-  A patch bump is appropriate; there are no breaking configuration changes.
-  Date/Author: 2026-07-06 / Claude.
+- Decision: Prioritize Phase 1.1 (shared Client) and Phase 4.1 (semaphore raise) as the first implementation step.
+  Rationale: These two changes are the smallest in effort and deliver the largest improvement (connection reuse eliminates repeated handshakes; higher parallelism multiplies throughput on a CDN that can absorb it). They are also the lowest risk because they do not change the download logic itself.
+  Date: 2025-07-07. Author: planning session.
 
-- Decision: Fix documentation drift before tagging rather than after.
-  Rationale: The CLI description mismatch and missing token docs are
-  user-visible. The release notes should point to accurate README/help, and the
-  tag commit should carry the documentation fix so the GitHub Release snapshot
-  is consistent.
-  Date/Author: 2026-07-06 / Claude.
+- Decision: Keep the GitFetch fallback path intact.
+  Rationale: Tokenless environments and non-GitHub HTTPS URLs still need git-protocol fetch. TarballFetch already falls back to GitFetch on failure (`plugin.rs`, `materialize`), and this structure must be preserved so failures degrade gracefully.
+  Date: 2025-07-07.
 
-- Decision: Use `scripts/set-version.sh 0.2.4` for the version bump instead of
-  manual edits.
-  Rationale: The script atomically updates the workspace version, the
-  `[workspace.dependencies]` internal crate versions, and `crates/walker/Cargo.
-  toml`. Manual editing risks leaving a crate at a stale version, which would
-  break `cargo publish` in CI. The script is what the release workflow itself
-  runs (via `Set version from tag`), so using it locally mirrors CI behavior.
-  Date/Author: 2026-07-06 / Claude.
+- Decision: Use `flate2` with the `zlib-ng` backend rather than `async-compression`.
+  Rationale: gzip decompression is CPU-bound. Running it inside `spawn_blocking` with the C-backed `flate2::read::GzDecoder` outperforms the pure-Rust async decoder in raw throughput. The tarball is already fully downloaded before extraction, so async streaming is not required for correctness.
+  Date: 2025-07-07.
 
-- Decision: Keep `rsplug-fts` at `0.3.0`.
-  Rationale: `set-version.sh` does not touch the vendored fts crate, and there
-  are no source changes to it since `0.3.0`. The release workflow publishes it
-  idempotently (skips if already on crates.io).
-  Date/Author: 2026-07-06 / Claude.
+- Decision: Make REST-API rev resolution fall back to git `ls_remote` when the API rate-limit header (`X-RateLimit-Remaining`) is low or when a wildcard revision (e.g. `@v*`) is requested.
+  Rationale: Wildcard refs require enumerating tags, which the single-commit API endpoint does not support. Git protocol handles wildcards natively. Falling back on low rate-limit remaining prevents lockout.
+  Date: 2025-07-07.
 
-- Decision: Let CI auto-generate release notes first, then overwrite with the
-  curated body in Task 6.
-  Rationale: The workflow uses `softprops/action-gh-release@v2` with
-  `generate_release_notes: true`, which creates the Release immediately after
-  build. Overwriting afterward with `gh release edit --notes-file` is simpler
-  than injecting custom notes into the workflow and avoids race conditions.
-  Date/Author: 2026-07-06 / Claude.
+- Decision: Store HTTP conditional-request metadata (ETag, Last-Modified) in `repos/<repo>/worktrees/<snapshot_key>/.rsplug_http_meta.json`.
+  Rationale: Colocating the metadata with the snapshot it describes keeps cleanup simple — deleting the snapshot directory removes the metadata automatically.
+  Date: 2025-07-07.
 
 
 ## Outcomes & Retrospective
@@ -161,367 +117,215 @@ in Surprises & Discoveries):
 
 ## Context and Orientation
 
-rsplug.nvim is an external Rust binary Neovim plugin manager. The repository is
-a Cargo workspace with one application crate (`rsplug`) and five library crates
-(`rsplug-adaptive-semaphore`, `rsplug-dag`, `rsplug-file-specifier`,
-`rsplug-walker`, and the vendored `rsplug-fts`). The root `Cargo.toml` holds the
-workspace version at `0.2.3`; internal crates inherit it via `version.workspace
-= true` except `rsplug-walker` (explicit version) and `rsplug-fts` (explicit
-`0.3.0`).
+rsplug.nvim is a Rust workspace rooted at the repository top level. The main binary crate is `crates/rsplug`. It uses Tokio for async runtime, `git2` (libgit2 bindings) for Git operations, and `reqwest` for HTTP tarball downloads.
 
-Terms used in this plan:
+Key terms:
 
-- **workspace version**: `[workspace.package].version` in the root `Cargo.toml`.
-  Inherited by crates that set `version.workspace = true`.
-- **internal crate dependency versions**: The `version = "..."` fields inside
-  the `[workspace.dependencies]` entries for `adaptive_semaphore`, `dag`,
-  `file_specifier`, and `walker`. These must match the crate's own version or
-  `cargo publish` fails.
-- **trusted publishing**: The CI authenticates to crates.io via
-  `rust-lang/crates-io-auth-action@v1` using OpenID Connect, so no long-lived
-  `CARGO_REGISTRY_TOKEN` secret is needed.
-- **`set-version.sh`**: `scripts/set-version.sh <version>` rewrites the
-  workspace version and internal dependency versions atomically. It takes the
-  version without a leading `v`.
-- **release workflow**: `.github/workflows/release.yml`, triggered by any tag
-  matching `v*`. It has three jobs: `build` (5-platform matrix),
-  `publish-crates` (needs build), and `github-release` (needs build).
+- **TarballFetch**: The GitHub-HTTPS + token download path. Downloads a `.tar.gz` from `codeload.github.com`, decompresses, extracts, and creates a git2-compatible working tree.
+- **GitFetch**: The fallback path using git smart-HTTP via libgit2 into a bare `source.git` object store, then a local clone into a snapshot worktree.
+- **AdaptiveSemaphore**: A custom concurrency limiter (`crates/adaptive_semaphore`) that adjusts its permit count based on throughput and error rate. It starts at an initial limit, halves on regressions, and increments on improvements.
+- **codeload.github.com**: GitHub's CDN endpoint for archive/tarball downloads. It is outside the core REST API rate limit.
+- **snapshot**: A fixed checkout of a repository at a specific commit, stored under `repos/<repo>/worktrees/<snapshot_key>/`.
 
-Current published versions on crates.io (as of 2026-07-06):
-rsplug `0.2.3`, rsplug-adaptive-semaphore `0.2.3`, rsplug-dag `0.2.3`,
-rsplug-file-specifier `0.2.3`, rsplug-walker `0.2.3`, rsplug-fts `0.3.0`.
+Key files:
 
-Current git state: branch `main` is clean, 51 commits ahead of tag `v0.2.3`.
+- `crates/rsplug/Cargo.toml` — dependencies. Currently has `reqwest`, `async-compression`, `tar`, `tokio-util`, `futures-util`.
+- `crates/rsplug/src/main.rs` — entry point. Creates the `AdaptiveSemaphore` (line ~121) and spawns parallel `Plugin::load` tasks.
+- `crates/rsplug/src/rsplug/entities/plugin.rs` — `Plugin::load` orchestrates fetch strategy. `FetchCtx` struct (line ~608) bundles fetch arguments. `materialize` (line ~662) selects TarballFetch vs GitFetch.
+- `crates/rsplug/src/rsplug/util.rs` — `git` module (ls_remote, fetch, snapshot init), `github` module (URL/token/tarball helpers), `fetch` module (TarballFetch implementation).
+
+GitHub rate-limit landscape:
+
+- `codeload.github.com` tarball downloads: served by Fastly CDN, not counted against the core API quota. Effectively unlimited for rsplug's use case.
+- git smart-HTTP (`/info/refs`): subject to GitHub's git-operation limits, but generous with a token.
+- REST API (`api.github.com`): 5,000 requests/hour authenticated, 60/hour anonymous. The `X-RateLimit-Remaining` and `X-RateLimit-Reset` response headers report the current budget.
 
 
 ## Plan of Work
 
-The release proceeds in strict order because each step depends on the previous.
+The implementation proceeds in phases ordered by impact-to-effort ratio. Each phase leaves the binary in a working state — the test suite must pass after every phase.
 
-First, fix the documentation drift so the tag commit carries accurate docs.
-Edit `README.md` and `crates/rsplug/templates/doc/rsplug.txt` to correct the CLI
-description and add the GitHub token authentication and tarball fallback
-documentation.
+**Phase 1.1 — Shared reqwest::Client.** Instead of constructing `reqwest::Client::new()` inside `download_and_extract`, build one `Client` at application startup with tuned pool and HTTP/2 settings, and pass it down through `FetchCtx`. This makes the second and subsequent tarball downloads reuse warm connections and lets HTTP/2 multiplex multiple downloads over a single connection to `codeload.github.com`.
 
-Second, bump the version. Run `scripts/set-version.sh 0.2.4` to update the
-workspace version and all internal crate dependency versions together. Verify
-that `rsplug-fts` remains at `0.3.0`.
+**Phase 1.2 — Eliminate temp-file staging.** Currently the gzip-decompressed stream is copied to a temp file before tar extraction. After switching to `flate2` (Phase 2.1), the `GzDecoder` can feed `tar::Archive` directly inside a single `spawn_blocking` call, removing the intermediate disk write entirely. This is bundled with Phase 2.1 implementation since both touch the same function.
 
-Third, verify publishability. Run `cargo fmt --check`, `cargo clippy`, and
-`cargo test` across the workspace, then `cargo publish --dry-run` for each crate
-in dependency order (leaf crates first, `rsplug` last). The local dry-run cannot
-fully test trusted publishing, but it validates packaging and metadata.
+**Phase 2.1 — flate2 with zlib-ng.** Replace the `async-compression` gzip decoder with `flate2::read::GzDecoder` using the `zlib-ng` C backend. Add `flate2 = { version = "1", features = ["zlib-ng"] }` to `Cargo.toml`. Rewrite `download_and_extract` to download the raw gzip bytes, then decompress and extract in one `spawn_blocking` pass. After this, `async-compression` can be removed from dependencies if no other code uses it.
 
-Fourth, the release notes body is already drafted (see Artifacts); confirm it is
-ready.
+**Phase 3.1 — REST-API rev resolution.** Add a `github::resolve_rev_via_api` function that calls `GET /repos/{owner}/{repo}/commits/{ref}` and reads `.sha` from the JSON response. For the no-revision case (default branch), call `GET /repos/{owner}/{repo}` and read `.default_branch`, then resolve that branch. Use this in `ls_remote` when the source is GitHub HTTPS and a token is present. Check the `X-RateLimit-Remaining` header; if it falls below a threshold (e.g. 50), fall back to git protocol. Wildcard revisions always use git protocol.
 
-Fifth, create the `v0.2.4` annotated tag on the tip of `main` (after the docs
-and version-bump commits), push `main` and the tag, and watch the release
-workflow. The workflow runs `set-version.sh` again from the tag name, so the CI
-build uses version `0.2.4` regardless of the committed `Cargo.toml` — but
-committing the bump keeps the repository consistent for future checkouts.
+**Phase 3.2 — Conditional requests for update.** When `--update` re-fetches a repository that already has a snapshot, attach `If-None-Match` (ETag) or `If-Modified-Since` headers from the stored `.rsplug_http_meta.json`. If GitHub returns `304 Not Modified`, skip the download and reuse the existing snapshot. Store new ETag/Last-Modified values from each successful response.
 
-Sixth, once the GitHub Release exists, overwrite its auto-generated notes with
-the curated body using `gh release edit --notes-file`.
+**Phase 4.1 — Raise semaphore initial limit.** Change `AdaptiveSemaphore::with_limits(8, ...)` to `with_limits(32, 1, 512, ...)` in `main.rs`. The adaptive logic remains the safety net — if errors spike, it halves automatically.
+
+**Phase 5.1 — Benchmark.** Measure cold-install and update times on a fixed plugin set before and after. Record results in the Outcomes section.
 
 
 ## Concrete Steps
 
-All commands run from the repository root `/Users/ama/rsplug.nvim` unless noted.
+Unless noted, all commands run from the repository root (`/Users/ama/.herdr/worktrees/rsplug.nvim/fast-dl`).
 
+**Step 1 — Add flate2 dependency.**
 
-### Task 1 — Documentation fixes
+Edit `crates/rsplug/Cargo.toml`: add `flate2 = { version = "1", features = ["zlib-ng"] }` to `[dependencies]`. Keep `async-compression` for now (remove in Step 3 after confirming nothing else uses it).
 
-Step 1: Fix the CLI description string.
+Expected: `cargo build -p rsplug` succeeds.
 
-In `README.md` around line 326, change:
+**Step 2 — Create shared Client.**
 
-    Vim plugin manager written in Rust
+In `crates/rsplug/src/main.rs`, before the plugin-loading loop, construct a `reqwest::Client`:
 
-to:
+    let http_client = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(64)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
 
-    A blazingly fast Neovim plugin manager written in Rust
+Thread this `Client` (wrapped in `Clone`) through the `plugin.load(...)` call chain into `FetchCtx`. Add an `http_client: reqwest::Client` field to `FetchCtx` in `plugin.rs`.
 
-In `crates/rsplug/templates/doc/rsplug.txt` around line 181, change the same
-string (indented by four spaces) to the Neovim tagline.
+Expected: `cargo build -p rsplug` succeeds. Existing tests pass.
 
-Step 2: Add GitHub token authentication and tarball fallback documentation.
+**Step 3 — Rewrite download_and_extract.**
 
-In `README.md`, add a subsection (after the "Command-Line Interface" section or
-within "Advanced Topics") describing:
+In `crates/rsplug/src/rsplug/util.rs`, rewrite `TarballFetch::download_and_extract` to:
 
-- Setting `GITHUB_TOKEN` or `GH_TOKEN` authenticates GitHub API/git requests and
-  avoids anonymous rate limits.
-- `GITHUB_TOKEN` takes precedence over `GH_TOKEN` (same convention as `gh` CLI).
-- If unset, rsplug falls back to anonymous access, which may hit GitHub rate
-  limits.
-- When a Git fetch fails due to rate limiting, rsplug automatically falls back
-  to downloading the GitHub tarball archive for the resolved commit.
+1. Use the shared `Client` from `FetchCtx` (passed as a new parameter) instead of `Client::new()`.
+2. Send the GET request with the `Authorization` header when a token is present.
+3. Read the full response body into `bytes::Bytes` (add `bytes` to deps if not already transitively available — reqwest re-exports it).
+4. In a single `spawn_blocking` call: wrap the bytes in `std::io::Cursor`, create `flate2::read::GzDecoder`, create `tar::Archive`, iterate entries, strip the top-level directory, and unpack into `dest`.
+5. Remove the `tempfile::tempdir()` temp-file logic.
 
-Add the equivalent content to the help template
-`crates/rsplug/templates/doc/rsplug.txt` in the appropriate section (e.g., under
-"Command-Line Usage" or a new "GitHub Authentication" subsection).
+After confirming the build, check if `async-compression` is still used anywhere. If not, remove it from `Cargo.toml` and remove the `futures-util` / `tokio-util` stream imports if they become unused.
 
-Step 3: Verify the help text matches.
+Expected: `cargo test -p rsplug` passes, including `init_snapshot_checks_out_commit_into_a_detached_worktree`. A manual install of a GitHub plugin succeeds and produces the same file tree as before.
 
-Run:
+**Step 4 — Raise semaphore limit.**
 
-    cargo run --quiet -- --help 2>&1 | head -1
+In `crates/rsplug/src/main.rs`, change the `AdaptiveSemaphore::with_limits` call from initial limit 8 to 32 and max from 256 to 512.
 
-Expected output:
+Expected: `cargo build -p rsplug` succeeds. No test changes needed.
 
-    A blazingly fast Neovim plugin manager written in Rust
+**Step 5 — REST-API rev resolution (Phase 3.1).**
 
-Step 4: Commit.
+In `crates/rsplug/src/rsplug/util.rs`, inside the `github` module, add:
 
-    git add README.md crates/rsplug/templates/doc/rsplug.txt
-    git commit -m "docs: sync CLI description and add GitHub token auth docs"
+    pub async fn resolve_rev_via_api(
+        client: &reqwest::Client,
+        owner: &str,
+        repo: &str,
+        rev: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<String, Error>
 
+This function calls the appropriate endpoint, parses the JSON `sha` or `default_branch` field, and returns the commit hash string. It reads `X-RateLimit-Remaining` and returns a distinct error variant (or `Option`) when the budget is low so the caller can fall back to git protocol.
 
-### Task 2 — Version bump
+In `git::ls_remote`, detect GitHub HTTPS sources with a token. If so, try `resolve_rev_via_api` first; on rate-limit-low or wildcard rev, fall back to the existing git-protocol logic.
 
-Step 1: Run the version script.
+Expected: existing `ls_remote` tests pass. A manual `--update` on a GitHub plugin resolves the rev correctly.
 
-    bash scripts/set-version.sh 0.2.4
+**Step 6 — Conditional requests (Phase 3.2).**
 
-Expected output:
+In `TarballFetch::fetch_to_snapshot`, before downloading, check for `.rsplug_http_meta.json` in the snapshot directory (if it already exists for an update). Attach `If-None-Match` / `If-Modified-Since` headers. If the response is `304`, return early without downloading. After a successful `200`, write the new ETag and Last-Modified to the meta file.
 
-    ✓ Set workspace version to 0.2.4 (rsplug-walker 0.2.4)
+Expected: `--update` with no upstream changes skips the download and logs a "not modified" message.
 
-Step 2: Verify the version sync.
+**Step 7 — Benchmark.**
 
-    grep '^version' Cargo.toml
-    # Expected: version = "0.2.4"
+    # Cold install (clear cache first)
+    rm -rf ~/.cache/rsplug/repos
+    time rsplug --install
 
-    grep 'version =' Cargo.toml
-    # Expected: adaptive_semaphore/dag/file_specifier/walker all show 0.2.4
+    # Update (no changes)
+    time rsplug --update
 
-    grep '^version' crates/walker/Cargo.toml
-    # Expected: version = "0.2.4"
+Record before/after numbers in the Outcomes section.
 
-    grep '^version' crates/walker/vendor/fts/Cargo.toml
-    # Expected: version = "0.3.0"  (unchanged)
+**Step 8 — Lint and test (after every step).**
 
-Step 3: Commit.
-
-    git add Cargo.toml crates/walker/Cargo.toml
-    git commit -m "chore: bump version to 0.2.4"
-
-
-### Task 3 — Publishability verification
-
-Step 1: Workspace checks (do NOT use `cargo check -q` per `AGENTS.md`).
-
-    cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo fmt
     cargo test --workspace
+    cargo clippy --workspace --all-targets
 
-All three must pass.
-
-Step 2: Dry-run publish in dependency order.
-
-    cargo publish -p rsplug-adaptive-semaphore --dry-run
-    cargo publish -p rsplug-dag --dry-run
-    cargo publish -p rsplug-file-specifier --dry-run
-    cargo publish -p rsplug-fts --dry-run
-    cargo publish -p rsplug-walker --dry-run
-    cargo publish -p rsplug --dry-run
-
-Each must finish without `error`. Warnings are acceptable (especially for
-`rsplug-fts` due to its vendored `Cargo.toml`).
-
-Step 3: If any dry-run errors, fix the root cause before proceeding. Do not
-suppress errors with `--allow-dirty` locally; that flag is CI-only for the fts
-crate.
-
-
-### Task 4 — Confirm release notes body
-
-The curated release notes body is in the Artifacts section below. Confirm it is
-accurate and complete before tagging. No git operation needed.
-
-
-### Task 5 — Tag, push, and watch CI
-
-Step 1: Confirm main has the docs and version commits.
-
-    git log --oneline -3
-    # Expected: the two commits from Task 1 and Task 2 at the top.
-
-Step 2: Create the annotated tag.
-
-    git tag -a v0.2.4 -m "Release v0.2.4"
-
-Step 3: Push main and the tag.
-
-    git push origin main
-    git push origin v0.2.4
-
-Step 4: Watch the release workflow.
-
-    gh run list --workflow=release.yml --limit=3
-    gh run watch "$(gh run list --workflow=release.yml --limit=1 --json databaseId -q '.[0].databaseId')"
-
-Wait for all three jobs (`build` × 5 platforms, `publish-crates`,
-`github-release`) to complete successfully.
-
-Step 5: Verify the release artifacts.
-
-    curl -fsSL -A "rsplug-check" "https://crates.io/api/v1/crates/rsplug" | grep -o '"max_stable_version":"[^"]*"'
-    # Expected: "max_stable_version":"0.2.4"
-
-    gh release view v0.2.4 --json tagName,name,assets --jq '{tag: .tagName, name: .name, assets: [.assets[].name]}'
-    # Expected: five assets (4× tar.gz, 1× zip)
-
-
-### Task 6 — Replace release notes
-
-Step 1: Write the curated notes to a temp file and apply.
-
-    cat > /tmp/rsplug-v0.2.4-notes.md << 'EOF'
-    (paste the body from Artifacts below)
-    EOF
-
-    gh release edit v0.2.4 --notes-file /tmp/rsplug-v0.2.4-notes.md
-
-Step 2: Verify.
-
-    gh release view v0.2.4 --json body --jq '.body'
-
-Step 3: Clean up.
-
-    rm -f /tmp/rsplug-v0.2.4-notes.md
+Note: `AGENTS.md` says do not run `cargo check -q`.
 
 
 ## Validation and Acceptance
 
-The release is accepted when all of the following are true:
+Behavior-based criteria:
 
-1. `rsplug --help` and the README/help template CLI descriptions all say "A
-   blazingly fast Neovim plugin manager written in Rust".
-2. README and help template document the `GITHUB_TOKEN`/`GH_TOKEN` env vars and
-   the tarball fallback.
-3. Root `Cargo.toml` shows `version = "0.2.4"`; internal crate dependency
-   versions are all `0.2.4`; `rsplug-fts` remains `0.3.0`.
-4. `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` pass on
-   the workspace.
-5. `cargo publish --dry-run` succeeds for all six crates in dependency order.
-6. Tag `v0.2.4` exists on the remote at the tip of `main`.
-7. The GitHub Actions `release.yml` run for `v0.2.4` has all jobs green.
-8. `https://crates.io/crates/rsplug` shows version `0.2.4`.
-9. The GitHub Release `v0.2.4` has five binary assets attached.
-10. The GitHub Release `v0.2.4` body matches the curated notes (Features / Bug
-    Fixes / Internal / Full Changelog link).
+1. A fresh `rsplug --install` of a GitHub plugin (e.g. `nvim-lua/plenary.nvim`) produces a working snapshot directory with the correct files, identical to the pre-change output. Verified by `diff -r` between old and new snapshot directories.
+
+2. `cargo test --workspace` passes, including:
+   - `init_snapshot_checks_out_commit_into_a_detached_worktree`
+   - `tarball_url_formats_correctly`
+   - `supports_tarball_classifies_correctly`
+   - `parse_github_url_extracts_owner_repo`
+   - All `AdaptiveSemaphore` unit tests.
+
+3. `cargo clippy --workspace --all-targets` produces no new warnings.
+
+4. Cold-install benchmark shows measurable speedup over the pre-change baseline. Target: at least 2x faster on a 30-plugin cold install. Record the actual numbers.
+
+5. `--update` with no upstream changes completes faster than before (conditional-request skip) and does not produce a `200` download in the debug log.
+
+6. Tokenless fallback: with `GITHUB_TOKEN` and `GH_TOKEN` both unset, a GitHub plugin still installs correctly via the GitFetch fallback path.
+
+Manual verification commands:
+
+    # Verify a plugin snapshot is correct
+    ls ~/.cache/rsplug/repos/github.com/nvim-lua/plenary.nvim/worktrees/
+
+    # Verify the semaphore starts at 32 (add a debug log temporarily, or check via a unit test)
+    # Verify shared client is used (debug log or strace for connection count)
 
 
 ## Idempotence and Recovery
 
-- **Re-running `set-version.sh`**: Safe to run repeatedly; it overwrites the
-  version fields to the same value. If it was run with the wrong version, just
-  re-run with the correct one.
-
-- **Documentation commit**: If the docs commit has an error, amend or add a
-  follow-up commit before tagging. Once tagged and pushed, do not rewrite
-  history; add a new commit and re-tag (delete and recreate the tag).
-
-- **Tag created locally but not pushed**: Safe to delete with `git tag -d
-  v0.2.4` and recreate.
-
-- **Tag pushed but CI build failed**: Delete the remote tag (`git push origin
-  :refs/tags/v0.2.4`), fix the issue, commit, and re-tag. If
-  `publish-crates` partially succeeded (some crates published, some not), the
-  workflow's idempotency check (`curl` to crates.io before each publish) means
-  re-running will skip already-published crates.
-
-- **GitHub Release created but notes are wrong**: `gh release edit v0.2.4
-  --notes-file <file>` can be run any number of times.
-
-- **`cargo publish --dry-run` network failure**: Re-run the individual crate
-  command. Dry-runs are non-destructive.
+- Every phase can be reverted independently via `git revert` because the binary remains functional after each step.
+- If `flate2` with `zlib-ng` fails to compile on a target platform, fall back to the `miniz_oxide` backend: `flate2 = { version = "1", features = ["miniz_oxide"] }`. This is slower but pure-Rust and always available.
+- If the REST-API rev resolution returns an unexpected response format, the code must fall back to git protocol, not error out. The `ls_remote` function must never regress for tokenless users.
+- If a conditional request returns an unexpected status (not 200 or 304), treat it as a normal download — discard the stored metadata and proceed with the full tarball.
+- If the shared `Client` construction fails (rare — only on misconfigured TLS), the application should fall back to constructing a default `Client::new()` per the old behavior rather than refusing to start.
+- Clearing the cache (`rm -rf ~/.cache/rsplug/repos`) is always a safe recovery action — it forces a full re-download but never corrupts state.
+- The benchmark step (`rm -rf ~/.cache/rsplug/repos`) is idempotent and safe to repeat.
 
 
 ## Artifacts and Notes
 
-### Curated release notes body for v0.2.4
+Baseline measurements (to be filled in before implementation):
 
-Use this body in Task 6 (`gh release edit v0.2.4 --notes-file`):
+    Cold install (N plugins): ___s (before) / ___s (after)
+    Update no-change (N plugins): ___s (before) / ___s (after)
 
-    ## v0.2.4
+Current dependency versions relevant to this plan:
 
-    ### Features
+    reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+    async-compression = { version = "0.4", features = ["gzip", "tokio"] }
+    tar = "0.4"
 
-    - **GitHub token authentication**: Set `GITHUB_TOKEN` or `GH_TOKEN` to
-      authenticate GitHub API requests and avoid rate limits. Token lookup
-      follows the `gh` CLI convention (`GITHUB_TOKEN` takes precedence over
-      `GH_TOKEN`).
-    - **GitHub tarball fetch fallback**: When a Git fetch hits GitHub's rate
-      limit, rsplug automatically falls back to downloading the tarball
-      archive.
-    - **Adaptive semaphore for fetch rate limiting**: Fetch operations now use
-      an adaptive concurrency limiter that backs off on rate-limit errors.
-    - **Dynamic loading bar width**: The progress loading bar now adjusts its
-      width to fit the terminal.
-    - **Improved cache fetch progress UI**: Fetch stage progress reporting is
-      now clearer.
+Planned additions:
 
-    ### Bug Fixes
+    flate2 = { version = "1", features = ["zlib-ng"] }
 
-    - **`-u` alone no longer installs uninstalled repos**: Running `rsplug -u`
-      without `--install` no longer accidentally installs repos that were not
-      yet installed.
-    - **Git dependency dep_name now uses repo basename**: `dep_name` for Git
-      URL dependencies is now consistently derived from the repo basename.
-    - **Readable source names in not-installed warnings**: The "not installed"
-      warning now shows human-readable source names instead of internal
-      identifiers.
-
-    ### Internal
-
-    - Snapshot cache infrastructure (source.git + per-snapshot worktrees) for
-      stable plugin references across updates.
-    - Plugin identity separated from absolute placement paths.
-    - Config parse error messages improved.
-    - Lua runtime style unified (single-quote, no-paren) across generated
-      templates.
-
-    **Full Changelog**: https://github.com/gw31415/rsplug.nvim/compare/v0.2.3...v0.2.4
-
-### Workflow reference
-
-The release workflow is `.github/workflows/release.yml`. Key facts:
-
-- Trigger: push of any tag matching `v*`.
-- `build` job: matrix of 5 targets (x86_64-linux, aarch64-linux,
-  aarch64-macos, x86_64-macos, x86_64-windows). `fail-fast: false` but
-  `publish-crates` and `github-release` both `needs: build`, so all five must
-  pass.
-- `publish-crates` job: runs `scripts/set-version.sh` from the tag name, then
-  publishes in order: rsplug-adaptive-semaphore, rsplug-dag,
-  rsplug-file-specifier, rsplug-fts, rsplug-walker, rsplug. Uses
-  `--no-verify --allow-dirty`. Sleeps 10s between crates. Skips crates already
-  on crates.io.
-- `github-release` job: uses `softprops/action-gh-release@v2` with
-  `generate_release_notes: true` and attaches all binary artifacts.
+The `reqwest` `stream` feature and `futures-util` may become unnecessary after Phase 1.2/2.1 if the response body is read via `response.bytes()` instead of `bytes_stream()`. Check and clean up after Step 3.
 
 
 ## Interfaces and Dependencies
 
-No source code interfaces change in this release. The release process depends on:
+Public/internal interfaces that must exist after this plan:
 
-- `scripts/set-version.sh` — version bump script.
-- `.github/workflows/release.yml` — CI release pipeline.
-- `gh` CLI — for watching runs and editing the release.
-- crates.io trusted publishing (`rust-lang/crates-io-auth-action@v1`).
-- `softprops/action-gh-release@v2` — GitHub Release creation.
+- `FetchCtx` struct (`plugin.rs`) gains an `http_client: reqwest::Client` field. All call sites in `Plugin::load`, `materialize`, and `ensure_source_git` must pass it through.
+- `TarballFetch::fetch_to_snapshot` signature changes to accept `&reqwest::Client` (or receive it via an expanded `FetchCtx`).
+- `github::resolve_rev_via_api` — new async function in the `github` module. Takes `&reqwest::Client`, owner, repo, optional rev, optional token. Returns `Result<String, Error>` where the error distinguishes rate-limit-exhausted from genuine failure.
+- `git::ls_remote` — modified to try REST-API resolution first for GitHub HTTPS + token, falling back to git protocol. Signature unchanged externally.
+- `main.rs` — constructs the shared `Client` and passes it into the load chain. Semaphore initial limit changes from 8 to 32.
 
-External service dependencies: GitHub Actions runners (ubuntu, macos, windows),
-crates.io, and the crates.io OIDC trust configuration for the repository.
+External dependencies added: `flate2`. Dependencies potentially removed: `async-compression`, possibly `futures-util` and `tokio-util::io` if the streaming path is fully replaced.
+
+No changes to the lockfile format, CLI arguments, or Lua runtime integration.
 
 
 ## Revision Notes
 
-- (2026-07-06) Initial ExecPlan created, replacing the previous snapshot-cache
-  design plan (which was fully implemented and released as part of the 0.2.x
-  line). This plan covers only the v0.2.4 release process: documentation fixes,
-  version bump, publishability verification, tagging, CI release, and curated
-  release notes.
+- 2025-07-07: Initial ExecPlan created from planning session. Converted from a conventional phase-table format to the OpenAI/Codex living-document ExecPlan structure. Content and technical decisions unchanged from the prior version; section organization and required living-document sections added.

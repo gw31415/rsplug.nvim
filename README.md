@@ -354,12 +354,31 @@ export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
 If neither variable is set, rsplug falls back to anonymous access.
 
-### Tarball Fallback
+### Fast Download (GitHub HTTPS + token)
 
-When a Git fetch fails due to GitHub rate limiting, rsplug automatically falls
-back to downloading the GitHub tarball archive for the resolved commit. This
-keeps installs working even when the anonymous rate limit is exhausted, though
-setting a token (above) is recommended to avoid the fallback path entirely.
+When a GitHub token is available, rsplug uses the fastest available download
+path instead of the Git smart-HTTP protocol:
+
+1. **REST API rev resolution** — commit SHAs are resolved via
+   `api.github.com` JSON endpoints (a single lightweight request) instead of
+   the Git ref advertisement. The `X-RateLimit-Remaining` header is monitored;
+   if the budget is low or a wildcard revision (`@v*`) is requested, rsplug
+   falls back to Git `ls-remote`.
+2. **Tarball download** — the repository snapshot is fetched as a `.tar.gz`
+   archive from `codeload.github.com` (Fastly CDN, outside the core API rate
+   limit) rather than cloning the Git object store. Archives are decompressed
+   with the C-backed `zlib-ng` library for maximum throughput.
+3. **Connection reuse** — a single shared HTTP client with connection pooling
+   and HTTP/2 multiplexing handles all downloads, so repeated TCP/TLS
+   handshakes to the same host are eliminated.
+4. **High parallelism** — up to 32 concurrent tarball downloads (adaptive:
+   automatically halved on error-rate spikes).
+
+Tarball downloads are not counted against the GitHub API rate limit, so this
+path can sustain high throughput even with many plugins.
+
+If the tarball download fails (e.g. private repo without token, or network
+error), rsplug automatically falls back to the Git smart-HTTP clone path.
 
 ## How It Works
 
