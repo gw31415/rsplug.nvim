@@ -58,7 +58,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p rsplug
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
