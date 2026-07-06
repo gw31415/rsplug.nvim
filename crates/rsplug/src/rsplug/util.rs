@@ -501,9 +501,177 @@ pub mod github {
         let val = std::env::var("GITHUB_TOKEN")
             .or_else(|_| std::env::var("GH_TOKEN"))
             .ok()?;
-        // Box::leak は &'static mut str を返すが、関数シグネチャに合わせて
-        // &'static str にキャストする（所有権は放棄、プロセス終了まで生存）。
         Some(Box::leak(val.into_boxed_str()))
+    }
+
+    /// tarball download URL を生成する。
+    /// GitHub: `https://github.com/{owner}/{repo}/archive/{ref}.tar.gz`
+    /// `ref` にはコミットハッシュ（40桁 hex）を渡す。
+    pub fn tarball_url(owner: &str, repo: &str, oid: &str) -> String {
+        format!("https://github.com/{owner}/{repo}/archive/{oid}.tar.gz")
+    }
+
+    /// 指定 URL が tarball download 対象か（GitHub HTTPS URL か）。
+    pub fn supports_tarball(url: &str) -> bool {
+        url.starts_with("https://github.com/")
+    }
+
+    /// `https://github.com/{owner}/{repo}` から (owner, repo) を抽出する。
+    /// 末尾 `.git` は許容する。抽出できなければ `None`。
+    pub fn parse_github_url(url: &str) -> Option<(String, String)> {
+        let rest = url.strip_prefix("https://github.com/")?;
+        let rest = rest.strip_suffix(".git").unwrap_or(rest);
+        let mut parts = rest.split('/');
+        let owner = parts.next()?.to_string();
+        let repo = parts.next()?.to_string();
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some((owner, repo))
+    }
+}
+
+pub mod fetch {
+    //! Phase 2: HTTP tarball download によるフェッチ（GitHub HTTPS + token 認証）。
+    //!
+    //! GitFetch（git smart HTTP + git2）相当の処理は `Plugin::load` 側で既存の
+    //! source.git パスとして扱い、TarballFetch 失敗時のフォールバック先とする。
+    //! GitHub 固有の知識（tarball URL・対象判定・top-level dir strip）は
+    //! `super::github` と本モジュール内に局所化し、コアロジックには晒さない。
+
+    use std::path::Path;
+
+    use super::super::error::Error;
+    use super::github;
+
+    /// Phase 2: HTTP tarball download + 展開によるフェッチ。
+    pub struct TarballFetch;
+
+    impl TarballFetch {
+        /// `url`（GitHub HTTPS）のコミット `oid` の tarball をダウンロードし、`snapshot_root`
+        /// に展開した上で git2 互換の作業ツリー（init + add -A + commit）を作る。
+        /// 展開後は既存の `is_dirty` / `diff_hash` / `ls_files` がそのまま動作する。
+        /// なお head_rev（lockfile / SnapshotKey 用）は元リポジトリの OID を使うため、
+        /// ここで作るローカルコミットのハッシュとは無関係（互換性維持）。
+        pub async fn fetch_to_snapshot(
+            &self,
+            url: &str,
+            oid: &str,
+            snapshot_root: &Path,
+            token: Option<&str>,
+        ) -> Result<(), Error> {
+            let (owner, repo) = github::parse_github_url(url).ok_or_else(|| {
+                Error::Io(std::io::Error::other(format!(
+                    "not a GitHub HTTPS URL for tarball: {url}"
+                )))
+            })?;
+            let tarball_url = github::tarball_url(&owner, &repo, oid);
+
+            tokio::fs::create_dir_all(snapshot_root).await?;
+            Self::download_and_extract(&tarball_url, snapshot_root, token).await?;
+
+            // git2 互換の作業ツリーを作る（後段の is_dirty / diff_hash / ls_files 用）
+            let snapshot_root = snapshot_root.to_path_buf();
+            let oid_owned = oid.to_string();
+            tokio::task::spawn_blocking(move || {
+                Self::init_git_worktree(&snapshot_root, &oid_owned)
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(format!("join error: {e}"))))??;
+
+            Ok(())
+        }
+
+        /// tarball を HTTP GET でダウンロードし、dest にストリーミング展開する。
+        async fn download_and_extract(
+            url: &str,
+            dest: &Path,
+            token: Option<&str>,
+        ) -> Result<(), Error> {
+            use async_compression::tokio::bufread::GzipDecoder;
+            use futures_util::StreamExt;
+            use tokio::io::AsyncWriteExt;
+
+            let client = reqwest::Client::new();
+            let mut req = client.get(url);
+            if let Some(token) = token {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            let response = req.send().await.map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "tarball download failed: {e}"
+                )))
+            })?;
+            if !response.status().is_success() {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "tarball download HTTP {} for {url}",
+                    response.status()
+                ))));
+            }
+
+            // bytes_stream → AsyncRead → GzipDecoder
+            let stream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
+            let async_read = tokio_util::io::StreamReader::new(stream);
+            let mut gzip_decoder = GzipDecoder::new(async_read);
+
+            // gzip 展開結果を一時ファイルに書き出し、tar 展開は spawn_blocking で行う
+            let tmp = tempfile::tempdir().map_err(Error::Io)?;
+            let tmp_path = tmp.path().join("tarball.tar");
+            {
+                let mut file = tokio::fs::File::create(&tmp_path).await?;
+                tokio::io::copy(&mut gzip_decoder, &mut file).await?;
+                file.flush().await?;
+            }
+
+            // tar 展開（spawn_blocking）
+            let dest = dest.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&tmp_path)?;
+                let mut archive = tar::Archive::new(file);
+                for entry in archive.entries()? {
+                    let mut entry = entry?;
+                    let path = entry.path()?.into_owned();
+                    // GitHub tarball のトップレベルディレクトリ（owner-repo-ref/）を strip
+                    let rel: std::path::PathBuf = path.components().skip(1).collect();
+                    if rel.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let dest_path = dest.join(&rel);
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    entry.unpack(&dest_path)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(format!("join error: {e}"))))??;
+
+            Ok(())
+        }
+
+        /// tarball 展開ディレクトリを git2 互換の作業ツリーにする。
+        fn init_git_worktree(snapshot_root: &Path, oid: &str) -> Result<(), Error> {
+            let repo = git2::Repository::init(snapshot_root)?;
+            let mut index = repo.index()?;
+            index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+            index.write()?;
+            let sig = git2::Signature::now("rsplug", "rsplug@localhost")?;
+            let tree_id = index.write_tree()?;
+            let tree = repo.find_tree(tree_id)?;
+            let commit_oid = repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                &format!("rsplug snapshot {oid}"),
+                &tree,
+                &[],
+            )?;
+            repo.set_head_detached(commit_oid)?;
+            Ok(())
+        }
     }
 }
 
@@ -657,6 +825,41 @@ mod tests {
             std::env::remove_var("GH_TOKEN");
         }
         assert_eq!(github::token(), None);
+    }
+
+    #[test]
+    fn tarball_url_formats_correctly() {
+        assert_eq!(
+            github::tarball_url("owner", "repo", "abc123"),
+            "https://github.com/owner/repo/archive/abc123.tar.gz"
+        );
+    }
+
+    #[test]
+    fn supports_tarball_classifies_correctly() {
+        assert!(github::supports_tarball("https://github.com/owner/repo"));
+        assert!(github::supports_tarball(
+            "https://github.com/owner/repo.git"
+        ));
+        assert!(!github::supports_tarball("https://gitlab.com/owner/repo"));
+        assert!(!github::supports_tarball("ssh://git@github.com/owner/repo"));
+    }
+
+    #[test]
+    fn parse_github_url_extracts_owner_repo() {
+        assert_eq!(
+            github::parse_github_url("https://github.com/owner/repo"),
+            Some(("owner".into(), "repo".into()))
+        );
+        assert_eq!(
+            github::parse_github_url("https://github.com/owner/repo.git"),
+            Some(("owner".into(), "repo".into()))
+        );
+        assert_eq!(
+            github::parse_github_url("https://gitlab.com/owner/repo"),
+            None
+        );
+        assert_eq!(github::parse_github_url("https://github.com/owner"), None);
     }
 
     #[tokio::test]

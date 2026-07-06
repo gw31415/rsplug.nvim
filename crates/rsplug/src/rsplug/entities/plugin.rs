@@ -286,7 +286,7 @@ impl Plugin {
         locked_rev: Option<Arc<str>>,
         semaphore: adaptive_semaphore::AdaptiveSemaphore,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
-        use super::{util::git, *};
+        use super::util::git;
         use crate::{
             log::{Message, msg},
             rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, truncate},
@@ -411,41 +411,34 @@ impl Plugin {
         };
         let head_rev_str = oid.to_string();
 
-        // --- source.git の確保と fetch (PLANS §8 step 3-6, §15.10) ---
-        // 新 layout (source.git) が無い場合: install/update なら作成、locked なら cache 不足
-        // エラー、それ以外（通常起動）なら未インストールとしてスキップ。
-        // 旧 layout の可変 checkout は自動で読み飛ばす（install/update で新 layout に移行）。
-        let mut source_repo = match git::open_source(&source_git).await {
-            Ok(r) => r,
-            Err(_) if install || update => {
-                let _permit = semaphore.acquire().await;
-                msg(Message::Cache("Initializing", url.clone()));
-                git::init_source(&source_git, &url).await?
-            }
-            Err(_) if locked_rev.is_some() => {
-                return Err(invalid_data(format!(
-                    "Missing cached repository for locked revision: {}",
-                    url
-                )));
-            }
-            Err(_) => {
-                msg(Message::PluginNotInstalled(display_name(
-                    &source_name,
-                    &logid,
-                )));
-                return Ok(None);
-            }
+        let _running_guard = RunningGuard::new();
+
+        // --- フェッチ戦略の選択 (Phase 2) ---
+        // token があって GitHub HTTPS URL なら TarballFetch（source.git 不要）。
+        // それ以外は従来の GitFetch（source.git）パス。TarballFetch 失敗時は GitFetch にフォールバック。
+        let use_tarball = token.is_some() && util::github::supports_tarball(&url);
+        let locked = locked_rev.is_some();
+
+        // フェッチヘルパーへ渡すコンテキスト。GitFetch/TarballFetch で共有し、引数過多を避ける。
+        let ctx = FetchCtx {
+            url: &url,
+            oid,
+            source_git: &source_git,
+            token: &token,
+            source_name: &source_name,
+            semaphore: &semaphore,
+            install,
+            update,
+            locked,
+            logid: &logid,
         };
-        // fetch 許可取得後〜load() 戻りまでを「稼働中」とする。permit は fetch
-        // ブロック内だけで離す（build は semaphore 外で並列に走らせるため）が、
-        // ガードはブロックの戻り値として外側に移動し、関数の終わりまで残す。
-        let _running_guard = {
-            let _permit = semaphore.acquire().await;
-            msg(Message::Cache("Fetching", url.clone()));
-            let guard = RunningGuard::new();
-            source_repo.fetch_oid(oid, token.clone()).await?;
-            guard
-        };
+
+        // GitFetch（非 tarball）の場合だけここで source.git を確保する。
+        // TarballFetch は source.git を使わないので、失敗時フォールバックまで確保を遅延する
+        // （無駄な git fetch を避ける）。未インストール（install/update/locked いずれでもない）ならスキップ。
+        if !use_tarball && !ensure_source_git(&ctx).await? {
+            return Ok(None);
+        }
 
         // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
         tokio::fs::create_dir_all(&worktrees).await?;
@@ -469,7 +462,10 @@ impl Plugin {
             let building = building_worktree_dir(&worktrees);
             let _ = tokio::fs::remove_dir_all(&building).await;
             let building: Arc<Path> = Arc::from(building);
-            let repo = git::init_snapshot(building.clone(), &source_git, oid).await?;
+            let repo = match materialize(&ctx, building.as_ref(), use_tarball).await? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
 
             // lua_post_update は update 検知時のみ building worktree で実行。
             if update && let Some(lua_post_update) = lua_post_update.as_deref() {
@@ -529,7 +525,10 @@ impl Plugin {
             (final_root, opened)
         } else {
             // build 無し: key は確定（dirty=None）。final があれば再利用、なければ作成。
-            let repo = git::init_snapshot(final_root.as_ref(), &source_git, oid).await?;
+            let repo = match materialize(&ctx, final_root.as_ref(), use_tarball).await? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
             (final_root.clone(), repo)
         };
 
@@ -604,14 +603,97 @@ impl Plugin {
     }
 }
 
-/// build 中の一時 worktree: `worktrees/.building-<pid>-<nonce>` (PLANS §7)。
-/// `worktrees/` 内の hidden directory なので scan 対象にならない（先頭 `.`）。
-fn building_worktree_dir(worktrees: &Path) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    worktrees.join(format!(".building-{}-{}", std::process::id(), nonce))
+/// フェッチに必要なコンテキスト（GitFetch / TarballFetch 共通）。
+/// `Plugin::load` で組み立ててヘルパーに渡すことで引数過多を避ける。
+struct FetchCtx<'a> {
+    url: &'a Arc<str>,
+    oid: Oid,
+    source_git: &'a Path,
+    token: &'a Option<Arc<str>>,
+    source_name: &'a Option<String>,
+    semaphore: &'a adaptive_semaphore::AdaptiveSemaphore,
+    install: bool,
+    update: bool,
+    locked: bool,
+    logid: &'a str,
+}
+
+/// source.git を（必要なら作成して）開き、`oid` を fetch する（GitFetch 相当）。
+/// 戻り値 `Ok(true)` = source.git に oid を fetch 済み、`Ok(false)` = 未インストールなのでスキップ。
+/// `Err` = locked で cache 不足、または fetch 失敗。
+async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
+    use super::util::git;
+    use crate::log::{Message, msg};
+
+    let mut repo = match git::open_source(ctx.source_git).await {
+        Ok(r) => r,
+        Err(_) if ctx.install || ctx.update => {
+            let _permit = ctx.semaphore.acquire().await;
+            msg(Message::Cache("Initializing", ctx.url.clone()));
+            git::init_source(ctx.source_git, ctx.url).await?
+        }
+        Err(_) if ctx.locked => {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Missing cached repository for locked revision: {}", ctx.url),
+            )));
+        }
+        Err(_) => {
+            msg(Message::PluginNotInstalled(display_name(
+                ctx.source_name,
+                ctx.logid,
+            )));
+            return Ok(false);
+        }
+    };
+    {
+        let _permit = ctx.semaphore.acquire().await;
+        msg(Message::Cache("Fetching", ctx.url.clone()));
+        repo.fetch_oid(ctx.oid, ctx.token.clone()).await?;
+    }
+    Ok(true)
+}
+
+/// snapshot worktree を `dest` に実体化し、開いた [`util::git::Repository`] を返す。
+/// `use_tarball` なら TarballFetch を試行し、失敗時は GitFetch（source.git）にフォールバックする。
+/// `use_tarball` でない場合は source.git 経由で init_snapshot する（呼出元で source.git 確保済みが前提）。
+/// 戻り値 `Ok(None)` = 未インストールスキップ。
+async fn materialize(
+    ctx: &FetchCtx<'_>,
+    dest: &Path,
+    use_tarball: bool,
+) -> Result<Option<util::git::Repository>, Error> {
+    use super::util::{fetch::TarballFetch, git};
+    use crate::log::{Message, msg};
+
+    if use_tarball {
+        let tarball_ok = {
+            let _permit = ctx.semaphore.acquire().await;
+            msg(Message::Cache("Fetching", ctx.url.clone()));
+            let head_rev = ctx.oid.to_string();
+            match TarballFetch
+                .fetch_to_snapshot(ctx.url.as_ref(), &head_rev, dest, ctx.token.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    msg(Message::Cache("Fetching:done", ctx.url.clone()));
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        if tarball_ok {
+            return Ok(Some(git::open(dest.to_path_buf()).await?));
+        }
+        // TarballFetch 失敗 → GitFetch（source.git）にフォールバック
+        if !ensure_source_git(ctx).await? {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(
+        git::init_snapshot(dest.to_path_buf(), ctx.source_git, ctx.oid).await?,
+    ))
 }
 
 /// 未インストール警告の表示名。`source_name`（`dep_name` 由来）を優先し、
@@ -628,11 +710,6 @@ fn display_name(source_name: &Option<String>, logid: &str) -> Arc<str> {
 /// fetch 許可を取得してネットワーク実作業に入った時点で `new()` が +1 し
 /// （`LoadPluginRunning`）、`load()` の戻りとともに `Drop` が -1 する
 /// （`LoadPluginRunningDone`）。成功・エラー全経路で対になる。
-///
-/// 従来は完了時の `LoadPluginDone` だけで全体バーが進んだため、パイプライン
-/// 充填中や並列度立ち上がり時にバーが長く 0% で止まり、最後に一気に進んで見えた。
-/// このガードの区間を「稼働中」としてバーに □ で可視化することで、作業中の
-/// 実体を逐次反映する。
 struct RunningGuard;
 
 impl RunningGuard {
@@ -646,6 +723,16 @@ impl Drop for RunningGuard {
     fn drop(&mut self) {
         crate::log::msg(crate::log::Message::LoadPluginRunningDone);
     }
+}
+
+/// build 中の一時 worktree: `worktrees/.building-<pid>-<nonce>` (PLANS §7)。
+/// `worktrees/` 内の hidden directory なので scan 対象にならない（先頭 `.`）。
+fn building_worktree_dir(worktrees: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    worktrees.join(format!(".building-{}-{}", std::process::id(), nonce))
 }
 
 /// repo の `build`(sh) と `lua_build` を `workdir` で実行する。

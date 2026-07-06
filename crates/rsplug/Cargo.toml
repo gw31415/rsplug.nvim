@@ -35,3 +35,9 @@ toml_edit = "0.23"
 unicode-width = "0.2"
 wildmatch = "2.6"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+# Phase 2: HTTP tarball download
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+async-compression = { version = "0.4", features = ["gzip", "tokio"] }
+tar = "0.4"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
