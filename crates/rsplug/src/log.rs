@@ -336,12 +336,6 @@ fn sanitize_build_line(line: &str) -> Option<String> {
     Some(trimmed.replace('\n', " "))
 }
 
-/// Loading 全体進捗バーの固定セル幅。
-/// `wide_bar` と違いカスタムトラッカーで自前描画するため、`ProgressState` からは
-/// 端末幅が取れない（描画幅はトラッカーに渡されない）。よって固定幅とし、
-/// `dual_bar_cells` で確定的に計算してテスト可能にする。
-const LOADING_BAR_CELLS: usize = 40;
-
 /// `width` セルのバーを (Done, 稼働中, 未実行) に配分する。
 /// 端数は切り捨てて Done→稼働中の順に確保し、合計が常に `width` になるよう
 /// 未実行で調整する（稼働中が Done の右隣に連続して描かれる）。
@@ -352,6 +346,18 @@ fn dual_bar_cells(done: u64, running: u64, len: u64, width: usize) -> (usize, us
     let running_cells = ((running * width / len).min(width - done_cells as u64)) as usize;
     let idle_cells = width as usize - done_cells - running_cells;
     (done_cells, running_cells, idle_cells)
+}
+
+fn loading_bar_width(running: usize) -> usize {
+    let term_width = console::Term::stderr().size().1 as usize;
+    loading_bar_width_for(term_width, running)
+}
+
+fn loading_bar_width_for(term_width: usize, running: usize) -> usize {
+    let active_width = running.to_string().width() + " active".width();
+    // Matches loading_style(): "{spinner} {prefix} [{elapsed}] [{dualbar}] {pos}/{len} {active}".
+    let fixed_width = 40 + active_width;
+    term_width.saturating_sub(fixed_width).max(10)
 }
 
 /// Loading バー本体: `■`(Done=cyan) + `□`(稼働中=yellow) + (空白=未実行)。
@@ -370,8 +376,8 @@ impl ProgressTracker for DualBarTracker {
         let done = state.pos();
         let len = state.len().unwrap_or(done).max(1);
         let running = self.running.load(Ordering::Relaxed) as u64;
-        let (done_cells, running_cells, idle_cells) =
-            dual_bar_cells(done, running, len, LOADING_BAR_CELLS);
+        let width = loading_bar_width(running as usize);
+        let (done_cells, running_cells, idle_cells) = dual_bar_cells(done, running, len, width);
         let _ = write!(
             w,
             "{}{}{}",
@@ -409,16 +415,18 @@ impl ProgressTracker for ActiveTracker {
 /// Loading バーの ProgressStyle。`dualbar`(本体) と `active`(稼働中数) を
 /// 共有の稼働中計数 `running` に束ねる。spinner / prefix は既存スタイルを維持。
 fn loading_style(running: Arc<AtomicUsize>) -> ProgressStyle {
-    ProgressStyle::with_template("{spinner} {prefix:.blue.bold} {dualbar} {pos}/{len} {active}")
-        .unwrap()
-        .with_key(
-            "dualbar",
-            DualBarTracker {
-                running: running.clone(),
-            },
-        )
-        .with_key("active", ActiveTracker { running })
-        .tick_strings(&["◒", "◐", "◓", "◑", " "])
+    ProgressStyle::with_template(
+        "{spinner} {prefix:.blue.bold} [{elapsed_precise}] [{dualbar}] {pos:>7}/{len:7} {active}",
+    )
+    .unwrap()
+    .with_key(
+        "dualbar",
+        DualBarTracker {
+            running: running.clone(),
+        },
+    )
+    .with_key("active", ActiveTracker { running })
+    .tick_strings(&["◒", "◐", "◓", "◑", " "])
 }
 
 impl ProgressManager {
@@ -1324,12 +1332,18 @@ mod tests {
         assert_eq!((done, running, idle), (8, 2, 0));
 
         // 端数は切り捨て。130 plugins, width 40: done=65 -> 20, running=8 -> 2.
-        let (done, running, idle) = dual_bar_cells(65, 8, 130, LOADING_BAR_CELLS);
+        let (done, running, idle) = dual_bar_cells(65, 8, 130, 40);
         assert_eq!((done, running, idle), (20, 2, 18));
 
         // len=0 でも安全（分母を max(1) で護る）。
-        let (done, running, idle) = dual_bar_cells(0, 0, 0, LOADING_BAR_CELLS);
-        assert_eq!((done, running, idle), (0, 0, LOADING_BAR_CELLS));
+        let (done, running, idle) = dual_bar_cells(0, 0, 0, 40);
+        assert_eq!((done, running, idle), (0, 0, 40));
+    }
+
+    #[test]
+    fn loading_bar_width_uses_remaining_terminal_width() {
+        assert_eq!(loading_bar_width_for(100, 3), 52);
+        assert_eq!(loading_bar_width_for(20, 123), 10);
     }
 
     /// 完了 0 のときでも稼働中 □ と「N active」が見えること＝本修正の目的。
