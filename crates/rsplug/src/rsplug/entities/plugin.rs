@@ -650,6 +650,7 @@ async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
         let _permit = ctx.semaphore.acquire().await;
         msg(Message::Cache("Fetching", ctx.url.clone()));
         repo.fetch_oid(ctx.oid, ctx.token.clone()).await?;
+        msg(Message::Cache("Fetching:done", ctx.url.clone()));
     }
     Ok(true)
 }

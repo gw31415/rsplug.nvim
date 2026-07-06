@@ -1,5 +1,5 @@
 use console::style;
-use hashbrown::{HashMap, hash_map::Entry};
+use hashbrown::HashMap;
 use indicatif::{
     MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle,
     style::ProgressTracker,
@@ -49,6 +49,10 @@ pub enum Message {
     /// 稼働中プラグインの完了（=稼働中 -1）。`RunningGuard` の Drop で送出される。
     LoadPluginRunningDone,
     LoadDone,
+    /// fetched 行を300ms経過後に空欄化する。世代で最新のタイマーだけ有効。
+    FetchDoneIdle {
+        idle_gen: u64,
+    },
     /// フラグなし実行でキャッシュが無くロードできなかった（未インストール）。
     PluginNotInstalled(Arc<str>),
     MergeFinished {
@@ -76,6 +80,7 @@ static LOGGER: Lazy<Logger> = Lazy::new(init);
 
 const CACHE_FETCH_PROGRESS_ID: &str = "cache_fetch_progress";
 const CACHE_FETCH_STAGE_ID: &str = "cache_fetch_stage";
+const CACHE_FETCH_DONE_ID: &str = "cache_fetch_done";
 
 #[derive(Clone)]
 struct ConfigGroup {
@@ -262,8 +267,12 @@ impl Display for ConfigList {
 /// MultiProgress は挿入順に描画するため、追加順＝表示順に依存できる。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ChildKey {
-    /// Fetching / Initializing ステージ行（`progress_bars[CACHE_FETCH_STAGE_ID]`）。
+    /// Fetching / Initializing 行（`progress_bars[CACHE_FETCH_STAGE_ID]`）。
     FetchStage,
+    /// fetched 完了ノート行（`progress_bars[CACHE_FETCH_DONE_ID]`）。
+    FetchDone,
+    /// Fetch object aggregate progress（`progress_bars[CACHE_FETCH_PROGRESS_ID]`）。
+    FetchProgress,
     /// Updating 行（`self.updating_bar`）。
     Updating,
     /// ビルド行（`progress_bars[id]`）。
@@ -275,8 +284,12 @@ struct ProgressManager {
     pb_style: ProgressStyle,
     pb_style_spinner_mid: ProgressStyle,
     pb_style_spinner_last: ProgressStyle,
-    pb_style_bar_last: ProgressStyle,
-    pb_style_bar_last_nolead: ProgressStyle,
+    pb_style_blank_mid: ProgressStyle,
+    pb_style_blank_last: ProgressStyle,
+    pb_style_fetch_note_child_mid: ProgressStyle,
+    pb_style_fetch_note_child_last: ProgressStyle,
+    pb_style_fetch_bar_mid: ProgressStyle,
+    pb_style_fetch_bar_last: ProgressStyle,
     pb_style_summary: ProgressStyle,
 
     // State
@@ -284,10 +297,23 @@ struct ProgressManager {
     installskipped_count: usize,
     yankfile_count: usize,
     not_installed: Vec<Arc<str>>,
-    cachefetching_oids: HashMap<String, usize>,
+    cachefetching_oids: HashMap<String, (usize, usize)>,
     cache_updating_fetching: HashMap<String, ()>,
     cache_updating_current: Option<String>,
     updating_bar: Option<BarState>,
+    /// Fetching 進行中の URL 集合（Updating 行と同じ並行追跡パターン）。
+    cache_fetching: HashMap<String, ()>,
+    /// Fetching 行に現在表示中の URL。
+    cache_fetching_current: Option<String>,
+    /// fetched 行に表示中の URL（最後に完了した1つ）。
+    cache_fetch_done_url: Option<String>,
+    /// Fetching 行が空欄（進行中なし）かどうか。
+    fetch_stage_is_blank: bool,
+    /// fetched 行が空欄（300ms 経過）かどうか。
+    fetch_done_is_blank: bool,
+    /// fetched 行の空欄化タイマーの世代。新しい Fetching:done ごとに進め、
+    /// 世代が一致しない遅延メッセージは無視する（キャンセル相当）。
+    fetch_done_idle_gen: u64,
     /// レベル1子バーの追加順。最後の子の罫線を `└─` に切り替えるために使う。
     child_order: Vec<ChildKey>,
     config_files: Vec<Arc<Path>>,
@@ -295,6 +321,10 @@ struct ProgressManager {
     /// Loading バーの「稼働中」計数。LoadBegin でバー生成時に作り、
     /// `dualbar`/`active` トラッカーと共有する。LoadDone で破棄。
     loading_running: Option<Arc<AtomicUsize>>,
+    /// fetched 行の300ms空欄化タイマー用の sender。
+    /// 本番は `init` が注入、テストは None（タイマー不起動、`FetchDoneIdle` を直接
+    /// `process` に送って検証）。グローバル LOGGER に依存しないことで単体テストを可能にする。
+    idle_tx: Option<mpsc::UnboundedSender<Message>>,
 }
 
 struct BarState {
@@ -430,17 +460,23 @@ fn loading_style(running: Arc<AtomicUsize>) -> ProgressStyle {
 }
 
 impl ProgressManager {
+    /// 検証用: stderr 描画、タイマー sender 無し。
+    #[cfg(test)]
     fn new() -> Self {
-        Self::build(ProgressDrawTarget::stderr())
+        Self::build(ProgressDrawTarget::stderr(), None)
     }
 
-    /// 描画先を注入可能にしたコンストラクタ（検証用）。本番は new() → stderr。
+    /// 描画先を注入可能にしたコンストラクタ（検証用）。本番は `init` が
+    /// `build(stderr, Some(tx))` を呼ぶ。テストはタイマー sender 無し。
     #[cfg(test)]
     fn with_draw_target(draw_target: ProgressDrawTarget) -> Self {
-        Self::build(draw_target)
+        Self::build(draw_target, None)
     }
 
-    fn build(draw_target: ProgressDrawTarget) -> Self {
+    fn build(
+        draw_target: ProgressDrawTarget,
+        idle_tx: Option<mpsc::UnboundedSender<Message>>,
+    ) -> Self {
         // ツリー罫線で階層を表現する:
         //   Loading は親（レベル0）、Fetching/Building/Updating は子（レベル1）、
         //   フェッチオブジェクト進捗は孫（レベル2）。
@@ -454,21 +490,38 @@ impl ProgressManager {
             ProgressStyle::with_template("{spinner}  └─ {prefix:.blue.bold} {wide_msg}")
                 .unwrap()
                 .tick_strings(&["◒", "◐", "◓", "◑", " "]);
-        // レベル2 孫バー（フェッチオブジェクト進捗、単一）。常に └─。
-        // 先頭の │ は親(FetchStage)が最後の子でないときだけ出す。
-        let pb_style_bar_last = ProgressStyle::with_template(
-            "{spinner}  │  └─ [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
+        let pb_style_fetch_bar_mid = ProgressStyle::with_template(
+            "{spinner}  ├─ {prefix:.blue.bold} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
         )
         .unwrap()
         .progress_chars("■□ ")
         .tick_strings(&["◒", "◐", "◓", "◑", " "]);
-        // 親(FetchStage)が最後の子のときは │ を空白で段揃え（`  │  `=5セル → 空白5つ）。
-        let pb_style_bar_last_nolead = ProgressStyle::with_template(
-            "{spinner}     └─ [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
+        let pb_style_fetch_bar_last = ProgressStyle::with_template(
+            "{spinner}  └─ {prefix:.blue.bold} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7}",
         )
         .unwrap()
         .progress_chars("■□ ")
         .tick_strings(&["◒", "◐", "◓", "◑", " "]);
+        // 空欄行（Fetching が進行中なし／fetched が300ms経過）。罫線のみ、内容は描かない。
+        // 中間は │、最後は空白。レベル1バーと fetched(レベル2)行で共用。
+        // tick_strings は2要素（最終要素は indicatif の完了状態用に予約されるため、
+        // アニメーション要素を1要素だけにするとゼロ除算になる）。
+        let pb_style_blank_mid = ProgressStyle::with_template("{spinner}  │")
+            .unwrap()
+            .tick_strings(&[" ", " "]);
+        let pb_style_blank_last = ProgressStyle::with_template("{spinner}   ")
+            .unwrap()
+            .tick_strings(&[" ", " "]);
+        // fetched 行は Fetching の子（レベル2）。横線(─)は引かず、Fetching の縦線を継ぐか空白。
+        // Fetching が中間(├─)なら │、Fetching が最後(└─)なら空白。いずれも Fetching より1段階右。
+        let pb_style_fetch_note_child_mid =
+            ProgressStyle::with_template("{spinner}  │   {prefix:.dim} {wide_msg}")
+                .unwrap()
+                .tick_strings(&[" ", " "]);
+        let pb_style_fetch_note_child_last =
+            ProgressStyle::with_template("{spinner}      {prefix:.dim} {wide_msg}")
+                .unwrap()
+                .tick_strings(&[" ", " "]);
         // prefix を自前で色付けする（✓/✗ 付きの持続サマリー行用）。テキストはそのまま通る。
         let pb_style_summary = ProgressStyle::with_template("{prefix} {wide_msg}").unwrap();
 
@@ -487,8 +540,12 @@ impl ProgressManager {
             pb_style,
             pb_style_spinner_mid,
             pb_style_spinner_last,
-            pb_style_bar_last,
-            pb_style_bar_last_nolead,
+            pb_style_blank_mid,
+            pb_style_blank_last,
+            pb_style_fetch_note_child_mid,
+            pb_style_fetch_note_child_last,
+            pb_style_fetch_bar_mid,
+            pb_style_fetch_bar_last,
             pb_style_summary,
             progress_bars: HashMap::from([("config_files".to_string(), barstate)]),
             installskipped_count: 0,
@@ -498,10 +555,17 @@ impl ProgressManager {
             cache_updating_fetching: HashMap::new(),
             cache_updating_current: None,
             updating_bar: None,
+            cache_fetching: HashMap::new(),
+            cache_fetching_current: None,
+            cache_fetch_done_url: None,
+            fetch_stage_is_blank: false,
+            fetch_done_is_blank: false,
+            fetch_done_idle_gen: 0,
             child_order: Vec::new(),
             config_files: Vec::new(),
             osc94: None,
             loading_running: None,
+            idle_tx,
         }
     }
 
@@ -510,37 +574,75 @@ impl ProgressManager {
     fn child_bar(&self, key: &ChildKey) -> Option<&BarState> {
         match key {
             ChildKey::FetchStage => self.progress_bars.get(CACHE_FETCH_STAGE_ID),
+            ChildKey::FetchDone => self.progress_bars.get(CACHE_FETCH_DONE_ID),
+            ChildKey::FetchProgress => self.progress_bars.get(CACHE_FETCH_PROGRESS_ID),
             ChildKey::Updating => self.updating_bar.as_ref(),
             ChildKey::Building(id) => self.progress_bars.get(id.as_str()),
         }
     }
 
-    /// 子バーの追加/除去後に呼び、追加順に従い最後の子に └─・それ以外に ├─ を当て直す。
-    /// 併せて孫バー(cache_fetch_progress)の罫線も、親(FetchStage)が最後か否かで切り替える。
-    /// set_style 自体は即時描画しないが各バーは steady_tick(100ms) で再描画され、
-    /// prefix/message は保持される（indicatif 0.18 で確認）。
+    /// 子バーの表示カテゴリ優先順（＝物理 insert 順）。
+    /// `child_order` の push 順はバーの再生成時に物理 insert 順とずれうるため、
+    /// 罫線（├─/└─）はこの優先順で決める。Building 同士は元の追加順を維持（sort は安定）。
+    fn category_rank(key: &ChildKey) -> u8 {
+        match key {
+            ChildKey::Updating => 0,
+            ChildKey::FetchStage => 1,
+            ChildKey::FetchDone => 2,
+            ChildKey::FetchProgress => 3,
+            ChildKey::Building(_) => 4,
+        }
+    }
+
+    /// 子バーの追加/除去後に呼び、表示順に従い最後の子に └─・それ以外に ├─ を当て直す。
+    /// `child_order` の push 順は物理 insert 順とずれうるため、`category_rank` で整列して
+    /// から罫線を決める（物理 insert も同じ優先順を保証している）。
     fn refresh_connectors(&self) {
-        let last = self.child_order.last();
-        for key in &self.child_order {
+        let mut ordered: Vec<&ChildKey> = self.child_order.iter().collect();
+        ordered.sort_by_key(|k| Self::category_rank(k));
+        // fetched は Fetching の子（レベル2）。レベル1の最後は FetchDone を除いて決める。
+        let level1_last = ordered
+            .iter()
+            .copied()
+            .rfind(|k| !matches!(k, ChildKey::FetchDone));
+        let fetch_is_last = level1_last == Some(&ChildKey::FetchStage);
+        for key in ordered {
             let Some(bs) = self.child_bar(key) else {
                 continue;
             };
-            let style = if Some(key) == last {
-                self.pb_style_spinner_last.clone()
-            } else {
-                self.pb_style_spinner_mid.clone()
+            let is_level1_last = Some(key) == level1_last;
+            let style = match key {
+                ChildKey::FetchStage if self.fetch_stage_is_blank && is_level1_last => {
+                    self.pb_style_blank_last.clone()
+                }
+                ChildKey::FetchStage if self.fetch_stage_is_blank => {
+                    self.pb_style_blank_mid.clone()
+                }
+                ChildKey::FetchStage if is_level1_last => self.pb_style_spinner_last.clone(),
+                ChildKey::FetchStage => self.pb_style_spinner_mid.clone(),
+                ChildKey::FetchDone => {
+                    // fetched は Fetching の子。Fetching の最終性で縦線(│)を継ぐか空白か。
+                    if self.fetch_done_is_blank {
+                        if fetch_is_last {
+                            self.pb_style_blank_last.clone()
+                        } else {
+                            self.pb_style_blank_mid.clone()
+                        }
+                    } else if fetch_is_last {
+                        self.pb_style_fetch_note_child_last.clone()
+                    } else {
+                        self.pb_style_fetch_note_child_mid.clone()
+                    }
+                }
+                ChildKey::FetchProgress if is_level1_last => self.pb_style_fetch_bar_last.clone(),
+                ChildKey::FetchProgress => self.pb_style_fetch_bar_mid.clone(),
+                _ if is_level1_last => self.pb_style_spinner_last.clone(),
+                _ => self.pb_style_spinner_mid.clone(),
             };
             bs.bar.set_style(style);
-        }
-        // 孫バー。親(FetchStage)が最後の子のときだけ先頭の │ を消して段揃えする。
-        if let Some(gc) = self.progress_bars.get(CACHE_FETCH_PROGRESS_ID) {
-            let fetch_is_last = last == Some(&ChildKey::FetchStage);
-            let style = if fetch_is_last {
-                self.pb_style_bar_last_nolead.clone()
-            } else {
-                self.pb_style_bar_last.clone()
-            };
-            gc.bar.set_style(style);
+            // set_style 自体は即時描画しない。steady_tick していないバー（note/空欄系）
+            // にも罫線切替を即時反映するため、ここで明示的に tick する。
+            bs.bar.tick();
         }
     }
 
@@ -559,21 +661,124 @@ impl ProgressManager {
         self.refresh_connectors();
     }
 
+    /// Objects 行（CACHE_FETCH_PROGRESS_ID）を表示順末尾に挿入する。
+    /// 表示順 [Updating]→[Fetching]→[fetched]→[Objects] の最後。
+    fn add_fetch_progress_bar(&self, pb: ProgressBar) -> ProgressBar {
+        if let Some(done) = self.progress_bars.get(CACHE_FETCH_DONE_ID) {
+            self.multipb.insert_after(&done.bar, pb)
+        } else if let Some(stage) = self.progress_bars.get(CACHE_FETCH_STAGE_ID) {
+            self.multipb.insert_after(&stage.bar, pb)
+        } else if let Some(updating) = self.updating_bar.as_ref() {
+            self.multipb.insert_after(&updating.bar, pb)
+        } else {
+            self.multipb.add(pb)
+        }
+    }
+
+    /// Fetching 行（CACHE_FETCH_STAGE_ID）を挿入する。
+    /// 順序上 Updating の直後、fetched/Objects の前。
+    fn add_fetch_stage_bar(&self, pb: ProgressBar) -> ProgressBar {
+        if let Some(updating) = self.updating_bar.as_ref() {
+            self.multipb.insert_after(&updating.bar, pb)
+        } else if let Some(done) = self.progress_bars.get(CACHE_FETCH_DONE_ID) {
+            self.multipb.insert_before(&done.bar, pb)
+        } else if let Some(progress) = self.progress_bars.get(CACHE_FETCH_PROGRESS_ID) {
+            self.multipb.insert_before(&progress.bar, pb)
+        } else {
+            self.multipb.add(pb)
+        }
+    }
+
+    /// fetched 行（CACHE_FETCH_DONE_ID）を挿入する。
+    /// 順序上 Fetching の直後、Objects の前。
+    fn add_fetch_done_bar(&self, pb: ProgressBar) -> ProgressBar {
+        if let Some(stage) = self.progress_bars.get(CACHE_FETCH_STAGE_ID) {
+            self.multipb.insert_after(&stage.bar, pb)
+        } else if let Some(updating) = self.updating_bar.as_ref() {
+            self.multipb.insert_after(&updating.bar, pb)
+        } else if let Some(progress) = self.progress_bars.get(CACHE_FETCH_PROGRESS_ID) {
+            self.multipb.insert_before(&progress.bar, pb)
+        } else {
+            self.multipb.add(pb)
+        }
+    }
+
     fn ensure_fetch_stage(&mut self, stage: &'static str, url: &str) {
+        self.cache_fetching.insert(url.to_string(), ());
         let existed = self.progress_bars.contains_key(CACHE_FETCH_STAGE_ID);
-        let bar_state = self
-            .progress_bars
-            .entry(CACHE_FETCH_STAGE_ID.to_string())
-            .or_insert_with(|| {
-                let pb = ProgressBar::new_spinner().with_style(self.pb_style_spinner_mid.clone());
-                pb.enable_steady_tick(Duration::from_millis(100));
-                BarState::new(self.multipb.add(pb))
-            });
-        bar_state.bar.set_prefix(stage);
-        bar_state.set_message_if_changed(url.to_string());
         if !existed {
+            let pb = ProgressBar::new_spinner()
+                .with_style(self.pb_style_spinner_mid.clone())
+                .with_prefix("Fetching");
+            pb.enable_steady_tick(Duration::from_millis(100));
+            let pb = self.add_fetch_stage_bar(pb);
+            self.progress_bars
+                .insert(CACHE_FETCH_STAGE_ID.to_string(), BarState::new(pb));
             self.register_child(ChildKey::FetchStage);
         }
+        // 空欄状態（進行中なしだった）からアクティブに復帰。
+        self.fetch_stage_is_blank = false;
+        let bar_state = self.progress_bars.get_mut(CACHE_FETCH_STAGE_ID).unwrap();
+        bar_state.bar.set_prefix(stage);
+        // 他の URL が表示中でなければ更新（Updating 行と同じ判断: 上書きしない）。
+        if self.cache_fetching_current.is_none()
+            || self.cache_fetching_current.as_deref() == Some(url)
+        {
+            bar_state.set_message_if_changed(url.to_string());
+            self.cache_fetching_current = Some(url.to_string());
+        }
+        self.refresh_connectors();
+    }
+
+    /// `Fetching:done` 到着時の処理。fetched 専用バー（CACHE_FETCH_DONE_ID）を
+    /// 独立ライフサイクルで扱い、Fetching 行とは別行に表示する。
+    /// 当該 URL を進行中集合から外し、進行中が尽きたら Fetching 行を**空欄**にする
+    /// （行は消さず保つ）。fetched 行は300ms後に空欄化される（`FetchDoneIdle`）。
+    fn mark_fetch_done(&mut self, url: &str) {
+        let existed = self.progress_bars.contains_key(CACHE_FETCH_DONE_ID);
+        if !existed {
+            let pb = ProgressBar::new_spinner()
+                .with_style(self.pb_style_fetch_note_child_mid.clone())
+                .with_prefix("fetched");
+            let pb = self.add_fetch_done_bar(pb);
+            self.progress_bars
+                .insert(CACHE_FETCH_DONE_ID.to_string(), BarState::new(pb));
+            self.register_child(ChildKey::FetchDone);
+        }
+        let bar_state = self.progress_bars.get_mut(CACHE_FETCH_DONE_ID).unwrap();
+        bar_state.set_message_if_changed(format!("{}", style(url).dim().italic()));
+        self.cache_fetch_done_url = Some(url.to_string());
+        // fetched 行をアクティブ表示（300ms後に空欄化タイマーが発火）。
+        self.fetch_done_is_blank = false;
+        // 300ms 後に fetched 行を空欄にする。世代を進め、最新のタイマーだけ有効にする。
+        self.fetch_done_idle_gen = self.fetch_done_idle_gen.wrapping_add(1);
+        let idle_gen = self.fetch_done_idle_gen;
+        if let Some(tx) = self.idle_tx.clone() {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = tx.send(Message::FetchDoneIdle { idle_gen });
+            });
+        }
+
+        // Fetching 行の完了処理: 当該 URL を進行中集合から外す。
+        self.cache_fetching.remove(url);
+        if self.cache_fetching.is_empty() {
+            // 進行中が無くなったら Fetching 行を空欄に（消さず行を保つ）。
+            // last_message をリセットし、再 Fetching 時に set_message_if_changed が確実に送るようにする。
+            self.fetch_stage_is_blank = true;
+            if let Some(bs) = self.progress_bars.get_mut(CACHE_FETCH_STAGE_ID) {
+                bs.last_message = None;
+            }
+            self.cache_fetching_current = None;
+        } else if self.cache_fetching_current.as_deref() == Some(url) {
+            // 表示中 URL が完了したら残存のいずれかに切替（Updating 行と同じ）。
+            let next = self.cache_fetching.keys().next().cloned();
+            self.cache_fetching_current = next.clone();
+            if let Some(bs) = self.progress_bars.get_mut(CACHE_FETCH_STAGE_ID) {
+                bs.set_message_if_changed(next.unwrap_or_default());
+            }
+        }
+        self.refresh_connectors();
     }
 
     fn clear_fetch_stage(&mut self) {
@@ -581,6 +786,17 @@ impl ProgressManager {
             pb.bar.finish_and_clear();
             self.unregister_child(&ChildKey::FetchStage);
         }
+        if let Some(pb) = self.progress_bars.remove(CACHE_FETCH_DONE_ID) {
+            pb.bar.finish_and_clear();
+            self.unregister_child(&ChildKey::FetchDone);
+        }
+        self.cache_fetching.clear();
+        self.cache_fetching_current = None;
+        self.cache_fetch_done_url = None;
+        self.fetch_stage_is_blank = false;
+        self.fetch_done_is_blank = false;
+        // 保留中の 300ms タイマーを無効化（世代を進めて不一致にする）。
+        self.fetch_done_idle_gen = self.fetch_done_idle_gen.wrapping_add(1);
     }
 
     /// フラグなし実行でキャッシュが無くロードできなかったプラグインの警告を印字。
@@ -659,6 +875,10 @@ impl ProgressManager {
                     self.ensure_fetch_stage(r#type, url.as_ref());
                     return;
                 }
+                if r#type == "Fetching:done" {
+                    self.mark_fetch_done(url.as_ref());
+                    return;
+                }
 
                 match r#type {
                     "Updating" | "Updating:done" => {
@@ -724,30 +944,25 @@ impl ProgressManager {
                 total_objs_count,
                 received_objs_count,
             } => {
-                // 孫バー（単一）は常に └─。先頭の │ は親(FetchStage)が最後の子でない
-                // ときだけ出す。親位置がその後変われば register/unregister の
-                // refresh_connectors が追従する。
-                let style = if self.child_order.last() == Some(&ChildKey::FetchStage) {
-                    self.pb_style_bar_last_nolead.clone()
-                } else {
-                    self.pb_style_bar_last.clone()
-                };
-                let pb = self
-                    .progress_bars
-                    .entry(CACHE_FETCH_PROGRESS_ID.to_string())
-                    .or_insert_with(|| {
-                        let pb = ProgressBar::new(0).with_style(style);
-                        pb.enable_steady_tick(Duration::from_millis(100));
-                        BarState::new(self.multipb.add(pb))
-                    });
-                let entry = self.cachefetching_oids.entry(id);
-                if let Entry::Vacant(_) = entry {
-                    pb.bar.inc_length(total_objs_count as u64);
+                let existed = self.progress_bars.contains_key(CACHE_FETCH_PROGRESS_ID);
+                if !existed {
+                    let pb = ProgressBar::new(0)
+                        .with_style(self.pb_style_fetch_bar_last.clone())
+                        .with_prefix("Objects");
+                    pb.enable_steady_tick(Duration::from_millis(100));
+                    let pb = self.add_fetch_progress_bar(pb);
+                    self.progress_bars
+                        .insert(CACHE_FETCH_PROGRESS_ID.to_string(), BarState::new(pb));
+                    self.register_child(ChildKey::FetchProgress);
                 }
-                let prev = entry.or_default();
-                let increment = received_objs_count.saturating_sub(*prev);
-                *prev = received_objs_count;
-                pb.bar.inc(increment as u64);
+                let pb = self.progress_bars.get_mut(CACHE_FETCH_PROGRESS_ID).unwrap();
+                let (prev_total, prev_received) = self.cachefetching_oids.entry(id).or_default();
+                pb.bar
+                    .inc_length(total_objs_count.saturating_sub(*prev_total) as u64);
+                pb.bar
+                    .inc(received_objs_count.saturating_sub(*prev_received) as u64);
+                *prev_total = total_objs_count;
+                *prev_received = received_objs_count;
                 // OSC 9;4: フェッチ中は全体オブジェクト比(受信/総数)、完了時は Loading(不定)。
                 let pos = pb.bar.position();
                 let len = pb.bar.length().unwrap_or(pos).max(1);
@@ -840,6 +1055,18 @@ impl ProgressManager {
                 if let Some(state) = self.progress_bars.get_mut("loading") {
                     state.bar.inc(1);
                 }
+            }
+            Message::FetchDoneIdle { idle_gen } => {
+                // 世代が一致しなければ古いタイマーとして無視。
+                if idle_gen != self.fetch_done_idle_gen {
+                    return;
+                }
+                // fetched 行を空欄に。last_message をリセットし、次回の fetched 表示で確実に送る。
+                if let Some(bs) = self.progress_bars.get_mut(CACHE_FETCH_DONE_ID) {
+                    bs.last_message = None;
+                }
+                self.fetch_done_is_blank = true;
+                self.refresh_connectors();
             }
             Message::LoadDone => {
                 self.clear_fetch_stage();
@@ -974,10 +1201,26 @@ impl ProgressManager {
 fn init() -> Logger {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (tx_end, rx_end) = mpsc::unbounded_channel::<()>();
+    // FetchDoneIdle（300ms遅延）用にメイン channel とは別の channel を持つ。
+    // メインと同じ sender を manager に持たせると、close() が sender を drop しても
+    // manager 内の clone が生きて rx が閉じず、受信ループが抜けず終了しなくなる。
+    let (idle_tx, mut idle_rx) = mpsc::unbounded_channel::<Message>();
     tokio::spawn(async move {
-        let mut manager = ProgressManager::new();
-        while let Some(msg) = rx.recv().await {
-            manager.process(msg);
+        let mut manager = ProgressManager::build(ProgressDrawTarget::stderr(), Some(idle_tx));
+        loop {
+            // メイン channel が閉じたら（close 呼出）即座に抜ける。
+            // idle channel は manager が idle_tx を保持するため自力では閉じない。
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => manager.process(msg),
+                    None => break,
+                },
+                msg = idle_rx.recv() => {
+                    if let Some(msg) = msg {
+                        manager.process(msg);
+                    }
+                }
+            }
         }
         let _ = tx_end.send(());
     });
@@ -1318,6 +1561,14 @@ mod tests {
             .join("\n")
     }
 
+    /// child_order を表示順（category_rank）で整列したビュー。検証は整列後で行う
+    /// （追加順はバーの再生成時に物理 insert 順とずれるため）。
+    fn ordered_children(m: &ProgressManager) -> Vec<ChildKey> {
+        let mut v: Vec<ChildKey> = m.child_order.to_vec();
+        v.sort_by_key(ProgressManager::category_rank);
+        v
+    }
+
     /// 二色バーのセル配分: ■(Done) → □(稼働中) → (空白=未実行) の順に確保し、
     /// 常に合計 = width になること。稼働中は Done の右隣に連続して描かれる。
     #[test]
@@ -1344,6 +1595,298 @@ mod tests {
     fn loading_bar_width_uses_remaining_terminal_width() {
         assert_eq!(loading_bar_width_for(100, 3), 52);
         assert_eq!(loading_bar_width_for(20, 123), 10);
+    }
+
+    #[test]
+    fn fetch_object_progress_aggregates_all_repos() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        m.process(Message::CacheFetchObjectsProgress {
+            id: "a".into(),
+            total_objs_count: 100,
+            received_objs_count: 40,
+        });
+        m.process(Message::CacheFetchObjectsProgress {
+            id: "b".into(),
+            total_objs_count: 50,
+            received_objs_count: 10,
+        });
+        m.process(Message::CacheFetchObjectsProgress {
+            id: "a".into(),
+            total_objs_count: 120,
+            received_objs_count: 60,
+        });
+
+        let pb = &m
+            .progress_bars
+            .get(CACHE_FETCH_PROGRESS_ID)
+            .expect("object progress bar")
+            .bar;
+        assert_eq!(pb.length(), Some(170));
+        assert_eq!(pb.position(), 70);
+    }
+
+    #[test]
+    fn fetch_done_note_is_below_object_progress() {
+        let (term, screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        let url = Arc::<str>::from("file:///x/a");
+        m.process(Message::Cache("Updating", url.clone()));
+        m.process(Message::Cache("Updating:done", url.clone()));
+        m.process(Message::Cache("Fetching", url.clone()));
+        m.process(Message::CacheFetchObjectsProgress {
+            id: "a".into(),
+            total_objs_count: 10,
+            received_objs_count: 10,
+        });
+        std::thread::sleep(Duration::from_millis(160));
+
+        let rendered = screen_rendered(&screen);
+        let updating = rendered.find("Updating").expect("updating bar");
+        let fetching = rendered.find("Fetching").expect("fetching bar");
+        let objects = rendered.find("Objects").expect("objects bar");
+        assert!(
+            updating < fetching,
+            "fetching should follow updating; got:\n{rendered}"
+        );
+        assert!(
+            fetching < objects,
+            "objects should follow fetching while fetch is running; got:\n{rendered}"
+        );
+
+        m.process(Message::Cache("Fetching:done", url));
+        std::thread::sleep(Duration::from_millis(160));
+
+        let rendered = screen_rendered(&screen);
+        assert!(
+            rendered.contains("fetched"),
+            "done note missing; got:\n{rendered}"
+        );
+        let updating = rendered.find("Updating").expect("updating bar");
+        let fetched = rendered.find("fetched").expect("done note");
+        let objects = rendered.find("Objects").expect("objects bar");
+        assert!(
+            updating < fetched && fetched < objects,
+            "done note should keep the fetching row position above object progress; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("file:///x/a"),
+            "done url; got:\n{rendered}"
+        );
+    }
+
+    /// Fetching 行と fetched 行が別バー（別行）として存在すること＝本修正（2バー分離）の中核。
+    /// 従来は1バーを共用して prefix を "Fetching"⇔"fetched" で切り替えたため、
+    /// 並行 fetch で同一行が入れ替わって見えた。
+    #[test]
+    fn fetching_and_fetched_are_separate_rows() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        let a = Arc::<str>::from("file:///x/a");
+        let b = Arc::<str>::from("file:///x/b");
+        // 2 URL を並行 fetch 開始（いずれも進行中）。
+        m.process(Message::Cache("Fetching", a.clone()));
+        m.process(Message::Cache("Fetching", b.clone()));
+        // 片方だけ完了 → fetched 行が出る。もう片方はまだ Fetching。
+        m.process(Message::Cache("Fetching:done", a));
+
+        // Fetching（b 進行中）と fetched（a）が別バーとして両方存在。
+        assert!(
+            m.progress_bars.contains_key(CACHE_FETCH_STAGE_ID),
+            "Fetching bar must exist while b is inflight"
+        );
+        assert!(
+            m.progress_bars.contains_key(CACHE_FETCH_DONE_ID),
+            "fetched bar must exist for completed a"
+        );
+        // 表示順で FetchStage が FetchDone より前（Fetching 上、fetched 下）。
+        assert_eq!(
+            ordered_children(&m),
+            vec![ChildKey::FetchStage, ChildKey::FetchDone],
+            "Fetching and fetched must be distinct bars in order"
+        );
+    }
+
+    /// 4バーが存在する状態で表示順 [Updating]→[Fetching]→[fetched]→[Objects] を検証。
+    #[test]
+    fn fetching_row_order_with_updating_and_objects() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        let a = Arc::<str>::from("file:///x/a");
+        let b = Arc::<str>::from("file:///x/b");
+        m.process(Message::Cache("Updating", a.clone()));
+        m.process(Message::Cache("Fetching", a.clone()));
+        m.process(Message::Cache("Fetching", b.clone()));
+        m.process(Message::Cache("Fetching:done", a.clone()));
+        m.process(Message::CacheFetchObjectsProgress {
+            id: "a".into(),
+            total_objs_count: 10,
+            received_objs_count: 5,
+        });
+
+        // 表示順は category_rank 整列で [Updating, FetchStage, FetchDone, FetchProgress]。
+        assert_eq!(
+            ordered_children(&m),
+            vec![
+                ChildKey::Updating,
+                ChildKey::FetchStage,
+                ChildKey::FetchDone,
+                ChildKey::FetchProgress,
+            ],
+            "display order must be Updating<Fetching<fetched<Objects"
+        );
+    }
+
+    /// 2 URL を交互に Fetching しても表示中 URL（最初）が上書きされないこと。
+    /// Updating 行と同じ並行追跡パターン（current は先着優先）。
+    #[test]
+    fn fetching_concurrent_urls_keep_current() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        let a = Arc::<str>::from("file:///x/aaaaaaaa");
+        let b = Arc::<str>::from("file:///x/bbbbbbbb");
+        m.process(Message::Cache("Fetching", a.clone()));
+        m.process(Message::Cache("Fetching", b.clone()));
+
+        // 両方とも進行中集合にいる。
+        assert_eq!(m.cache_fetching.len(), 2, "both URLs are inflight");
+        // current は最初の URL のまま（2番目で上書きしない）。
+        assert_eq!(
+            m.cache_fetching_current.as_deref(),
+            Some("file:///x/aaaaaaaa"),
+            "current must stay as the first URL"
+        );
+    }
+
+    /// 全 URL 完了後、Fetching 行は消えず空欄になる（進行中集合は空）。
+    /// 再 Fetching 時に空欄→アクティブ復帰し、正位置（fetched の前）を保つことも検証。
+    #[test]
+    fn fetching_bar_blanks_when_no_inflight() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        let a = Arc::<str>::from("file:///x/a");
+        let b = Arc::<str>::from("file:///x/b");
+        m.process(Message::Cache("Fetching", a.clone()));
+        m.process(Message::Cache("Fetching:done", a));
+
+        // 進行中が尽きたので Fetching 行は空欄になる（消えず行を保つ）。
+        assert!(
+            m.progress_bars.contains_key(CACHE_FETCH_STAGE_ID),
+            "Fetching bar must remain (blank, not cleared)"
+        );
+        assert!(
+            m.fetch_stage_is_blank,
+            "Fetching bar must be blank when no inflight"
+        );
+        assert!(m.cache_fetching.is_empty(), "inflight set must be empty");
+        assert!(
+            m.progress_bars.contains_key(CACHE_FETCH_DONE_ID),
+            "fetched bar must remain"
+        );
+
+        // 別 URL を再度 Fetching → 空欄からアクティブ復帰。
+        m.process(Message::Cache("Fetching", b));
+        assert!(
+            m.progress_bars.contains_key(CACHE_FETCH_STAGE_ID),
+            "Fetching bar must still exist"
+        );
+        assert!(
+            !m.fetch_stage_is_blank,
+            "Fetching bar must resume from blank"
+        );
+        // 表示順で FetchStage が FetchDone より前（復帰でも順序崩れなし）。
+        assert_eq!(
+            ordered_children(&m),
+            vec![ChildKey::FetchStage, ChildKey::FetchDone],
+            "Fetching must stay above fetched"
+        );
+    }
+
+    /// FetchDoneIdle は世代が一致しなければ無視される。最新の Fetching:done だけが
+    /// 空欄化タイマーを発火する（タイマーは process に直接 FetchDoneIdle を送って検証）。
+    #[test]
+    fn fetch_done_idle_respects_generation() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        let a = Arc::<str>::from("file:///x/a");
+        let b = Arc::<str>::from("file:///x/b");
+        m.process(Message::Cache("Fetching", a.clone()));
+        m.process(Message::Cache("Fetching:done", a.clone()));
+        // mark_fetch_done で世代=1、fetched 行はアクティブ表示。
+        assert!(!m.fetch_done_is_blank, "fetched is active after done");
+
+        // 現在より前の世代の idle は無視される。
+        m.process(Message::FetchDoneIdle { idle_gen: 0 });
+        assert!(!m.fetch_done_is_blank, "stale idle must be ignored");
+
+        // 2件目の done で世代=2 に進む。
+        m.process(Message::Cache("Fetching", b.clone()));
+        m.process(Message::Cache("Fetching:done", b));
+        // 1件目の世代(1)の idle は無視。
+        m.process(Message::FetchDoneIdle { idle_gen: 1 });
+        assert!(!m.fetch_done_is_blank, "idle with old gen must be ignored");
+
+        // 現世代(2)の idle で空欄化。
+        m.process(Message::FetchDoneIdle { idle_gen: 2 });
+        assert!(
+            m.fetch_done_is_blank,
+            "current gen idle must blank the fetched row"
+        );
+    }
+
+    /// fetched 行の罫線は Fetching の最終性に連動する:
+    /// Fetching がレベル1最後(└─)なら fetched は罫線なし、
+    /// Objects 等が下にあれば Fetching は中間(├─)で fetched は │。
+    #[test]
+    fn fetched_connector_follows_fetch_last() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        let a = Arc::<str>::from("file:///x/a");
+
+        // Objects 無し: Fetching が最後のレベル1子 → fetched は child_last（罫線なし）。
+        m.process(Message::Cache("Fetching", a.clone()));
+        m.process(Message::Cache("Fetching:done", a.clone()));
+        let level1_last = ordered_children(&m)
+            .iter()
+            .rfind(|k| !matches!(k, ChildKey::FetchDone))
+            .cloned();
+        assert_eq!(
+            level1_last,
+            Some(ChildKey::FetchStage),
+            "Fetching is last level1 when no Objects"
+        );
+
+        // Objects 追加: Objects が最後 → Fetching は中間 → fetched は child_mid（│）。
+        m.process(Message::CacheFetchObjectsProgress {
+            id: "a".into(),
+            total_objs_count: 10,
+            received_objs_count: 5,
+        });
+        let level1_last = ordered_children(&m)
+            .iter()
+            .rfind(|k| !matches!(k, ChildKey::FetchDone))
+            .cloned();
+        assert_eq!(
+            level1_last,
+            Some(ChildKey::FetchProgress),
+            "Objects is last level1 when present"
+        );
     }
 
     /// 完了 0 のときでも稼働中 □ と「N active」が見えること＝本修正の目的。
