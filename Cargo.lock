@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "rsplug"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-compression",
  "clap",
@@ -1373,14 +1373,14 @@ dependencies = [
 
 [[package]]
 name = "rsplug-adaptive-semaphore"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "rsplug-dag"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "hashbrown",
  "thiserror",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "rsplug-file-specifier"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "wildmatch",
 ]
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "rsplug-walker"
-version = "0.2.0"
+version = "0.2.4"
 dependencies = [
  "hashbrown",
  "path-dedot",
