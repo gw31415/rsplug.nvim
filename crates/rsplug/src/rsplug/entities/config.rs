@@ -51,23 +51,12 @@ impl Sum for Config {
 pub struct CacheConfig {
     #[serde(default, rename = "repo")]
     pub repo: Option<RepoSource>,
-    #[serde(default, rename = "sym")]
-    pub manually_to_sym: bool,
     #[serde(default)]
     pub build: Vec<String>,
     #[serde(default)]
     pub lua_build: Option<String>,
     #[serde(default)]
     pub lua_post_update: Option<String>,
-}
-
-impl CacheConfig {
-    pub fn to_sym(&self) -> bool {
-        self.manually_to_sym
-            || !self.build.is_empty()
-            || self.lua_build.is_some()
-            || self.lua_post_update.is_some()
-    }
 }
 
 #[serde_as]
@@ -377,7 +366,6 @@ mod tests {
             config.plugins[0].cache.lua_post_update.as_deref(),
             Some("vim.g.updated = true")
         );
-        assert!(config.plugins[0].cache.to_sym());
     }
     #[test]
     fn plugin_config_deserializes_on_source() {

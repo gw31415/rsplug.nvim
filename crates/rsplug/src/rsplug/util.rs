@@ -150,6 +150,38 @@ pub mod git {
             .unwrap()
         }
 
+        /// 追跡ファイル + ignore 外の未追跡ファイル（build 成果物）の一覧を取得。
+        /// `git ls-files` ＋ `git ls-files --others --exclude-standard` 相当。
+        /// build プラグインの成果物を pack copy に含めるために使う（sym 廃止後の copy 統一）。
+        pub async fn ls_files_with_untracked(&self) -> Result<Vec<PathBuf>, Error> {
+            let repo = self.0.clone();
+            spawn_blocking(move || {
+                let repo = repo.lock().unwrap();
+                let mut files: Vec<PathBuf> = repo
+                    .index()?
+                    .iter()
+                    .map(|entry| bytes_to_pathbuf(entry.path))
+                    .collect();
+                // ignore されていない untracked（build 成果物）を追加。
+                let mut opts = git2::StatusOptions::new();
+                opts.include_untracked(true)
+                    .recurse_untracked_dirs(true)
+                    .include_ignored(false);
+                for entry in repo.statuses(Some(&mut opts))?.iter() {
+                    if entry.status() == git2::Status::WT_NEW
+                        && let Ok(path) = entry.path()
+                    {
+                        files.push(PathBuf::from(path));
+                    }
+                }
+                files.sort();
+                files.dedup();
+                Ok(files)
+            })
+            .await
+            .unwrap()
+        }
+
         /// source.git に指定 oid を fetch する（HEAD も作業ツリーも変えない）。
         pub async fn fetch_oid(&mut self, oid: Oid, token: Option<Arc<str>>) -> Result<(), Error> {
             let repo = self.0.clone();
@@ -1055,6 +1087,30 @@ mod tests {
         // ls_files が tracked file を返す
         let files = repo.ls_files().await.unwrap();
         assert!(files.iter().any(|p| p == std::path::Path::new("README.md")));
+
+        // ls_files_with_untracked は tracked + ignore外の untracked（build 成果物）を返す
+        std::fs::write(snap.join("build_artifact.txt"), "out\n").unwrap();
+        let files_with = repo.ls_files_with_untracked().await.unwrap();
+        assert!(
+            files_with
+                .iter()
+                .any(|p| p == std::path::Path::new("README.md")),
+            "tracked file must be included"
+        );
+        assert!(
+            files_with
+                .iter()
+                .any(|p| p == std::path::Path::new("build_artifact.txt")),
+            "untracked build artifact must be included"
+        );
+        // ls_files（tracked only）は untracked を含まない
+        let files_tracked = repo.ls_files().await.unwrap();
+        assert!(
+            !files_tracked
+                .iter()
+                .any(|p| p == std::path::Path::new("build_artifact.txt")),
+            "ls_files must not include untracked"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

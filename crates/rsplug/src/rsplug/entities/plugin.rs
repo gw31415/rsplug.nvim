@@ -322,10 +322,8 @@ impl Plugin {
             order,
         } = self;
 
-        let to_sym = cache.to_sym();
         let CacheConfig {
             repo,
-            manually_to_sym: _,
             build,
             lua_build,
             lua_post_update,
@@ -573,41 +571,40 @@ impl Plugin {
         let filesource = Arc::new(FileSource::Directory {
             path: snapshot_root_path.clone(),
         });
-        let files = repository.ls_files().await?;
+        // build 成果物（untracked）を含めるか。has_build のとき ls-files+untracked、
+        // それ以外は tracked のみ。sym 廃止後は常に CopyEachFile で pack に copy する。
+        let files = if has_build {
+            repository.ls_files_with_untracked().await?
+        } else {
+            repository.ls_files().await?
+        };
         let mut lazy_type = lazy_type.clone();
         for luam in extract_unique_lua_modules(files.iter()) {
             lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
         }
-        let files: HowToPlaceFiles = if to_sym {
-            HowToPlaceFiles::RepoSnapshotLink {
-                target: snapshot_root_path.clone(),
-                identity: identity.clone(),
-            }
-        } else {
-            HowToPlaceFiles::CopyEachFile(
-                files
-                    .into_iter()
-                    .filter_map(|path| {
-                        let ignored = merge.ignore.matched(&path);
-                        if !ignored && snapshot_root_path.join(&path).is_file() {
-                            Some((
-                                path.clone(),
-                                FileItem {
-                                    source: filesource.clone(),
-                                    identity: FileIdentity::RepoFile(RepoFileIdentity::new(
-                                        identity.clone(),
-                                        path,
-                                    )),
-                                    merge_type: MergeType::Conflict,
-                                },
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-            )
-        };
+        let files: HowToPlaceFiles = HowToPlaceFiles::CopyEachFile(
+            files
+                .into_iter()
+                .filter_map(|path| {
+                    let ignored = merge.ignore.matched(&path);
+                    if !ignored && snapshot_root_path.join(&path).is_file() {
+                        Some((
+                            path.clone(),
+                            FileItem {
+                                source: filesource.clone(),
+                                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                                    identity.clone(),
+                                    path,
+                                )),
+                                merge_type: MergeType::Conflict,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        );
 
         // ロード成功が確定したので、実際に更新/新規インストールされたプラグインを
         // サマリーへ通知する。早帰り(Ok(None))経路には到達しない＝スキップしたものは報告しない。

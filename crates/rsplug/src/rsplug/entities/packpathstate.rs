@@ -132,51 +132,14 @@ pub(super) enum FileIdentity {
 }
 
 /// プラグインファイルの配置方法。
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) enum HowToPlaceFiles {
     CopyEachFile(BTreeMap<PathBuf, FileItem>),
-    /// Git repo snapshot への symlink。`target` は配置用の絶対 runtime path、
-    /// `identity` が論理 identity。下記 `Hash`/`PartialEq`/`Eq` は `target` を除外し
-    /// `identity` のみで同一性を決める（cache root が違っても同じ snapshot なら同じ id）。
-    RepoSnapshotLink {
-        target: Arc<Path>,
-        identity: RepoSnapshotIdentity,
-    },
 }
 
 impl Default for HowToPlaceFiles {
     fn default() -> Self {
         HowToPlaceFiles::CopyEachFile(BTreeMap::new())
-    }
-}
-
-impl PartialEq for HowToPlaceFiles {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::CopyEachFile(a), Self::CopyEachFile(b)) => a == b,
-            (
-                Self::RepoSnapshotLink { identity: la, .. },
-                Self::RepoSnapshotLink { identity: lb, .. },
-            ) => la == lb,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for HowToPlaceFiles {}
-
-impl Hash for HowToPlaceFiles {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::CopyEachFile(map) => {
-                0u8.hash(state);
-                map.hash(state);
-            }
-            Self::RepoSnapshotLink { identity, .. } => {
-                1u8.hash(state);
-                identity.hash(state);
-            }
-        }
     }
 }
 
@@ -211,18 +174,14 @@ impl LoadedPlugin {
     /// 配置（runtime）用の snapshot root。repo 由来でなければ（script-only や生成ファイルのみ
     /// なら）`None`。**配置情報であり `plugin_id` の hash には含まれない** (PLANS §10.3)。
     pub fn snapshot_root(&self) -> Option<Arc<Path>> {
-        match &self.files {
-            HowToPlaceFiles::RepoSnapshotLink { target, .. } => Some(target.clone()),
-            HowToPlaceFiles::CopyEachFile(files) => {
-                files
-                    .values()
-                    .next()
-                    .and_then(|item| match item.source.as_ref() {
-                        FileSource::Directory { path } => Some(path.clone()),
-                        FileSource::File { .. } => None,
-                    })
-            }
-        }
+        let HowToPlaceFiles::CopyEachFile(files) = &self.files;
+        files
+            .values()
+            .next()
+            .and_then(|item| match item.source.as_ref() {
+                FileSource::Directory { path } => Some(path.clone()),
+                FileSource::File { .. } => None,
+            })
     }
 }
 
@@ -352,10 +311,7 @@ impl Add for LoadedPlugin {
                         order,
                         merge_enabled,
                         is_plugctl,
-                    } = self
-                    else {
-                        unreachable!() // SAFETY: Because self.files is verified to be a CopyEachFile
-                    };
+                    } = self;
                     let Self {
                         source_name: _,
                         lazy_type: _,
@@ -364,10 +320,7 @@ impl Add for LoadedPlugin {
                         order: r_order,
                         merge_enabled: _,
                         is_plugctl: r_is_plugctl,
-                    } = rhs
-                    else {
-                        unreachable!() // SAFETY: Because rhs.files is verified to be a CopyEachFile
-                    };
+                    } = rhs;
                     files.extend(rfiles);
                     script += rscript;
                     let order = order.min(r_order);
@@ -386,12 +339,6 @@ impl Add for LoadedPlugin {
                     );
                 }
             }
-            (HowToPlaceFiles::CopyEachFile(_), HowToPlaceFiles::RepoSnapshotLink { .. })
-            | (HowToPlaceFiles::RepoSnapshotLink { .. }, HowToPlaceFiles::CopyEachFile(_))
-            | (
-                HowToPlaceFiles::RepoSnapshotLink { .. },
-                HowToPlaceFiles::RepoSnapshotLink { .. },
-            ) => {}
         };
         (self, Some(rhs))
     }
@@ -484,7 +431,6 @@ struct Files {
 
 enum DirectoryExtractionType {
     Files(Vec<(PathBuf, Arc<FileSource>)>),
-    Symlink(Arc<Path>),
 }
 
 #[cfg(unix)]
@@ -504,16 +450,6 @@ fn os_string_to_install_key(name: OsString) -> Box<[u8]> {
         .into_owned()
         .into_bytes()
         .into_boxed_slice()
-}
-
-#[cfg(unix)]
-async fn symlink_plugin_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
-    tokio::fs::symlink(original, link).await
-}
-
-#[cfg(windows)]
-async fn symlink_plugin_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
-    tokio::fs::symlink_dir(original, link).await
 }
 
 #[cfg(unix)]
@@ -650,21 +586,9 @@ impl PackPathState {
                     } = self.files.entry(id_str.clone()).or_insert(Files {
                         is_plugctl,
                         dir_type: DirectoryExtractionType::Files(Vec::new()),
-                    })
-                    else {
-                        unreachable!() // SAFETY: idは一意なので、ここに到達することはない
-                    };
+                    });
                     tree.push((path, item.source));
                 }
-            }
-            HowToPlaceFiles::RepoSnapshotLink { target, .. } => {
-                self.files.insert(
-                    id_str.clone(),
-                    Files {
-                        is_plugctl,
-                        dir_type: DirectoryExtractionType::Symlink(target),
-                    },
-                );
             }
         }
     }
@@ -716,7 +640,6 @@ impl PackPathState {
         let init_content = render_init(&control_ids);
         let mut tasks = JoinSet::new();
         let yank_semaphore = AdaptiveSemaphore::new();
-        let symlink_semaphore = AdaptiveSemaphore::new();
 
         for (
             id,
@@ -728,13 +651,7 @@ impl PackPathState {
         {
             let id: Arc<str> = id.into();
             let dir = gen_root.join("opt").join(id.as_ref());
-            let installed = {
-                let dir_is_symlink = dir.is_symlink();
-                match &dir_type {
-                    DirectoryExtractionType::Files(_) => dir.is_dir() && !dir_is_symlink,
-                    DirectoryExtractionType::Symlink(_) => dir_is_symlink,
-                }
-            };
+            let installed = dir.is_dir() && !dir.is_symlink();
             if installed {
                 msg(Message::InstallSkipped(id));
             } else {
@@ -800,25 +717,6 @@ impl PackPathState {
                                 res??;
                             }
                             helptags(dir.as_path()).await
-                        });
-                    }
-                    DirectoryExtractionType::Symlink(sym) => {
-                        let symlink_semaphore = symlink_semaphore.clone();
-                        tasks.spawn(async move {
-                            let permit = symlink_semaphore.acquire().await;
-                            let result = async {
-                                tokio::fs::remove_dir_all(&dir).await.ok();
-                                tokio::fs::create_dir_all(dir.parent().unwrap()).await?;
-                                symlink_plugin_dir(sym, dir.as_path()).await?;
-                                Ok::<_, io::Error>(())
-                            }
-                            .await;
-                            let is_error = result.is_err();
-                            permit.finish(is_error);
-                            result?;
-                            // Avoid mutating symlink source; helptags are generated
-                            // from PlugCtl's copied doc files instead.
-                            Ok(())
                         });
                     }
                 }
@@ -1086,33 +984,6 @@ mod tests {
         )])))
         .plugin_id();
         assert_eq!(id_a, id_b, "absolute cache path must not affect plugin_id");
-    }
-
-    #[test]
-    fn snapshot_link_id_is_independent_of_absolute_target() {
-        let identity = snap(
-            "github.com/owner/repo",
-            b"0123456789012345678901234567890123456789",
-        );
-        let make = |target: &str| {
-            synth(HowToPlaceFiles::RepoSnapshotLink {
-                target: Arc::from(PathBuf::from(target)),
-                identity: identity.clone(),
-            })
-            .plugin_id()
-        };
-        assert_eq!(make("/A/repos/owner/repo"), make("/B/repos/owner/repo"));
-
-        // 同一 identity で target だけ違うなら == でも等しい（identity のみで同一性を判定する）
-        let a = synth(HowToPlaceFiles::RepoSnapshotLink {
-            target: Arc::from(PathBuf::from("/A/r")),
-            identity: identity.clone(),
-        });
-        let b = synth(HowToPlaceFiles::RepoSnapshotLink {
-            target: Arc::from(PathBuf::from("/B/r")),
-            identity,
-        });
-        assert_eq!(a, b);
     }
 
     #[test]

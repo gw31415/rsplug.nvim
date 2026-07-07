@@ -1,10 +1,10 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet, btree_map::Keys},
+    collections::{BTreeMap, btree_map::Keys},
     fmt::Display,
     iter::Sum,
     ops::AddAssign,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -22,81 +22,6 @@ struct PkgId2ScriptsItem {
     script: SetupScript,
     order: usize,
     start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
-}
-
-fn collect_doc_files_from_root(
-    root: &Path,
-    snapshot: RepoSnapshotIdentity,
-) -> BTreeMap<PathBuf, FileItem> {
-    let doc_root = root.join("doc");
-    if !doc_root.is_dir() {
-        return BTreeMap::new();
-    }
-
-    let source = Arc::new(FileSource::Directory {
-        path: Arc::from(root.to_path_buf()),
-    });
-    let mut files = BTreeMap::new();
-    let mut seen_dirs = HashSet::new();
-    let mut stack = vec![(doc_root, 0usize)];
-
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > 128 {
-            continue;
-        }
-        let Ok(canonical) = std::fs::canonicalize(&dir) else {
-            continue;
-        };
-        if !seen_dirs.insert(canonical) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-
-            if kind.is_dir() {
-                stack.push((path, depth + 1));
-                continue;
-            }
-
-            if kind.is_symlink() {
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    continue;
-                };
-                if meta.is_dir() {
-                    stack.push((path, depth + 1));
-                    continue;
-                }
-                if !meta.is_file() {
-                    continue;
-                }
-            } else if !kind.is_file() {
-                continue;
-            }
-
-            let Ok(rel_path) = path.strip_prefix(root) else {
-                continue;
-            };
-            files.insert(
-                rel_path.to_path_buf(),
-                FileItem {
-                    source: source.clone(),
-                    identity: FileIdentity::RepoFile(RepoFileIdentity::new(
-                        snapshot.clone(),
-                        rel_path.to_path_buf(),
-                    )),
-                    merge_type: MergeType::Overwrite,
-                },
-            );
-        }
-    }
-
-    files
 }
 
 #[derive(Hash, Eq, PartialEq, PartialOrd, Ord)]
@@ -472,15 +397,8 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
         {
             let mut overwrite_copies = BTreeMap::new();
             for (_id, files) in overwrite_files {
-                match files {
-                    HowToPlaceFiles::CopyEachFile(files) => {
-                        // If CopyEachFile then merge
-                        overwrite_copies.extend(files);
-                    }
-                    HowToPlaceFiles::RepoSnapshotLink { .. } => {
-                        panic!("RepoSnapshotLink is not supported for overwrite_files in PlugCtl");
-                    }
-                }
+                let HowToPlaceFiles::CopyEachFile(files) = files;
+                overwrite_copies.extend(files);
             }
             if !overwrite_copies.is_empty() {
                 plugs.push(LoadedPlugin {
@@ -601,32 +519,22 @@ impl PlugCtl {
     ) -> Self {
         // Steal `doc/**` files
         let mut overwrite_files = move |id: PluginID| {
-            BTreeMap::from([(
-                id,
-                match files {
-                    HowToPlaceFiles::CopyEachFile(map) => {
-                        let doc_keys: Vec<PathBuf> = map
-                            .keys()
-                            .filter(|p| p.starts_with("doc/"))
-                            .cloned()
-                            .collect();
-                        let mut extracted = BTreeMap::new();
-                        for key in doc_keys {
-                            if let Some(mut file) = map.remove(&key) {
-                                file.merge_type = MergeType::Overwrite;
-                                extracted.insert(key, file);
-                            }
-                        }
-                        HowToPlaceFiles::CopyEachFile(extracted)
+            BTreeMap::from([(id, {
+                let HowToPlaceFiles::CopyEachFile(map) = files;
+                let doc_keys: Vec<PathBuf> = map
+                    .keys()
+                    .filter(|p| p.starts_with("doc/"))
+                    .cloned()
+                    .collect();
+                let mut extracted = BTreeMap::new();
+                for key in doc_keys {
+                    if let Some(mut file) = map.remove(&key) {
+                        file.merge_type = MergeType::Overwrite;
+                        extracted.insert(key, file);
                     }
-                    HowToPlaceFiles::RepoSnapshotLink { target, identity } => {
-                        HowToPlaceFiles::CopyEachFile(collect_doc_files_from_root(
-                            target,
-                            identity.clone(),
-                        ))
-                    }
-                },
-            )])
+                }
+                HowToPlaceFiles::CopyEachFile(extracted)
+            })])
         };
 
         let id_str = id.as_str();
