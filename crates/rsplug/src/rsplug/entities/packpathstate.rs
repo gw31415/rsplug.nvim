@@ -388,11 +388,7 @@ impl FileSource {
             tokio::fs::create_dir_all(to.as_ref().parent().unwrap()).await?;
             #[cfg(target_os = "macos")]
             {
-                // APFS clonefile を優先（CoW・独立 inode）。hard_link と違い元 snapshot を
-                // 編集しても pack へ影響しない。非 APFS / 別 volume では失敗するので copy にフォールバック。
-                if clonefile(from.as_ref(), to.as_ref()).await.is_err() {
-                    tokio::fs::copy(from.as_ref(), to.as_ref()).await?;
-                }
+                tokio::fs::copy(from, to).await?;
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -454,35 +450,6 @@ fn os_string_to_install_key(name: OsString) -> Box<[u8]> {
         .into_owned()
         .into_bytes()
         .into_boxed_slice()
-}
-
-/// APFS の `clonefile(2)` で CoW クローンを作る。非 APFS や別 volume では失敗する
-/// （呼び出し元で `tokio::fs::copy` にフォールバック）。
-#[cfg(target_os = "macos")]
-async fn clonefile(from: &Path, to: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::raw::{c_char, c_int};
-    use std::os::unix::ffi::OsStrExt;
-    unsafe extern "C" {
-        fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
-    }
-    let from = from.to_path_buf();
-    let to = to.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let src = CString::new(from.as_os_str().as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let dst = CString::new(to.as_os_str().as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        // SAFETY: `src`/`dst` は NUL 終端の有効なパスポインタ。`flags=0` はデフォルト挙動。
-        let ret = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
-        if ret < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    })
-    .await
-    .map_err(|e| io::Error::other(format!("clonefile join failed: {e}")))?
 }
 
 #[cfg(unix)]
