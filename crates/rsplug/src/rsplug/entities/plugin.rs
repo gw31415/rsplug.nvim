@@ -375,30 +375,35 @@ impl Plugin {
         //              ※未インストールは対象外（スキップ）。`-u` 単独で新規 install はしない。
         //   - install: 未インストールならリモートから新規 fetch する。
         //   - それ以外(通常起動): 既存 snapshot の commit をそのまま使い、無ければスキップ。
-        let oid = if let Some(locked_rev) = locked_rev.as_deref() {
+        let (oid, was_updated, was_installed) = if let Some(locked_rev) = locked_rev.as_deref() {
             if !is_full_hex_hash(locked_rev) {
                 return Err(invalid_data(format!(
                     "Locked revision must be full hash for {}: got {}",
                     url, locked_rev
                 )));
             }
-            Oid::from_str(locked_rev).map_err(Error::Git2)?
+            (
+                Oid::from_str(locked_rev).map_err(Error::Git2)?,
+                false,
+                false,
+            )
         } else {
             match latest_snapshot_oid(&worktrees).await? {
-                Some(_) if update => {
+                Some(existing) if update => {
                     let _permit = semaphore.acquire().await;
                     msg(Message::Cache("Updating", url.clone()));
                     let oid = resolve_remote_oid(&http_client, &url, &rev, &token).await?;
                     msg(Message::Cache("Updating:done", url.clone()));
-                    oid
+                    // リモートの最新 rev が既存 snapshot と異なれば「実際に更新された」。
+                    (oid, existing != oid, false)
                 }
-                Some(existing) => existing,
+                Some(existing) => (existing, false, false),
                 None if install => {
                     let _permit = semaphore.acquire().await;
                     msg(Message::Cache("Updating", url.clone()));
                     let oid = resolve_remote_oid(&http_client, &url, &rev, &token).await?;
                     msg(Message::Cache("Updating:done", url.clone()));
-                    oid
+                    (oid, false, true)
                 }
                 None => {
                     // 未インストール。install も update(既存更新) も対象外なのでスキップ。
@@ -589,6 +594,14 @@ impl Plugin {
                     .collect(),
             )
         };
+
+        // ロード成功が確定したので、実際に更新/新規インストールされたプラグインを
+        // サマリーへ通知する。早帰り(Ok(None))経路には到達しない＝スキップしたものは報告しない。
+        if was_updated {
+            msg(Message::PluginUpdated(display_name(&source_name, &logid)));
+        } else if was_installed {
+            msg(Message::PluginInstalled(display_name(&source_name, &logid)));
+        }
 
         let loaded = LoadedPlugin {
             source_name,
