@@ -20,11 +20,14 @@ CONTENTS                                                      *rsplug-contents*
     6. Lock File .............................. |rsplug-lockfile|
     7. Plugin Lifecycle ....................... |rsplug-lifecycle|
     8. Runtime Integration .................... |rsplug-runtime|
+        8.1 Startup Generation Manifests ...... |rsplug-runtime-generation|
+        8.2 Selecting a generation with `RSPLUG_GENERATION` .. |rsplug-runtime-generation-select|
     9. Migration Notes ........................ |rsplug-migration|
     10. Advanced Topics ....................... |rsplug-advanced|
         10.1 Plugin Merging ................... |rsplug-merging|
         10.2 Build Caching .................... |rsplug-build-cache|
         10.3 GitHub Authentication ............ |rsplug-github-auth|
+        10.4 Fast Download .................... |rsplug-fast-download|
     11. Troubleshooting ....................... |rsplug-troubleshooting|
     12. Examples .............................. |rsplug-examples|
 
@@ -894,6 +897,29 @@ directories when no retained manifest references them. This prevents an already-
 running Neovim from failing because an update deleted hook/runtime modules that
 its loaded control package still refers to.
 
+Selecting a generation with `RSPLUG_GENERATION`:~
+
+Because retained generations stay addressable, you can boot Neovim with an older
+generation by setting the `RSPLUG_GENERATION` environment variable to a
+generation id (the `<hash>` of a control package). List the available ids with:
+
+>bash
+    ls ~/.cache/rsplug/generations/
+<
+
+Each `~/.cache/rsplug/generations/<hash>.lua` names a retained generation; pass
+its `<hash>` (a 32-character hex string) to `RSPLUG_GENERATION` and rsplug's
+`init.lua` will `:packadd` that control package instead of the latest one:
+
+>bash
+    RSPLUG_GENERATION=<hash> nvim
+<
+
+When unset, the latest generation is used (the default behavior). If the value
+is malformed or names a generation that has already been pruned (rsplug keeps
+only the latest few), rsplug logs a warning and falls back to the latest
+generation.
+
 Custom packpath:~
 
 If you use a custom lock file location or output directory, adjust
@@ -1037,13 +1063,30 @@ Token environment variables:~
 
     If neither variable is set, rsplug falls back to anonymous access.
 
-Tarball fetch fallback:~
+------------------------------------------------------------------------------
+10.4 Fast Download                                        *rsplug-fast-download*
 
-    When a Git fetch fails due to GitHub rate limiting, rsplug automatically
-    downloads the GitHub tarball archive for the resolved commit instead.
-    This keeps installs working even when the anonymous rate limit is
-    exhausted, though setting a token (above) is recommended to avoid the
-    fallback path entirely.
+When a GitHub token is available, rsplug uses the fastest available download
+path instead of the Git smart-HTTP protocol:
+
+1. REST API rev resolution — commit SHAs are resolved via `api.github.com`
+   JSON endpoints instead of the Git ref advertisement. The `X-RateLimit-Remaining`
+   header is monitored; if the budget is low or a wildcard revision (`@v*`) is
+   requested, rsplug falls back to Git `ls-remote`.
+2. Tarball download — the repository snapshot is fetched as a `.tar.gz` archive
+   from `codeload.github.com` (Fastly CDN, outside the core API rate limit)
+   rather than cloning the Git object store.
+3. Connection reuse — a single shared HTTP client with connection pooling and
+   HTTP/2 multiplexing handles all downloads.
+4. High parallelism — up to 32 concurrent tarball downloads, automatically
+   halved on error-rate spikes.
+
+Tarball downloads are not counted against the GitHub API rate limit, so this
+path can sustain high throughput even with many plugins.
+
+If the tarball download fails (for example, a private repo without token or a
+network error), rsplug automatically falls back to the Git smart-HTTP clone
+path.
 
 ==============================================================================
 11. Troubleshooting                                   *rsplug-troubleshooting*
