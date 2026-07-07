@@ -55,6 +55,10 @@ pub enum Message {
     },
     /// フラグなし実行でキャッシュが無くロードできなかった（未インストール）。
     PluginNotInstalled(Arc<str>),
+    /// `-u` でリモートの rev が変化し、実際に更新されたプラグイン（表示名）。
+    PluginUpdated(Arc<str>),
+    /// `-i` で未インストールから新規 fetch されたプラグイン（表示名）。
+    PluginInstalled(Arc<str>),
     MergeFinished {
         total: usize,
         merged: usize,
@@ -142,6 +146,23 @@ fn summary_prefix(label: &str, ok: bool) -> String {
         style("✗").red().bold().to_string()
     };
     format!("{} {}", mark, style(label).blue().bold())
+}
+
+/// プラグイン名一覧の本体行を組み立てる。先頭3件を個別に20字 truncate して ` · ` で結合し、
+/// 超過分は ` …` で省略する。未インストール/更新/新規インストールの各サマリーで共通利用。
+fn ellipsis_names(names: &[Arc<str>]) -> String {
+    const NAME_DISPLAY_LIMIT: usize = 20;
+    let n = names.len();
+    let shown: Vec<String> = names
+        .iter()
+        .take(3)
+        .map(|s| truncate(s, NAME_DISPLAY_LIMIT))
+        .collect();
+    let mut body = shown.join(" · ");
+    if n > shown.len() {
+        body.push_str(" …");
+    }
+    body
 }
 
 struct ConfigList {
@@ -297,6 +318,10 @@ struct ProgressManager {
     installskipped_count: usize,
     yankfile_count: usize,
     not_installed: Vec<Arc<str>>,
+    /// `-u` で実際に rev が変わった（更新された）プラグインの表示名。
+    updated_plugins: Vec<Arc<str>>,
+    /// `-i` で新規 fetch されたプラグインの表示名。
+    installed_plugins: Vec<Arc<str>>,
     cachefetching_oids: HashMap<String, (usize, usize)>,
     cache_updating_fetching: HashMap<String, ()>,
     cache_updating_current: Option<String>,
@@ -551,6 +576,8 @@ impl ProgressManager {
             installskipped_count: 0,
             yankfile_count: 0,
             not_installed: Vec::new(),
+            updated_plugins: Vec::new(),
+            installed_plugins: Vec::new(),
             cachefetching_oids: HashMap::new(),
             cache_updating_fetching: HashMap::new(),
             cache_updating_current: None,
@@ -799,33 +826,39 @@ impl ProgressManager {
         self.fetch_done_idle_gen = self.fetch_done_idle_gen.wrapping_add(1);
     }
 
-    /// フラグなし実行でキャッシュが無くロードできなかったプラグインの警告を印字。
-    /// 各 name は logid のような共通 truncate ではなく、**個別に** 20字超のときだけ
-    /// truncate する。これにより複数プラグインを並べても何が未インストールか判読できる。
-    fn warn_not_installed(&self) {
-        let n = self.not_installed.len();
-        let header = format!(
-            "{} {} plugins not installed (run with -i to install)",
-            style("⚠").yellow().bold(),
-            n
-        );
-        const NAME_DISPLAY_LIMIT: usize = 20;
-        let shown: Vec<String> = self
-            .not_installed
-            .iter()
-            .take(3)
-            .map(|s| truncate(s, NAME_DISPLAY_LIMIT))
-            .collect();
-        let mut body = shown.join(" · ");
-        if n > shown.len() {
-            body.push_str(" …");
-        }
+    /// ヘッダー行と名前一覧（`ellipsis_names`）から2行ブロックを組み立てて印字する。
+    /// `warn_not_installed` / `print_plugin_list_block` の共通の描画本体。
+    fn print_name_block(&self, header: String, names: &[Arc<str>]) {
+        let body = ellipsis_names(names);
         let block = if body.is_empty() {
             header
         } else {
             format!("{header}\n    {}", style(body).dim())
         };
         self.multipb.println(block).unwrap();
+    }
+
+    /// フラグなし実行でキャッシュが無くロードできなかったプラグインの警告を印字。
+    /// 各 name は logid のような共通 truncate ではなく、**個別に** 20字超のときだけ
+    /// truncate する。これにより複数プラグインを並べても何が未インストールか判読できる。
+    fn warn_not_installed(&self) {
+        let header = format!(
+            "{} {} plugins not installed (run with -i to install)",
+            style("⚠").yellow().bold(),
+            self.not_installed.len()
+        );
+        self.print_name_block(header, &self.not_installed);
+    }
+
+    /// 更新/新規インストールされたプラグインのサマリーブロックを印字。
+    /// `warn_not_installed` と同じ体裁（個別20字 truncate・先頭3件・超過は ` …`）。
+    fn print_plugin_list_block(&self, label: &str, names: &[Arc<str>]) {
+        let header = format!(
+            "{} {} plugins",
+            summary_prefix(label, true),
+            style(names.len()).green().bold(),
+        );
+        self.print_name_block(header, names);
     }
 
     fn process(&mut self, msg: Message) {
@@ -1101,9 +1134,21 @@ impl ProgressManager {
                 if !self.not_installed.is_empty() {
                     self.warn_not_installed();
                 }
+                if !self.updated_plugins.is_empty() {
+                    self.print_plugin_list_block("Updated", &self.updated_plugins);
+                }
+                if !self.installed_plugins.is_empty() {
+                    self.print_plugin_list_block("Installed", &self.installed_plugins);
+                }
             }
             Message::PluginNotInstalled(id) => {
                 self.not_installed.push(id);
+            }
+            Message::PluginUpdated(id) => {
+                self.updated_plugins.push(id);
+            }
+            Message::PluginInstalled(id) => {
+                self.installed_plugins.push(id);
             }
             Message::DetectLockFile(path) => {
                 self.multipb
@@ -1545,6 +1590,35 @@ mod tests {
             "remaining plugins should be elided; got:\n{rendered}"
         );
         // 先頭3件は表示され、4件目は表示されない
+        assert!(rendered.contains("aaaa"), "got:\n{rendered}");
+        assert!(
+            !rendered.contains("dddd"),
+            "4th should be hidden; got:\n{rendered}"
+        );
+    }
+
+    /// `-u` で実際に更新されたプラグインが、LoadDone で `✓ Updated N plugins`
+    /// ブロック（先頭3件・個別 truncate・超過 ` …`）として印字されることを検証する。
+    #[test]
+    fn updated_block_lists_names_with_ellipsis() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        for s in ["aaaa", "bbbb", "cccc", "dddd"] {
+            m.process(Message::PluginUpdated(Arc::from(s)));
+        }
+        m.process(Message::LoadDone);
+
+        let rendered = screen_rendered(&screen);
+        assert!(
+            rendered.contains("Updated 4 plugins"),
+            "header should report 4 updated; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(" …"),
+            "remaining plugins should be elided; got:\n{rendered}"
+        );
         assert!(rendered.contains("aaaa"), "got:\n{rendered}");
         assert!(
             !rendered.contains("dddd"),
