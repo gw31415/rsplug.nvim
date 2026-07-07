@@ -30,10 +30,10 @@ rsplug.nvim は2つの系を持つ:
 - [x] (2026-07-07) 核心課題特定: `to_sym()` が `build`/`lua_build`/`lua_post_update` で自動 true。理由は `CopyEachFile` が `git ls_files`（追跡ファイルのみ）で build 成果物（untracked）を含まないため。sym は worktree 全体を見せて成果物を伝えていた。
 - [x] (2026-07-07) 成果物 copy 方針決定: `git ls-files` ＋ `git ls-files --others --exclude-standard`（.gitignore 尊重）。
 - [x] (2026-07-07) 影響なし確認: Lua runtime（`templates/*.lua`, `*.stpl`）は `snapshot`/`repos`/`cache` に非依存・pack 内完結。`init.lua → generations/{ctl}.lua` sym は系A内で閉じる（維持）。`to_sym` フィールド削除も serde（`deny_unknown_fields` 無し）で既存 TOML は無視される。
-- [ ] Phase 0: `yank` の `hard_link` に copy フォールバック追加（別FS/Nix 前提）。
-- [ ] Phase 1: build プラグインのファイル列挙を `ls-files` + untracked に拡張。
-- [ ] Phase 2: `RepoSnapshotLink`/`to_sym`/`DirectoryExtractionType::Symlink`/`symlink_plugin_dir`/`collect_doc_files_from_root` 廃止。
-- [ ] Phase 3: テスト整理・実機検証（Neowright）。
+- [x] (2026-07-07) Phase 0: `yank` の `hard_link` に ExDev で copy フォールバック追加（`packpathstate.rs`）。commit b272ade。
+- [x] (2026-07-07) Phase 1: `Repository::ls_files_with_untracked`（`ls-files` + `--others --exclude-standard`）追加。`Plugin::load` が `has_build` で切り替え。
+- [x] (2026-07-07) Phase 2: `RepoSnapshotLink`/`DirectoryExtractionType::Symlink`/`symlink_plugin_dir`/`collect_doc_files_from_root`/`to_sym`/`manually_to_sym` を一括廃止。`Plugin::load` は常に `CopyEachFile`。commit a2ffd7f。
+- [ ] Phase 3: テスト整理・実機検証（Neowright）。コード側テスト（`snapshot_link_id_*`/`to_sym` 系）は Phase 2 で削除済み。build 成果物 copy の実機検証が残り。
 
 
 ## Surprises & Discoveries
@@ -68,10 +68,17 @@ rsplug.nvim は2つの系を持つ:
   Rationale: トピックが異なり、1ファイルに混ぜると構造が乱れる。
   Date: 2026-07-07.
 
+- Decision: macOS の pack copy は自前 `clonefile(2)` でなく `tokio::fs::copy`（`std::fs::copy`）に任せる。一時的に自前 clonefile を入れたが revert した。
+  Rationale: 最近の Rust では `std::fs::copy` が macOS/APFS で `fclonefileat`/`clonefile`（CoW）を使用し、HFS+ では `fcopyfile` にフォールバックする（std が自動切替）。自前 clonefile と同等で、フォールバック含め std に委ねる方が保守負荷が低い。非 macOS は `hard_link` → `copy`（ExDev）を維持（hard_link が走るのは非 macOS 同一FS のみ）。
+  Date: 2026-07-07.
+
 
 ## Outcomes & Retrospective
 
-No implementation yet.
+- (2026-07-07) Phase 0-2 実装完了。`pack` は `RepoSnapshotLink` を廃止し常にファイル copy で自己完結（`repos/` への symlink なし）。`init.lua → generations/<id>.lua` の pack 内 sym のみ維持。
+- (2026-07-07) build プラグインの成果物は `ls_files_with_untracked`（untracked 含む）で pack copy に届く。`hard_link` は別FSで copy にフォールバックし Nix store 配置に対応。
+- (2026-07-07) 検証: `cargo test --workspace` 全パス（71件）、`cargo clippy --workspace --all-targets -D warnings` warning なし、`cargo fmt --check` クリーン。
+- 残課題: build 成果物 copy の**実機検証**（Neowright/隔離 HOME で `:helptags`・lazy load が壊れないこと、`find pack -type l` で generations/init.lua 以外に symlink がないこと）。
 
 
 ## Context and Orientation
