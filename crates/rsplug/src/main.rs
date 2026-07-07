@@ -8,7 +8,7 @@ use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use std::{
     collections::{BTreeMap, BinaryHeap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::task::JoinSet;
@@ -27,6 +27,9 @@ struct Args {
     /// Fix the repo version with rev in the lockfile
     #[arg(long)]
     locked: bool,
+    /// Remove cached snapshot directories that are not referenced by the lock file
+    #[arg(long)]
+    gc: bool,
     /// Specify the lockfile path
     #[arg(long)]
     lockfile: Option<PathBuf>,
@@ -44,6 +47,7 @@ async fn app() -> Result<(), Error> {
     let Args {
         install,
         update,
+        gc,
         lockfile,
         locked,
         config_files,
@@ -56,6 +60,12 @@ async fn app() -> Result<(), Error> {
     // touch the dir and then fail with ENOENT when writing the lockfile or the
     // packpath below.
     tokio::fs::create_dir_all(DEFAULT_APP_DIR.as_path()).await?;
+
+    // --gc: garbage-collect orphaned snapshot directories not referenced by the
+    // lock file. This is an early-return path — no plugin loading occurs.
+    if gc {
+        return garbage_collect(&lockfile, DEFAULT_REPOCACHE_DIR.as_path()).await;
+    }
 
     // Parse config files in deterministic path order.
     // `order` uses config_index, so walker receive order must not affect config order.
@@ -94,16 +104,19 @@ async fn app() -> Result<(), Error> {
         configs.into_iter().sum::<rsplug::Config>()
     };
 
-    let locked_map = if locked {
-        match rsplug::LockFile::read(lockfile.as_path()).await {
-            Ok(rsplug::LockFile { locked, .. }) => {
+    // Always read the lock file as the baseline. `--locked` uses it to pin
+    // revisions; non-`--locked` runs use it as the starting point for the
+    // output lock file so that entries for plugins not in the config are
+    // preserved.
+    let locked_map = match rsplug::LockFile::read(lockfile.as_path()).await {
+        Ok(rsplug::LockFile { locked: map, .. }) => {
+            if locked {
                 msg(Message::DetectLockFile(lockfile.clone()));
-                locked
             }
-            Err(e) => return Err(e.into()),
+            map
         }
-    } else {
-        BTreeMap::new()
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => return Err(e.into()),
     };
 
     let plugins = rsplug::Plugin::new(config)?;
@@ -140,7 +153,7 @@ async fn app() -> Result<(), Error> {
         })?;
     // reqwest::Client は内部が Arc なので clone は安価。FnMut closure 内に move するため先に clone。
     let http_client = http_client.clone();
-    let (mut plugins, lock_infos) = {
+    let (mut plugins, lock_infos, urls_to_remove) = {
         let res = plugins
             .into_iter()
             .map(|plugin| {
@@ -148,32 +161,33 @@ async fn app() -> Result<(), Error> {
                 let fetch_semaphore = fetch_semaphore.clone();
                 let http_client = http_client.clone();
                 async move {
-                    let locked_rev = if let Some(repo) = plugin.cache.repo.as_ref() {
-                        let url = repo.url();
-                        if locked {
-                            if let Some(entry) = locked_map.get(&url) {
-                                if entry.kind != rsplug::LockedResourceType::Git {
+                    let (locked_rev, repo_url): (Option<Arc<str>>, Option<String>) =
+                        if let Some(repo) = plugin.cache.repo.as_ref() {
+                            let url = repo.url();
+                            if locked {
+                                if let Some(entry) = locked_map.get(&url) {
+                                    if entry.kind != rsplug::LockedResourceType::Git {
+                                        return Err(Error::Io(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "Unsupported lock type for {}: {:?}",
+                                                url, entry.kind
+                                            ),
+                                        )));
+                                    }
+                                    (Some(Arc::<str>::from(entry.rev.as_str())), Some(url))
+                                } else {
                                     return Err(Error::Io(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
-                                        format!(
-                                            "Unsupported lock type for {}: {:?}",
-                                            url, entry.kind
-                                        ),
+                                        format!("Missing locked revision for {}", url),
                                     )));
                                 }
-                                Some(Arc::<str>::from(entry.rev.as_str()))
                             } else {
-                                return Err(Error::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Missing locked revision for {}", url),
-                                )));
+                                (None, Some(url))
                             }
                         } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                            (None, None)
+                        };
                     let result = plugin
                         .load(
                             install,
@@ -185,7 +199,17 @@ async fn app() -> Result<(), Error> {
                         )
                         .await;
                     msg(Message::LoadPluginDone);
-                    Ok(result?)
+                    // Distinguish: repo present but load returned None means
+                    // not-installed (cache missing) → mark for lock removal.
+                    let url_to_remove = if repo_url.is_some()
+                        && result.is_ok()
+                        && result.as_ref().unwrap().is_none()
+                    {
+                        repo_url
+                    } else {
+                        None
+                    };
+                    Ok((result?, url_to_remove))
                 }
             })
             .collect::<JoinSet<_>>()
@@ -194,28 +218,37 @@ async fn app() -> Result<(), Error> {
         // Wait until all loading is complete.
         // NOTE: It does not abort if an error occurs (because of the build process).
         msg(Message::LoadDone);
-        let (plugins, locks) = res
+        let (plugins, locks, remove_urls) = res
             .into_iter()
             .try_fold(
-                (BinaryHeap::new(), Vec::new()),
-                |(mut plugins, mut locks), res| {
-                    if let Some((loaded, lock_info)) = res? {
+                (BinaryHeap::new(), Vec::new(), Vec::new()),
+                |(mut plugins, mut locks, mut remove_urls), res| {
+                    let (result, url_to_remove) = res?;
+                    if let Some((loaded, lock_info)) = result {
                         plugins.push(loaded);
                         if let Some(lock_info) = lock_info {
                             locks.push(lock_info);
                         }
                     }
-                    Ok::<_, Box<Error>>((plugins, locks))
+                    if let Some(url) = url_to_remove {
+                        remove_urls.push(url);
+                    }
+                    Ok::<_, Box<Error>>((plugins, locks, remove_urls))
                 },
             )
             .map_err(|e| *e)?;
-        (plugins, locks)
+        (plugins, locks, remove_urls)
     };
     let total_count = plugins.len();
 
     if !locked {
         let mut merged_locked =
             Arc::try_unwrap(locked_map).expect("No other references to locked_map");
+        // Remove entries for plugins that are in the config but not installed
+        // (cache missing). This keeps the lock file in sync with the cache.
+        for url in &urls_to_remove {
+            merged_locked.remove(url);
+        }
         for (url, resolved_rev) in lock_infos {
             merged_locked.insert(
                 url,
@@ -250,6 +283,281 @@ async fn app() -> Result<(), Error> {
         .await
         .map_err(rsplug::Error::Io)?;
     Ok(())
+}
+
+/// Remove snapshot directories under `repos/` that are not referenced by the lock file.
+///
+/// lock ファイルは URL → locked commit の対応を持つ。GC は各 lock URL を
+/// [`rsplug::plugin::cachedir_from_url`] で `repos/` からの相対 cachedir に正方向変換し、
+/// on-disk の repo ディレクトリ（`repos_dir` からの相対パス = cachedir）と照合する。
+/// 一致した repo の `worktrees/` のうち、snapshot key の commit 接頭辞が locked `rev`
+/// に一致しないものを削除する。lock に無い repo（URL→cachedir 変換不能含む）は触らない。
+///
+/// 安全策: lock ファイルが無い/空の場合は何も削除しない（キャッシュ全消去を防ぐ）。
+async fn garbage_collect(lockfile: &Path, repos_dir: &Path) -> Result<(), Error> {
+    let lock = rsplug::LockFile::read(lockfile).await?;
+    if lock.locked.is_empty() {
+        eprintln!(
+            "rsplug --gc: lock file is empty, refusing to delete anything.\n\
+             Run a normal rsplug invocation first to populate the lock file."
+        );
+        return Ok(());
+    }
+
+    // URL → 相対 cachedir → rev の表を作る。dir → URL の逆変換は `.git`/scheme/auth の
+    // 扱いが脆弱なので使わず、正方向変換でディレクトリパスと比較する。
+    let rev_by_cachedir: BTreeMap<PathBuf, String> = lock
+        .locked
+        .iter()
+        .filter_map(|(url, res)| {
+            rsplug::plugin::cachedir_from_url(url).map(|cachedir| (cachedir, res.rev.clone()))
+        })
+        .collect();
+
+    let mut removed = 0usize;
+    let mut kept = 0usize;
+
+    // Walk top-level hosts (e.g. github.com)
+    let mut host_entries = tokio::fs::read_dir(repos_dir).await?;
+    while let Some(host_entry) = host_entries.next_entry().await? {
+        let host_path = host_entry.path();
+        if host_path.is_dir() {
+            walk_repos_for_gc(
+                &host_path,
+                repos_dir,
+                &rev_by_cachedir,
+                &mut removed,
+                &mut kept,
+            )
+            .await?;
+        }
+    }
+
+    eprintln!("rsplug --gc: removed {removed} orphaned snapshot(s), kept {kept}.");
+    Ok(())
+}
+
+/// `repos_dir` 配下を走査し、`worktrees/` を持つ repo ディレクトリで GC を行う。
+/// repo ディレクトリは `repos_dir` からの相対パス（= cachedir）で `rev_by_cachedir` を引く。
+/// async 再帰を避けるため明示的なスタックを使う。
+async fn walk_repos_for_gc(
+    start_dir: &Path,
+    repos_dir: &Path,
+    rev_by_cachedir: &BTreeMap<PathBuf, String>,
+    removed: &mut usize,
+    kept: &mut usize,
+) -> Result<(), Error> {
+    let mut stack = vec![start_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let worktrees = dir.join("worktrees");
+        if worktrees.is_dir() {
+            // repo ディレクトリ: repos_dir からの相対パス（= cachedir）で lock を引く。
+            if let Ok(cachedir) = dir.strip_prefix(repos_dir)
+                && let Some(locked_rev) = rev_by_cachedir.get(cachedir)
+            {
+                gc_worktrees(&worktrees, locked_rev, removed, kept).await?;
+            }
+            // lock に無い repo は触らない。
+            continue;
+        }
+        // Recurse into subdirectories
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove snapshot directories under `worktrees/` whose commit prefix does not
+/// match `locked_rev`.
+async fn gc_worktrees(
+    worktrees: &Path,
+    locked_rev: &str,
+    removed: &mut usize,
+    kept: &mut usize,
+) -> Result<(), Error> {
+    let mut entries = tokio::fs::read_dir(worktrees).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Skip hidden directories (e.g. .building-*)
+        if name_str.starts_with('.') {
+            continue;
+        }
+        // Parse commit prefix (first segment before __)
+        let commit = name_str.split("__").next().unwrap_or(name_str);
+        let path = entry.path();
+        if commit == locked_rev {
+            *kept += 1;
+        } else {
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {
+                    *removed += 1;
+                    eprintln!("rsplug --gc: removed {}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("rsplug --gc: failed to remove {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gc_tests {
+    //! Acceptance 4/5 (--gc) の振る舞い検証。GC は URL→cachedir の正方向変換で
+    //! lock と on-disk ディレクトリを照合するため、絶対パス渡りや .git 末尾でも破綻しない。
+    use super::*;
+    use rsplug::{LockFile, LockedResource, LockedResourceType};
+    use std::borrow::Cow;
+
+    const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    async fn write_lock(path: &Path, entries: &[(&str, &str)]) {
+        let locked = entries
+            .iter()
+            .map(|(url, rev)| {
+                (
+                    url.to_string(),
+                    LockedResource {
+                        kind: LockedResourceType::Git,
+                        rev: rev.to_string(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        LockFile {
+            version: Cow::Borrowed("1"),
+            locked,
+        }
+        .write(path)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_locked_removes_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let worktrees = repos.join("github.com/owner/repo/worktrees");
+        tokio::fs::create_dir_all(worktrees.join(HEX_A))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(worktrees.join(HEX_B))
+            .await
+            .unwrap();
+        // build-suffix 付き snapshot key も commit 接頭辞で判定されることを確認
+        tokio::fs::create_dir_all(worktrees.join(format!("{HEX_B}__v1_xyz")))
+            .await
+            .unwrap();
+
+        let lockfile = tmp.path().join("rsplug.lock.json");
+        write_lock(&lockfile, &[("https://github.com/owner/repo", HEX_A)]).await;
+
+        garbage_collect(&lockfile, &repos).await.unwrap();
+
+        assert!(
+            worktrees.join(HEX_A).is_dir(),
+            "locked snapshot must survive"
+        );
+        assert!(
+            !worktrees.join(HEX_B).is_dir(),
+            "orphan snapshot must be removed"
+        );
+        assert!(
+            !worktrees.join(format!("{HEX_B}__v1_xyz")).is_dir(),
+            "orphan snapshot with build suffix must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_skips_repo_without_lock_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let worktrees = repos.join("github.com/other/repo/worktrees");
+        tokio::fs::create_dir_all(worktrees.join(HEX_A))
+            .await
+            .unwrap();
+
+        // lock は別 repo を指す → 当該 repo は lock に無い → 触らない
+        let lockfile = tmp.path().join("rsplug.lock.json");
+        write_lock(&lockfile, &[("https://github.com/owner/repo", HEX_A)]).await;
+
+        garbage_collect(&lockfile, &repos).await.unwrap();
+
+        assert!(
+            worktrees.join(HEX_A).is_dir(),
+            "repo without lock entry must be left untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_handles_dot_git_url() {
+        // .git 付き URL: default_cachedir は .git を剥がす。正方向変換で一致する。
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let worktrees = repos.join("gitlab.com/foo/bar/worktrees");
+        tokio::fs::create_dir_all(worktrees.join(HEX_A))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(worktrees.join(HEX_B))
+            .await
+            .unwrap();
+
+        let lockfile = tmp.path().join("rsplug.lock.json");
+        write_lock(&lockfile, &[("https://gitlab.com/foo/bar.git", HEX_A)]).await;
+
+        garbage_collect(&lockfile, &repos).await.unwrap();
+
+        assert!(worktrees.join(HEX_A).is_dir());
+        assert!(!worktrees.join(HEX_B).is_dir());
+    }
+
+    #[tokio::test]
+    async fn gc_refuses_empty_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let worktrees = repos.join("github.com/owner/repo/worktrees");
+        tokio::fs::create_dir_all(worktrees.join(HEX_A))
+            .await
+            .unwrap();
+
+        let lockfile = tmp.path().join("rsplug.lock.json");
+        write_lock(&lockfile, &[]).await;
+
+        garbage_collect(&lockfile, &repos).await.unwrap();
+
+        assert!(
+            worktrees.join(HEX_A).is_dir(),
+            "empty lock must not delete anything"
+        );
+    }
+
+    #[test]
+    fn cachedir_from_url_matches_default_cachedir() {
+        // GitHub: url()=https://github.com/o/r → cachedir github.com/o/r
+        assert_eq!(
+            rsplug::plugin::cachedir_from_url("https://github.com/owner/repo"),
+            Some(PathBuf::from("github.com/owner/repo"))
+        );
+        // .git 末尾は剥がれる
+        assert_eq!(
+            rsplug::plugin::cachedir_from_url("https://gitlab.com/foo/bar.git"),
+            Some(PathBuf::from("gitlab.com/foo/bar"))
+        );
+        // SSH 形式はパース不可 → None
+        assert_eq!(
+            rsplug::plugin::cachedir_from_url("git@github.com:o/r.git"),
+            None
+        );
+    }
 }
 
 static DEFAULT_APP_DIR: Lazy<PathBuf> = Lazy::new(|| {

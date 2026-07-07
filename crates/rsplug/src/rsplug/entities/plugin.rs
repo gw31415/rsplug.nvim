@@ -208,6 +208,20 @@ impl FromStr for RepoSource {
     }
 }
 
+/// URL 文字列から、cache 名前空間（`repos/` 直下）に対する相対 cachedir を再構築する。
+///
+/// lock ファイルは URL をキーにするが、キャッシュは [`RepoSource::default_cachedir`]
+/// の相対パスに配置される。GC のように「lock の URL → on-disk ディレクトリ」の対応付けが
+/// 必要な処理は、この関数で URL を cachedir に正方向変換してディレクトリパスと比較する。
+/// `RepoSource` を経由するため [`RepoSource::default_cachedir`] と必ず一致し、
+/// dir → URL の脆弱な逆変換（`.git` 末尾や scheme/auth/port の扱い）に頼らない。
+/// rsplug が扱わない形式（SSH `git@host:...` 等）はパースに失敗して `None` を返す。
+pub fn cachedir_from_url(url: &str) -> Option<PathBuf> {
+    RepoSource::from_str(url)
+        .ok()
+        .map(|repo| repo.default_cachedir())
+}
+
 impl Plugin {
     /// 設定ファイルから Plugin のコレクションを構築する
     pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, DagError> {

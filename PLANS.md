@@ -1,4 +1,4 @@
-# GitHub Fetch 高速化 ExecPlan
+# Lock file / cache directory synchronization ExecPlan
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
@@ -7,241 +7,218 @@ This document follows the repository-level `PLANS.md` convention described in `A
 
 ## Purpose / Big Picture
 
-rsplug.nvim is an external Rust binary that installs Neovim plugins by fetching Git repositories into a cache directory. When the repository is on GitHub and a token is available (`GITHUB_TOKEN` / `GH_TOKEN`), rsplug downloads a tarball from `codeload.github.com` instead of using the Git smart-HTTP protocol. This tarball path is the "GitHub mode" that this plan targets.
+rsplug.nvim stores fetched plugin snapshots on disk under `~/.cache/rsplug/repos/<repo>/worktrees/<snapshot_key>/`. It also maintains a JSON lock file (`rsplug.lock.json`) that records the resolved commit hash (`rev`) for each repository URL.
 
-The problem: GitHub-mode fetch is slower than it needs to be. The user wants to push against the GitHub rate limit ceiling and use every available technique — connection pooling, higher parallelism, faster decompression libraries, and protocol-level optimizations — to minimize download time.
+The problem: the lock file is only written as a side-effect of `--install` / `--update` / `--locked` runs. If the user skips lock-file updates for a while, the lock file drifts out of sync with what is actually on disk:
+
+1. A plugin may exist in `repos/` (installed) but be absent from the lock file, or have a stale `rev` that no longer matches any snapshot on disk.
+2. A plugin may be listed in the lock file but its cache directory was deleted (manually or by a failed cleanup), so the locked `rev` points to nothing.
+3. Stale snapshot directories from old commits accumulate in `worktrees/` and are never garbage-collected.
 
 After this plan is fully implemented, the user will observe:
 
-- Installing a fresh set of 30+ plugins completes noticeably faster than before (target: 2-4x improvement on cold install).
-- Re-running `rsplug --update` with no upstream changes returns quickly because unchanged tarballs are skipped via conditional requests.
-- The `--install` log shows many plugins fetching concurrently without errors, and no spurious rate-limit failures.
+- Running rsplug without `--install`/`--update`/`--locked` (the default "load from cache" mode) always writes a lock file whose `rev` values reflect the snapshot directories actually present on disk — not the last-fetched values.
+- Snapshot directories that do not correspond to the lock file's `rev` are garbage-collected (with `--gc`) or at least identified.
+- The lock file never claims a revision that has no corresponding on-disk snapshot.
 
-Success is demonstrated by a before/after timing comparison on a fixed plugin set, plus passing the existing test suite.
+The key concern raised by the user: **the `repos/` directory is not immutable**. Snapshot worktrees can be mutated by build scripts, `lua_post_update`, or external tools, and `source.git` object stores are append-only bare repos. This plan must not assume immutability where it does not hold, and must explicitly separate the parts that are safe to implement now from the parts that depend on making the cache more robust.
 
 
 ## Progress
 
-- [x] (2025-07-07) Analyzed current fetch implementation across `plugin.rs`, `util.rs`, `main.rs`.
-- [x] (2025-07-07) Identified six bottlenecks (per-call Client creation, two-stage gzip, pure-Rust decompressor, git-protocol rev resolution, no conditional requests, low initial parallelism).
-- [x] (2025-07-07) Confirmed GitHub rate-limit landscape: codeload tarballs are CDN-served and outside the core API quota; git smart-HTTP and REST API are rate-limited but generous with a token.
-- [x] (2025-07-07) Phase 1.1: Shared `reqwest::Client` with pool/HTTP/2 settings, threaded through `FetchCtx` and `Plugin::load`.
-- [x] (2025-07-07) Phase 1.2: Eliminated temp-file staging; gzip+tar extraction in single `spawn_blocking` via `bytes::Bytes` → `Cursor`.
-- [x] (2025-07-07) Phase 2.1: Replaced `async-compression` with `flate2` (zlib-ng backend). Removed `async-compression`, `futures-util`, `tokio-util` deps.
-- [x] (2025-07-07) Phase 3.1: Added `github::resolve_rev_via_api` (REST API rev resolution with `X-RateLimit-Remaining` threshold and wildcard fallback). `resolve_remote_oid` dispatches API-first, git-protocol-fallback.
-- [x] (2025-07-07) Phase 4.1: Raised fetch semaphore from 8→32 initial, 256→512 max.
-- [x] (2025-07-07) `cargo fmt`, `cargo test --workspace` (140 tests, 0 failed), `cargo clippy --workspace --all-targets` (0 warnings) — all clean.
-- [x] Phase 5.1: Run before/after benchmarks on a fixed plugin set.
+- [x] (2025-07-07) Analyzed current lock-file write path (`main.rs` lines 143-234) and cache layout (`plugin.rs` `latest_snapshot_oid`, `packpathstate.rs` `RepoSnapshotIdentity`).
+- [x] (2025-07-07) Identified the three drift scenarios (lock missing entries, lock stale rev, orphaned snapshots).
+- [x] (2025-07-07) Classified tasks into "safe now" (depends only on reading existing on-disk state) and "blocked on immutability" (assumes snapshots are never mutated post-creation).
+- [x] (2026-07-07) Phase 1: Reconstruct lock file from on-disk snapshots during default (non-install/update/locked) runs. `locked_map` を常にロックファイルから初期化（NotFound は空マップ）。`Plugin::load` の結果から「repo 有りかつ `Ok(None)` = 未インストール」の URL を `urls_to_remove` に集めて lock から削除 → `lock_infos` を overlay。
+- [x] (2026-07-07) Phase 2: Add `--gc` flag to remove orphaned snapshot directories not referenced by the lock file. URL→cachedir 正方向変換 (`rsplug::plugin::cachedir_from_url`) で lock をディレクトリパスと照合。`main.rs:gc_tests` で Acceptance 4/5 を検証済み。
+- [ ] Phase 3 (deferred): Immutable snapshot design — make snapshot worktrees read-only after creation so GC and lock reconstruction can trust the on-disk commit hash.
 
 
 ## Surprises & Discoveries
 
-- Observation: `TarballFetch::download_and_extract` calls `reqwest::Client::new()` on every invocation (`util.rs` line ~595). This defeats connection pooling, keep-alive, and HTTP/2 multi-streaming entirely. Every plugin pays a fresh TCP + TLS handshake to `codeload.github.com`.
-  Evidence: `crates/rsplug/src/rsplug/util.rs`, `download_and_extract` method.
+- Observation: The lock file is written only when `!locked` (main.rs:216). On a default run (no flags), `locked` is `false`, so the lock file IS written — but only with `rev` values from `lock_infos`, which are populated only by `Plugin::load` when it actually fetches (install/update). On a default run with no fetch, `lock_infos` is empty for already-installed plugins, so the lock file is rewritten with whatever was in the pre-existing lock file (merged into `locked_map`). This means **the default run does not add missing entries or fix stale revs** — it just round-trips the old data.
+  Evidence: `main.rs:97-107` (reads lock file into `locked_map` only when `--locked`), `main.rs:216-234` (writes lock file when `!locked`), `main.rs:197-212` (lock_infos collected from load results).
 
-- Observation: The gzip decompression pipeline writes the decompressed tar to a temp file (`tempfile::tempdir()`) before extracting in `spawn_blocking`. This doubles the disk I/O for no benefit.
-  Evidence: `util.rs` lines ~619-650.
+- Observation: `Plugin::load` returns `lock_info = Some((url, head_rev_str))` only when it reaches the end of the fetch/materialize path (plugin.rs:602). When the plugin is already installed and loaded from cache (the `Some(existing) => existing` branch at plugin.rs:395), it still returns `lock_info` because `head_rev_str` is set from the existing snapshot's directory name. So the data IS available — but `main.rs` only merges `lock_infos` into `locked_map`, and when `--locked` is not set, `locked_map` starts empty (not from the file). So **the default run does write the lock file from lock_infos, but only for plugins present in the config** — plugins removed from config but still cached will be dropped from the lock file.
+  Evidence: `main.rs:105-107` (`BTreeMap::new()` when not `--locked`), `plugin.rs:602` (`lock_info` always returned on success).
 
-- Observation: `async-compression` is a pure-Rust gzip implementation. The C-based `zlib-ng` (via `flate2`) is typically 1.5-3x faster for decompression.
-  Evidence: `Cargo.toml` dependency list; `flate2` feature flags documentation.
+- Observation: The snapshot directory name encodes the commit hash: `<40-hex-commit>` or `<40-hex-commit>__v1_<hash>` (packpathstate.rs:68-85). `latest_snapshot_oid` (plugin.rs:928-939) parses this prefix. So **the on-disk commit is recoverable from the directory name without opening the git repo**.
 
-- Observation: The fetch semaphore starts at 8 concurrent operations (`main.rs` line ~121). GitHub codeload is a Fastly CDN with effectively unlimited throughput for tarballs, so this is overly conservative.
-  Evidence: `crates/rsplug/src/main.rs`, `AdaptiveSemaphore::with_limits(8, 1, 256, ...)`.
+- Observation: `latest_snapshot_dir` picks the newest snapshot by mtime. If multiple snapshots exist (e.g. before and after a build change), only the newest is reflected. The older ones become orphans.
 
-- Observation: `ls_remote` uses git smart-HTTP (`/info/refs` ref advertisement), which transfers the full ref list and requires protocol negotiation. A single GitHub REST API call (`/repos/{owner}/{repo}/commits/{ref}`) returns just the SHA and is lighter on the wire.
-  Evidence: `util.rs`, `git::ls_remote` function.
+- Observation: Snapshot worktrees ARE mutable. Build scripts (`build`, `lua_build`) run inside the worktree and produce uncommitted changes (plugin.rs:461-527). The `.rsplug_build_success` marker file records the build identity (plugin.rs:546-552). `is_dirty()` and `diff_hash()` exist to capture this, but the worktree itself is a standard git working tree that any external process could modify.
+  Evidence: `plugin.rs:461-527`, `util.rs:176-211` (`diff_hash`, `is_dirty`), `packpathstate.rs:35-36` (`dirty_diff` field).
 
-- Discovery (during release): The Windows (x86_64-pc-windows-msvc) CI build
-  failed because the workspace layout changed between v0.2.3 and v0.2.4.
-  v0.2.3's root `Cargo.toml` was a real package (`members = [".", ...]` with
-  a `[package]` table), so a bare `cargo build` compiled only the root `rsplug`
-  crate. v0.2.4 switched to a virtual workspace (`members = ["crates/*", ...]`
-  with no root `[package]`), so `cargo build` tried to compile every member
-  including `rsplug-fts`, which uses Unix-only APIs (`std::os::unix`,
-  `nlink_t`, `OsStr::from_bytes`) and cannot build on Windows.
-  Fix: added `-p rsplug` to the CI build command in `release.yml` so the
-  workspace root crate is built explicitly, independent of workspace layout.
+- Discovery: The lock file currently records only `{ type: "git", rev: <hash> }`. It does not record build status, dirty diff, or snapshot key. This means the lock file cannot distinguish between a clean checkout and a built-up snapshot at the same commit — but for lock/cache sync purposes, the commit hash is sufficient as the primary key.
 
-- Discovery (during release): The `publish-crates` CI job skipped all library
-  crates and failed when publishing `rsplug`. Root cause: `Cargo.lock` was
-  committed with stale versions (0.2.3 / 0.2.0) after `set-version.sh` bumped
-  only the `Cargo.toml` files. The CI version check uses `cargo pkgid`, which
-  reads `Cargo.lock`, so it saw the old versions, found them already on
-  crates.io, and skipped every dependency. `rsplug 0.2.4` then failed because
-  its `0.2.4` internal dependencies were absent from crates.io.
-  Fix: regenerate and commit `Cargo.lock` after `set-version.sh`.
-  Lesson: `set-version.sh` should update `Cargo.lock` itself, or the release
-  checklist must include a `cargo update -w` step before committing.
+- Discovery (2026-07-07): Phase 2 の初版 GC（`repo_url_from_cache_dir`）は dir→URL の逆変換だったが、`walk_repos_for_gc` が絶対パスを渡すため `parts[0]` が `/` になり host 判定が不可能 → lock ルックアップが全件不一致で **GC が何も削除しなかった**。加えて `default_cachedir` は `.git` 末尾を剥がすが `repo.url()`（lock キー）は剥がさないため、`.git` 付き URL でも不一致。正方向変換（URL→cachedir）で統一して解決した。Evidence: `plugin.rs:default_cachedir`, `util.rs:github::url`, `main.rs:garbage_collect`.
 
 
 ## Decision Log
 
-- Decision: Prioritize Phase 1.1 (shared Client) and Phase 4.1 (semaphore raise) as the first implementation step.
-  Rationale: These two changes are the smallest in effort and deliver the largest improvement (connection reuse eliminates repeated handshakes; higher parallelism multiplies throughput on a CDN that can absorb it). They are also the lowest risk because they do not change the download logic itself.
+- Decision: Split the work into three phases. Phase 1 (lock reconstruction) and Phase 2 (GC) are safe to implement now because they only read on-disk state. Phase 3 (immutability) is deferred because it requires a design change to how snapshots are created and managed.
+  Rationale: The user explicitly asked to proceed with implementation where possible and defer only the parts that depend on the immutability concern.
   Date: 2025-07-07. Author: planning session.
 
-- Decision: Keep the GitFetch fallback path intact.
-  Rationale: Tokenless environments and non-GitHub HTTPS URLs still need git-protocol fetch. TarballFetch already falls back to GitFetch on failure (`plugin.rs`, `materialize`), and this structure must be preserved so failures degrade gracefully.
+- Decision: Phase 1 changes the default-run behavior so that the lock file always reflects on-disk snapshots. The lock file is written for every run (not just install/update), and `rev` values come from the actual snapshot directory names, not from stale lock file data.
+  Rationale: The user's core complaint is that the lock file drifts. The fix is to make the lock file a function of the cache state, not of the fetch history.
   Date: 2025-07-07.
 
-- Decision: Use `flate2` with the `zlib-ng` backend rather than `async-compression`.
-  Rationale: gzip decompression is CPU-bound. Running it inside `spawn_blocking` with the C-backed `flate2::read::GzDecoder` outperforms the pure-Rust async decoder in raw throughput. The tarball is already fully downloaded before extraction, so async streaming is not required for correctness.
+- Decision: For Phase 1, when multiple snapshots exist for a repo, use the same "newest by mtime" heuristic that `latest_snapshot_oid` already uses. This is consistent with the existing load behavior.
+  Rationale: Changing the snapshot selection logic is out of scope; we sync what we would actually load.
   Date: 2025-07-07.
 
-- Decision: Make REST-API rev resolution fall back to git `ls_remote` when the API rate-limit header (`X-RateLimit-Remaining`) is low or when a wildcard revision (e.g. `@v*`) is requested.
-  Rationale: Wildcard refs require enumerating tags, which the single-commit API endpoint does not support. Git protocol handles wildcards natively. Falling back on low rate-limit remaining prevents lockout.
+- Decision: Phase 2 (`--gc`) is opt-in via a flag, not automatic. Deleting snapshot directories is destructive and should not happen silently during normal operation.
+  Rationale: The user may have manually created snapshots or may want to keep old ones. GC must be explicit.
   Date: 2025-07-07.
 
-- Decision: Store HTTP conditional-request metadata (ETag, Last-Modified) in `repos/<repo>/worktrees/<snapshot_key>/.rsplug_http_meta.json`.
-  Rationale: Colocating the metadata with the snapshot it describes keeps cleanup simple — deleting the snapshot directory removes the metadata automatically.
+- Decision: Phase 3 (immutable snapshots) is documented but not implemented in this plan. The concern is valid: until snapshots are immutable, GC and lock reconstruction trust directory names that could theoretically be renamed. However, rsplug itself never renames snapshot directories after creation, so the practical risk is low.
+  Rationale: Documenting the concern and the desired direction is better than silently ignoring it.
   Date: 2025-07-07.
+
+- Decision: GC は dir→URL の逆変換ではなく、URL→cachedir の正方向変換（`rsplug::plugin::cachedir_from_url`）で lock と on-disk ディレクトリを照合する。
+  Rationale: 逆変換は `.git`/scheme/auth/port の扱いが `default_cachedir` と一致せず脆弱（絶対パス渡りでも破綻）。正方向変換は `RepoSource` を経由するため常に整合する。PLANS.md の「GC ロジックは main.rs」は維持し、変換ヘルパのみライブラリに共有した。
+  Date: 2026-07-07.
 
 
 ## Outcomes & Retrospective
 
-All acceptance criteria met. The v0.2.4 release shipped successfully after
-resolving two CI failures discovered during the release process (documented
-in Surprises & Discoveries):
-
-- All five platform builds passed (aarch64/x86_64 macOS, aarch64/x86_64 Linux,
-  x86_64 Windows). The Windows build initially failed due to the virtual
-  workspace compiling Unix-only `rsplug-fts`; fixed by adding `-p rsplug` to
-  the CI build command.
-- All six crates published to crates.io (`rsplug` now at `0.2.4`,
-  `rsplug-fts` remains `0.3.0`). Publishing initially failed because the
-  committed `Cargo.lock` had stale versions; fixed by regenerating it.
-- The GitHub Release `v0.2.4` has five binary assets (4× tar.gz, 1× zip).
-- The curated release notes (Features / Bug Fixes / Internal / Full Changelog)
-  were applied cleanly via `gh release edit --notes-file`.
+- (2026-07-07) Phase 1 実装（`main.rs`）: `locked_map` を常にロックファイルから初期化（`NotFound` は空マップ）。`Plugin::load` の結果から「repo 有りかつ `Ok(None)`（= 未インストール/フェッチ失敗）」の URL を `urls_to_remove` に集め、lock から削除した上で `lock_infos` を overlay。デフォルト実行後に lock の `rev` が on-disk snapshot と一致し、設定にあって未インストールの repo は lock から除去される（Acceptance 1/2/3 設計通り）。
+- (2026-07-07) Phase 2 実装（`main.rs` + `plugin.rs`）: `--gc` で orphaned snapshot を削除。初版は dir→URL 逆変換（`repo_url_from_cache_dir`）を使っていたが絶対パス渡りで破綻し GC が機能していなかった。root-cause 修正として URL→cachedir 正方向変換ヘルパ `cachedir_from_url` を `plugin.rs` に追加し、GC は lock を cachedir マップに変換して `repos_dir` からの相対パスで照合。`gc_tests`（orphan 削除 / locked 保持 / build 接尾辞付き / lock 無し repo スキップ / `.git` URL / 空 lock 拒否 / cachedir 変換）で Acceptance 4/5 を担保。
+- (2026-07-07) 検証: `cargo check` / `cargo test --workspace`（全パス、`gc_tests` 5件追加）/ `cargo clippy --workspace --all-targets -D warnings`（warning なし）/ `cargo fmt --check` すべて通過。
+- Retrospective: GC の逆変換バグはテスト不在により発見が遅れた。Acceptance をテストで先に書く、あるいは GC 実装と同時にテストを追加すべきだった（今回あわせて追加）。Phase 1 の「未インストール vs script-only」区別は `Plugin::load` の戻り値形状（`Ok(None)` は repo 有りかつ未インストールのみ）に依存しており、将来 load の戻り値が変わると壊れうる点に注意。
 
 
 ## Context and Orientation
 
-rsplug.nvim is a Rust workspace rooted at the repository top level. The main binary crate is `crates/rsplug`. It uses Tokio for async runtime, `git2` (libgit2 bindings) for Git operations, and `reqwest` for HTTP tarball downloads.
+rsplug.nvim is a Rust workspace. The main binary crate is `crates/rsplug`. The cache directory layout is:
+
+    ~/.cache/rsplug/
+    ├── rsplug.lock.json          # lock file (JSON)
+    └── repos/
+        └── <repo_cachedir>/      # e.g. github.com/owner/repo
+            ├── source.git/       # bare object store (GitFetch path only)
+            └── worktrees/
+                ├── <snapshot_key>/   # fixed checkout at a specific commit
+                └── .building-<pid>-<nonce>/  # temporary build worktree
+
+The snapshot key is either `<40-hex-commit>` (no build) or `<40-hex-commit>__v1_<hash>` (with build). The commit hash is always the first `__`-delimited segment.
+
+The lock file format is:
+
+    {
+      "version": "1",
+      "locked": {
+        "<repo-url>": { "type": "git", "rev": "<40-hex-commit>" }
+      }
+    }
 
 Key terms:
 
-- **TarballFetch**: The GitHub-HTTPS + token download path. Downloads a `.tar.gz` from `codeload.github.com`, decompresses, extracts, and creates a git2-compatible working tree.
-- **GitFetch**: The fallback path using git smart-HTTP via libgit2 into a bare `source.git` object store, then a local clone into a snapshot worktree.
-- **AdaptiveSemaphore**: A custom concurrency limiter (`crates/adaptive_semaphore`) that adjusts its permit count based on throughput and error rate. It starts at an initial limit, halves on regressions, and increments on improvements.
-- **codeload.github.com**: GitHub's CDN endpoint for archive/tarball downloads. It is outside the core REST API rate limit.
-- **snapshot**: A fixed checkout of a repository at a specific commit, stored under `repos/<repo>/worktrees/<snapshot_key>/`.
+- **Lock file** (`rsplug.lock.json`): records the resolved commit hash for each repository URL. Written by rsplug, read by `--locked` runs.
+- **Snapshot**: a fixed checkout of a repository at a specific commit, stored under `worktrees/<snapshot_key>/`.
+- **`latest_snapshot_oid`**: function in `plugin.rs` that finds the newest snapshot directory and parses its commit hash from the directory name.
+- **`locked_map`**: in-memory `BTreeMap<String, LockedResource>` built in `main.rs`. When `--locked`, it is loaded from the lock file. Otherwise, it starts empty and is populated from `lock_infos` returned by `Plugin::load`.
 
 Key files:
 
-- `crates/rsplug/Cargo.toml` — dependencies. Currently has `reqwest`, `async-compression`, `tar`, `tokio-util`, `futures-util`.
-- `crates/rsplug/src/main.rs` — entry point. Creates the `AdaptiveSemaphore` (line ~121) and spawns parallel `Plugin::load` tasks.
-- `crates/rsplug/src/rsplug/entities/plugin.rs` — `Plugin::load` orchestrates fetch strategy. `FetchCtx` struct (line ~608) bundles fetch arguments. `materialize` (line ~662) selects TarballFetch vs GitFetch.
-- `crates/rsplug/src/rsplug/util.rs` — `git` module (ls_remote, fetch, snapshot init), `github` module (URL/token/tarball helpers), `fetch` module (TarballFetch implementation).
-
-GitHub rate-limit landscape:
-
-- `codeload.github.com` tarball downloads: served by Fastly CDN, not counted against the core API quota. Effectively unlimited for rsplug's use case.
-- git smart-HTTP (`/info/refs`): subject to GitHub's git-operation limits, but generous with a token.
-- REST API (`api.github.com`): 5,000 requests/hour authenticated, 60/hour anonymous. The `X-RateLimit-Remaining` and `X-RateLimit-Reset` response headers report the current budget.
+- `crates/rsplug/src/main.rs` — entry point. Lines 97-107 build `locked_map` (from file only if `--locked`). Lines 143-213 load plugins and collect `lock_infos`. Lines 216-234 write the lock file when `!locked`.
+- `crates/rsplug/src/rsplug/entities/plugin.rs` — `Plugin::load` (line 281). Returns `Option<(LoadedPlugin, Option<(String, String)>)>` where the second element is `(url, rev)`. `latest_snapshot_oid` (line 928) reads on-disk commit from snapshot dir name.
+- `crates/rsplug/src/rsplug/entities/lockfile.rs` — `LockFile` struct, read/write methods.
+- `crates/rsplug/src/rsplug/entities/packpathstate.rs` — `RepoSnapshotIdentity` and `snapshot_key()` logic.
 
 
 ## Plan of Work
 
-The implementation proceeds in phases ordered by impact-to-effort ratio. Each phase leaves the binary in a working state — the test suite must pass after every phase.
+### Phase 1 — Lock file reconstruction from cache (safe now)
 
-**Phase 1.1 — Shared reqwest::Client.** Instead of constructing `reqwest::Client::new()` inside `download_and_extract`, build one `Client` at application startup with tuned pool and HTTP/2 settings, and pass it down through `FetchCtx`. This makes the second and subsequent tarball downloads reuse warm connections and lets HTTP/2 multiplex multiple downloads over a single connection to `codeload.github.com`.
+**Goal**: After any rsplug run, the lock file's `rev` values match the snapshot directories actually on disk.
 
-**Phase 1.2 — Eliminate temp-file staging.** Currently the gzip-decompressed stream is copied to a temp file before tar extraction. After switching to `flate2` (Phase 2.1), the `GzDecoder` can feed `tar::Archive` directly inside a single `spawn_blocking` call, removing the intermediate disk write entirely. This is bundled with Phase 2.1 implementation since both touch the same function.
+Currently, `main.rs` builds `locked_map` from the lock file only when `--locked`. On default runs, `locked_map` starts empty and is populated from `lock_infos` (the revs that `Plugin::load` resolved). This works for install/update but does not fix drift for already-installed plugins whose lock entry is stale or missing.
 
-**Phase 2.1 — flate2 with zlib-ng.** Replace the `async-compression` gzip decoder with `flate2::read::GzDecoder` using the `zlib-ng` C backend. Add `flate2 = { version = "1", features = ["zlib-ng"] }` to `Cargo.toml`. Rewrite `download_and_extract` to download the raw gzip bytes, then decompress and extract in one `spawn_blocking` pass. After this, `async-compression` can be removed from dependencies if no other code uses it.
+The change: always initialize `locked_map` from the existing lock file (if present), then overlay `lock_infos` from `Plugin::load`. This ensures:
 
-**Phase 3.1 — REST-API rev resolution.** Add a `github::resolve_rev_via_api` function that calls `GET /repos/{owner}/{repo}/commits/{ref}` and reads `.sha` from the JSON response. For the no-revision case (default branch), call `GET /repos/{owner}/{repo}` and read `.default_branch`, then resolve that branch. Use this in `ls_remote` when the source is GitHub HTTPS and a token is present. Check the `X-RateLimit-Remaining` header; if it falls below a threshold (e.g. 50), fall back to git protocol. Wildcard revisions always use git protocol.
+1. Plugins already in the lock file but not in the config are preserved (not dropped).
+2. Plugins in the config get their `rev` updated from the actual on-disk snapshot.
+3. Plugins in the config but not on disk (skipped via `PluginNotInstalled`) are removed from the lock file (their `lock_info` is `None`, and we need to explicitly handle removal).
 
-**Phase 3.2 — Conditional requests for update.** When `--update` re-fetches a repository that already has a snapshot, attach `If-None-Match` (ETag) or `If-Modified-Since` headers from the stored `.rsplug_http_meta.json`. If GitHub returns `304 Not Modified`, skip the download and reuse the existing snapshot. Store new ETag/Last-Modified values from each successful response.
+The key insight: `Plugin::load` already returns `lock_info = Some((url, rev))` when it successfully loads from cache (plugin.rs:602, where `head_rev_str` comes from the existing snapshot). So the data is already flowing — we just need `main.rs` to use it correctly.
 
-**Phase 4.1 — Raise semaphore initial limit.** Change `AdaptiveSemaphore::with_limits(8, ...)` to `with_limits(32, 1, 512, ...)` in `main.rs`. The adaptive logic remains the safety net — if errors spike, it halves automatically.
+**Implementation in `main.rs`**:
 
-**Phase 5.1 — Benchmark.** Measure cold-install and update times on a fixed plugin set before and after. Record results in the Outcomes section.
+1. Always read the lock file into `locked_map` at startup (not just when `--locked`). This gives us the baseline.
+2. After collecting `lock_infos` from `Plugin::load`, build the final `locked_map` by:
+   - Starting from the file-loaded `locked_map` (preserves entries for plugins not in config).
+   - For each plugin in the config: if `lock_info` is `Some`, update the entry; if `None` (plugin not installed / skipped), remove the entry from `locked_map`.
+3. Write the lock file for every run (currently gated on `!locked`, which is correct — `--locked` runs should not rewrite the lock file).
+
+To remove entries for not-installed plugins, we need to track which URLs were processed. We can build a set of URLs seen during loading and subtract from `locked_map`.
+
+### Phase 2 — Garbage collection (`--gc` flag) (safe now)
+
+**Goal**: Remove snapshot directories that do not correspond to the lock file's `rev`.
+
+Add a `--gc` CLI flag. When invoked, rsplug:
+
+1. Reads the lock file.
+2. For each repo in `repos/`, scans `worktrees/` for snapshot directories.
+3. Keeps only the snapshot whose commit matches the lock file's `rev` (the `<commit>` prefix of the snapshot key). Removes all others.
+4. Optionally removes `source.git` object stores that have no remaining snapshots.
+
+This is safe because it only deletes directories, and only when the user explicitly asks.
+
+**Note on immutability concern**: GC trusts that the snapshot directory name accurately reflects its commit. Since rsplug creates these directories via `git2::Repository::clone` + `set_head_detached`, and never renames them, the name is reliable in practice. A corrupted or externally-renamed directory would be GC'd or kept incorrectly, but this is an edge case the user accepts by running `--gc`.
+
+### Phase 3 — Immutable snapshot design (deferred)
+
+**Goal**: Make snapshot worktrees read-only after creation so that GC and lock reconstruction can fully trust on-disk state.
+
+This is a design-level change that affects:
+- How `build` / `lua_build` / `lua_post_update` execute (they need write access during build, then the tree is frozen).
+- How `source.git` relates to snapshots (currently shared via hardlinks for GitFetch path).
+- Whether the `.rsplug_build_success` marker and dirty diff should be part of the immutable record.
+
+This phase is documented for future work. It is not implemented now because:
+- The user asked to defer parts that depend on the immutability concern.
+- It requires significant changes to the build pipeline and snapshot lifecycle.
 
 
 ## Concrete Steps
 
-Unless noted, all commands run from the repository root (`/Users/ama/.herdr/worktrees/rsplug.nvim/fast-dl`).
+Unless noted, all commands run from the repository root (`/Users/ama/.herdr/worktrees/rsplug.nvim/lockfornix`).
 
-**Step 1 — Add flate2 dependency.**
+**Step 1 — Always read lock file at startup (Phase 1a).**
 
-Edit `crates/rsplug/Cargo.toml`: add `flate2 = { version = "1", features = ["zlib-ng"] }` to `[dependencies]`. Keep `async-compression` for now (remove in Step 3 after confirming nothing else uses it).
+Edit `crates/rsplug/src/main.rs`: change the `locked_map` initialization so it always reads the lock file (not just when `--locked`). The `--locked` flag still controls whether the lock file is used to pin revisions, but the file is always read as the baseline for the output lock file.
 
-Expected: `cargo build -p rsplug` succeeds.
+Expected: `cargo build -p rsplug` succeeds. No behavior change visible yet.
 
-**Step 2 — Create shared Client.**
+**Step 2 — Track processed URLs and sync lock file (Phase 1b).**
 
-In `crates/rsplug/src/main.rs`, before the plugin-loading loop, construct a `reqwest::Client`:
+In `main.rs`, after the plugin loading loop, build the final lock file:
 
-    let http_client = reqwest::Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .pool_max_idle_per_host(64)
-        .tcp_keepalive(std::time::Duration::from_secs(60))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+1. Collect a `HashSet<String>` of URLs that were processed (from the config's plugins).
+2. For each URL in the config: if `Plugin::load` returned `lock_info`, update `locked_map`; if it returned `None` (not installed), remove the URL from `locked_map`.
+3. Write the lock file (when `!locked`).
 
-Thread this `Client` (wrapped in `Clone`) through the `plugin.load(...)` call chain into `FetchCtx`. Add an `http_client: reqwest::Client` field to `FetchCtx` in `plugin.rs`.
+The `Plugin::load` return value currently cannot distinguish "not installed" from "script-only plugin" (both return `Ok(None)` without lock_info). We need to ensure that for plugins with a `repo` field that returned `None`, the URL is known so we can remove it. Since we have the URL in the closure (main.rs:152), we can collect processed URLs there.
 
-Expected: `cargo build -p rsplug` succeeds. Existing tests pass.
+Expected: After a default run, the lock file matches the cache state.
 
-**Step 3 — Rewrite download_and_extract.**
+**Step 3 — Add `--gc` flag (Phase 2).**
 
-In `crates/rsplug/src/rsplug/util.rs`, rewrite `TarballFetch::download_and_extract` to:
+Add `gc: bool` to `Args` in `main.rs`. When `--gc` is set:
 
-1. Use the shared `Client` from `FetchCtx` (passed as a new parameter) instead of `Client::new()`.
-2. Send the GET request with the `Authorization` header when a token is present.
-3. Read the full response body into `bytes::Bytes` (add `bytes` to deps if not already transitively available — reqwest re-exports it).
-4. In a single `spawn_blocking` call: wrap the bytes in `std::io::Cursor`, create `flate2::read::GzDecoder`, create `tar::Archive`, iterate entries, strip the top-level directory, and unpack into `dest`.
-5. Remove the `tempfile::tempdir()` temp-file logic.
+1. Read the lock file.
+2. Walk `repos/` directory.
+3. For each repo dir, walk `worktrees/`.
+4. For each snapshot dir, parse the commit from the directory name.
+5. If the commit does not match the lock file's `rev` for this repo's URL, remove the directory.
+6. If `worktrees/` is empty after cleanup, optionally remove the repo dir and `source.git`.
 
-After confirming the build, check if `async-compression` is still used anywhere. If not, remove it from `Cargo.toml` and remove the `futures-util` / `tokio-util` stream imports if they become unused.
+Expected: `cargo build -p rsplug` succeeds. `rsplug --gc --config ...` removes orphaned snapshots.
 
-Expected: `cargo test -p rsplug` passes, including `init_snapshot_checks_out_commit_into_a_detached_worktree`. A manual install of a GitHub plugin succeeds and produces the same file tree as before.
-
-**Step 4 — Raise semaphore limit.**
-
-In `crates/rsplug/src/main.rs`, change the `AdaptiveSemaphore::with_limits` call from initial limit 8 to 32 and max from 256 to 512.
-
-Expected: `cargo build -p rsplug` succeeds. No test changes needed.
-
-**Step 5 — REST-API rev resolution (Phase 3.1).**
-
-In `crates/rsplug/src/rsplug/util.rs`, inside the `github` module, add:
-
-    pub async fn resolve_rev_via_api(
-        client: &reqwest::Client,
-        owner: &str,
-        repo: &str,
-        rev: Option<&str>,
-        token: Option<&str>,
-    ) -> Result<String, Error>
-
-This function calls the appropriate endpoint, parses the JSON `sha` or `default_branch` field, and returns the commit hash string. It reads `X-RateLimit-Remaining` and returns a distinct error variant (or `Option`) when the budget is low so the caller can fall back to git protocol.
-
-In `git::ls_remote`, detect GitHub HTTPS sources with a token. If so, try `resolve_rev_via_api` first; on rate-limit-low or wildcard rev, fall back to the existing git-protocol logic.
-
-Expected: existing `ls_remote` tests pass. A manual `--update` on a GitHub plugin resolves the rev correctly.
-
-**Step 6 — Conditional requests (Phase 3.2).**
-
-In `TarballFetch::fetch_to_snapshot`, before downloading, check for `.rsplug_http_meta.json` in the snapshot directory (if it already exists for an update). Attach `If-None-Match` / `If-Modified-Since` headers. If the response is `304`, return early without downloading. After a successful `200`, write the new ETag and Last-Modified to the meta file.
-
-Expected: `--update` with no upstream changes skips the download and logs a "not modified" message.
-
-**Step 7 — Benchmark.**
-
-    # Cold install (clear cache first)
-    rm -rf ~/.cache/rsplug/repos
-    time rsplug --install
-
-    # Update (no changes)
-    time rsplug --update
-
-Record before/after numbers in the Outcomes section.
-
-**Step 8 — Lint and test (after every step).**
+**Step 4 — Lint and test (after every step).**
 
     cargo fmt
     cargo test --workspace
@@ -254,78 +231,86 @@ Note: `AGENTS.md` says do not run `cargo check -q`.
 
 Behavior-based criteria:
 
-1. A fresh `rsplug --install` of a GitHub plugin (e.g. `nvim-lua/plenary.nvim`) produces a working snapshot directory with the correct files, identical to the pre-change output. Verified by `diff -r` between old and new snapshot directories.
+1. After a default run (no flags), the lock file's `rev` for each installed plugin matches the commit hash in the newest snapshot directory name under `repos/<repo>/worktrees/`. Verified by comparing `jq .locked <lockfile>` with `ls repos/<repo>/worktrees/`.
 
-2. `cargo test --workspace` passes, including:
-   - `init_snapshot_checks_out_commit_into_a_detached_worktree`
-   - `tarball_url_formats_correctly`
-   - `supports_tarball_classifies_correctly`
-   - `parse_github_url_extracts_owner_repo`
-   - All `AdaptiveSemaphore` unit tests.
+2. A plugin removed from the config but still cached: its entry is preserved in the lock file after a default run (not dropped). Verified by checking the lock file before and after.
 
-3. `cargo clippy --workspace --all-targets` produces no new warnings.
+3. A plugin in the config but not installed (cache deleted): its entry is removed from the lock file after a default run. Verified by checking the lock file.
 
-4. Cold-install benchmark shows measurable speedup over the pre-change baseline. Target: at least 2x faster on a 30-plugin cold install. Record the actual numbers.
+4. `--gc` removes snapshot directories whose commit does not match the lock file. Verified by creating a stale snapshot dir manually, running `--gc`, and confirming it is removed.
 
-5. `--update` with no upstream changes completes faster than before (conditional-request skip) and does not produce a `200` download in the debug log.
+5. `--gc` does not remove the snapshot matching the lock file's `rev`. Verified by checking the matching snapshot survives.
 
-6. Tokenless fallback: with `GITHUB_TOKEN` and `GH_TOKEN` both unset, a GitHub plugin still installs correctly via the GitFetch fallback path.
+6. `cargo test --workspace` passes, including existing lock file and snapshot tests.
+
+7. `cargo clippy --workspace --all-targets` produces no new warnings.
 
 Manual verification commands:
 
-    # Verify a plugin snapshot is correct
-    ls ~/.cache/rsplug/repos/github.com/nvim-lua/plenary.nvim/worktrees/
+    # Check lock file matches cache
+    jq .locked ~/.cache/rsplug/rsplug.lock.json | head
+    ls ~/.cache/rsplug/repos/github.com/*/worktrees/
 
-    # Verify the semaphore starts at 32 (add a debug log temporarily, or check via a unit test)
-    # Verify shared client is used (debug log or strace for connection count)
+    # Test GC
+    # (create a fake stale snapshot)
+    mkdir -p ~/.cache/rsplug/repos/github.com/test/fake/worktrees/0000000000000000000000000000000000000000
+    rsplug --gc --config ...
+    ls ~/.cache/rsplug/repos/github.com/test/fake/worktrees/  # fake dir should be gone
 
 
 ## Idempotence and Recovery
 
-- Every phase can be reverted independently via `git revert` because the binary remains functional after each step.
-- If `flate2` with `zlib-ng` fails to compile on a target platform, fall back to the `miniz_oxide` backend: `flate2 = { version = "1", features = ["miniz_oxide"] }`. This is slower but pure-Rust and always available.
-- If the REST-API rev resolution returns an unexpected response format, the code must fall back to git protocol, not error out. The `ls_remote` function must never regress for tokenless users.
-- If a conditional request returns an unexpected status (not 200 or 304), treat it as a normal download — discard the stored metadata and proceed with the full tarball.
-- If the shared `Client` construction fails (rare — only on misconfigured TLS), the application should fall back to constructing a default `Client::new()` per the old behavior rather than refusing to start.
-- Clearing the cache (`rm -rf ~/.cache/rsplug/repos`) is always a safe recovery action — it forces a full re-download but never corrupts state.
-- The benchmark step (`rm -rf ~/.cache/rsplug/repos`) is idempotent and safe to repeat.
+- Phase 1 (lock reconstruction) is idempotent: running it multiple times produces the same lock file as long as the cache state is unchanged.
+- If the lock file is deleted, a default run recreates it from the cache state. No data loss.
+- If the cache is deleted, the lock file entries for those repos are removed on the next run (Phase 1b removes entries for not-installed plugins).
+- Phase 2 (`--gc`) is destructive but opt-in. Recovery: re-run `--install` to re-fetch deleted snapshots. Clearing the cache (`rm -rf ~/.cache/rsplug/repos`) is always safe.
+- `--gc` should never remove the snapshot matching the lock file's `rev`. If the lock file is empty or missing, `--gc` should warn and refuse to delete anything (to avoid wiping the entire cache).
 
 
 ## Artifacts and Notes
 
-Baseline measurements (to be filled in before implementation):
+Current lock file write logic (main.rs:216-234):
 
-    Cold install (N plugins): ___s (before) / ___s (after)
-    Update no-change (N plugins): ___s (before) / ___s (after)
+    if !locked {
+        let mut merged_locked = Arc::try_unwrap(locked_map).expect("...");
+        for (url, resolved_rev) in lock_infos {
+            merged_locked.insert(url, LockedResource { ... });
+        }
+        LockFile { version: "1".into(), locked: merged_locked }.write(...).await?;
+    }
 
-Current dependency versions relevant to this plan:
+Problem: `merged_locked` starts from `locked_map`, which is empty on non-`--locked` runs. So entries for plugins not in the config are lost. And entries for plugins in the config but not installed are preserved (stale).
 
-    reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-    async-compression = { version = "0.4", features = ["gzip", "tokio"] }
-    tar = "0.4"
+After Phase 1:
 
-Planned additions:
-
-    flate2 = { version = "1", features = ["zlib-ng"] }
-
-The `reqwest` `stream` feature and `futures-util` may become unnecessary after Phase 1.2/2.1 if the response body is read via `response.bytes()` instead of `bytes_stream()`. Check and clean up after Step 3.
+    if !locked {
+        let mut merged_locked = Arc::try_unwrap(locked_map).expect("...");
+        // Remove entries for not-installed plugins in the config
+        for url in processed_urls_with_no_lock_info {
+            merged_locked.remove(&url);
+        }
+        // Update entries from actual load results
+        for (url, resolved_rev) in lock_infos {
+            merged_locked.insert(url, LockedResource { ... });
+        }
+        LockFile { version: "1".into(), locked: merged_locked }.write(...).await?;
+    }
 
 
 ## Interfaces and Dependencies
 
-Public/internal interfaces that must exist after this plan:
+Interfaces that must exist after this plan:
 
-- `FetchCtx` struct (`plugin.rs`) gains an `http_client: reqwest::Client` field. All call sites in `Plugin::load`, `materialize`, and `ensure_source_git` must pass it through.
-- `TarballFetch::fetch_to_snapshot` signature changes to accept `&reqwest::Client` (or receive it via an expanded `FetchCtx`).
-- `github::resolve_rev_via_api` — new async function in the `github` module. Takes `&reqwest::Client`, owner, repo, optional rev, optional token. Returns `Result<String, Error>` where the error distinguishes rate-limit-exhausted from genuine failure.
-- `git::ls_remote` — modified to try REST-API resolution first for GitHub HTTPS + token, falling back to git protocol. Signature unchanged externally.
-- `main.rs` — constructs the shared `Client` and passes it into the load chain. Semaphore initial limit changes from 8 to 32.
+- `main.rs` — `locked_map` is always initialized from the lock file (if present), regardless of `--locked`. The `--locked` flag still controls rev pinning, not file reading.
+- `main.rs` — new logic to track processed URLs and remove stale entries from the lock file.
+- `main.rs` — new `--gc` CLI flag and GC logic.
+- `LockFile` struct — no changes needed (existing read/write is sufficient).
+- `Plugin::load` — no changes needed (already returns correct `lock_info` for cache-loaded plugins).
 
-External dependencies added: `flate2`. Dependencies potentially removed: `async-compression`, possibly `futures-util` and `tokio-util::io` if the streaming path is fully replaced.
-
-No changes to the lockfile format, CLI arguments, or Lua runtime integration.
+No changes to the lock file format, Lua runtime integration, or the cache directory layout (Phase 1-2). Phase 3 (deferred) would change the snapshot creation path.
 
 
 ## Revision Notes
 
-- 2025-07-07: Initial ExecPlan created from planning session. Converted from a conventional phase-table format to the OpenAI/Codex living-document ExecPlan structure. Content and technical decisions unchanged from the prior version; section organization and required living-document sections added.
+- 2025-07-07: Initial ExecPlan created. Phase 1 (lock reconstruction) and Phase 2 (GC) are scoped as safe to implement now. Phase 3 (immutable snapshots) is documented but deferred per the user's instruction to separate concerns that depend on cache immutability.
+- 2026-07-07: Phase 1 / Phase 2 を実装完了。Phase 2 の初版 GC は逆変換バグで機能していなかったため、URL→cachedir 正方向変換で根本修正し `gc_tests` を追加。Phase 3（不変 snapshot）は引き続き defer。
