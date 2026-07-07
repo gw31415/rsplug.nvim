@@ -441,6 +441,29 @@ directories when no retained manifest references them. This avoids deleting Lua
 hook/runtime modules still referenced by a Neovim instance that started before a
 later rsplug update.
 
+#### Selecting a generation with `RSPLUG_GENERATION`
+
+Because retained generations stay addressable, you can boot Neovim with an older
+generation by setting the `RSPLUG_GENERATION` environment variable to a
+generation id (the `<hash>` of a control plugin). List the available ids with:
+
+```sh
+ls ~/.cache/rsplug/generations/
+```
+
+Each `~/.cache/rsplug/generations/<hash>.lua` names a retained generation; pass
+its `<hash>` (a 32-character hex string) to `RSPLUG_GENERATION` and rsplug's
+`init.lua` will `:packadd` that control plugin instead of the latest one:
+
+```sh
+RSPLUG_GENERATION=<hash> nvim
+```
+
+When unset, the latest generation is used (the default behavior). If the value
+is malformed or names a generation that has already been pruned (rsplug keeps
+only the latest few), rsplug logs a warning and falls back to the latest
+generation.
+
 ## Who Is This For?
 
 rsplug.nvim is ideal for:

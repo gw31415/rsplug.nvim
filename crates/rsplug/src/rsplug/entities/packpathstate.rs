@@ -916,7 +916,12 @@ mod tests {
         let control_id = b"control-package".plugin_id().as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&control_id))).unwrap();
 
-        assert!(script.contains(&format!("vim.cmd.packadd '{control_id}'")));
+        // The control id is emitted into the ids table and looped over with vim.cmd.packadd(id).
+        assert!(
+            script.contains(&format!("'{control_id}'")),
+            "control id must appear in the ids table: {script:?}"
+        );
+        assert!(script.contains("vim.cmd.packadd(id)"));
         assert!(!script.contains("packloadall"));
     }
 
@@ -925,12 +930,14 @@ mod tests {
         let a = b"aaaa".plugin_id().as_str();
         let b = b"bbbb".plugin_id().as_str();
         let script = String::from_utf8(render_init(&[a.clone(), b.clone()])).unwrap();
-        // ponytail: locks in the exact packadd block shape; break whitespace here if the template changes.
+        // locks in the exact ids-table shape; break whitespace here if the template changes.
         let actual = script
             .split("vim.opt.packpath:prepend(root)\n\n")
             .nth(1)
             .unwrap();
-        let expected = format!("vim.cmd.packadd '{a}'\nvim.cmd.packadd '{b}'\n\nlocal ok, rsplug");
+        let expected = format!(
+            "local requested = vim.env.RSPLUG_GENERATION\nlocal ids = {{ '{a}','{b}', }}\n"
+        );
         assert!(
             actual.starts_with(&expected),
             "unexpected init template output: {actual:?}\nexpected prefix: {expected:?}"
@@ -967,6 +974,26 @@ mod tests {
             !script.contains("rsplug.startup()"),
             "empty control_ids must not call startup: {script:?}"
         );
+        assert!(
+            !script.contains("RSPLUG_GENERATION"),
+            "empty control_ids must not emit the generation override block: {script:?}"
+        );
+    }
+
+    #[test]
+    fn init_template_supports_rsplug_generation_override() {
+        let id = b"gen".plugin_id().as_str();
+        let script = String::from_utf8(render_init(std::slice::from_ref(&id))).unwrap();
+        // Reads RSPLUG_GENERATION and prefers it over the default ids when valid.
+        assert!(script.contains("vim.env.RSPLUG_GENERATION"));
+        // Guards the override id: hex-only and exactly 32 chars (no path traversal).
+        assert!(script.contains("^[0-9a-fA-F]+$"));
+        assert!(script.contains("#requested == 32"));
+        // Confirms the generation file exists before switching to it.
+        assert!(script.contains("vim.fn.filereadable"));
+        // Falls back with a warning when the override is unusable.
+        assert!(script.contains("vim.notify"));
+        assert!(script.contains("vim.log.levels.WARN"));
     }
 
     #[test]
