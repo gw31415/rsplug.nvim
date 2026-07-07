@@ -440,9 +440,23 @@ impl FileSource {
         async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
             tokio::fs::create_dir_all(to.as_ref().parent().unwrap()).await?;
             #[cfg(target_os = "macos")]
-            tokio::fs::copy(from, to).await?;
+            {
+                tokio::fs::copy(from, to).await?;
+            }
             #[cfg(not(target_os = "macos"))]
-            tokio::fs::hard_link(from, to).await?;
+            {
+                // hard_link は同一ファイルシステムのみ。別FS（Nix store 等）へ配置すると
+                // ExDev (errno 18) で失敗するため、そのときは copy にフォールバックする。
+                // copy はディスクを消費するが、pack を自己完結させる（sym 廃止）前提では必須。
+                const EXDEV: i32 = 18;
+                if let Err(e) = tokio::fs::hard_link(from.as_ref(), to.as_ref()).await {
+                    if e.raw_os_error() == Some(EXDEV) {
+                        tokio::fs::copy(from.as_ref(), to.as_ref()).await?;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
             Ok(())
         }
 
