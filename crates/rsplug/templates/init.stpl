@@ -11,9 +11,22 @@ local root = vim.fn.fnamemodify(vim.fn.resolve(source), ':h:h')
 
 vim.opt.packpath:prepend(root)
 
-<% for id in control_ids {%>vim.cmd.packadd '<%= id %>'
-<%}%>
-<% if !control_ids.is_empty() { %>local ok, rsplug = pcall(require, '_rsplug')
+<% if !control_ids.is_empty() { %>local requested = vim.env.RSPLUG_GENERATION
+local ids = { <% for id in control_ids {%>'<%= id %>',<%}%> }
+if requested ~= nil and requested ~= ''
+	and #requested == 32
+	and string.match(requested, '^[0-9a-fA-F]+$') ~= nil
+	and vim.fn.filereadable(root .. '/generations/' .. string.lower(requested) .. '.lua') == 1
+then
+	ids = { string.lower(requested) }
+elseif requested ~= nil and requested ~= '' then
+	vim.notify(('[rsplug] RSPLUG_GENERATION %q is not available, falling back to the default generation'):format(requested), vim.log.levels.WARN)
+end
+for _, id in ipairs(ids) do
+	vim.cmd.packadd(id)
+end
+
+local ok, rsplug = pcall(require, '_rsplug')
 if not ok then
 	error('[rsplug] failed to load generated runtime: ' .. tostring(rsplug))
 end

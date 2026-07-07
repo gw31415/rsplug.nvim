@@ -580,9 +580,10 @@ pub mod github {
             .get("x-ratelimit-remaining")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-            && remaining < RATE_LIMIT_THRESHOLD {
-                return Err(ApiError::RateLimited);
-            }
+            && remaining < RATE_LIMIT_THRESHOLD
+        {
+            return Err(ApiError::RateLimited);
+        }
 
         if !resp.status().is_success() {
             return Err(ApiError::Other(format!(
@@ -623,9 +624,10 @@ pub mod github {
             .get("x-ratelimit-remaining")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-            && remaining < RATE_LIMIT_THRESHOLD {
-                return Err(ApiError::RateLimited);
-            }
+            && remaining < RATE_LIMIT_THRESHOLD
+        {
+            return Err(ApiError::RateLimited);
+        }
 
         if !resp2.status().is_success() {
             return Err(ApiError::Other(format!(
