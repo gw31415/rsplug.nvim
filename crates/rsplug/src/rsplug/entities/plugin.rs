@@ -324,6 +324,7 @@ impl Plugin {
 
         let CacheConfig {
             repo,
+            dotgit,
             build,
             lua_build,
             lua_post_update,
@@ -338,6 +339,7 @@ impl Plugin {
                 order,
                 merge_enabled,
                 is_plugctl: false,
+                dotgit: false,
             };
             return Ok(Some((loaded, None)));
         };
@@ -434,7 +436,8 @@ impl Plugin {
         // --- フェッチ戦略の選択 (Phase 2) ---
         // token があって GitHub HTTPS URL なら TarballFetch（source.git 不要）。
         // それ以外は従来の GitFetch（source.git）パス。TarballFetch 失敗時は GitFetch にフォールバック。
-        let use_tarball = token.is_some() && util::github::supports_tarball(&url);
+        // dotgit=true は .git 複製が必要なため TarballFetch（.git を作れない）を無効化し GitFetch に強制する。
+        let use_tarball = !dotgit && token.is_some() && util::github::supports_tarball(&url);
         let locked = locked_rev.is_some();
 
         // フェッチヘルパーへ渡すコンテキスト。GitFetch/TarballFetch で共有し、引数過多を避ける。
@@ -622,6 +625,7 @@ impl Plugin {
             order,
             merge_enabled,
             is_plugctl: false,
+            dotgit,
         };
         let lock_info = Some((url.to_string(), head_rev_str));
 

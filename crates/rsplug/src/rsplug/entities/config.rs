@@ -51,6 +51,9 @@ impl Sum for Config {
 pub struct CacheConfig {
     #[serde(default, rename = "repo")]
     pub repo: Option<RepoSource>,
+    /// pack に `.git` を複製する（git 利用プラグイン用）。`true` だと TarballFetch を無効化し GitFetch に強制する。
+    #[serde(default)]
+    pub dotgit: bool,
     #[serde(default)]
     pub build: Vec<String>,
     #[serde(default)]

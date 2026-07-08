@@ -34,6 +34,10 @@ rsplug.nvim は2つの系を持つ:
 - [x] (2026-07-07) Phase 1: `Repository::ls_files_with_untracked`（`ls-files` + `--others --exclude-standard`）追加。`Plugin::load` が `has_build` で切り替え。
 - [x] (2026-07-07) Phase 2: `RepoSnapshotLink`/`DirectoryExtractionType::Symlink`/`symlink_plugin_dir`/`collect_doc_files_from_root`/`to_sym`/`manually_to_sym` を一括廃止。`Plugin::load` は常に `CopyEachFile`。commit a2ffd7f。
 - [ ] Phase 3: テスト整理・実機検証（Neowright）。コード側テスト（`snapshot_link_id_*`/`to_sym` 系）は Phase 2 で削除済み。build 成果物 copy の実機検証が残り。
+- [ ] Phase 4: `dotgit` オプション（pack に `.git` 複製、dotgit=true は GitFetch 強制）。
+- [ ] Phase 5: `FileSource::yank` の clonefile 対応（ディレクトリ単位、実行時フォールバック）。
+- [ ] Phase 6: `CopyEachFile` をディレクトリ・ファイル不分別辞書に（遅延評価）。
+- [ ] Phase 7: FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更。
 
 
 ## Surprises & Discoveries
@@ -54,6 +58,10 @@ rsplug.nvim は2つの系を持つ:
 
 - Decision: build 成果物（untracked）の pack copy は `git ls-files` ＋ `git ls-files --others`（**.gitignore 無視**、ignored ディレクトリは再帰列挙）で列挙する。
   Rationale: 当初は `--exclude-standard`（.gitignore 尊重）だったが、実機検証（blink.cmp）で build 成果物が `.gitignore` 対象（`target/`）にあり pack に届かないことが判明。旧 sym 版は worktree 全体参照で見えていたため、copy 版でも `.gitignore` 無視で同等にする（2026-07-07 の `--exclude-standard` Decision は取り消し）。重量 copy は clonefile/hard_link で軽減。実行時の変更は pack でなく Neovim の XDG パス（`~/.local/share/nvim`, `~/.cache/nvim`）が標準。
+  Date: 2026-07-08.
+
+- Decision: `dotgit` オプション（デフォルト false）を追加。true のプラグインは pack に snapshot の `.git` を全体 copy し、blink.cmp 等の git 利用プラグイン（`.git` で sha/tag チェック）を救う。TarballFetch は `.git` を作れないため、dotgit=true は GitFetch を強制（use_tarball=false）。Phase 5-7（clonefile yank / 辞書不分別 / FetchTarball .git 削除）を後続計画として記録。
+  Rationale: sym 廃止で pack に `.git` が無く、blink.cmp が outdated 判定で Lua fallback する実機問題の根本対応。全体 copy（軽量でなく）で確実性を優先。Phase 5 で clonefile ディレクトリ copy が実現すれば `.git` copy の重量も軽減される。
   Date: 2026-07-08.
 
 - Decision: `yank` の `hard_link` に ExDev（別FS）検出で copy フォールバックを入れる。
@@ -137,6 +145,48 @@ Key files:
 - Acceptance 1-6 を検証。
 
 
+### Phase 4 — `dotgit` オプション（pack に `.git` 複製）
+
+**Goal**: `dotgit` オプション（デフォルト **false**）。`true` のプラグインは snapshot の `.git` を pack に全体 copy し、git 利用プラグイン（blink.cmp の `.git` による sha/tag チェック、gitsigns 等）を救う。TarballFetch は `.git` を作れないため、`dotgit=true` は GitFetch を強制する。
+
+実装:
+
+- `config.rs`: `CacheConfig.dotgit`（`#[serde(default)]`、TOML `dotgit`）。
+- `plugin.rs`: `use_tarball = use_tarball && !dotgit`（dotgit=true は GitFetch 強制）。`LoadedPlugin.dotgit` 伝達。
+- `packpathstate.rs`: `LoadedPlugin.dotgit`。`install` で dotgit=true の plugin の `snapshot_root/.git` を `pack/_gen/opt/<id>/.git` に全体 copy。
+- `plugctl.rs`: dotgit の伝達。
+
+### Phase 5 — `FileSource::yank` の clonefile 対応（ディレクトリ単位）
+
+**Goal**: clonefile 対応環境（macOS APFS、Linux の一部）ならディレクトリ単位 copy でシステムコールを削減。実行時評価で最適方式を選択しフォールバック。
+
+実装:
+
+- `AtomicU8` グローバル状態（clonefile: 0, hardlink: 1, copy: 2）。実行時失敗（「システム未対応」エラー）で昇格し以降フォールバック。
+- 基本 clonefile から試行 → 未対応なら hardlink → ExDev なら copy。
+- 状態 != 0（clonefile 不可）のとき、現在の再帰的 copy コード（`packpathstate.rs` の yank）をこちらに移行。並行処理（JoinSet）を維持。
+- `FileSource::yank` にディレクトリ単位 copy インタフェースを追加。
+
+### Phase 6 — `CopyEachFile` をディレクトリ・ファイル不分別辞書に
+
+**Goal**: ファイル単位辞書 → ディレクトリ・ファイル不分別の辞書。インスタンス化時の「再帰探索」「全アイテムのファイルタイプ評価」を遅延化。Phase 5 のディレクトリ単位 clonefile を活用。
+
+実装:
+
+- 辞書キーをディレクトリ・ファイル両方に拡張。
+- マージ時の競合チェック: (2a) X/Y のディレクトリ/ファイル種別を `OnceCell`/`Atomic` でキャッシュしつつ判定。(2b) いずれかがファイルなら競合。(2c) 両者ディレクトリなら深度1だけ子要素を探索し、子の競合を 2a-2c で再帰判定。
+
+### Phase 7 — FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更
+
+**Goal**: Phase 5-6 で不要になる `ls-files` 等を削除しコードベースを縮減。FetchTarball リポジトリで `.git` を作らない（現在は git バックエンドでないのに `.git` が作られ誤解を生む）。
+
+サブタスク:
+
+- GitHub バックエンドのハッシュ計算を変更。現在は Git と同じ方式だが、tarball から直接ハッシュ、または GitHub API でハッシュ取得（コスト低減）。
+- API ハッシュの場合、build 等の副作用要素でハッシュ更新すること。
+- ハッシュ変更による互換性考慮は不要。
+
+
 ## Concrete Steps
 
 Unless noted, all commands run from the repository root.
@@ -176,3 +226,4 @@ Unless noted, all commands run from the repository root.
 ## Revision Notes
 
 - 2026-07-07: 初版。設計検討完了（案1 copy 統一、`ls-files`+untracked、`hard_link` フォールバック）。Phase 0/1 を safe-now、Phase 2 を廃止、Phase 3 を実機検証とする。実装は未着手。
+- 2026-07-08: 実機検証で blink.cmp の `.git` チェック問題を発見。Phase 4（`dotgit` オプション）を追加。Phase 5-7（clonefile yank / 辞書不分別 / FetchTarball `.git` 削除）を後続計画として追加。

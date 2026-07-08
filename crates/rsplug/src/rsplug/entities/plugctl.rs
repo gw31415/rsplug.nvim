@@ -96,6 +96,7 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Loade
         order: usize::MAX,
         merge_enabled: true,
         is_plugctl: true,
+        dotgit: false,
     }
 }
 
@@ -217,6 +218,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 order: usize::MAX,
                 merge_enabled: true,
                 is_plugctl: true,
+                dotgit: false,
             });
         }
 
@@ -271,6 +273,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     order: usize::MAX,
                     merge_enabled: true,
                     is_plugctl: true,
+                    dotgit: false,
                 }
             });
         }
@@ -304,6 +307,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 order: usize::MAX,
                 merge_enabled: true,
                 is_plugctl: true,
+                dotgit: false,
             });
         }
         if !cmd2pkgid.is_empty() {
@@ -338,6 +342,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     order: usize::MAX,
                     merge_enabled: true,
                     is_plugctl: true,
+                    dotgit: false,
                 }
             });
         }
@@ -366,6 +371,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 order: usize::MAX,
                 merge_enabled: true,
                 is_plugctl: true,
+                dotgit: false,
             });
         }
         if !keypattern2pkgid.is_empty() {
@@ -409,6 +415,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     order: usize::MAX,
                     merge_enabled: true,
                     is_plugctl: true,
+                    dotgit: false,
                 });
             }
         }

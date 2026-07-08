@@ -162,6 +162,9 @@ pub struct LoadedPlugin {
     pub(super) merge_enabled: bool,
     /// PlugCtlを元に作成されたかどうか
     pub(super) is_plugctl: bool,
+    /// pack に `.git` を複製するか（git 利用プラグイン用）。`dotgit=true` かつ repo 由来なら
+    /// snapshot の `.git` を `pack/_gen/opt/<id>/.git` に copy する。
+    pub(super) dotgit: bool,
 }
 
 impl LoadedPlugin {
@@ -311,6 +314,7 @@ impl Add for LoadedPlugin {
                         order,
                         merge_enabled,
                         is_plugctl,
+                        dotgit,
                     } = self;
                     let Self {
                         source_name: _,
@@ -320,6 +324,7 @@ impl Add for LoadedPlugin {
                         order: r_order,
                         merge_enabled: _,
                         is_plugctl: r_is_plugctl,
+                        dotgit: r_dotgit,
                     } = rhs;
                     files.extend(rfiles);
                     script += rscript;
@@ -334,6 +339,7 @@ impl Add for LoadedPlugin {
                             order,
                             merge_enabled,
                             is_plugctl: is_plugctl || r_is_plugctl,
+                            dotgit: dotgit || r_dotgit,
                         },
                         None,
                     );
@@ -427,6 +433,8 @@ impl FileSource {
 struct Files {
     is_plugctl: bool,
     dir_type: DirectoryExtractionType,
+    /// dotgit=true かつ repo 由来なら install 時に snapshot の .git を pack に copy する。
+    dotgit: bool,
 }
 
 enum DirectoryExtractionType {
@@ -482,6 +490,36 @@ fn render_init(control_ids: &[PluginIDStr]) -> Vec<u8> {
         .render_once()
         .map(String::into_bytes)
         .unwrap_or_else(|_| Vec::new())
+}
+
+/// ディレクトリを再帰的に copy（ファイル・ディレクトリ・symlink を保持）。
+/// `.git` 複製（dotgit）用。Phase 5 で yank の clonefile ディレクトリ copy に統合予定。
+async fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
+    tokio::fs::create_dir_all(dst).await?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        let meta = tokio::fs::symlink_metadata(&s).await?;
+        if meta.is_dir() {
+            tokio::fs::create_dir_all(&d).await?;
+            let mut entries = tokio::fs::read_dir(&s).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name();
+                stack.push((s.join(&name), d.join(&name)));
+            }
+        } else if meta.is_symlink() {
+            let target = tokio::fs::read_link(&s).await?;
+            #[cfg(unix)]
+            tokio::fs::symlink(&target, &d).await?;
+            // Windows では symlink 作成に権限が必要なためファイル copy にフォールバック
+            #[cfg(not(unix))]
+            {
+                tokio::fs::copy(&s, &d).await?;
+            }
+        } else {
+            tokio::fs::copy(&s, &d).await?;
+        }
+    }
+    Ok(())
 }
 
 fn manifest_entries(manifest: &GenerationManifest) -> HashSet<Box<[u8]>> {
@@ -572,6 +610,7 @@ impl PackPathState {
             order,
             merge_enabled: _,
             is_plugctl,
+            dotgit,
         } = loaded_plugin;
 
         if !is_plugctl {
@@ -583,9 +622,11 @@ impl PackPathState {
                     let Files {
                         is_plugctl: _,
                         dir_type: DirectoryExtractionType::Files(tree),
+                        dotgit: _,
                     } = self.files.entry(id_str.clone()).or_insert(Files {
                         is_plugctl,
                         dir_type: DirectoryExtractionType::Files(Vec::new()),
+                        dotgit,
                     });
                     tree.push((path, item.source));
                 }
@@ -646,6 +687,7 @@ impl PackPathState {
             Files {
                 is_plugctl: _,
                 dir_type,
+                dotgit,
             },
         ) in files
         {
@@ -692,6 +734,15 @@ impl PackPathState {
                 match dir_type {
                     DirectoryExtractionType::Files(files) => {
                         tokio::fs::remove_file(dir.as_path()).await.ok();
+                        // dotgit=true なら .git 複製元の snapshot_root を事前取得（files は into_iter で消費するため）
+                        let snapshot_root = if dotgit {
+                            files.iter().find_map(|(_, s)| match s.as_ref() {
+                                FileSource::Directory { path } => Some(path.clone()),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        };
                         let dir = Arc::new(dir);
                         // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
                         let yank_semaphore = yank_semaphore.clone();
@@ -715,6 +766,13 @@ impl PackPathState {
                                 .collect::<JoinSet<_>>();
                             while let Some(res) = copies.join_next().await {
                                 res??;
+                            }
+                            // dotgit=true なら snapshot の .git を pack に全体 copy（git 利用プラグイン用）
+                            if let Some(root) = snapshot_root {
+                                let src_git = root.join(".git");
+                                if src_git.is_dir() {
+                                    copy_dir_all(&src_git, &dir.join(".git")).await?;
+                                }
                             }
                             helptags(dir.as_path()).await
                         });
@@ -962,6 +1020,7 @@ mod tests {
             order: 0,
             merge_enabled: true,
             is_plugctl: false,
+            dotgit: false,
         }
     }
 
