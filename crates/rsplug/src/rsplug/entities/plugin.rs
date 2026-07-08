@@ -169,6 +169,24 @@ pub(super) fn snapshot_root(repo_root: &Path, snapshot_key: &str) -> PathBuf {
     worktrees_dir(repo_root).join(snapshot_key)
 }
 
+/// `worktrees/` に `<oid>` または `<oid>__...` の snapshot が既にあるか。
+/// GitFetch（source.git 不要）で既存 snapshot を再利用する判定に使う。
+async fn snapshot_exists_for_oid(worktrees: &Path, oid: &str) -> bool {
+    let Ok(mut rd) = tokio::fs::read_dir(worktrees).await else {
+        return false;
+    };
+    let prefix_exact = oid.to_string();
+    let prefix_under = format!("{oid}__");
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if let Some(name) = entry.file_name().to_str()
+            && (name == prefix_exact || name.starts_with(&prefix_under))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// URL末尾の `@rev` を分離する。authority部（`://` 〜 最初の `/`）内の `@` は無視する。
 fn split_url_rev(s: &str) -> (&str, Option<&str>) {
     let path_start = s
@@ -455,10 +473,13 @@ impl Plugin {
             logid: &logid,
         };
 
-        // GitFetch（非 tarball）の場合だけここで source.git を確保する。
-        // TarballFetch は source.git を使わないので、失敗時フォールバックまで確保を遅延する
-        // （無駄な git fetch を避ける）。未インストール（install/update/locked いずれでもない）ならスキップ。
-        if !use_tarball && !ensure_source_git(&ctx).await? {
+        // GitFetch（非 tarball）の場合だけ source.git を確保する。ただし既存 snapshot
+        // （worktrees/ に <oid> または <oid>__... がある）があれば source.git 不要で再利用する
+        // （dotgit=true で TarballFetch 由来の snapshot を流用する移行ケース等）。
+        if !use_tarball
+            && !snapshot_exists_for_oid(&worktrees, &head_rev_str).await
+            && !ensure_source_git(&ctx).await?
+        {
             return Ok(None);
         }
 
