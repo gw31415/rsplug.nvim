@@ -33,8 +33,9 @@ rsplug.nvim は2つの系を持つ:
 - [x] (2026-07-07) Phase 0: `yank` の `hard_link` に ExDev で copy フォールバック追加（`packpathstate.rs`）。commit b272ade。
 - [x] (2026-07-07) Phase 1: `Repository::ls_files_with_untracked`（`ls-files` + `--others --exclude-standard`）追加。`Plugin::load` が `has_build` で切り替え。
 - [x] (2026-07-07) Phase 2: `RepoSnapshotLink`/`DirectoryExtractionType::Symlink`/`symlink_plugin_dir`/`collect_doc_files_from_root`/`to_sym`/`manually_to_sym` を一括廃止。`Plugin::load` は常に `CopyEachFile`。commit a2ffd7f。
-- [ ] Phase 3: テスト整理・実機検証（Neowright）。コード側テスト（`snapshot_link_id_*`/`to_sym` 系）は Phase 2 で削除済み。build 成果物 copy の実機検証が残り。
-- [ ] Phase 4: `dotgit` オプション（pack に `.git` 複製、dotgit=true は GitFetch 強制）。
+- [x] (2026-07-08) Phase 3: テスト整理・実機検証。コード側テスト（`snapshot_link_id_*`/`to_sym` 系）は Phase 2 で削除済み。build 成果物 copy の実機検証は Phase 4 の blink.cmp 検証（`target/release/libblink_cmp_fuzzy.dylib` が pack に届きロード成功）で実施済み。`:helptags`・lazy load が壊れないことも blink.cmp 実機で確認（messages 空）。
+- [x] (2026-07-08) Phase 4: `dotgit` オプション実装（commit `78a9feb` + 修正 `98651d6`）。pack に `.git` 複製、dotgit=true は GitFetch 強制（`use_tarball = !dotgit && ...`）。blink.cmp で `git rev-parse HEAD` が version file と一致、fuzzy.rust が outdated/Lua-fallback 無しでロード（RUST_OK=true, messages 空）を確認。
+- [x] (2026-07-08) Phase 4b: `dotgit=true` なのに既存 snapshot に `.git` が無い場合、`PluginDotgitMissing` WARNING を出して pack への配置をスキップ（commit `854ac77`）。回復手段は `-u` を案内（`-i` は既存 cache の再生成には効かない）。テスト `dotgit_missing_snapshot_skips_install` / `warn_dotgit_missing_uses_refresh_hint` で検証。
 - [ ] Phase 5: `FileSource::yank` の clonefile 対応（ディレクトリ単位、実行時フォールバック）。
 - [ ] Phase 6: `CopyEachFile` をディレクトリ・ファイル不分別辞書に（遅延評価）。
 - [ ] Phase 7: FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更。
@@ -64,6 +65,10 @@ rsplug.nvim は2つの系を持つ:
   Rationale: sym 廃止で pack に `.git` が無く、blink.cmp が outdated 判定で Lua fallback する実機問題の根本対応。全体 copy（軽量でなく）で確実性を優先。Phase 5 で clonefile ディレクトリ copy が実現すれば `.git` copy の重量も軽減される。
   Date: 2026-07-08.
 
+- Decision: `dotgit=true` のプラグインで snapshot に `.git` が無い場合は、`PluginNotInstalled` 相当の WARNING を出して pack への copy を止める。回復案内は `-u` を選ぶ。
+  Rationale: このケースは「install されているが dotgit payload が無い」ので、無警告で copy すると git 利用プラグインが壊れる。`-i` は既に存在する cache には効かないため、既存 snapshot を再 materialize する導線として `-u` を案内する。
+  Date: 2026-07-08.
+
 - Decision: `yank` の `hard_link` に ExDev（別FS）検出で copy フォールバックを入れる。
   Rationale: copy 統一のポータビリティ（Nix store 配置）を成立させる前提。これが無いと別FSで install が失敗する。
   Date: 2026-07-07.
@@ -86,8 +91,10 @@ rsplug.nvim は2つの系を持つ:
 - (2026-07-07) Phase 0-2 実装完了。`pack` は `RepoSnapshotLink` を廃止し常にファイル copy で自己完結（`repos/` への symlink なし）。`init.lua → generations/<id>.lua` の pack 内 sym のみ維持。
 - (2026-07-08) `.gitignore` 無視に変更（実機検証で blink.cmp の `target/` が pack に届かない問題を解決）。`ls_files_with_untracked` は ignored ディレクトリ（`target/` 等）の中身を再帰 copy。
 - (2026-07-08) 実機検証（隔離 HOME, cmp.toml, `--locked`, build 済み snapshot 再利用）: `find pack/_gen -type l` = **0件**（sym 廃止確認）。blink.cmp の `target/release/libblink_cmp_fuzzy.dylib` が pack に copy されることを確認。
-- 検証: `cargo test --workspace` 全パス（71件）、`cargo clippy --workspace --all-targets -D warnings` warning なし、`cargo fmt --check` クリーン。
-- 残課題: Neowright での Neovim 実機確認（`:helptags`・lazy load が壊れないこと）。ネイティブライブラリが pack に届いたため動作期待大。
+- 検証: `cargo test --workspace` 全パス、`cargo clippy --workspace --all-targets -D warnings` warning なし、`cargo fmt --check` クリーン。
+- (2026-07-08) Phase 3 残課題（Neowright 実機確認）は解決: Phase 4 の blink.cmp 実機検証で、ネイティブライブラリ（`target/release/libblink_cmp_fuzzy.dylib`）が pack に届き、lazy load・`:helptags` が壊れないことを確認（messages 空）。
+- (2026-07-08) Phase 4（dotgit）実装・検証: `dotgit` オプション（デフォルト false）。`true` のプラグインは snapshot の `.git` を pack に全体 copy し、blink.cmp の `.git` チェック問題（outdated 判定 → Lua fallback）を根本解決。実機で `git rev-parse HEAD` が version file と一致、fuzzy.rust が正常ロード（RUST_OK=true, messages 空）。dotgit=true は GitFetch 強制だが、既存 snapshot（TarballFetch 由来等）があれば `snapshot_exists_for_oid` で source.git 作成をスキップし再利用（`98651d6`）。
+- (2026-07-08) Phase 4b（WARNING）実装・検証: `dotgit=true` で snapshot に `.git` が無い（= copy 不能）場合、`Message::PluginDotgitMissing` 警告を出して pack install を skip。回復は `-u` を案内（`-i` は既存 cache 再生成に非効力）。テスト `dotgit_missing_snapshot_skips_install`（pack に copy されない）と `warn_dotgit_missing_uses_refresh_hint`（メッセージ内容）で検証。
 
 
 ## Context and Orientation
@@ -227,3 +234,4 @@ Unless noted, all commands run from the repository root.
 
 - 2026-07-07: 初版。設計検討完了（案1 copy 統一、`ls-files`+untracked、`hard_link` フォールバック）。Phase 0/1 を safe-now、Phase 2 を廃止、Phase 3 を実機検証とする。実装は未着手。
 - 2026-07-08: 実機検証で blink.cmp の `.git` チェック問題を発見。Phase 4（`dotgit` オプション）を追加。Phase 5-7（clonefile yank / 辞書不分別 / FetchTarball `.git` 削除）を後続計画として追加。
+- 2026-07-09: Phase 3/4/4b 完了を Progress・Outcomes に反映。実装・検証は 2026-07-08 に完了済み（`78a9feb`/`98651d6`/`854ac77`）だが、レート制限でドキュメント更新が滞留していた。`cargo test`/`clippy -D warnings`/`fmt --check` すべて再確認グリーン。Phase 5-7 は後続計画として未着手。

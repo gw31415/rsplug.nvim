@@ -743,6 +743,16 @@ impl PackPathState {
                         } else {
                             None
                         };
+                        if dotgit
+                            && snapshot_root
+                                .as_ref()
+                                .is_none_or(|root| !root.join(".git").is_dir())
+                        {
+                            // ponytail: dotgit copy cannot be faked from a snapshot without `.git`;
+                            // skip the pack install and let the user refresh the cache with `-u`.
+                            msg(Message::PluginDotgitMissing(id.clone()));
+                            continue;
+                        }
                         let dir = Arc::new(dir);
                         // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
                         let yank_semaphore = yank_semaphore.clone();
@@ -1244,5 +1254,62 @@ mod tests {
         assert_ne!(make("plugin/a.lua", b"x"), make("plugin/b.lua", b"x")); // path 違い
         assert_ne!(make("plugin/a.lua", b"x"), make("plugin/a.lua", b"y")); // data 違い
         assert_eq!(make("plugin/a.lua", b"x"), make("plugin/a.lua", b"x")); // 同一
+    }
+
+    #[tokio::test]
+    async fn dotgit_missing_snapshot_skips_install() {
+        let dir =
+            std::env::temp_dir().join(format!("rsplug-dotgit-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let snapshot_root = dir.join("snapshot");
+        let packpath = dir.join("packpath");
+        std::fs::create_dir_all(snapshot_root.join("plugin")).unwrap();
+        std::fs::write(snapshot_root.join("plugin/init.lua"), "print('x')\n").unwrap();
+
+        let snapshot = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/owner/repo"),
+            b"0123456789012345678901234567890123456789".to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let files = BTreeMap::from([(
+            PathBuf::from("plugin/init.lua"),
+            FileItem {
+                source: Arc::new(FileSource::Directory {
+                    path: Arc::from(snapshot_root.clone()),
+                }),
+                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                    snapshot,
+                    PathBuf::from("plugin/init.lua"),
+                )),
+                merge_type: MergeType::Conflict,
+            },
+        )]);
+        let loaded = LoadedPlugin {
+            source_name: None,
+            lazy_type: LazyType::Start,
+            files: HowToPlaceFiles::CopyEachFile(files),
+            script: SetupScript::default(),
+            order: 0,
+            merge_enabled: true,
+            is_plugctl: false,
+            dotgit: true,
+        };
+        let plugin_id = loaded.plugin_id();
+
+        let mut state = PackPathState::new();
+        state.insert(loaded);
+        state.install(&packpath).await.unwrap();
+
+        assert!(
+            !packpath
+                .join("pack/_gen/opt")
+                .join(plugin_id.as_str())
+                .exists(),
+            "dotgit-missing plugin must not be copied into pack"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

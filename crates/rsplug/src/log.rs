@@ -59,6 +59,8 @@ pub enum Message {
     PluginUpdated(Arc<str>),
     /// `-i` で未インストールから新規 fetch されたプラグイン（表示名）。
     PluginInstalled(Arc<str>),
+    /// `dotgit=true` なのに snapshot に `.git` が無いプラグイン（表示名）。
+    PluginDotgitMissing(Arc<str>),
     MergeFinished {
         total: usize,
         merged: usize,
@@ -322,6 +324,8 @@ struct ProgressManager {
     updated_plugins: Vec<Arc<str>>,
     /// `-i` で新規 fetch されたプラグインの表示名。
     installed_plugins: Vec<Arc<str>>,
+    /// `dotgit=true` なのに `.git` がなく、pack へ copy できないプラグインの表示名。
+    dotgit_missing: Vec<Arc<str>>,
     cachefetching_oids: HashMap<String, (usize, usize)>,
     cache_updating_fetching: HashMap<String, ()>,
     cache_updating_current: Option<String>,
@@ -578,6 +582,7 @@ impl ProgressManager {
             not_installed: Vec::new(),
             updated_plugins: Vec::new(),
             installed_plugins: Vec::new(),
+            dotgit_missing: Vec::new(),
             cachefetching_oids: HashMap::new(),
             cache_updating_fetching: HashMap::new(),
             cache_updating_current: None,
@@ -848,6 +853,16 @@ impl ProgressManager {
             self.not_installed.len()
         );
         self.print_name_block(header, &self.not_installed);
+    }
+
+    /// `dotgit=true` なのに snapshot に `.git` が無く、pack へ copy できない警告。
+    fn warn_dotgit_missing(&self) {
+        let header = format!(
+            "{} {} dotgit plugins missing `.git` (run with -u to refresh)",
+            style("⚠").yellow().bold(),
+            self.dotgit_missing.len()
+        );
+        self.print_name_block(header, &self.dotgit_missing);
     }
 
     /// 更新/新規インストールされたプラグインのサマリーブロックを印字。
@@ -1150,6 +1165,9 @@ impl ProgressManager {
             Message::PluginInstalled(id) => {
                 self.installed_plugins.push(id);
             }
+            Message::PluginDotgitMissing(id) => {
+                self.dotgit_missing.push(id);
+            }
             Message::DetectLockFile(path) => {
                 self.multipb
                     .println(format!(
@@ -1231,6 +1249,9 @@ impl ProgressManager {
                     } else {
                         pb.bar.finish_and_clear();
                     }
+                }
+                if !self.dotgit_missing.is_empty() {
+                    self.warn_dotgit_missing();
                 }
             }
             Message::Error(e) => {
@@ -1594,6 +1615,33 @@ mod tests {
         assert!(
             !rendered.contains("dddd"),
             "4th should be hidden; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn warn_dotgit_missing_uses_refresh_hint() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        m.process(Message::PluginDotgitMissing(Arc::from("dotgit-plugin")));
+        m.process(Message::InstallDone);
+
+        let rendered = {
+            let s = screen.lock().unwrap();
+            s.rows
+                .iter()
+                .map(|r| console::strip_ansi_codes(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            rendered.contains("dotgit plugins missing `.git`"),
+            "dotgit warning should explain the missing payload; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("run with -u to refresh"),
+            "dotgit warning should point at -u; got:\n{rendered}"
         );
     }
 
