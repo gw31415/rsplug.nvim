@@ -52,9 +52,9 @@ rsplug.nvim は2つの系を持つ:
   Rationale: pack を自己完結・ポータブル・Nix safe にする。`AGENTS.md` の「deterministic portable output」に合致。worktree は系B（キャッシュ）の効率化に専念させる。案2（pack 直 worktree）は pack に `.git` が入り Nix read-only と衝突、案3（copy 維持・sym のみ廃止）は `hard_link` 別FS問題が残るため不採用。
   Date: 2026-07-07.
 
-- Decision: build 成果物（untracked）の pack copy は `git ls-files` ＋ `git ls-files --others --exclude-standard` で列挙する。
-  Rationale: `.gitignore` を尊重し git セマンティクスと一致させる。worktree 全体 copy は `.gitignore` 再実装が必要で git と齟齬が出る。`git add` 方式は snapshot の index を汚す。
-  Date: 2026-07-07.
+- Decision: build 成果物（untracked）の pack copy は `git ls-files` ＋ `git ls-files --others`（**.gitignore 無視**、ignored ディレクトリは再帰列挙）で列挙する。
+  Rationale: 当初は `--exclude-standard`（.gitignore 尊重）だったが、実機検証（blink.cmp）で build 成果物が `.gitignore` 対象（`target/`）にあり pack に届かないことが判明。旧 sym 版は worktree 全体参照で見えていたため、copy 版でも `.gitignore` 無視で同等にする（2026-07-07 の `--exclude-standard` Decision は取り消し）。重量 copy は clonefile/hard_link で軽減。実行時の変更は pack でなく Neovim の XDG パス（`~/.local/share/nvim`, `~/.cache/nvim`）が標準。
+  Date: 2026-07-08.
 
 - Decision: `yank` の `hard_link` に ExDev（別FS）検出で copy フォールバックを入れる。
   Rationale: copy 統一のポータビリティ（Nix store 配置）を成立させる前提。これが無いと別FSで install が失敗する。
@@ -76,9 +76,10 @@ rsplug.nvim は2つの系を持つ:
 ## Outcomes & Retrospective
 
 - (2026-07-07) Phase 0-2 実装完了。`pack` は `RepoSnapshotLink` を廃止し常にファイル copy で自己完結（`repos/` への symlink なし）。`init.lua → generations/<id>.lua` の pack 内 sym のみ維持。
-- (2026-07-07) build プラグインの成果物は `ls_files_with_untracked`（untracked 含む）で pack copy に届く。`hard_link` は別FSで copy にフォールバックし Nix store 配置に対応。
-- (2026-07-07) 検証: `cargo test --workspace` 全パス（71件）、`cargo clippy --workspace --all-targets -D warnings` warning なし、`cargo fmt --check` クリーン。
-- 残課題: build 成果物 copy の**実機検証**（Neowright/隔離 HOME で `:helptags`・lazy load が壊れないこと、`find pack -type l` で generations/init.lua 以外に symlink がないこと）。
+- (2026-07-08) `.gitignore` 無視に変更（実機検証で blink.cmp の `target/` が pack に届かない問題を解決）。`ls_files_with_untracked` は ignored ディレクトリ（`target/` 等）の中身を再帰 copy。
+- (2026-07-08) 実機検証（隔離 HOME, cmp.toml, `--locked`, build 済み snapshot 再利用）: `find pack/_gen -type l` = **0件**（sym 廃止確認）。blink.cmp の `target/release/libblink_cmp_fuzzy.dylib` が pack に copy されることを確認。
+- 検証: `cargo test --workspace` 全パス（71件）、`cargo clippy --workspace --all-targets -D warnings` warning なし、`cargo fmt --check` クリーン。
+- 残課題: Neowright での Neovim 実機確認（`:helptags`・lazy load が壊れないこと）。ネイティブライブラリが pack に届いたため動作期待大。
 
 
 ## Context and Orientation
@@ -146,7 +147,7 @@ Unless noted, all commands run from the repository root.
 ## Validation and Acceptance
 
 1. `to_sym=true`（TOML `sym`）を指定しても copy になる（sym が作られない）。pack 配下にプラグイン実体の symlink が無い。
-2. `build`/`lua_build`/`lua_post_update` を持つプラグインの pack copy に、build 成果物（untracked・`.gitignore` 外）が含まれる。`:helptags` で help が生成される。
+2. `build`/`lua_build`/`lua_post_update` を持つプラグインの pack copy に、build 成果物（`.gitignore` 対象の `target/` 等を含む全 untracked）が含まれる。`:helptags` で help が生成される。
 3. pack を別FS（tmpdir 等で模擬）に install しても `hard_link` 失敗で copy にフォールバックし成功する。
 4. pack が `repos/` 配下を一切参照しない（`find pack -type l` で `generations`/`init.lua` 以外に symlink が無い）。
 5. `rsplug.lock.json` と repos の同期・`--gc` が、pack への影響なく機能する（`PLANS.md` lock/cache の Acceptance と両立）。
