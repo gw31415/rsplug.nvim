@@ -47,7 +47,7 @@
                 cmake
                 git
                 pkg-config
-              ];
+              ] ++ lib.optional stdenv.isLinux autoPatchelfHook;
               buildInputs = with pkgs; [
                 libgit2
                 openssl
