@@ -42,11 +42,14 @@
               name = "rsplug";
               src = ./.;
               cargoLock.lockFile = ./Cargo.lock;
+              doCheck = false;
               nativeBuildInputs = with pkgs; [
                 cmake
                 git
-                libgit2
                 pkg-config
+              ];
+              buildInputs = with pkgs; [
+                libgit2
                 openssl
               ];
             }
