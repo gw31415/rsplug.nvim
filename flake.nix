@@ -25,7 +25,7 @@
         };
         toolchain = fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "18blq77d227zfgqwadk3zanlwlxp3i23pqpc11ck0yqf20p6dlgv";
+          sha256 = "11c20cr8irfg63j6mj5yl32s5qbs4z4qbfa0ibvrj9nqw480dxcs";
         };
       in
       {
@@ -43,6 +43,8 @@
               src = ./.;
               cargoLock.lockFile = ./Cargo.lock;
               nativeBuildInputs = with pkgs; [
+                cmake
+                git
                 libgit2
                 pkg-config
                 openssl
