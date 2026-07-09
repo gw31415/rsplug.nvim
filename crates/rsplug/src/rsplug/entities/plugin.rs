@@ -495,10 +495,16 @@ impl Plugin {
         );
         let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &pre_identity.snapshot_key()));
 
-        let (snapshot_root_path, repository): (Arc<Path>, git::Repository) = if final_root.exists()
+        let (snapshot_root_path, repository): (Arc<Path>, MaterializedRepo) = if final_root.exists()
         {
-            // 同一 key の snapshot が既存 → 再利用（build/lua_post_update をスキップ）
-            (final_root.clone(), git::open(final_root.clone()).await?)
+            // 同一 key の snapshot が既存 → 再利用（build/lua_post_update をスキップ）。
+            // Phase 7 以降の tarball snapshot は `.git` 無し → Plain、旧 snapshot は Git。
+            let repo = if final_root.join(".git").exists() {
+                MaterializedRepo::Git(git::open(final_root.clone()).await?)
+            } else {
+                MaterializedRepo::Plain
+            };
+            (final_root.clone(), repo)
         } else if has_build {
             // build がある: 一時 worktree で build → dirty 計算 → final key → rename/reuse。
             // dirty_diff を snapshot_key に含めるため、build 後でないと最終 key が確定しない。
@@ -509,6 +515,8 @@ impl Plugin {
                 Some(r) => r,
                 None => return Ok(None),
             };
+            // tarball（Plain）かを記憶: rename 後 Git は開き直すが Plain は git::open 不要。
+            let is_plain = matches!(repo, MaterializedRepo::Plain);
 
             // lua_post_update は update 検知時のみ building worktree で実行。
             if update && let Some(lua_post_update) = lua_post_update.as_deref() {
@@ -564,8 +572,13 @@ impl Plugin {
             // final_root（= pre_identity の key）へ原子リネーム。失敗しても final_root は作られない。
             drop(repo);
             tokio::fs::rename(building.as_ref(), final_root.as_ref()).await?;
-            let opened = git::open(final_root.clone()).await?;
-            (final_root, opened)
+            // Plain は `.git` 無しで開き直せない。Git のみ git::open する。
+            let repo = if is_plain {
+                MaterializedRepo::Plain
+            } else {
+                MaterializedRepo::Git(git::open(final_root.clone()).await?)
+            };
+            (final_root, repo)
         } else {
             // build 無し: key は確定（dirty=None）。final があれば再利用、なければ作成。
             let repo = match materialize(&ctx, final_root.as_ref(), use_tarball).await? {
@@ -578,6 +591,7 @@ impl Plugin {
         // --- 最終 identity と build 成功 marker (snapshot_root 単位, PLANS §11) ---
         let identity = build_repo_snapshot_identity(
             &repository,
+            snapshot_root_path.as_ref(),
             cachedir.clone(),
             head_rev_str.as_bytes().to_vec(),
             &build,
@@ -745,15 +759,24 @@ async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
     Ok(true)
 }
 
-/// snapshot worktree を `dest` に実体化し、開いた [`util::git::Repository`] を返す。
-/// `use_tarball` なら TarballFetch を試行し、失敗時は GitFetch（source.git）にフォールバックする。
-/// `use_tarball` でない場合は source.git 経由で init_snapshot する（呼出元で source.git 確保済みが前提）。
+/// 実体化された snapshot のバックエンド。
+/// `Git` = source.git 経由の worktree（`.git` 有り）。`Plain` = tarball 展開のみ（`.git` 無し、Phase 7）。
+/// identity/dirty の計算が異なる: `Git` は git diff、`Plain` はファイル内容ハッシュ。
+enum MaterializedRepo {
+    Git(util::git::Repository),
+    Plain,
+}
+
+/// snapshot worktree を `dest` に実体化し、そのバックエンド [`MaterializedRepo`] を返す。
+/// `use_tarball` なら TarballFetch を試行（成功すれば `.git` を作らない `Plain`）、
+/// 失敗時は GitFetch（source.git）にフォールバック（`Git`）。
+/// `use_tarball` でない場合は source.git 経由で init_snapshot する（呼出元で source.git 確保済みが前提、`Git`）。
 /// 戻り値 `Ok(None)` = 未インストールスキップ。
 async fn materialize(
     ctx: &FetchCtx<'_>,
     dest: &Path,
     use_tarball: bool,
-) -> Result<Option<util::git::Repository>, Error> {
+) -> Result<Option<MaterializedRepo>, Error> {
     use super::util::{fetch::TarballFetch, git};
     use crate::log::{Message, msg};
 
@@ -780,7 +803,8 @@ async fn materialize(
             }
         };
         if tarball_ok {
-            return Ok(Some(git::open(dest.to_path_buf()).await?));
+            // Phase 7: tarball は `.git` を作らない。identity/dirty は内容ハッシュで計算。
+            return Ok(Some(MaterializedRepo::Plain));
         }
         // TarballFetch 失敗 → GitFetch（source.git）にフォールバック
         if !ensure_source_git(ctx).await? {
@@ -788,9 +812,9 @@ async fn materialize(
         }
     }
 
-    Ok(Some(
+    Ok(Some(MaterializedRepo::Git(
         git::init_snapshot(dest.to_path_buf(), ctx.source_git, ctx.oid).await?,
-    ))
+    )))
 }
 
 /// 未インストール警告の表示名。`source_name`（`dep_name` 由来）を優先し、
@@ -1021,16 +1045,27 @@ async fn extract_unique_lua_modules_from_snapshot(snapshot_root: &Path) -> Vec<S
 }
 
 async fn build_repo_snapshot_identity(
-    repository: &util::git::Repository,
+    repo: &MaterializedRepo,
+    snapshot_root: &Path,
     repo_cache_dir: PathBuf,
     head_rev: Vec<u8>,
     build: &[String],
     lua_build: Option<&str>,
 ) -> Result<RepoSnapshotIdentity, Error> {
-    let dirty_diff = if repository.is_dirty().await? {
-        Some(repository.diff_hash().await?)
-    } else {
-        None
+    let has_build = !build.is_empty() || lua_build.is_some();
+    // Git は git diff、tarball（Plain）は build があればファイル内容ハッシュ（Phase 7）。
+    let dirty_diff = match repo {
+        MaterializedRepo::Git(g) => {
+            if g.is_dirty().await? {
+                Some(g.diff_hash().await?)
+            } else {
+                None
+            }
+        }
+        MaterializedRepo::Plain if has_build => {
+            Some(util::dirty_diff_from_content(snapshot_root).await?)
+        }
+        MaterializedRepo::Plain => None,
     };
 
     Ok(RepoSnapshotIdentity::new(
@@ -1046,11 +1081,14 @@ fn is_full_hex_hash(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn lua_build_nvim_command(lua_script_path: &OsStr) -> [Cow<'_, OsStr>; 6] {
+fn lua_build_nvim_command(lua_script_path: &OsStr) -> [Cow<'_, OsStr>; 8] {
     [
         Cow::Borrowed(OsStr::new("nvim")),
         Cow::Borrowed(OsStr::new("--headless")),
         Cow::Borrowed(OsStr::new("-u")),
+        Cow::Borrowed(OsStr::new("NONE")),
+        // ShaDa 無効化: 並列 build で複数 nvim が main.shada を奪い合い E138 が出るのを防ぐ。
+        Cow::Borrowed(OsStr::new("-i")),
         Cow::Borrowed(OsStr::new("NONE")),
         Cow::Borrowed(OsStr::new("-l")),
         Cow::Borrowed(lua_script_path),

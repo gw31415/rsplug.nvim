@@ -35,6 +35,8 @@ toml_edit = "0.23"
 unicode-width = "0.2"
 wildmatch = "2.6"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+# reflink (clonefile/FICLONE)・errno 定数のプラットフォーム FFI。git2/tokio の既存推移依存。
+libc = "0.2"
 # Phase 2: HTTP tarball download
 reqwest = { version = "0.12", default-features = false, features = [
 	"rustls-tls",

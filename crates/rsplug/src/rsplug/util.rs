@@ -645,10 +645,9 @@ pub mod fetch {
 
     impl TarballFetch {
         /// `url`（GitHub HTTPS）のコミット `oid` の tarball をダウンロードし、`snapshot_root`
-        /// に展開した上で git2 互換の作業ツリー（init + add -A + commit）を作る。
-        /// 展開後は既存の `is_dirty` / `diff_hash` / `ls_files` がそのまま動作する。
-        /// なお head_rev（lockfile / SnapshotKey 用）は元リポジトリの OID を使うため、
-        /// ここで作るローカルコミットのハッシュとは無関係（互換性維持）。
+        /// に展開する（**`.git` は作らない**）。Phase 7 で git2 互換化作業ツリーの生成を廃止し、
+        /// identity/dirty はファイル内容ハッシュ（`dirty_diff_from_content`）で計算する。
+        /// head_rev（lockfile / SnapshotKey 用）は元リポジトリの OID を使う。
         pub async fn fetch_to_snapshot(
             &self,
             client: &reqwest::Client,
@@ -666,15 +665,6 @@ pub mod fetch {
 
             tokio::fs::create_dir_all(snapshot_root).await?;
             Self::download_and_extract(client, &tarball_url, snapshot_root, token).await?;
-
-            // git2 互換の作業ツリーを作る（後段の is_dirty / diff_hash / ls_files 用）
-            let snapshot_root = snapshot_root.to_path_buf();
-            let oid_owned = oid.to_string();
-            tokio::task::spawn_blocking(move || {
-                Self::init_git_worktree(&snapshot_root, &oid_owned)
-            })
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("join error: {e}"))))??;
 
             Ok(())
         }
@@ -738,28 +728,52 @@ pub mod fetch {
 
             Ok(())
         }
+    }
+}
 
-        /// tarball 展開ディレクトリを git2 互換の作業ツリーにする。
-        fn init_git_worktree(snapshot_root: &Path, oid: &str) -> Result<(), Error> {
-            let repo = git2::Repository::init(snapshot_root)?;
-            let mut index = repo.index()?;
-            index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
-            index.write()?;
-            let sig = git2::Signature::now("rsplug", "rsplug@localhost")?;
-            let tree_id = index.write_tree()?;
-            let tree = repo.find_tree(tree_id)?;
-            let commit_oid = repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &format!("rsplug snapshot {oid}"),
-                &tree,
-                &[],
-            )?;
-            repo.set_head_detached(commit_oid)?;
+/// git でない snapshot（FetchTarball 由来）の dirty 差分を、ファイルツリーの**内容**から
+/// 直接ハッシュ化する。git 版 `Repository::diff_hash`（`util.rs` git モジュール）に代わる
+/// 内容ベースの identity 入力（Phase 7）。`.rsplug_build_success`（identity 由来で循環する）と
+/// `.git`（メタデータ）は除外し、各ディレクトリのエントリをソート順に走査、
+/// 各ファイルの (相対パス, 内容) を `Xxh3` に update して 128bit digest を返す。
+pub async fn dirty_diff_from_content(root: &std::path::Path) -> Result<[u8; 16], std::io::Error> {
+    use std::path::{Path, PathBuf};
+    use xxhash_rust::xxh3::Xxh3;
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<[u8; 16]> {
+        fn walk(hasher: &mut Xxh3, base: &Path, rel: &Path) -> std::io::Result<()> {
+            let dir = base.join(rel);
+            // 決定論的順序: 各ディレクトリのエントリをソート。`.git`/`.rsplug_build_success` は除外。
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)?
+                .filter_map(|e| e.ok().map(|e| PathBuf::from(e.file_name())))
+                .filter(|name| {
+                    name != Path::new(".git") && name != Path::new(".rsplug_build_success")
+                })
+                .collect();
+            entries.sort();
+            for name in entries {
+                let child_rel = rel.join(&name);
+                let meta = std::fs::symlink_metadata(base.join(&child_rel))?;
+                if meta.is_dir() {
+                    walk(hasher, base, &child_rel)?;
+                } else {
+                    // 構造変更も hash に反映するため相対パスを含める。
+                    hasher.update(child_rel.to_string_lossy().as_bytes());
+                    hasher.update(b"\0");
+                    // ファイル内容（symlink は target を追従して読む）。
+                    let content = std::fs::read(base.join(&child_rel))?;
+                    hasher.update(&content);
+                    hasher.update(b"\0");
+                }
+            }
             Ok(())
         }
-    }
+        let mut hasher = Xxh3::new();
+        walk(&mut hasher, &root, Path::new(""))?;
+        Ok(hasher.digest128().to_ne_bytes())
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("content hash join failed: {e}")))?
 }
 
 pub async fn execute(
@@ -882,6 +896,50 @@ pub fn truncate(val: &impl ToString, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dirty_diff_from_content_is_deterministic_and_excludes_marker_and_git() {
+        // tarball snapshot の dirty を内容ハッシュで計算する（Phase 7）。
+        // plugin_id に入るため決定性と除外ルール（`.rsplug_build_success`/`.git`）を固定。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("plugin.vim"), b"let g:foo = 1\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("lua")).await.unwrap();
+        tokio::fs::write(root.join("lua/init.lua"), b"return {}\n")
+            .await
+            .unwrap();
+
+        let h1 = dirty_diff_from_content(root).await.unwrap();
+        // 決定性: 同内容なら同一。
+        let h1b = dirty_diff_from_content(root).await.unwrap();
+        assert_eq!(h1, h1b, "content hash must be deterministic");
+
+        // `.rsplug_build_success`（identity 由来で循環）は除外 → 変わらない。
+        tokio::fs::write(root.join(".rsplug_build_success"), b"deadbeef")
+            .await
+            .unwrap();
+        let h2 = dirty_diff_from_content(root).await.unwrap();
+        assert_eq!(h1, h2, "build-success marker must be excluded");
+
+        // `.git`（メタデータ）は除外 → 変わらない。
+        tokio::fs::create_dir_all(root.join(".git/refs"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n")
+            .await
+            .unwrap();
+        let h3 = dirty_diff_from_content(root).await.unwrap();
+        assert_eq!(h1, h3, ".git directory must be excluded");
+
+        // 内容変更 → hash 変化。
+        tokio::fs::write(root.join("plugin.vim"), b"let g:foo = 2\n")
+            .await
+            .unwrap();
+        let h4 = dirty_diff_from_content(root).await.unwrap();
+        assert_ne!(h1, h4, "content change must change hash");
+    }
 
     #[test]
     fn truncate_respects_utf8_boundaries_and_display_width() {

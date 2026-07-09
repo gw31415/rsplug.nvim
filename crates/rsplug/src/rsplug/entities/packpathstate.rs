@@ -723,7 +723,7 @@ const STRATEGY_HARDLINK: u8 = 1;
 const STRATEGY_COPY: u8 = 2;
 
 /// 別 filesystem を跨ぐ errno（reflink も hardlink も不可）。
-const EXDEV: i32 = 18;
+const EXDEV: i32 = libc::EXDEV;
 
 fn copy_strategy() -> u8 {
     COPY_STRATEGY.load(AtomicOrdering::Relaxed)
@@ -743,23 +743,17 @@ fn advance_strategy(error: &io::Error) {
 #[cfg(target_os = "macos")]
 fn reflink_unsupported(e: &io::Error) -> bool {
     // EXDEV は別経路で copy まで jump するのでここでは除外。
-    const ENOTSUP: i32 = 45;
-    const ENOSYS: i32 = 78;
-    const EOPNOTSUPP: i32 = 102;
     matches!(
         e.raw_os_error(),
-        Some(ENOTSUP) | Some(ENOSYS) | Some(EOPNOTSUPP)
+        Some(libc::ENOTSUP) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
     )
 }
 
 #[cfg(target_os = "linux")]
 fn reflink_unsupported(e: &io::Error) -> bool {
-    const ENOTTY: i32 = 25;
-    const ENOSYS: i32 = 38;
-    const EOPNOTSUPP: i32 = 95;
     matches!(
         e.raw_os_error(),
-        Some(ENOTTY) | Some(ENOSYS) | Some(EOPNOTSUPP)
+        Some(libc::ENOTTY) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
     )
 }
 
@@ -909,11 +903,7 @@ async fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 async fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::CString;
-    use std::os::raw::{c_char, c_int};
     use std::os::unix::ffi::OsStrExt;
-    unsafe extern "C" {
-        fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
-    }
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -922,7 +912,7 @@ async fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
         let d = CString::new(dst.as_os_str().as_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // SAFETY: `s`/`d` は有効な NUL 終端パス。`flags=0` はデフォルト挙動（CoW clone）。
-        let ret = unsafe { clonefile(s.as_ptr(), d.as_ptr(), 0) };
+        let ret = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) };
         if ret < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -937,13 +927,7 @@ async fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
 /// btrfs/xfs 等 reflink 対応 FS でのみ成功。dst は未存在・親は存在が前提。
 #[cfg(target_os = "linux")]
 async fn ficlone_file(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::os::raw::{c_int, c_ulong};
     use std::os::unix::io::AsRawFd;
-    // FICLONE = _IOW(0x94, 9, int) = 0x40049409
-    const FICLONE: c_ulong = 0x40049409;
-    extern "C" {
-        fn ioctl(fd: c_int, request: c_ulong, arg: c_int) -> c_int;
-    }
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -953,7 +937,7 @@ async fn ficlone_file(src: &Path, dst: &Path) -> io::Result<()> {
             .write(true)
             .open(&dst)?;
         // SAFETY: FICLONE ioctl に src fd を渡し dst に reflink させる。3 引数固定呼出。
-        let ret = unsafe { ioctl(dst_f.as_raw_fd(), FICLONE, src_f.as_raw_fd()) };
+        let ret = unsafe { libc::ioctl(dst_f.as_raw_fd(), libc::FICLONE, src_f.as_raw_fd()) };
         if ret < 0 {
             let e = io::Error::last_os_error();
             let _ = std::fs::remove_file(&dst); // 部分作成した空 dst を掃除
@@ -1157,6 +1141,12 @@ impl PackPathState {
                             nvim.arg("--headless")
                                 .arg("-u")
                                 .arg("NONE")
+                                // ShaDa を無効化しないと、並列 helptags で複数 nvim が
+                                // 同一 main.shada の書き込みを奪い合い E138 が出る（`-u NONE`
+                                // だけでは ShaDa は抑制されない）。`-n` で swap も切る。
+                                .arg("-i")
+                                .arg("NONE")
+                                .arg("-n")
                                 .arg("-c")
                                 // TODO: escape help_dir properly
                                 .arg(&cmd)

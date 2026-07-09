@@ -1341,6 +1341,7 @@ dependencies = [
  "hashbrown",
  "indicatif",
  "itertools",
+ "libc",
  "once_cell",
  "regex",
  "reqwest",

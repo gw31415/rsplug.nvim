@@ -1,316 +1,257 @@
-# Lock file / cache directory synchronization ExecPlan
+# rsplug.nvim ExecPlans（統合）
 
-This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+本ファイルは `AGENTS.md`（ExecPlans セクション）の慣習に従う living document である。
+2026-07-10 に旧 `PLANS.md`（lock/cache 同期）と `PLANS-copy-unification.md`（pack copy 統一）を
+1ファイルに統合した。`§C` に `--gc` 拡張の未実装プランを追加した。
 
-This document follows the repository-level `PLANS.md` convention described in `AGENTS.md` (ExecPlans section).
+## 目次
 
+- [§A — lock file / cache directory 同期](#a--lock-file--cache-directory-同期)
+- [§B — sym 廃止 / pack copy 統一](#b--sym-廃止--pack-copy-統一)
+- [§C — `--gc` 拡張（未実装プラン）](#c----gc-拡張未実装プラン)
+- [Revision Notes](#revision-notes)
+
+---
+
+# §A — lock file / cache directory 同期
 
 ## Purpose / Big Picture
 
-rsplug.nvim stores fetched plugin snapshots on disk under `~/.cache/rsplug/repos/<repo>/worktrees/<snapshot_key>/`. It also maintains a JSON lock file (`rsplug.lock.json`) that records the resolved commit hash (`rev`) for each repository URL.
+rsplug.nvim は `~/.cache/rsplug/repos/<repo>/worktrees/<snapshot_key>/` に snapshot を、JSON lock
+（`rsplug.lock.json`）に repo URL → 解決 commit を保持する。lock は `--install`/`--update`/`--locked`
+の副作用としてしか書かれなかったため、cache と drift する問題があった。
 
-The problem: the lock file is only written as a side-effect of `--install` / `--update` / `--locked` runs. If the user skips lock-file updates for a while, the lock file drifts out of sync with what is actually on disk:
+完了後の観測:
+- デフォルト実行（flag 無し）でも lock の `rev` が on-disk snapshot と一致する。
+- orphane snapshot は `--gc` で削除される。
+- lock は存在しない snapshot を主張しない。
 
-1. A plugin may exist in `repos/` (installed) but be absent from the lock file, or have a stale `rev` that no longer matches any snapshot on disk.
-2. A plugin may be listed in the lock file but its cache directory was deleted (manually or by a failed cleanup), so the locked `rev` points to nothing.
-3. Stale snapshot directories from old commits accumulate in `worktrees/` and are never garbage-collected.
-
-After this plan is fully implemented, the user will observe:
-
-- Running rsplug without `--install`/`--update`/`--locked` (the default "load from cache" mode) always writes a lock file whose `rev` values reflect the snapshot directories actually present on disk — not the last-fetched values.
-- Snapshot directories that do not correspond to the lock file's `rev` are garbage-collected (with `--gc`) or at least identified.
-- The lock file never claims a revision that has no corresponding on-disk snapshot.
-
-The key concern raised by the user: **the `repos/` directory is not immutable**. Snapshot worktrees can be mutated by build scripts, `lua_post_update`, or external tools, and `source.git` object stores are append-only bare repos. This plan must not assume immutability where it does not hold, and must explicitly separate the parts that are safe to implement now from the parts that depend on making the cache more robust.
-
+`repos/` は不変でない（build/lua_post_update/外部で snapshot worktree が変わりうる）。本 plan は不変性
+を仮定しない範囲（on-disk 状態の読取りのみ）を実装し、不変性に依存する部分は §C / 将来に委ねる。
 
 ## Progress
 
-- [x] (2025-07-07) Analyzed current lock-file write path (`main.rs` lines 143-234) and cache layout (`plugin.rs` `latest_snapshot_oid`, `packpathstate.rs` `RepoSnapshotIdentity`).
-- [x] (2025-07-07) Identified the three drift scenarios (lock missing entries, lock stale rev, orphaned snapshots).
-- [x] (2025-07-07) Classified tasks into "safe now" (depends only on reading existing on-disk state) and "blocked on immutability" (assumes snapshots are never mutated post-creation).
-- [x] (2026-07-07) Phase 1: Reconstruct lock file from on-disk snapshots during default (non-install/update/locked) runs. `locked_map` を常にロックファイルから初期化（NotFound は空マップ）。`Plugin::load` の結果から「repo 有りかつ `Ok(None)` = 未インストール」の URL を `urls_to_remove` に集めて lock から削除 → `lock_infos` を overlay。
-- [x] (2026-07-07) Phase 2: Add `--gc` flag to remove orphaned snapshot directories not referenced by the lock file. URL→cachedir 正方向変換 (`rsplug::plugin::cachedir_from_url`) で lock をディレクトリパスと照合。`main.rs:gc_tests` で Acceptance 4/5 を検証済み。
-- [ ] Phase 3 (deferred): Immutable snapshot design — make snapshot worktrees read-only after creation so GC and lock reconstruction can trust the on-disk commit hash.
-
+- [x] (2026-07-07) Phase 1: lock を on-disk snapshot から再構築。`locked_map` を常にロックファイルから
+  初期化（NotFound は空）。`Plugin::load` の `Ok(None)`（repo 有り・未インストール）URL を
+  `urls_to_remove` に集めて lock から削除 → `lock_infos` を overlay。
+- [x] (2026-07-07) Phase 2: `--gc` で orphane snapshot 削除。URL→cachedir 正方向変換
+  （`rsplug::plugin::cachedir_from_url`）で lock と照合。`main.rs:gc_tests` で Acceptance 4/5 検証済み。
+- [ ] Phase 3（deferred）: 不変 snapshot 設計（read-only 化）。
 
 ## Surprises & Discoveries
 
-- Observation: The lock file is written only when `!locked` (main.rs:216). On a default run (no flags), `locked` is `false`, so the lock file IS written — but only with `rev` values from `lock_infos`, which are populated only by `Plugin::load` when it actually fetches (install/update). On a default run with no fetch, `lock_infos` is empty for already-installed plugins, so the lock file is rewritten with whatever was in the pre-existing lock file (merged into `locked_map`). This means **the default run does not add missing entries or fix stale revs** — it just round-trips the old data.
-  Evidence: `main.rs:97-107` (reads lock file into `locked_map` only when `--locked`), `main.rs:216-234` (writes lock file when `!locked`), `main.rs:197-212` (lock_infos collected from load results).
-
-- Observation: `Plugin::load` returns `lock_info = Some((url, head_rev_str))` only when it reaches the end of the fetch/materialize path (plugin.rs:602). When the plugin is already installed and loaded from cache (the `Some(existing) => existing` branch at plugin.rs:395), it still returns `lock_info` because `head_rev_str` is set from the existing snapshot's directory name. So the data IS available — but `main.rs` only merges `lock_infos` into `locked_map`, and when `--locked` is not set, `locked_map` starts empty (not from the file). So **the default run does write the lock file from lock_infos, but only for plugins present in the config** — plugins removed from config but still cached will be dropped from the lock file.
-  Evidence: `main.rs:105-107` (`BTreeMap::new()` when not `--locked`), `plugin.rs:602` (`lock_info` always returned on success).
-
-- Observation: The snapshot directory name encodes the commit hash: `<40-hex-commit>` or `<40-hex-commit>__v1_<hash>` (packpathstate.rs:68-85). `latest_snapshot_oid` (plugin.rs:928-939) parses this prefix. So **the on-disk commit is recoverable from the directory name without opening the git repo**.
-
-- Observation: `latest_snapshot_dir` picks the newest snapshot by mtime. If multiple snapshots exist (e.g. before and after a build change), only the newest is reflected. The older ones become orphans.
-
-- Observation: Snapshot worktrees ARE mutable. Build scripts (`build`, `lua_build`) run inside the worktree and produce uncommitted changes (plugin.rs:461-527). The `.rsplug_build_success` marker file records the build identity (plugin.rs:546-552). `is_dirty()` and `diff_hash()` exist to capture this, but the worktree itself is a standard git working tree that any external process could modify.
-  Evidence: `plugin.rs:461-527`, `util.rs:176-211` (`diff_hash`, `is_dirty`), `packpathstate.rs:35-36` (`dirty_diff` field).
-
-- Discovery: The lock file currently records only `{ type: "git", rev: <hash> }`. It does not record build status, dirty diff, or snapshot key. This means the lock file cannot distinguish between a clean checkout and a built-up snapshot at the same commit — but for lock/cache sync purposes, the commit hash is sufficient as the primary key.
-
-- Discovery (2026-07-07): Phase 2 の初版 GC（`repo_url_from_cache_dir`）は dir→URL の逆変換だったが、`walk_repos_for_gc` が絶対パスを渡すため `parts[0]` が `/` になり host 判定が不可能 → lock ルックアップが全件不一致で **GC が何も削除しなかった**。加えて `default_cachedir` は `.git` 末尾を剥がすが `repo.url()`（lock キー）は剥がさないため、`.git` 付き URL でも不一致。正方向変換（URL→cachedir）で統一して解決した。Evidence: `plugin.rs:default_cachedir`, `util.rs:github::url`, `main.rs:garbage_collect`.
-
+- デフォルト実行は `!locked` で lock を書くが、`locked_map` は `lock_infos`（fetch 時のみ）から埋まる。
+  既インストールの cache 由来 plugin は `head_rev_str` を snapshot dir 名から設定して `lock_info` を返す
+  （`plugin.rs:602`）。データは流れているが、`main.rs` が `--locked` 非設定時は file から `locked_map`
+  を初期化しなかったため、設定に無い既存 plugin のエントリが欠落していた（Phase 1 で修正）。
+- snapshot dir 名が commit hash を符号化: `<40-hex>` or `<40-hex>__v1_<hash>`（`packpathstate.rs:71`）。
+  `latest_snapshot_oid`（`plugin.rs:928`）がこの prefix を parse する。git repo を開かずに commit が復元可能。
+- **GC 逆変換バグ**: 初版 GC は dir→URL 逆変換だったが `walk_repos_for_gc` が絶対パスを渡すため
+  `parts[0]==/` となり host 判定不可 → 全件不一致で何も削除しなかった。`default_cachedir` は `.git` 末尾を
+  剥がすが lock key（`repo.url()`）は剥がさないため `.git` 付き URL でも不一致。正方向変換（URL→cachedir）
+  で統一して解決。Evidence: `plugin.rs:default_cachedir`, `util.rs:github::url`, `main.rs:garbage_collect`。
 
 ## Decision Log
 
-- Decision: Split the work into three phases. Phase 1 (lock reconstruction) and Phase 2 (GC) are safe to implement now because they only read on-disk state. Phase 3 (immutability) is deferred because it requires a design change to how snapshots are created and managed.
-  Rationale: The user explicitly asked to proceed with implementation where possible and defer only the parts that depend on the immutability concern.
-  Date: 2025-07-07. Author: planning session.
-
-- Decision: Phase 1 changes the default-run behavior so that the lock file always reflects on-disk snapshots. The lock file is written for every run (not just install/update), and `rev` values come from the actual snapshot directory names, not from stale lock file data.
-  Rationale: The user's core complaint is that the lock file drifts. The fix is to make the lock file a function of the cache state, not of the fetch history.
-  Date: 2025-07-07.
-
-- Decision: For Phase 1, when multiple snapshots exist for a repo, use the same "newest by mtime" heuristic that `latest_snapshot_oid` already uses. This is consistent with the existing load behavior.
-  Rationale: Changing the snapshot selection logic is out of scope; we sync what we would actually load.
-  Date: 2025-07-07.
-
-- Decision: Phase 2 (`--gc`) is opt-in via a flag, not automatic. Deleting snapshot directories is destructive and should not happen silently during normal operation.
-  Rationale: The user may have manually created snapshots or may want to keep old ones. GC must be explicit.
-  Date: 2025-07-07.
-
-- Decision: Phase 3 (immutable snapshots) is documented but not implemented in this plan. The concern is valid: until snapshots are immutable, GC and lock reconstruction trust directory names that could theoretically be renamed. However, rsplug itself never renames snapshot directories after creation, so the practical risk is low.
-  Rationale: Documenting the concern and the desired direction is better than silently ignoring it.
-  Date: 2025-07-07.
-
-- Decision: GC は dir→URL の逆変換ではなく、URL→cachedir の正方向変換（`rsplug::plugin::cachedir_from_url`）で lock と on-disk ディレクトリを照合する。
-  Rationale: 逆変換は `.git`/scheme/auth/port の扱いが `default_cachedir` と一致せず脆弱（絶対パス渡りでも破綻）。正方向変換は `RepoSource` を経由するため常に整合する。PLANS.md の「GC ロジックは main.rs」は維持し、変換ヘルパのみライブラリに共有した。
-  Date: 2026-07-07.
-
+- Phase 1/2 は on-disk 状態の読取りのみで安全 → 即実装。Phase 3（不変性）は設計変更を要するため defer。
+- `--gc` は opt-in（破壊的）。ユーザーが手動 snapshot を保持したい場合を考慮。
+- GC は逆変換でなく URL→cachedir 正方向変換で照合する（`cachedir_from_url`）。逆変換は `.git`/scheme/auth
+  扱いが脆弱。GC ロジックは `main.rs` に維持し、変換ヘルパのみライブラリに共有。
 
 ## Outcomes & Retrospective
 
-- (2026-07-07) Phase 1 実装（`main.rs`）: `locked_map` を常にロックファイルから初期化（`NotFound` は空マップ）。`Plugin::load` の結果から「repo 有りかつ `Ok(None)`（= 未インストール/フェッチ失敗）」の URL を `urls_to_remove` に集め、lock から削除した上で `lock_infos` を overlay。デフォルト実行後に lock の `rev` が on-disk snapshot と一致し、設定にあって未インストールの repo は lock から除去される（Acceptance 1/2/3 設計通り）。
-- (2026-07-07) Phase 2 実装（`main.rs` + `plugin.rs`）: `--gc` で orphaned snapshot を削除。初版は dir→URL 逆変換（`repo_url_from_cache_dir`）を使っていたが絶対パス渡りで破綻し GC が機能していなかった。root-cause 修正として URL→cachedir 正方向変換ヘルパ `cachedir_from_url` を `plugin.rs` に追加し、GC は lock を cachedir マップに変換して `repos_dir` からの相対パスで照合。`gc_tests`（orphan 削除 / locked 保持 / build 接尾辞付き / lock 無し repo スキップ / `.git` URL / 空 lock 拒否 / cachedir 変換）で Acceptance 4/5 を担保。
-- (2026-07-07) 検証: `cargo check` / `cargo test --workspace`（全パス、`gc_tests` 5件追加）/ `cargo clippy --workspace --all-targets -D warnings`（warning なし）/ `cargo fmt --check` すべて通過。
-- Retrospective: GC の逆変換バグはテスト不在により発見が遅れた。Acceptance をテストで先に書く、あるいは GC 実装と同時にテストを追加すべきだった（今回あわせて追加）。Phase 1 の「未インストール vs script-only」区別は `Plugin::load` の戻り値形状（`Ok(None)` は repo 有りかつ未インストールのみ）に依存しており、将来 load の戻り値が変わると壊れうる点に注意。
+- Phase 1/2 実装済み（`main.rs` + `plugin.rs`）。デフォルト実行後に lock `rev` が snapshot と一致し、
+  設定にあって未インストールの repo は lock から除去される（Acceptance 1/2/3）。`--gc` は orphane snapshot
+  を削除（Acceptance 4/5）。
+- 検証: `cargo test --workspace`（`gc_tests` 5件追加）/ `clippy -D warnings` / `fmt --check` すべて緑。
+- Retrospective: GC 逆変換バグはテスト不在で発見が遅れた。Acceptance をテストで先書きすべきだった。
 
+## Context / Key files
 
-## Context and Orientation
+- `main.rs` — `locked_map` 初期化（111-120）、load 収集（156-241）、lock 書込み（244-267）、`garbage_collect`（297-410）、`gc_tests`（413-561）。
+- `plugin.rs` — `Plugin::load`、`latest_snapshot_oid`（928）、`cachedir_from_url`。
+- `lockfile.rs` — `LockFile` read/write。
+- `packpathstate.rs` — `RepoSnapshotIdentity`、`snapshot_key()`。
 
-rsplug.nvim is a Rust workspace. The main binary crate is `crates/rsplug`. The cache directory layout is:
+cache layout: `~/.cache/rsplug/repos/<cachedir>/{source.git/,worktrees/<snapshot_key>/}`。
+lock 形式: `{"version":"1","locked":{"<url>":{"type":"git","rev":"<40hex>"}}}`。
 
-    ~/.cache/rsplug/
-    ├── rsplug.lock.json          # lock file (JSON)
-    └── repos/
-        └── <repo_cachedir>/      # e.g. github.com/owner/repo
-            ├── source.git/       # bare object store (GitFetch path only)
-            └── worktrees/
-                ├── <snapshot_key>/   # fixed checkout at a specific commit
-                └── .building-<pid>-<nonce>/  # temporary build worktree
+## §A Validation / Acceptance
 
-The snapshot key is either `<40-hex-commit>` (no build) or `<40-hex-commit>__v1_<hash>` (with build). The commit hash is always the first `__`-delimited segment.
+1. デフォルト実行後、各 plugin の lock `rev` が `repos/<repo>/worktrees/` の最新 snapshot dir 名の commit と一致。
+2. 設定から削除済みだが cache 残存 plugin の lock エントリは保全される。
+3. 設定に有るが未インストール（cache 無し）plugin のエントリは lock から削除される。
+4. `--gc` が lock の `rev` に一致しない snapshot を削除する。
+5. `--gc` が lock の `rev` に一致する snapshot を保全する。
+6. `cargo test --workspace` / `clippy -D warnings` / `fmt --check` 通過。
 
-The lock file format is:
+---
 
-    {
-      "version": "1",
-      "locked": {
-        "<repo-url>": { "type": "git", "rev": "<40-hex-commit>" }
-      }
-    }
+# §B — sym 廃止 / pack copy 統一
 
-Key terms:
+## Purpose / Big Picture
 
-- **Lock file** (`rsplug.lock.json`): records the resolved commit hash for each repository URL. Written by rsplug, read by `--locked` runs.
-- **Snapshot**: a fixed checkout of a repository at a specific commit, stored under `worktrees/<snapshot_key>/`.
-- **`latest_snapshot_oid`**: function in `plugin.rs` that finds the newest snapshot directory and parses its commit hash from the directory name.
-- **`locked_map`**: in-memory `BTreeMap<String, LockedResource>` built in `main.rs`. When `--locked`, it is loaded from the lock file. Otherwise, it starts empty and is populated from `lock_infos` returned by `Plugin::load`.
+rsplug は2系を持つ:
+- **系A（出力）**: pack directory（`{packpath}/pack/_gen/opt/{id}/`, `generations/{ctl}.lua`, `init.lua`）。Neovim が読む。deterministic・portable・Nix 向き。
+- **系B（キャッシュ）**: `repos/<repo>/{source.git/,worktrees/{snapshot_key}/}`, `rsplug.lock.json`。マシン固有。
 
-Key files:
+かつて `to_sym`（`sym` 明示 or `build`/`lua_build`/`lua_post_update` で自動）のとき、系A の pack が系B の
+snapshot を symlink 参照していた（`RepoSnapshotLink`）。これが pack の非自己完結・Nix 非安全・GC との
+絡みを生んでいた。本 plan は `RepoSnapshotLink` を廃止し pack に常に copy 実体を置く。
 
-- `crates/rsplug/src/main.rs` — entry point. Lines 97-107 build `locked_map` (from file only if `--locked`). Lines 143-213 load plugins and collect `lock_infos`. Lines 216-234 write the lock file when `!locked`.
-- `crates/rsplug/src/rsplug/entities/plugin.rs` — `Plugin::load` (line 281). Returns `Option<(LoadedPlugin, Option<(String, String)>)>` where the second element is `(url, rev)`. `latest_snapshot_oid` (line 928) reads on-disk commit from snapshot dir name.
-- `crates/rsplug/src/rsplug/entities/lockfile.rs` — `LockFile` struct, read/write methods.
-- `crates/rsplug/src/rsplug/entities/packpathstate.rs` — `RepoSnapshotIdentity` and `snapshot_key()` logic.
+## Progress（Phase 0-7）
 
+- [x] Phase 0: `yank` の `hard_link` に ExDev で copy フォールバック追加。
+- [x] Phase 1: `Repository::ls_files_with_untracked` 追加、`Plugin::load` が `has_build` で切替。
+- [x] Phase 2: `RepoSnapshotLink`/`DirectoryExtractionType::Symlink`/`symlink_plugin_dir`/`to_sym` を一括廃止。常に `CopyEachFile`。
+- [x] Phase 3: テスト整理・実機検証（blink.cmp でネイティブライブラリ pack 到達・lazy load・`:helptags` 正常）。
+- [x] Phase 4: `dotgit` オプション実装。pack に `.git` 複製、dotgit=true は GitFetch 強制。
+- [x] Phase 4b: `dotgit=true` だが snapshot に `.git` 無し → `PluginDotgitMissing` WARNING + skip（回復は `-u`）。
+- [x] Phase 5: `clone_dir` プリミティブ（macOS `clonefile(2)`）。
+- [x] Phase 6c: copy 戦略 `AtomicU8{reflink,hardlink,copy}`、`yank`→`place_path`→`copy_tree`/`copy_leaf`
+  統一、`CopyEachFile` をディレクトリ・ファイル不分別辞書化、merge データロス修正（1段展開して子 key 化）、
+  dotgit `.git` を通常 sealed-dir エントリ化。**plugin_id 非互換**（既存 pack/lock は再生成）。
+- [x] (2026-07-10) Phase 7: FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更。**下記 Phase 7 詳細参照**。
+
+## Phase 7 詳細（2026-07-10 完了）
+
+**Goal**: tarball（GitHub HTTPS + token）snapshot で `.git` を作らない（git バックエンドでないのに
+`.git` が作られ誤解を招いていた）。identity/dirty を git でなく**ファイル内容ハッシュ**で計算。
+
+**変更点**:
+- `util.rs`: `TarballFetch::init_git_worktree`（git2 init + add -A + commit で `.git` を作っていた）を削除。
+  `fetch_to_snapshot` は download + 展開のみに。`ls_files` は Phase 6c で既に削除済み。
+- `plugin.rs`: `MaterializedRepo` enum 導入（`Git(util::git::Repository)` / `Plain`）。
+  - `materialize` は tarball 成功 → `Plain`（`git::open` しない）、失敗時フォールバック / 非 tarball → `Git`。
+  - snapshot 準備部: `repository` 型を `MaterializedRepo` に。再利用パスは `final_root/.git` 有無で
+    `Git(git::open)` / `Plain` を切替（Phase7 前後の snapshot 両対応）。has_build パスは `is_plain` を記憶し
+    rename 後に再構築。
+  - `build_repo_snapshot_identity(&MaterializedRepo, snapshot_root, ...)`: `Git` は `is_dirty`/`diff_hash`
+    （git diff）、`Plain` は build 有りなら `dirty_diff_from_content`、無ければ `None`（clean baseline）。
+- `util.rs` 新設 `dirty_diff_from_content(root)`: ツリーをソート順再帰走査し各ファイルの
+  （相対パス, 内容）を `Xxh3` に update して 128bit digest を返す。`.rsplug_build_success`（identity 由来で
+  循環）と `.git`（メタデータ）は除外。git 版 `diff_hash` と同じ digest 手法。単体テスト
+  `dirty_diff_from_content_is_deterministic_and_excludes_marker_and_git` で決定性・除外・内容感度を固定。
+- **libc 採用**: `packpathstate.rs` の手書き `extern "C"`（macOS `clonefile` / Linux `ioctl`）とマジック定数
+  `FICLONE = 0x40049409` を `libc::clonefile` / `libc::ioctl` / `libc::FICLONE` に置換。errno 定数
+  （`EXDEV`/`ENOTSUP`/`ENOSYS`/`EOPNOTSUPP`/`ENOTTY`）も `libc::*` 化。libc は既存推移依存（git2/tokio）で
+  コスト実質ゼロ。
+- **E138 修正**: `packpathstate.rs` helptags と `plugin.rs` `lua_build_nvim_command` の nvim 起動に
+  `-i NONE`（ShaDa 無効）を追加。並列 install で複数 nvim が同一 `main.shada` の書き込みを奪い合い
+  `E138: All .../main.shada.tmp.X files exist` が出る問題の根本修正（`-u NONE` だけでは ShaDa は抑制されない）。
+  helptags には `-n`（swap 無効）も追加。
+
+**plugin_id 影響**: 非 build の tarball は dirty=None のまま不変。build 付き tarball は git diff → 内容ハッシュ
+へ変化（ハッシュ変更の互換性考慮は不要・既存 pack/lock は再生成）。dotgit=true は GitFetch 強制で `Git` のため
+`.git` 有り・git diff のまま（影響なし）。
+
+**実機検証（隔離 HOME, GitHub HTTPS + token, tpope/vim-{repeat,surround,commentary,unimpaired}）**:
+- 4 snapshot とも `.git` 無し、`source.git` 無し（tarball パス確認）。
+- install 出力に E138/shada 無し（0件）。`~/.local/state/nvim` に `*.shada*` テンポラリ無し（`-i NONE` 効果）。
+- pack 生成・`doc/tags`（helptags）生成・`generations/<ctl>.lua` + `init.lua` symlink 生成。
+- 生成 init.lua を nvim headless でロード → messages 空（エラーなし）。
+- `cargo test --workspace`（81+件）/ `clippy -D warnings` / `fmt --check` すべて緑。
+
+## Surprises & Discoveries
+
+- `to_sym()` はユーザ明示だけでなく build/lua_build/lua_post_update で自動 true。sym の役割は build 成果物
+  （untracked）を pack に伝えること（`CopyEachFile` が追跡ファイルのみだったため）。
+- Lua runtime は pack 内相対パスのみで動作し `repos/cache` 非依存。sym 廃止で壊れない。
+- `init.lua → generations/{ctl}.lua` の sym は系A内で閉じ（維持）。本 plan 対象は pack↔repos の sym のみ。
+- **Phase 6a merge データロス**: `Plugin::load` が `ls_files`→`read_dir`（トップ sealed key）に切替えた結果、
+  `Add` の `files.extend` が同 path を上書きしマージディレクトリの片側 source が消失していた。Phase 6c の
+  「衝突時1段展開して子 key 化・再帰 union」で修正。
+- Phase 6a/6c で `git ls-files`/`init_git_worktree` の git 依存が削除された結果、Phase 7 で tarball の
+  `.git` を完全に外せるようになった（dirty も内容ハッシュで代替）。
+
+## Decision Log
+
+- sym（`RepoSnapshotLink`）を廃止し常に copy 実体（案1）。pack を自己完結・Nix safe にするため。
+- build 成果物 copy は `ls-files` ＋ `ls-files --others`（**.gitignore 無視**）。実機で `target/` が届かない
+  問題を解決するため（旧 sym は worktree 全体参照で見えていた）。
+- `dotgit` オプション（デフォ false）。true で snapshot の `.git` を pack に copy（blink.cmp 等の git 利用プラグイン用）。
+  TarballFetch は `.git` を作れないため GitFetch 強制。Phase 6c で `.git` は通常 sealed-dir エントリ化
+  （`LoadedPlugin.dotgit` は `-u` 回復のため残置）。
+- copy 戦略は `AtomicU8{0=reflink,1=hardlink,2=copy}` 単調昇格。`EXDev` は hardlink も失敗するため copy まで jump。
+- `init.lua → generations/{ctl}.lua` sym は維持（系A内完結）。
+- Phase 7: tarball dirty を GitHub API hash でなく**ファイル内容ハッシュ**に。API hash は build 副作用を別途
+  反映する手間が要るが、内容ハッシュは build 成果物を自然に取り込むため採用。`.git`/`.rsplug_build_success`
+  は除外し決定論性を保全。
+
+## Outcomes & Retrospective
+
+- pack は `RepoSnapshotLink` を廃止し常に copy で自己完結（`find pack -type l` で `generations`/`init.lua` 以外 0件）。
+- dotgit で blink.cmp の `.git` チェック問題（outdated → Lua fallback）を根本解決。
+- Phase 7 で tarball snapshot の `.git` が消え、identity が git 非依存に。E138 併合修正。
+- Retrospective: Phase 6a の sealed 列挙切替が merge データロスを招いた。Acceptance テストを同時追加すべき
+  だった（Phase 6c/7 でテスト厚化）。Phase 7 の `dirty_diff_from_content` も即座に単体テストを添えた。
+
+---
+
+# §C — `--gc` 拡張（未実装プラン）
+
+> **状態: 未実装（プランのみ）。** 2026-07-10 設計。実装時に本セクションを Progress/Outcomes に昇格させる。
+
+## Purpose / Big Picture
+
+現行 `--gc`（`main.rs:garbage_collect`）は「in-lock repo の orphane snapshot 削除」のみ。pack 側の
+クリーンアップは `install` の副作用（`retained_manifest_entries` で現世代 + 過去 `RETAIN_GENERATIONS` 世代
+の pack を保持、それ以外削除）でのみ行われ、`--gc` 単体では扱わない。
+
+ユーザー要望: `--gc` を以下 **2 動作を同時に** 行うよう拡張する。
+1. **generations に参照されていない pack のクリーンアップ**（pack GC）。
+2. **使われていない repos のクリーンアップ**（repos GC）。
+
+repos GC の削除範囲はユーザー確認済で **「両方」**:
+- (a) **lock 外リポジトリ全体削除** — lock に含まれない repo ディレクトリ（worktrees + source.git 含む）を丸ごと削除。
+- (b) **in-lock で snapshot 0 の source.git 削除** — GC 後 `worktrees/` が空（locked snapshot が disk に無い drift）なら `source.git` と空 repo ディレクトリを削除。
 
 ## Plan of Work
 
-### Phase 1 — Lock file reconstruction from cache (safe now)
+### 1. pack GC（generations 非参照 pack の削除）
 
-**Goal**: After any rsplug run, the lock file's `rev` values match the snapshot directories actually on disk.
+- `pack/_gen/opt/*/manifest.json` をすべて読み、`entries`（`opt/<id>`）の**和集合** = 参照 pack 集合を構築。
+  （`install` は現+過去 RETAIN_GENERATIONS 世代に pruning 済みなので、on-disk manifest の和集合が参照集合。）
+- **安全策**: manifest が1つも無ければ pack GC をスキップ（全削除防止。空 lock refuse と同思想）。
+- `pack/_gen/{start,opt}/<id>/` で参照集合に無いものを削除（`install` cleanup ループ
+  `packpathstate.rs:1265-1293` と同等）。
+- anchor pack が無い `generations/<id>.lua` を刈り取り（`packpathstate.rs:1301-1317` と同等）。
 
-Currently, `main.rs` builds `locked_map` from the lock file only when `--locked`. On default runs, `locked_map` starts empty and is populated from `lock_infos` (the revs that `Plugin::load` resolved). This works for install/update but does not fix drift for already-installed plugins whose lock entry is stale or missing.
+### 2. repos GC（`garbage_collect` 拡張）
 
-The change: always initialize `locked_map` from the existing lock file (if present), then overlay `lock_infos` from `Plugin::load`. This ensures:
+- lock 空 → refuse（既存）。各 repo ディレクトリ（cachedir = `repos/` からの相対パス）:
+  - **cachedir が lock に無い** → repo 全体（`worktrees/` + `source.git` + ディレクトリ）を削除。【新(a)】
+  - **cachedir が lock にある** → 既存 orphane snapshot 削除（locked `rev` に一致しないもの）。GC 後
+    `worktrees/` が空なら `source.git` と空 repo ディレクトリを削除。【新(b)】
+- 両動作を1回の `--gc` で同時実行。削除対象はログで明示（破壊的のため）。
 
-1. Plugins already in the lock file but not in the config are preserved (not dropped).
-2. Plugins in the config get their `rev` updated from the actual on-disk snapshot.
-3. Plugins in the config but not on disk (skipped via `PluginNotInstalled`) are removed from the lock file (their `lock_info` is `None`, and we need to explicitly handle removal).
+### 注意点（文書化必須）
 
-The key insight: `Plugin::load` already returns `lock_info = Some((url, rev))` when it successfully loads from cache (plugin.rs:602, where `head_rev_str` comes from the existing snapshot). So the data is already flowing — we just need `main.rs` to use it correctly.
+- 複数 lockfile を同一 `~/.cache/rsplug` に切り替えて使う運用では、`--gc` 実行時の lockfile に無い repo
+  （他設定由来）も (a) で削除されるリスクがある。`--gc` は「渡した lockfile が唯一の正」とみなす。
+- pack GC / repos GC とも「参照情報が空」なら refuse / skip する安全設計を維持する。
 
-**Implementation in `main.rs`**:
+## Validation / Acceptance（実装時）
 
-1. Always read the lock file into `locked_map` at startup (not just when `--locked`). This gives us the baseline.
-2. After collecting `lock_infos` from `Plugin::load`, build the final `locked_map` by:
-   - Starting from the file-loaded `locked_map` (preserves entries for plugins not in config).
-   - For each plugin in the config: if `lock_info` is `Some`, update the entry; if `None` (plugin not installed / skipped), remove the entry from `locked_map`.
-3. Write the lock file for every run (currently gated on `!locked`, which is correct — `--locked` runs should not rewrite the lock file).
+- pack GC: orphane pack 削除 / 参照 pack 保全 / manifest 無しで skip。
+- repos GC: lock 外 repo 全削除 / in-lock orphane snapshot / drift で source.git 削除 / 空 lock refuse。
+- 既存 `gc_tests`（`main.rs:413`）を拡張し、pack GC 用の manifest/on-disk pack フィクスチャを追加。
 
-To remove entries for not-installed plugins, we need to track which URLs were processed. We can build a set of URLs seen during loading and subtract from `locked_map`.
+## Concrete files（実装時）
 
-### Phase 2 — Garbage collection (`--gc` flag) (safe now)
+- `main.rs` — `garbage_collect` 拡張（pack GC 追加・repos GC の (a)/(b) 追加）、`gc_tests` 拡張。
+- pack GC の manifest 読取りは `packpathstate.rs` の `GenerationManifest`/`retained_manifest_entries`
+  相当のロジックを `--gc` 向けに再構築（current manifest 無しで on-disk manifest 全走査）。
 
-**Goal**: Remove snapshot directories that do not correspond to the lock file's `rev`.
+---
 
-Add a `--gc` CLI flag. When invoked, rsplug:
+# Revision Notes
 
-1. Reads the lock file.
-2. For each repo in `repos/`, scans `worktrees/` for snapshot directories.
-3. Keeps only the snapshot whose commit matches the lock file's `rev` (the `<commit>` prefix of the snapshot key). Removes all others.
-4. Optionally removes `source.git` object stores that have no remaining snapshots.
-
-This is safe because it only deletes directories, and only when the user explicitly asks.
-
-**Note on immutability concern**: GC trusts that the snapshot directory name accurately reflects its commit. Since rsplug creates these directories via `git2::Repository::clone` + `set_head_detached`, and never renames them, the name is reliable in practice. A corrupted or externally-renamed directory would be GC'd or kept incorrectly, but this is an edge case the user accepts by running `--gc`.
-
-### Phase 3 — Immutable snapshot design (deferred)
-
-**Goal**: Make snapshot worktrees read-only after creation so that GC and lock reconstruction can fully trust on-disk state.
-
-This is a design-level change that affects:
-- How `build` / `lua_build` / `lua_post_update` execute (they need write access during build, then the tree is frozen).
-- How `source.git` relates to snapshots (currently shared via hardlinks for GitFetch path).
-- Whether the `.rsplug_build_success` marker and dirty diff should be part of the immutable record.
-
-This phase is documented for future work. It is not implemented now because:
-- The user asked to defer parts that depend on the immutability concern.
-- It requires significant changes to the build pipeline and snapshot lifecycle.
-
-
-## Concrete Steps
-
-Unless noted, all commands run from the repository root (`/Users/ama/.herdr/worktrees/rsplug.nvim/lockfornix`).
-
-**Step 1 — Always read lock file at startup (Phase 1a).**
-
-Edit `crates/rsplug/src/main.rs`: change the `locked_map` initialization so it always reads the lock file (not just when `--locked`). The `--locked` flag still controls whether the lock file is used to pin revisions, but the file is always read as the baseline for the output lock file.
-
-Expected: `cargo build -p rsplug` succeeds. No behavior change visible yet.
-
-**Step 2 — Track processed URLs and sync lock file (Phase 1b).**
-
-In `main.rs`, after the plugin loading loop, build the final lock file:
-
-1. Collect a `HashSet<String>` of URLs that were processed (from the config's plugins).
-2. For each URL in the config: if `Plugin::load` returned `lock_info`, update `locked_map`; if it returned `None` (not installed), remove the URL from `locked_map`.
-3. Write the lock file (when `!locked`).
-
-The `Plugin::load` return value currently cannot distinguish "not installed" from "script-only plugin" (both return `Ok(None)` without lock_info). We need to ensure that for plugins with a `repo` field that returned `None`, the URL is known so we can remove it. Since we have the URL in the closure (main.rs:152), we can collect processed URLs there.
-
-Expected: After a default run, the lock file matches the cache state.
-
-**Step 3 — Add `--gc` flag (Phase 2).**
-
-Add `gc: bool` to `Args` in `main.rs`. When `--gc` is set:
-
-1. Read the lock file.
-2. Walk `repos/` directory.
-3. For each repo dir, walk `worktrees/`.
-4. For each snapshot dir, parse the commit from the directory name.
-5. If the commit does not match the lock file's `rev` for this repo's URL, remove the directory.
-6. If `worktrees/` is empty after cleanup, optionally remove the repo dir and `source.git`.
-
-Expected: `cargo build -p rsplug` succeeds. `rsplug --gc --config ...` removes orphaned snapshots.
-
-**Step 4 — Lint and test (after every step).**
-
-    cargo fmt
-    cargo test --workspace
-    cargo clippy --workspace --all-targets
-
-Note: `AGENTS.md` says do not run `cargo check -q`.
-
-
-## Validation and Acceptance
-
-Behavior-based criteria:
-
-1. After a default run (no flags), the lock file's `rev` for each installed plugin matches the commit hash in the newest snapshot directory name under `repos/<repo>/worktrees/`. Verified by comparing `jq .locked <lockfile>` with `ls repos/<repo>/worktrees/`.
-
-2. A plugin removed from the config but still cached: its entry is preserved in the lock file after a default run (not dropped). Verified by checking the lock file before and after.
-
-3. A plugin in the config but not installed (cache deleted): its entry is removed from the lock file after a default run. Verified by checking the lock file.
-
-4. `--gc` removes snapshot directories whose commit does not match the lock file. Verified by creating a stale snapshot dir manually, running `--gc`, and confirming it is removed.
-
-5. `--gc` does not remove the snapshot matching the lock file's `rev`. Verified by checking the matching snapshot survives.
-
-6. `cargo test --workspace` passes, including existing lock file and snapshot tests.
-
-7. `cargo clippy --workspace --all-targets` produces no new warnings.
-
-Manual verification commands:
-
-    # Check lock file matches cache
-    jq .locked ~/.cache/rsplug/rsplug.lock.json | head
-    ls ~/.cache/rsplug/repos/github.com/*/worktrees/
-
-    # Test GC
-    # (create a fake stale snapshot)
-    mkdir -p ~/.cache/rsplug/repos/github.com/test/fake/worktrees/0000000000000000000000000000000000000000
-    rsplug --gc --config ...
-    ls ~/.cache/rsplug/repos/github.com/test/fake/worktrees/  # fake dir should be gone
-
-
-## Idempotence and Recovery
-
-- Phase 1 (lock reconstruction) is idempotent: running it multiple times produces the same lock file as long as the cache state is unchanged.
-- If the lock file is deleted, a default run recreates it from the cache state. No data loss.
-- If the cache is deleted, the lock file entries for those repos are removed on the next run (Phase 1b removes entries for not-installed plugins).
-- Phase 2 (`--gc`) is destructive but opt-in. Recovery: re-run `--install` to re-fetch deleted snapshots. Clearing the cache (`rm -rf ~/.cache/rsplug/repos`) is always safe.
-- `--gc` should never remove the snapshot matching the lock file's `rev`. If the lock file is empty or missing, `--gc` should warn and refuse to delete anything (to avoid wiping the entire cache).
-
-
-## Artifacts and Notes
-
-Current lock file write logic (main.rs:216-234):
-
-    if !locked {
-        let mut merged_locked = Arc::try_unwrap(locked_map).expect("...");
-        for (url, resolved_rev) in lock_infos {
-            merged_locked.insert(url, LockedResource { ... });
-        }
-        LockFile { version: "1".into(), locked: merged_locked }.write(...).await?;
-    }
-
-Problem: `merged_locked` starts from `locked_map`, which is empty on non-`--locked` runs. So entries for plugins not in the config are lost. And entries for plugins in the config but not installed are preserved (stale).
-
-After Phase 1:
-
-    if !locked {
-        let mut merged_locked = Arc::try_unwrap(locked_map).expect("...");
-        // Remove entries for not-installed plugins in the config
-        for url in processed_urls_with_no_lock_info {
-            merged_locked.remove(&url);
-        }
-        // Update entries from actual load results
-        for (url, resolved_rev) in lock_infos {
-            merged_locked.insert(url, LockedResource { ... });
-        }
-        LockFile { version: "1".into(), locked: merged_locked }.write(...).await?;
-    }
-
-
-## Interfaces and Dependencies
-
-Interfaces that must exist after this plan:
-
-- `main.rs` — `locked_map` is always initialized from the lock file (if present), regardless of `--locked`. The `--locked` flag still controls rev pinning, not file reading.
-- `main.rs` — new logic to track processed URLs and remove stale entries from the lock file.
-- `main.rs` — new `--gc` CLI flag and GC logic.
-- `LockFile` struct — no changes needed (existing read/write is sufficient).
-- `Plugin::load` — no changes needed (already returns correct `lock_info` for cache-loaded plugins).
-
-No changes to the lock file format, Lua runtime integration, or the cache directory layout (Phase 1-2). Phase 3 (deferred) would change the snapshot creation path.
-
-
-## Revision Notes
-
-- 2025-07-07: Initial ExecPlan created. Phase 1 (lock reconstruction) and Phase 2 (GC) are scoped as safe to implement now. Phase 3 (immutable snapshots) is documented but deferred per the user's instruction to separate concerns that depend on cache immutability.
-- 2026-07-07: Phase 1 / Phase 2 を実装完了。Phase 2 の初版 GC は逆変換バグで機能していなかったため、URL→cachedir 正方向変換で根本修正し `gc_tests` を追加。Phase 3（不変 snapshot）は引き続き defer。
+- 2025-07-07: §A 初版（Phase 1/2 safe-now、Phase 3 defer）。
+- 2026-07-07: §A Phase 1/2 実装完了。GC 逆変換バグを正方向変換で根本修正し `gc_tests` 追加。
+- 2026-07-07..09: §B Phase 0-6c 実装（sym 廃止・copy 統一・dotgit・`AtomicU8` copy 戦略）。
+- 2026-07-10: **§B Phase 7 完了**（tarball `.git` 廃止・`MaterializedRepo` enum・`dirty_diff_from_content`
+  内容ハッシュ）。併せて libc 採用（reflink FFI）と E138 修正（`-i NONE`）を実施。実機検証済み。
+- 2026-07-10: 旧 `PLANS.md`（§A）と `PLANS-copy-unification.md`（§B）を本ファイルに統合。§B の
+  「ExecPlan は別ファイルに置く」Decision（2026-07-07）は、ユーザー指示（1つの PLANS.md に集約）により
+  **上書き**。§C（`--gc` 拡張）を未実装プランとして追加。
