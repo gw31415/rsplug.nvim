@@ -610,12 +610,13 @@ impl Plugin {
             path: snapshot_root_path.clone(),
         });
         // ls-files 列挙を廃止し、snapshot ルート直下を read_dir で1階層列挙する。
-        // ディレクトリ（lua/plugin/doc 等）も1エントリにまとめ、install で copy_tree する
-        //（ファイル数分の syscall を削減）。target/ 等の build 成果物は ignore 対象外なので
-        // pack に残る（旧 ls_files_with_untracked と同等）。.rsplug_build_success は
-        // ignore.gitignore で除外される。`.git` は通常 ignore 対象だが、dotgit=true のときは
-        // 例外扱いせず通常ディレクトリと同じくエントリに含める（pack への copy・plugin_id への
-        // 反映は他のディレクトリと同一経路。snapshot に `.git` が無い場合は install で検知し警告）。
+        // ディレクトリ（lua/plugin 等）も1エントリにまとめ、install で copy_tree する
+        //（ファイル数分の syscall を削減）。`doc` だけは盗み集約のため個別ファイルに展開する（下記）。
+        // target/ 等の build 成果物は ignore 対象外なので pack に残る（旧 ls_files_with_untracked と同等）。
+        // .rsplug_build_success は ignore.gitignore で除外される。`.git` は通常 ignore 対象だが、
+        // dotgit=true のときは例外扱いせず通常ディレクトリと同じくエントリに含める
+        //（pack への copy・plugin_id への反映は他のディレクトリと同一経路。
+        // snapshot に `.git` が無い場合は install で検知し警告）。
         let mut entries: Vec<PathBuf> = Vec::new();
         {
             let mut rd = tokio::fs::read_dir(snapshot_root_path.as_ref()).await?;
@@ -628,23 +629,36 @@ impl Plugin {
         for luam in extract_unique_lua_modules_from_snapshot(snapshot_root_path.as_ref()).await {
             lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
         }
-        let files: HowToPlaceFiles = HowToPlaceFiles::CopyEachFile(
-            entries
-                .into_iter()
-                // dotgit=true なら `.git` を ignore から救出して通常エントリに含める。
-                .filter(|name| dotgit && name == Path::new(".git") || !merge.ignore.matched(name))
-                .map(|name| {
-                    (
-                        name.clone(),
-                        FileItem::new(
-                            filesource.clone(),
-                            FileIdentity::RepoFile(RepoFileIdentity::new(identity.clone(), name)),
-                            MergeType::Conflict,
-                        ),
-                    )
-                })
-                .collect(),
-        );
+        // 各トップレベルエントリを配置対象に組み立てる。`doc` だけは例外:
+        // 「盗んで」`_rsplug:doc` start プラグインへ集約するため、sealed-dir 1エントリではなく
+        // 個別ファイル（`doc/<rel>`）に展開する（`PlugCtl::create` の `starts_with("doc/")` 盗みを効かせる）。
+        // それ以外は sealed-dir のまま（install で copy_tree が clonefile/per-file copy で配置）。
+        let mut file_entries: Vec<(PathBuf, FileItem)> = Vec::with_capacity(entries.len());
+        for name in &entries {
+            // dotgit=true なら `.git` を ignore から救出して通常エントリに含める。
+            if !(dotgit && name == Path::new(".git") || !merge.ignore.matched(name)) {
+                continue;
+            }
+            if name == Path::new("doc") {
+                file_entries.extend(
+                    doc_file_entries(snapshot_root_path.as_ref(), &filesource, &identity).await,
+                );
+            } else {
+                file_entries.push((
+                    name.clone(),
+                    FileItem::new(
+                        filesource.clone(),
+                        FileIdentity::RepoFile(RepoFileIdentity::new(
+                            identity.clone(),
+                            name.clone(),
+                        )),
+                        MergeType::Conflict,
+                    ),
+                ));
+            }
+        }
+        let files: HowToPlaceFiles =
+            HowToPlaceFiles::CopyEachFile(file_entries.into_iter().collect());
 
         // ロード成功が確定したので、実際に更新/新規インストールされたプラグインを
         // サマリーへ通知する。早帰り(Ok(None))経路には到達しない＝スキップしたものは報告しない。
@@ -1016,6 +1030,79 @@ async fn latest_snapshot_oid(worktrees: &Path) -> Result<Option<Oid>, Error> {
 /// snapshot の `lua/` 直下から Lua module 名を抽出する。
 /// `lua/<name>`（ディレクトリ）or `lua/<name>.lua`（ファイル）の stem を取る。
 /// ls-files 廃止に伴い read_dir で取得する（`lua/` が無ければ空）。
+/// `doc/` を再帰走査し、個別ファイルエントリ（key = `doc/<rel>`）を返す。
+/// `PlugCtl::create` が `doc/**` を盗んで `_rsplug:doc` start プラグインへ集約できるよう、
+/// `doc` を sealed-dir 1エントリではなく個別ファイルとして列挙する
+///（origin/main `collect_doc_files_from_root` 相当。同期 IO を避けるため async で走査）。
+/// doc_root が無い/ディレクトリでなければ空。エラーは寛容に skip し得た分だけ返す。
+async fn doc_file_entries(
+    snapshot_root: &Path,
+    filesource: &Arc<FileSource>,
+    identity: &RepoSnapshotIdentity,
+) -> Vec<(PathBuf, FileItem)> {
+    let doc_root = snapshot_root.join("doc");
+    let is_dir = tokio::fs::metadata(&doc_root)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if !is_dir {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen_dirs: hashbrown::HashSet<PathBuf> = hashbrown::HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(doc_root.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 128 {
+            continue;
+        }
+        // symlink ループ保護（origin/main collect_doc_files_from_root 準拠）。
+        if let Ok(canonical) = tokio::fs::canonicalize(&dir).await
+            && !seen_dirs.insert(canonical)
+        {
+            continue;
+        }
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let ft = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push((path, depth + 1));
+                continue;
+            }
+            let is_file = if ft.is_symlink() {
+                tokio::fs::metadata(&path)
+                    .await
+                    .map(|m| m.is_file())
+                    .unwrap_or(false)
+            } else {
+                ft.is_file()
+            };
+            if !is_file {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&doc_root) else {
+                continue;
+            };
+            let key = PathBuf::from("doc").join(rel);
+            out.push((
+                key.clone(),
+                FileItem::new(
+                    filesource.clone(),
+                    FileIdentity::RepoFile(RepoFileIdentity::new(identity.clone(), key)),
+                    MergeType::Conflict,
+                ),
+            ));
+        }
+    }
+    out
+}
+
 async fn extract_unique_lua_modules_from_snapshot(snapshot_root: &Path) -> Vec<String> {
     let mut rd = match tokio::fs::read_dir(snapshot_root.join("lua")).await {
         Ok(rd) => rd,
@@ -1794,6 +1881,58 @@ mod tests {
         assert!(
             with_repo.dependency_cachedirs.is_empty(),
             "script-only dependency must not contribute a cache dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn doc_file_entries_walks_doc_into_individual_keys() {
+        // doc を sealed-dir ではなく個別ファイル（doc/<rel>）に展開する（doc 盗みの前提）。
+        // ネスト・doc 外の除外・doc 無しの空 を検証する。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join("doc/sub"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("doc/foo.txt"), b"foo")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("doc/sub/bar.txt"), b"bar")
+            .await
+            .unwrap();
+        // doc 外は含まれない。
+        tokio::fs::write(root.join("plugin.vim"), b"x")
+            .await
+            .unwrap();
+
+        let filesource = Arc::new(FileSource::Directory {
+            path: Arc::from(root.to_path_buf()),
+        });
+        let identity = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/o/r"),
+            b"deadbeef".to_vec(),
+            None,
+            Arc::<[String]>::from(Vec::<String>::new()),
+            None,
+        );
+
+        let mut entries = doc_file_entries(root, &filesource, &identity).await;
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let keys: Vec<&Path> = entries.iter().map(|(k, _)| k.as_path()).collect();
+        assert_eq!(
+            keys,
+            vec![Path::new("doc/foo.txt"), Path::new("doc/sub/bar.txt")],
+        );
+        // 各 identity の relative_path がキーと一致（配置先の正確性）。
+        for (k, item) in &entries {
+            assert_eq!(item.identity.relative_path(), k.as_path());
+        }
+
+        // doc 無し snapshot は空。
+        let nodoc = tempfile::tempdir().unwrap();
+        assert!(
+            doc_file_entries(nodoc.path(), &filesource, &identity)
+                .await
+                .is_empty()
         );
     }
 }
