@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use once_cell::sync::OnceCell;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -88,47 +86,13 @@ pub mod hash {
     }
 }
 
-#[inline]
-fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        PathBuf::from(std::ffi::OsString::from_vec(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        PathBuf::from(String::from_utf8_lossy(&bytes).to_string())
-    }
-}
-
-/// ディレクトリ内の全ファイル（再帰）を絶対パスで返す。読めないエントリはスキップ。
-/// ignored ディレクトリ（target/ 等）の中身を ls_files_with_untracked で列挙するために使う。
-fn walk_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
 pub mod git {
     //! 各種 Git 操作関連のユーティリティ
 
     use std::{
         cell::Cell,
         ops::Deref,
-        path::{Path, PathBuf},
+        path::Path,
         str::FromStr,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
@@ -153,74 +117,6 @@ pub mod git {
         /// (INTERNAL) git2のRepositoryから生成
         fn from(value: git2::Repository) -> Self {
             Repository(Arc::new(Mutex::new(value)))
-        }
-
-        /// リポジトリ内のファイル一覧を取得
-        pub async fn ls_files(&self) -> Result<Vec<PathBuf>, Error> {
-            let repo = self.0.clone();
-            spawn_blocking(move || {
-                Ok(repo
-                    .lock()
-                    .unwrap()
-                    .index()?
-                    .iter()
-                    .map(|entry| bytes_to_pathbuf(entry.path))
-                    .collect::<Vec<_>>())
-            })
-            .await
-            .unwrap()
-        }
-
-        /// 追跡ファイル + 全 未追跡ファイル（.gitignore 対象含む build 成果物）の一覧を取得。
-        /// `git ls-files` ＋ `git ls-files --others`（`--exclude-standard` なし、ignore 無視）相当。
-        /// build プラグインの成果物（`target/` 等、.gitignore 対象が多い）を pack copy に含めるため、
-        /// .gitignore を無視して全 untracked を列挙する（旧 sym 版の worktree 全体参照と同等）。
-        /// 重量 copy は yank の clonefile/hard_link でディスクを節約する。
-        pub async fn ls_files_with_untracked(&self) -> Result<Vec<PathBuf>, Error> {
-            let repo = self.0.clone();
-            spawn_blocking(move || {
-                let repo = repo.lock().unwrap();
-                let workdir = repo
-                    .workdir()
-                    .ok_or_else(|| git2::Error::from_str("repository has no workdir"))?
-                    .to_path_buf();
-                let mut files: Vec<PathBuf> = repo
-                    .index()?
-                    .iter()
-                    .map(|entry| bytes_to_pathbuf(entry.path))
-                    .collect();
-                // .gitignore を無視し、ignored 含む全 untracked（build 成果物）を追加。
-                let mut opts = git2::StatusOptions::new();
-                opts.include_untracked(true)
-                    .recurse_untracked_dirs(true)
-                    .include_ignored(true);
-                for entry in repo.statuses(Some(&mut opts))?.iter() {
-                    let Ok(path) = entry.path() else {
-                        continue;
-                    };
-                    let status = entry.status();
-                    if status == git2::Status::WT_NEW {
-                        files.push(PathBuf::from(path));
-                    } else if status == git2::Status::IGNORED {
-                        let full = workdir.join(path);
-                        if full.is_dir() {
-                            // ignored ディレクトリ（target/ 等）は git2 が1エントリで返すため中身を再帰列挙。
-                            for child in walk_files(&full) {
-                                if let Ok(rel) = child.strip_prefix(&workdir) {
-                                    files.push(rel.to_path_buf());
-                                }
-                            }
-                        } else {
-                            files.push(PathBuf::from(path));
-                        }
-                    }
-                }
-                files.sort();
-                files.dedup();
-                Ok(files)
-            })
-            .await
-            .unwrap()
         }
 
         /// source.git に指定 oid を fetch する（HEAD も作業ツリーも変えない）。
@@ -1105,11 +1001,10 @@ mod tests {
         let oid_str = oid_str.trim();
         let oid = Oid::from_str(oid_str).unwrap();
 
-        let repo = super::git::init_snapshot(&snap, &origin, oid)
+        // init_snapshot が成功し、worktree に commit 内容が checkout されている
+        let _ = super::git::init_snapshot(&snap, &origin, oid)
             .await
             .unwrap();
-
-        // worktree に commit 内容が checkout されている
         let content = tokio::fs::read_to_string(snap.join("README.md"))
             .await
             .unwrap();
@@ -1125,43 +1020,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(head.trim(), oid_str);
-        // ls_files が tracked file を返す
-        let files = repo.ls_files().await.unwrap();
-        assert!(files.iter().any(|p| p == std::path::Path::new("README.md")));
-
-        // ls_files_with_untracked は tracked + 全 untracked（.gitignore 対象の build 成果物含む）を返す
-        std::fs::write(snap.join("build_artifact.txt"), "out\n").unwrap();
-        // .gitignore 対象のファイル（blink.cmp 等の target/ 配下を模擬）
-        std::fs::write(snap.join(".gitignore"), "target/\n").unwrap();
-        std::fs::create_dir_all(snap.join("target/release")).unwrap();
-        std::fs::write(snap.join("target/release/libfoo.dylib"), "binary\n").unwrap();
-        let files_with = repo.ls_files_with_untracked().await.unwrap();
-        assert!(
-            files_with
-                .iter()
-                .any(|p| p == std::path::Path::new("README.md")),
-            "tracked file must be included"
-        );
-        assert!(
-            files_with
-                .iter()
-                .any(|p| p == std::path::Path::new("build_artifact.txt")),
-            "untracked build artifact must be included"
-        );
-        assert!(
-            files_with
-                .iter()
-                .any(|p| p == std::path::Path::new("target/release/libfoo.dylib")),
-            ".gitignore'd build artifact (target/) must be included"
-        );
-        // ls_files（tracked only）は untracked を含まない
-        let files_tracked = repo.ls_files().await.unwrap();
-        assert!(
-            !files_tracked
-                .iter()
-                .any(|p| p == std::path::Path::new("target/release/libfoo.dylib")),
-            "ls_files must not include ignored build artifact"
-        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

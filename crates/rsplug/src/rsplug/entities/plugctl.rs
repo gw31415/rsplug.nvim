@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     iter::Sum,
     ops::AddAssign,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -530,7 +530,7 @@ impl PlugCtl {
                 let HowToPlaceFiles::CopyEachFile(map) = files;
                 let doc_keys: Vec<PathBuf> = map
                     .keys()
-                    .filter(|p| p.starts_with("doc/"))
+                    .filter(|p| p.starts_with("doc/") && p.as_path() != Path::new("doc"))
                     .cloned()
                     .collect();
                 let mut extracted = BTreeMap::new();

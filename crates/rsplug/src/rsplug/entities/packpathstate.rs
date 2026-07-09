@@ -7,7 +7,10 @@ use std::{
     io,
     ops::Add,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::SystemTime,
 };
 
@@ -432,13 +435,13 @@ impl FileSource {
 
 struct Files {
     is_plugctl: bool,
-    dir_type: DirectoryExtractionType,
+    /// ディレクトリエントリ: 同 path に複数 source（マージされたディレクトリ）。
+    /// install で各 source を順次 copy（1個目 `clone_dir`・2個目以降 `merge_copy_dir`）。
+    dirs: Vec<(PathBuf, Vec<Arc<FileSource>>)>,
+    /// ファイルエントリ: `source.yank` で copy。GeneratedFile 含む。
+    files: Vec<(PathBuf, Arc<FileSource>)>,
     /// dotgit=true かつ repo 由来なら install 時に snapshot の .git を pack に copy する。
     dotgit: bool,
-}
-
-enum DirectoryExtractionType {
-    Files(Vec<(PathBuf, Arc<FileSource>)>),
 }
 
 #[cfg(unix)]
@@ -492,8 +495,82 @@ fn render_init(control_ids: &[PluginIDStr]) -> Vec<u8> {
         .unwrap_or_else(|_| Vec::new())
 }
 
+/// macOS APFS の `clonefile(2)` でディレクトリ階層全体を1 syscall・CoW で clone する。
+/// ファイル数に比例した syscall を削減できる（`.git` の object store 等で効果大）。
+/// 非 APFS・別 volume・カーネル未対応では失敗し、呼び出し元が `copy_dir_all` にフォールバックする。
+/// dst は未存在・親は存在が前提（`clonefile` が dst を新規作成する）。
+#[cfg(target_os = "macos")]
+async fn clonefile_dir(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
+    }
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let s = CString::new(src.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let d = CString::new(dst.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: `s`/`d` は有効な NUL 終端パス。`flags=0` はデフォルト挙動（CoW clone）。
+        let ret = unsafe { clonefile(s.as_ptr(), d.as_ptr(), 0) };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("clonefile join failed: {e}")))?
+}
+
+/// `clonefile` が「この環境では使えない」エラーか（フォールバック対象）。
+/// EXDEV=別 volume, ENOTSUP=非APFS/属性未対応, ENOSYS=未実装, EOPNOTSUPP=未サポート。
+/// いずれかなら以降のディレクトリ copy を再帰 copy に固定する。
+#[cfg(target_os = "macos")]
+fn clonefile_unsupported(e: &io::Error) -> bool {
+    const EXDEV: i32 = 18;
+    const ENOTSUP: i32 = 45;
+    const ENOSYS: i32 = 78;
+    const EOPNOTSUPP: i32 = 102;
+    matches!(
+        e.raw_os_error(),
+        Some(EXDEV) | Some(ENOTSUP) | Some(ENOSYS) | Some(EOPNOTSUPP)
+    )
+}
+
+/// `clonefile` が効くか（APFS・同 volume）を実行時にキャッシュ。
+/// 一度でも unsupported エラーなら false に固定し、無駄な syscall を避ける。
+#[cfg(target_os = "macos")]
+static CLONEFILE_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+/// ディレクトリを copy する。macOS かつ APFS 同 volume なら `clonefile(2)` で
+/// ディレクトリ全体を1 syscall・CoW で clone し、ファイル数分の syscall を削減する
+/// （CoW かつ独立 inode なので、元 snapshot を編集しても pack に影響しない）。
+/// clonefile 非対応環境（非 APFS・別 volume・非 macOS）では `copy_dir_all`（再帰 copy）にフォールバックする。
+async fn clone_dir(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if CLONEFILE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        // dst の親を作成（dst 自体は clonefile が新規作成するので未存在のまま）。
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match clonefile_dir(src, dst).await {
+            Ok(()) => return Ok(()),
+            Err(e) if clonefile_unsupported(&e) => {
+                CLONEFILE_AVAILABLE.store(false, AtomicOrdering::Relaxed);
+                // フォールバック: dst は未作成のまま copy_dir_all へ（先頭で create_dir_all する）。
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    copy_dir_all(src, dst).await
+}
+
 /// ディレクトリを再帰的に copy（ファイル・ディレクトリ・symlink を保持）。
-/// `.git` 複製（dotgit）用。Phase 5 で yank の clonefile ディレクトリ copy に統合予定。
+/// `clone_dir` のフォールバック先、および非 macOS 既定のディレクトリ copy。
 async fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
     tokio::fs::create_dir_all(dst).await?;
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
@@ -511,6 +588,39 @@ async fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
             #[cfg(unix)]
             tokio::fs::symlink(&target, &d).await?;
             // Windows では symlink 作成に権限が必要なためファイル copy にフォールバック
+            #[cfg(not(unix))]
+            {
+                tokio::fs::copy(&s, &d).await?;
+            }
+        } else {
+            tokio::fs::copy(&s, &d).await?;
+        }
+    }
+    Ok(())
+}
+
+/// マージされたディレクトリを統合 copy。dst は既存（clone_dir 済み）の前提で、
+/// src の各エントリを dst に上書きする。dirs_mergeable で子競合無しなので、
+/// 上書きされるのは「片方にだけ存在するエントリ」のみ。ファイル・ディレクトリ・symlink を再帰。
+async fn merge_copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        let meta = tokio::fs::symlink_metadata(&s).await?;
+        if meta.is_dir() {
+            tokio::fs::create_dir_all(&d).await?;
+            let mut entries = tokio::fs::read_dir(&s).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name();
+                stack.push((s.join(&name), d.join(&name)));
+            }
+        } else if meta.is_symlink() {
+            let target = tokio::fs::read_link(&s).await?;
+            #[cfg(unix)]
+            {
+                // dst が既存（ファイル/symlink）なら削除してから再作成（ディレクトリは残す）。
+                let _ = tokio::fs::remove_file(&d).await;
+                tokio::fs::symlink(&target, &d).await?;
+            }
             #[cfg(not(unix))]
             {
                 tokio::fs::copy(&s, &d).await?;
@@ -619,16 +729,35 @@ impl PackPathState {
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
                 for (path, item) in files {
-                    let Files {
-                        is_plugctl: _,
-                        dir_type: DirectoryExtractionType::Files(tree),
-                        dotgit: _,
-                    } = self.files.entry(id_str.clone()).or_insert(Files {
+                    let entry = self.files.entry(id_str.clone()).or_insert(Files {
                         is_plugctl,
-                        dir_type: DirectoryExtractionType::Files(Vec::new()),
+                        dirs: Vec::new(),
+                        files: Vec::new(),
                         dotgit,
                     });
-                    tree.push((path, item.source));
+                    // 同 id に複数 LoadedPlugin が統合される場合、最初にエントリを作った
+                    // LoadedPlugin の is_plugctl/dotgit が or_insert で固定されるのを防ぐため、
+                    // 既存エントリのフラグを update する（どれか1つでも true なら true）。
+                    entry.is_plugctl = entry.is_plugctl || is_plugctl;
+                    entry.dotgit = entry.dotgit || dotgit;
+                    // ディレクトリエントリ（snapshot_root/path がディレクトリ）は dirs、
+                    // ファイルエントリは files に振り分け。install で dirs→files 順に copy する。
+                    let is_dir = match item.source.as_ref() {
+                        FileSource::Directory { path: root } => std::fs::metadata(root.join(&path))
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false),
+                        FileSource::File { .. } => false,
+                    };
+                    if is_dir {
+                        // 同 path のディレクトリエントリ（マージされた複数 source）は source を追加。
+                        if let Some(slot) = entry.dirs.iter_mut().find(|(p, _)| p == &path) {
+                            slot.1.push(item.source);
+                        } else {
+                            entry.dirs.push((path, vec![item.source]));
+                        }
+                    } else {
+                        entry.files.push((path, item.source));
+                    }
                 }
             }
         }
@@ -686,7 +815,8 @@ impl PackPathState {
             id,
             Files {
                 is_plugctl: _,
-                dir_type,
+                dirs,
+                files,
                 dotgit,
             },
         ) in files
@@ -731,62 +861,87 @@ impl PackPathState {
                         Ok(())
                     }
                 };
-                match dir_type {
-                    DirectoryExtractionType::Files(files) => {
-                        tokio::fs::remove_file(dir.as_path()).await.ok();
-                        // dotgit=true なら .git 複製元の snapshot_root を事前取得（files は into_iter で消費するため）
-                        let snapshot_root = if dotgit {
-                            files.iter().find_map(|(_, s)| match s.as_ref() {
+                {
+                    // clone_dir は dst 未存在前提なので残骸を掃除（ディレクトリ/ファイル混在に備え remove_dir_all）。
+                    tokio::fs::remove_dir_all(dir.as_path()).await.ok();
+                    // dotgit=true なら .git 複製元の snapshot_root を事前取得（dirs/files は into_iter で消費するため）
+                    let snapshot_root = if dotgit {
+                        dirs.iter()
+                            .flat_map(|(_, srcs)| srcs.iter())
+                            .chain(files.iter().map(|(_, s)| s))
+                            .find_map(|s| match s.as_ref() {
                                 FileSource::Directory { path } => Some(path.clone()),
                                 _ => None,
                             })
-                        } else {
-                            None
-                        };
-                        if dotgit
-                            && snapshot_root
-                                .as_ref()
-                                .is_none_or(|root| !root.join(".git").is_dir())
-                        {
-                            // ponytail: dotgit copy cannot be faked from a snapshot without `.git`;
-                            // skip the pack install and let the user refresh the cache with `-u`.
-                            msg(Message::PluginDotgitMissing(id.clone()));
-                            continue;
-                        }
-                        let dir = Arc::new(dir);
-                        // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
-                        let yank_semaphore = yank_semaphore.clone();
-                        tasks.spawn(async move {
-                            let mut copies = files
-                                .into_iter()
-                                .map(|(which, source)| {
-                                    let dir = dir.clone();
-                                    let id = id.clone();
-                                    let yank_semaphore = yank_semaphore.clone();
-                                    async move {
-                                        let permit = yank_semaphore.acquire().await;
-                                        let result = source.yank(&which, dir.as_path()).await;
-                                        let is_error = result.is_err();
-                                        permit.finish(is_error);
-                                        result?;
-                                        msg(Message::InstallYank { id, which });
-                                        Ok::<_, io::Error>(())
+                    } else {
+                        None
+                    };
+                    if dotgit
+                        && snapshot_root
+                            .as_ref()
+                            .is_none_or(|root| !root.join(".git").is_dir())
+                    {
+                        // dotgit copy cannot be faked from a snapshot without `.git`;
+                        // skip the pack install and let the user refresh the cache with `-u`.
+                        msg(Message::PluginDotgitMissing(id.clone()));
+                        continue;
+                    }
+                    let dir = Arc::new(dir);
+                    // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
+                    let yank_semaphore = yank_semaphore.clone();
+                    tasks.spawn(async move {
+                        // 1. ディレクトリエントリを先に clone_dir / merge_copy_dir。
+                        //    clone_dir が後の yank ファイルを上書きしないよう、ディレクトリを先に配置する。
+                        for (which, sources) in &dirs {
+                            let dst = dir.join(which);
+                            for (i, source) in sources.iter().enumerate() {
+                                if let FileSource::Directory { path: root } = source.as_ref() {
+                                    let src = root.join(which);
+                                    if i == 0 {
+                                        clone_dir(&src, &dst).await?;
+                                    } else {
+                                        // マージされた2個目以降: dst が既存なので中身を統合 copy。
+                                        merge_copy_dir(&src, &dst).await?;
                                     }
-                                })
-                                .collect::<JoinSet<_>>();
-                            while let Some(res) = copies.join_next().await {
-                                res??;
-                            }
-                            // dotgit=true なら snapshot の .git を pack に全体 copy（git 利用プラグイン用）
-                            if let Some(root) = snapshot_root {
-                                let src_git = root.join(".git");
-                                if src_git.is_dir() {
-                                    copy_dir_all(&src_git, &dir.join(".git")).await?;
                                 }
                             }
-                            helptags(dir.as_path()).await
-                        });
-                    }
+                            msg(Message::InstallYank {
+                                id: id.clone(),
+                                which: which.clone(),
+                            });
+                        }
+                        // 2. ファイルエントリを yank（GeneratedFile 含む）。
+                        let mut copies = files
+                            .into_iter()
+                            .map(|(which, source)| {
+                                let dir = dir.clone();
+                                let id = id.clone();
+                                let yank_semaphore = yank_semaphore.clone();
+                                async move {
+                                    let permit = yank_semaphore.acquire().await;
+                                    let result = source.yank(&which, dir.as_path()).await;
+                                    let is_error = result.is_err();
+                                    permit.finish(is_error);
+                                    result?;
+                                    msg(Message::InstallYank { id, which });
+                                    Ok::<_, io::Error>(())
+                                }
+                            })
+                            .collect::<JoinSet<_>>();
+                        while let Some(res) = copies.join_next().await {
+                            res??;
+                        }
+                        // 3. dotgit=true なら snapshot の .git を pack に全体 copy（git 利用プラグイン用）。
+                        //    clone_dir は macOS/APFS 同 volume で clonefile(2) により .git 全体を
+                        //    1 syscall・CoW で配置する（object store 等のファイル数分の syscall を削減）。
+                        if let Some(root) = snapshot_root {
+                            let src_git = root.join(".git");
+                            if src_git.is_dir() {
+                                clone_dir(&src_git, &dir.join(".git")).await?;
+                            }
+                        }
+                        helptags(dir.as_path()).await
+                    });
                 }
             }
         }
@@ -1308,6 +1463,163 @@ mod tests {
                 .join(plugin_id.as_str())
                 .exists(),
             "dotgit-missing plugin must not be copied into pack"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clone_dir_preserves_files_dirs_and_symlinks() {
+        let root = std::env::temp_dir().join(format!("rsplug-clonedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"world").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
+
+        clone_dir(&src, &dst).await.unwrap();
+
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"world");
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(dst.join("link.txt")).unwrap();
+            assert!(meta.file_type().is_symlink());
+            assert_eq!(
+                std::fs::read_link(dst.join("link.txt")).unwrap(),
+                Path::new("a.txt")
+            );
+        }
+
+        // 元 src を編集しても dst に影響しない（clonefile の CoW・独立 inode、
+        // または copy フォールバックの独立実体。hardlink で inode を共有しない）。
+        std::fs::write(src.join("a.txt"), b"changed").unwrap();
+        assert_eq!(
+            std::fs::read(dst.join("a.txt")).unwrap(),
+            b"hello",
+            "editing source must not mutate the pack copy"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn dotgit_copies_git_dir_into_pack() {
+        let dir = std::env::temp_dir().join(format!("rsplug-dotgit-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let snapshot_root = dir.join("snapshot");
+        let packpath = dir.join("packpath");
+        std::fs::create_dir_all(snapshot_root.join("plugin")).unwrap();
+        std::fs::write(snapshot_root.join("plugin/init.lua"), "print('x')\n").unwrap();
+        // snapshot に .git を用意（dotgit copy の対象）。clone_dir が全体 copy する。
+        std::fs::create_dir_all(snapshot_root.join(".git/refs/heads")).unwrap();
+        std::fs::write(snapshot_root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            snapshot_root.join(".git/refs/heads/main"),
+            "0123456789012345678901234567890123456789\n",
+        )
+        .unwrap();
+
+        let snapshot = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/owner/repo"),
+            b"0123456789012345678901234567890123456789".to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let files = BTreeMap::from([(
+            PathBuf::from("plugin/init.lua"),
+            FileItem {
+                source: Arc::new(FileSource::Directory {
+                    path: Arc::from(snapshot_root.clone()),
+                }),
+                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                    snapshot,
+                    PathBuf::from("plugin/init.lua"),
+                )),
+                merge_type: MergeType::Conflict,
+            },
+        )]);
+        let loaded = LoadedPlugin {
+            source_name: None,
+            lazy_type: LazyType::Start,
+            files: HowToPlaceFiles::CopyEachFile(files),
+            script: SetupScript::default(),
+            order: 0,
+            merge_enabled: true,
+            is_plugctl: false,
+            dotgit: true,
+        };
+        let plugin_id = loaded.plugin_id();
+
+        let mut state = PackPathState::new();
+        state.insert(loaded);
+        state.install(&packpath).await.unwrap();
+
+        let git_dir = packpath
+            .join("pack/_gen/opt")
+            .join(plugin_id.as_str())
+            .join(".git");
+        assert!(git_dir.is_dir(), ".git must be copied into pack for dotgit");
+        assert_eq!(
+            std::fs::read(git_dir.join("HEAD")).unwrap(),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(
+            std::fs::read(git_dir.join("refs/heads/main")).unwrap(),
+            b"0123456789012345678901234567890123456789\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn directory_entry_is_cloned_into_pack() {
+        // read_dir 化（Plugin::load）を模倣し、ルート直下のディレクトリエントリ（lua）と
+        // ファイルエントリ（init.lua）が混在する LoadedPlugin を install する。
+        // ディレクトリは clone_dir で中身ごと copy、ファイルは yank されることを検証する。
+        let dir = std::env::temp_dir().join(format!("rsplug-direntry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let snapshot_root = dir.join("snapshot");
+        let packpath = dir.join("packpath");
+        std::fs::create_dir_all(snapshot_root.join("lua/mymod")).unwrap();
+        std::fs::write(snapshot_root.join("lua/mymod/init.lua"), "print('lua')\n").unwrap();
+        std::fs::write(snapshot_root.join("init.lua"), "print('root')\n").unwrap();
+
+        let snapshot = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/owner/repo"),
+            b"0123456789012345678901234567890123456789".to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let root = snapshot_root.to_string_lossy().into_owned();
+        let files = BTreeMap::from([
+            repo_file(snapshot.clone(), "lua", &root),
+            repo_file(snapshot, "init.lua", &root),
+        ]);
+        let loaded = synth(HowToPlaceFiles::CopyEachFile(files));
+        let plugin_id = loaded.plugin_id();
+
+        let mut state = PackPathState::new();
+        state.insert(loaded);
+        state.install(&packpath).await.unwrap();
+
+        let pkg = packpath.join("pack/_gen/opt").join(plugin_id.as_str());
+        // ディレクトリエントリ（lua）は clone_dir で中身ごと copy される
+        assert_eq!(
+            std::fs::read(pkg.join("lua/mymod/init.lua")).unwrap(),
+            b"print('lua')\n",
+            "directory entry must be cloned recursively"
+        );
+        // ファイルエントリ（init.lua）は yank される
+        assert_eq!(
+            std::fs::read(pkg.join("init.lua")).unwrap(),
+            b"print('root')\n",
+            "file entry must be yanked"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

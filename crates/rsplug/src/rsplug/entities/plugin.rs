@@ -595,37 +595,39 @@ impl Plugin {
         let filesource = Arc::new(FileSource::Directory {
             path: snapshot_root_path.clone(),
         });
-        // build 成果物（untracked）を含めるか。has_build のとき ls-files+untracked、
-        // それ以外は tracked のみ。sym 廃止後は常に CopyEachFile で pack に copy する。
-        let files = if has_build {
-            repository.ls_files_with_untracked().await?
-        } else {
-            repository.ls_files().await?
-        };
+        // ls-files 列挙を廃止し、snapshot ルート直下を read_dir で1階層列挙する。
+        // ディレクトリ（lua/plugin/doc 等）も1エントリにまとめ、install で clone_dir する
+        //（ファイル数分の syscall を削減）。target/ 等の build 成果物は ignore 対象外なので
+        // pack に残る（旧 ls_files_with_untracked と同等）。.git/.rsplug_build_success は
+        // ignore.gitignore で除外される。
+        let mut entries: Vec<PathBuf> = Vec::new();
+        {
+            let mut rd = tokio::fs::read_dir(snapshot_root_path.as_ref()).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                entries.push(PathBuf::from(entry.file_name()));
+            }
+        }
+        entries.sort(); // 決定論的順序（plugin_id 安定化）
         let mut lazy_type = lazy_type.clone();
-        for luam in extract_unique_lua_modules(files.iter()) {
+        for luam in extract_unique_lua_modules_from_snapshot(snapshot_root_path.as_ref()).await {
             lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
         }
         let files: HowToPlaceFiles = HowToPlaceFiles::CopyEachFile(
-            files
+            entries
                 .into_iter()
-                .filter_map(|path| {
-                    let ignored = merge.ignore.matched(&path);
-                    if !ignored && snapshot_root_path.join(&path).is_file() {
-                        Some((
-                            path.clone(),
-                            FileItem {
-                                source: filesource.clone(),
-                                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
-                                    identity.clone(),
-                                    path,
-                                )),
-                                merge_type: MergeType::Conflict,
-                            },
-                        ))
-                    } else {
-                        None
-                    }
+                .filter(|name| !merge.ignore.matched(name))
+                .map(|name| {
+                    (
+                        name.clone(),
+                        FileItem {
+                            source: filesource.clone(),
+                            identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                                identity.clone(),
+                                name,
+                            )),
+                            merge_type: MergeType::Conflict,
+                        },
+                    )
                 })
                 .collect(),
         );
@@ -987,34 +989,35 @@ async fn latest_snapshot_oid(worktrees: &Path) -> Result<Option<Oid>, Error> {
     Ok(Oid::from_str(commit).ok())
 }
 
-fn extract_unique_lua_modules<'a>(
-    files: impl Iterator<Item = &'a PathBuf> + 'a,
-) -> impl Iterator<Item = String> + 'a {
+/// snapshot の `lua/` 直下から Lua module 名を抽出する。
+/// `lua/<name>`（ディレクトリ）or `lua/<name>.lua`（ファイル）の stem を取る。
+/// ls-files 廃止に伴い read_dir で取得する（`lua/` が無ければ空）。
+async fn extract_unique_lua_modules_from_snapshot(snapshot_root: &Path) -> Vec<String> {
+    let mut rd = match tokio::fs::read_dir(snapshot_root.join("lua")).await {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
     let mut seen = hashbrown::HashSet::new();
-
-    files.filter_map(move |path| {
-        let mut comps = path.components();
-
-        // 先頭が "lua" でなければ対象外
-        match comps.next().and_then(|c| c.as_os_str().to_str()) {
-            Some("lua") => {}
-            _ => return None,
-        }
-
-        // lua/ の直後を取得
-        let comp = comps.next()?;
-
-        let name = Path::new(comp.as_os_str())
-            .file_stem() // hoge2.lua → hoge2
-            .and_then(|s| s.to_str())?
-            .to_string();
-
-        if !name.is_empty() && seen.insert(name.clone()) {
-            Some(name)
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let stem = if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            name
         } else {
-            None
+            Path::new(&name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if !stem.is_empty() && seen.insert(stem.clone()) {
+            out.push(stem);
         }
-    })
+    }
+    out
 }
 
 async fn build_repo_snapshot_identity(

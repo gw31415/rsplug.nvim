@@ -36,8 +36,8 @@ rsplug.nvim は2つの系を持つ:
 - [x] (2026-07-08) Phase 3: テスト整理・実機検証。コード側テスト（`snapshot_link_id_*`/`to_sym` 系）は Phase 2 で削除済み。build 成果物 copy の実機検証は Phase 4 の blink.cmp 検証（`target/release/libblink_cmp_fuzzy.dylib` が pack に届きロード成功）で実施済み。`:helptags`・lazy load が壊れないことも blink.cmp 実機で確認（messages 空）。
 - [x] (2026-07-08) Phase 4: `dotgit` オプション実装（commit `78a9feb` + 修正 `98651d6`）。pack に `.git` 複製、dotgit=true は GitFetch 強制（`use_tarball = !dotgit && ...`）。blink.cmp で `git rev-parse HEAD` が version file と一致、fuzzy.rust が outdated/Lua-fallback 無しでロード（RUST_OK=true, messages 空）を確認。
 - [x] (2026-07-08) Phase 4b: `dotgit=true` なのに既存 snapshot に `.git` が無い場合、`PluginDotgitMissing` WARNING を出して pack への配置をスキップ（commit `854ac77`）。回復手段は `-u` を案内（`-i` は既存 cache の再生成には効かない）。テスト `dotgit_missing_snapshot_skips_install` / `warn_dotgit_missing_uses_refresh_hint` で検証。
-- [ ] Phase 5: `FileSource::yank` の clonefile 対応（ディレクトリ単位、実行時フォールバック）。
-- [ ] Phase 6: `CopyEachFile` をディレクトリ・ファイル不分別辞書に（遅延評価）。
+- [x] (2026-07-09) Phase 5: `clone_dir` プリミティブ実装。macOS APFS 同 volume で `clonefile(2)` によりディレクトリ階層全体を1 syscall・CoW で copy（ファイル数分の syscall を削減）。`AtomicBool CLONEFILE_AVAILABLE` で実行時キャッシュし、unsupported エラー（EXDEV/ENOTSUP/ENOSYS/EOPNOTSUPP）で再帰 copy（`copy_dir_all`）にフォールバック固定。dotgit `.git` copy に適用。テスト `clone_dir_preserves_files_dirs_and_symlinks`（ファイル/ディレクトリ/symlink 保持 + 独立 inode）・`dotgit_copies_git_dir_into_pack`（dotgit で .git が pack に copy される）。
+- [~] (2026-07-09) Phase 6: `CopyEachFile` をディレクトリ・ファイル不分別辞書に（snapshot ディレクトリ copy・merge 2a-2c）。**6a 完了**: `Plugin::load` read_dir 化（ルート直下エントリ・ignore.gitignore に `.git`/`.rsplug_build_success` 追加）・install `Files` を dirs/files 分割（dirs→`clone_dir`/`merge_copy_dir`・files→`yank`）・util.rs `ls_files` 系 + テスト削除（6c 前倒し）。テスト `directory_entry_is_cloned_into_pack`。**6b 残**: merge 2a-2c（`dirs_mergeable`/`entries_mergeable`・子要素再帰）・PlugCtl doc 盗み `doc` キー対応。**6c 残**: PLANS 改訂。**plugin_id 非互換**（ルート直下エントリで hash 変更・既存 pack/lock は再生成）。
 - [ ] Phase 7: FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更。
 
 
@@ -85,6 +85,10 @@ rsplug.nvim は2つの系を持つ:
   Rationale: 最近の Rust では `std::fs::copy` が macOS/APFS で `fclonefileat`/`clonefile`（CoW）を使用し、HFS+ では `fcopyfile` にフォールバックする（std が自動切替）。自前 clonefile と同等で、フォールバック含め std に委ねる方が保守負荷が低い。非 macOS は `hard_link` → `copy`（ExDev）を維持（hard_link が走るのは非 macOS 同一FS のみ）。
   Date: 2026-07-07.
 
+- Decision: **ディレクトリ単位** copy には macOS 限定で自前 `clonefile(2)` を再導入する（Phase 5）。ファイル単位の yank は引き続き std 任せ（触らない）。
+  Rationale: 2026-07-07 の revert は「**ファイル単位**なら std::fs::copy が CoW を使う」が理由。しかし `std::fs::copy` はディレクトリを copy できず、ディレクトリ階層全体を1 syscall・CoW で clone できるのは `clonefile(2)` のみ（man clonefile: src がディレクトリなら階屷全体を再帰 clone・symlink も保持）。`.git`（object store 等の多数ファイル）の copy で syscall 削減効果が大きい。戦略は `AtomicBool`（clonefile 可否の2値）で実行時キャッシュし、一度 unsupported（EXDEV/ENOTSUP/ENOSYS/EOPNOTSUPP）なら再帰 copy に固定して無駄な syscall を避ける。当初計画の `AtomicU8`（0=clonefile/1=hardlink/2=copy）でなく `AtomicBool` にした理由: ディレクトリ copy では hardlink が選択肢に入らない（ディレクトリの hardlink 不可＋inode 共有で元 snapshot 編集が pack に漏れる＝自己完結理念違反）。hardlink/copy のファイル単位切り替えはフォールバック先 `copy_dir_all` 内部（yank と同ロジック）に任せる。
+  Date: 2026-07-09.
+
 
 ## Outcomes & Retrospective
 
@@ -95,6 +99,7 @@ rsplug.nvim は2つの系を持つ:
 - (2026-07-08) Phase 3 残課題（Neowright 実機確認）は解決: Phase 4 の blink.cmp 実機検証で、ネイティブライブラリ（`target/release/libblink_cmp_fuzzy.dylib`）が pack に届き、lazy load・`:helptags` が壊れないことを確認（messages 空）。
 - (2026-07-08) Phase 4（dotgit）実装・検証: `dotgit` オプション（デフォルト false）。`true` のプラグインは snapshot の `.git` を pack に全体 copy し、blink.cmp の `.git` チェック問題（outdated 判定 → Lua fallback）を根本解決。実機で `git rev-parse HEAD` が version file と一致、fuzzy.rust が正常ロード（RUST_OK=true, messages 空）。dotgit=true は GitFetch 強制だが、既存 snapshot（TarballFetch 由来等）があれば `snapshot_exists_for_oid` で source.git 作成をスキップし再利用（`98651d6`）。
 - (2026-07-08) Phase 4b（WARNING）実装・検証: `dotgit=true` で snapshot に `.git` が無い（= copy 不能）場合、`Message::PluginDotgitMissing` 警告を出して pack install を skip。回復は `-u` を案内（`-i` は既存 cache 再生成に非効力）。テスト `dotgit_missing_snapshot_skips_install`（pack に copy されない）と `warn_dotgit_missing_uses_refresh_hint`（メッセージ内容）で検証。
+- (2026-07-09) Phase 5（clone_dir）実装・検証: `clone_dir` プリミティブ（macOS `clonefile_dir` FFI + `CLONEFILE_AVAILABLE: AtomicBool` 実行時キャッシュ + `copy_dir_all` フォールバック）を追加。dotgit の `.git` copy（`packpathstate.rs` install 内）を `copy_dir_all` → `clone_dir` に切替。macOS/APFS 同 volume で `.git` 全体が1 syscall・CoW・独立 inode で配置される（object store 等のファイル数に比例した syscall を削減し、元 snapshot 編集の影響も受けない）。非 macOS・非 APFS・別 volume は自動で再帰 copy にフォールバック。テスト `clone_dir_preserves_files_dirs_and_symlinks`（ファイル/ディレクトリ/symlink 保持 + 元編集で dst 不変＝独立 inode）・`dotgit_copies_git_dir_into_pack`（dotgit で .git が pack に copy される）で検証。
 
 
 ## Context and Orientation
@@ -235,3 +240,4 @@ Unless noted, all commands run from the repository root.
 - 2026-07-07: 初版。設計検討完了（案1 copy 統一、`ls-files`+untracked、`hard_link` フォールバック）。Phase 0/1 を safe-now、Phase 2 を廃止、Phase 3 を実機検証とする。実装は未着手。
 - 2026-07-08: 実機検証で blink.cmp の `.git` チェック問題を発見。Phase 4（`dotgit` オプション）を追加。Phase 5-7（clonefile yank / 辞書不分別 / FetchTarball `.git` 削除）を後続計画として追加。
 - 2026-07-09: Phase 3/4/4b 完了を Progress・Outcomes に反映。実装・検証は 2026-07-08 に完了済み（`78a9feb`/`98651d6`/`854ac77`）だが、レート制限でドキュメント更新が滞留していた。`cargo test`/`clippy -D warnings`/`fmt --check` すべて再確認グリーン。Phase 5-7 は後続計画として未着手。
+- 2026-07-09: Phase 5 実装（`clone_dir` + dotgit `.git` copy の clonefile 化）。Phase 6（`CopyEachFile` をディレクトリ・ファイル不分別辞書に）・Phase 7（FetchTarball の `.git` 削除 + ハッシュ計算変更）は後続。

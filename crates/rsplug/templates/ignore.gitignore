@@ -7,10 +7,12 @@ Makefile
 README
 README.md
 README.txt
+.git
 .gitattributes
 .github
 .gitignore
 .gitmessage
 .luacheckrc
+.rsplug_build_success
 .tool-versions
 .vscode
