@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
     time::SystemTime,
 };
@@ -134,6 +134,16 @@ pub(super) enum FileIdentity {
     GeneratedFile { path: PathBuf, data_hash: [u8; 16] },
 }
 
+impl FileIdentity {
+    /// snapshot root（あるいは配置ルート）からの相対パス。種別解決・copy 配置で使う。
+    pub(super) fn relative_path(&self) -> &Path {
+        match self {
+            FileIdentity::RepoFile(r) => &r.relative_path,
+            FileIdentity::GeneratedFile { path, .. } => path,
+        }
+    }
+}
+
 /// プラグインファイルの配置方法。
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) enum HowToPlaceFiles {
@@ -165,8 +175,9 @@ pub struct LoadedPlugin {
     pub(super) merge_enabled: bool,
     /// PlugCtlを元に作成されたかどうか
     pub(super) is_plugctl: bool,
-    /// pack に `.git` を複製するか（git 利用プラグイン用）。`dotgit=true` かつ repo 由来なら
-    /// snapshot の `.git` を `pack/_gen/opt/<id>/.git` に copy する。
+    /// pack に `.git` を含めるか（git 利用プラグイン用）。`dotgit=true` なら `Plugin::load` が
+    /// `.git` を通常 sealed-dir エントリとして列挙に含め（他ディレクトリと同一経路で copy される）、
+    /// install で `.git` エントリが無ければ `PluginDotgitMissing` で skip する。
     pub(super) dotgit: bool,
 }
 
@@ -191,12 +202,93 @@ impl LoadedPlugin {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+/// FileItem の種別（file/dir）。実行時に遅延解決され `FileItem.kind` にキャッシュされる。
+/// 配置情報であり identity ではないため hash/eq には含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileKind {
+    File,
+    Directory,
+}
+
+/// 種別キャッシュの内部値（`FileItem.kind`）。
+const KIND_UNCACHED: u8 = 0;
+const KIND_FILE: u8 = 1;
+const KIND_DIRECTORY: u8 = 2;
+
+#[derive(Debug)]
 pub(super) struct FileItem {
     pub source: Arc<FileSource>,
     /// ファイルの論理 identity。絶対配置パスは含まず、repo 由来か生成かで決まる。
     pub identity: FileIdentity,
     pub merge_type: MergeType,
+    /// 種別キャッシュ（実行時）。`KIND_UNCACHED`/`KIND_FILE`/`KIND_DIRECTORY`。
+    /// hash/eq から除外（plugin_id を非決定論化しない）。
+    kind: AtomicU8,
+}
+
+// identity に関わる3フィールドのみで同値・hash を判定する。`kind`（実行時キャッシュ）は除外。
+impl PartialEq for FileItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.identity == other.identity
+            && self.merge_type == other.merge_type
+    }
+}
+
+impl Eq for FileItem {}
+
+impl Hash for FileItem {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.source.hash(state);
+        self.identity.hash(state);
+        self.merge_type.hash(state);
+    }
+}
+
+impl FileItem {
+    pub(super) fn new(
+        source: Arc<FileSource>,
+        identity: FileIdentity,
+        merge_type: MergeType,
+    ) -> Self {
+        Self {
+            source,
+            identity,
+            merge_type,
+            kind: AtomicU8::new(KIND_UNCACHED),
+        }
+    }
+
+    /// このエントリの種別（file/dir）。初回のみ filesystem で解決しキャッシュする。
+    /// `FileSource::File`（生成ファイル）は常に file。
+    pub(super) fn kind(&self) -> FileKind {
+        let cached = self.kind.load(AtomicOrdering::Acquire);
+        if cached != KIND_UNCACHED {
+            return if cached == KIND_DIRECTORY {
+                FileKind::Directory
+            } else {
+                FileKind::File
+            };
+        }
+        let resolved = match self.source.as_ref() {
+            FileSource::File { .. } => FileKind::File,
+            FileSource::Directory { path } => {
+                if path.join(self.identity.relative_path()).is_dir() {
+                    FileKind::Directory
+                } else {
+                    FileKind::File
+                }
+            }
+        };
+        self.kind.store(
+            match resolved {
+                FileKind::File => KIND_FILE,
+                FileKind::Directory => KIND_DIRECTORY,
+            },
+            AtomicOrdering::Release,
+        );
+        resolved
+    }
 }
 
 impl PartialOrd for LoadedPlugin {
@@ -313,7 +405,7 @@ impl Add for LoadedPlugin {
                         is_plugctl: r_is_plugctl,
                         dotgit: r_dotgit,
                     } = rhs;
-                    files.extend(rfiles);
+                    files = union_files(files, rfiles);
                     script += rscript;
                     let order = order.min(r_order);
 
@@ -418,6 +510,80 @@ fn read_dir_children(dir: &Path) -> HashSet<OsString> {
     set
 }
 
+/// `files` と `rfiles` を union する。同 path の sealed-dir 衝突は1段展開して
+/// 子 key に置換する（Phase 6a で入った `extend` 上書きによる片側消失を防ぐ）。
+/// `dirs_mergeable(files, rfiles)` が true（全衝突が解決可能）の前提で呼ぶ。
+fn union_files(
+    mut files: BTreeMap<PathBuf, FileItem>,
+    rfiles: BTreeMap<PathBuf, FileItem>,
+) -> BTreeMap<PathBuf, FileItem> {
+    for (path, ritem) in rfiles {
+        match files.remove(&path) {
+            None => {
+                files.insert(path, ritem);
+            }
+            Some(litem) => {
+                if litem.kind() == FileKind::Directory && ritem.kind() == FileKind::Directory {
+                    // 両者 sealed-dir: 1段展開して子 key で union。
+                    expand_dir_union(&mut files, &path, litem, ritem);
+                } else {
+                    // file/file（predicate 済みで両者 Overwrite）: rhs 勝ち（旧 extend 互換）。
+                    files.insert(path, ritem);
+                }
+            }
+        }
+    }
+    files
+}
+
+/// 同 path の sealed-dir 同士（`litem`, `ritem`）を1段展開し、子 key を `out` に union する。
+/// 共通の子が両方 directory なら更に1段展開（再帰）、file/file なら rhs 勝ち。
+fn expand_dir_union(
+    out: &mut BTreeMap<PathBuf, FileItem>,
+    path: &Path,
+    litem: FileItem,
+    ritem: FileItem,
+) {
+    let lroot = snapshot_root_of(&litem.source).expect("directory item has Directory source");
+    let rroot = snapshot_root_of(&ritem.source).expect("directory item has Directory source");
+    let lchildren = read_dir_children(&lroot.join(path));
+    let rchildren = read_dir_children(&rroot.join(path));
+    for child in &lchildren {
+        let cpath = path.join(child);
+        let lc = child_item(&litem, cpath.clone());
+        if rchildren.contains(child) {
+            let rc = child_item(&ritem, cpath.clone());
+            if lc.kind() == FileKind::Directory && rc.kind() == FileKind::Directory {
+                expand_dir_union(out, &cpath, lc, rc);
+            } else {
+                out.insert(cpath, rc);
+            }
+        } else {
+            out.insert(cpath, lc);
+        }
+    }
+    for child in &rchildren {
+        if !lchildren.contains(child) {
+            let cpath = path.join(child);
+            let rc = child_item(&ritem, cpath.clone());
+            out.insert(cpath, rc);
+        }
+    }
+}
+
+/// `parent`（sealed-dir エントリ）の直下の子 `child_path` に対応する FileItem を作る。
+/// source は親と同じ snapshot root、identity は RepoFile で子パスを束ね直す。
+fn child_item(parent: &FileItem, child_path: PathBuf) -> FileItem {
+    let identity = match &parent.identity {
+        FileIdentity::RepoFile(r) => {
+            FileIdentity::RepoFile(RepoFileIdentity::new(r.snapshot.clone(), child_path))
+        }
+        // sealed-dir は Directory source（RepoFile）なので GeneratedFile には到達しない。
+        FileIdentity::GeneratedFile { .. } => parent.identity.clone(),
+    };
+    FileItem::new(parent.source.clone(), identity, parent.merge_type)
+}
+
 /// ファイルの取得(生成)元。
 #[derive(Debug)]
 pub(super) enum FileSource {
@@ -452,46 +618,26 @@ impl Hash for FileSource {
 }
 
 impl FileSource {
-    /// whichfile が install_dir からの相対パスとなるようにデータを配置する。
+    /// `whichfile`（install_dir からの相対パス）にデータを配置する。
+    /// Directory source はファイルシステム上の実際の種別（ディレクトリ・ファイル・symlink）に
+    /// 応じて `place_path` に配置を一任し、File source はデータを書き出す。
     async fn yank(
         &self,
         whichfile: impl AsRef<Path>,
         install_dir: impl AsRef<Path>,
     ) -> io::Result<()> {
-        async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-            tokio::fs::create_dir_all(to.as_ref().parent().unwrap()).await?;
-            #[cfg(target_os = "macos")]
-            {
-                tokio::fs::copy(from, to).await?;
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                // hard_link は同一ファイルシステムのみ。別FS（Nix store 等）へ配置すると
-                // ExDev (errno 18) で失敗するため、そのときは copy にフォールバックする。
-                // copy はディスクを消費するが、pack を自己完結させる（sym 廃止）前提では必須。
-                const EXDEV: i32 = 18;
-                if let Err(e) = tokio::fs::hard_link(from.as_ref(), to.as_ref()).await {
-                    if e.raw_os_error() == Some(EXDEV) {
-                        tokio::fs::copy(from.as_ref(), to.as_ref()).await?;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        use FileSource::*;
         match self {
-            Directory { path } => {
-                let from = path.join(&whichfile);
-                let to = install_dir.as_ref().join(&whichfile);
-                copy(from, to).await
+            FileSource::Directory { path } => {
+                let src = path.join(&whichfile);
+                let dst = install_dir.as_ref().join(&whichfile);
+                place_path(&src, &dst).await
             }
-            File { data } => {
-                let path = install_dir.as_ref().join(whichfile);
-                tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-                tokio::fs::write(path, data).await?;
+            FileSource::File { data } => {
+                let dst = install_dir.as_ref().join(whichfile);
+                if let Some(parent) = dst.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(dst, data).await?;
                 Ok(())
             }
         }
@@ -500,11 +646,8 @@ impl FileSource {
 
 struct Files {
     is_plugctl: bool,
-    /// ディレクトリエントリ: 同 path に複数 source（マージされたディレクトリ）。
-    /// install で各 source を順次 copy（1個目 `clone_dir`・2個目以降 `merge_copy_dir`）。
-    dirs: Vec<(PathBuf, Vec<Arc<FileSource>>)>,
-    /// ファイルエントリ: `source.yank` で copy。GeneratedFile 含む。
-    files: Vec<(PathBuf, Arc<FileSource>)>,
+    /// 配置エントリ（ファイル・sealed-dir 不分別）。install で各 `source.yank` に任せる。
+    entries: Vec<(PathBuf, Arc<FileSource>)>,
     /// dotgit=true かつ repo 由来なら install 時に snapshot の .git を pack に copy する。
     dotgit: bool,
 }
@@ -560,12 +703,211 @@ fn render_init(control_ids: &[PluginIDStr]) -> Vec<u8> {
         .unwrap_or_else(|_| Vec::new())
 }
 
-/// macOS APFS の `clonefile(2)` でディレクトリ階層全体を1 syscall・CoW で clone する。
-/// ファイル数に比例した syscall を削減できる（`.git` の object store 等で効果大）。
-/// 非 APFS・別 volume・カーネル未対応では失敗し、呼び出し元が `copy_dir_all` にフォールバックする。
+// ---- pack copy 戦略（Phase 6c） ----
+// 配置入口を `FileSource::yank` → `place_path` → `copy_tree`/`copy_file_with_strategy`
+// に統一し、実行時に reflink → hardlink → copy へ単調昇格する。
+
+/// 実行時 copy 戦略。失敗に応じて単調に昇格する。
+/// `0` = reflink（macOS `clonefile` / Linux `FICLONE`）
+/// `1` = hardlink
+/// `2` = copy（内容複製）
+static COPY_STRATEGY: AtomicU8 = AtomicU8::new(INITIAL_COPY_STRATEGY);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const INITIAL_COPY_STRATEGY: u8 = STRATEGY_REFLINK;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const INITIAL_COPY_STRATEGY: u8 = STRATEGY_HARDLINK;
+
+const STRATEGY_REFLINK: u8 = 0;
+const STRATEGY_HARDLINK: u8 = 1;
+const STRATEGY_COPY: u8 = 2;
+
+/// 別 filesystem を跨ぐ errno（reflink も hardlink も不可）。
+const EXDEV: i32 = 18;
+
+fn copy_strategy() -> u8 {
+    COPY_STRATEGY.load(AtomicOrdering::Relaxed)
+}
+
+/// 失敗に応じて戦略を昇格（単調）。`EXDev` は hardlink も失敗するため `copy` まで jump する。
+fn advance_strategy(error: &io::Error) {
+    let target = if error.raw_os_error() == Some(EXDEV) {
+        STRATEGY_COPY
+    } else {
+        copy_strategy().saturating_add(1).min(STRATEGY_COPY)
+    };
+    COPY_STRATEGY.fetch_max(target, AtomicOrdering::AcqRel);
+}
+
+/// reflink が「この環境では使えない」エラーか（1段昇格して hardlink へ）。
+#[cfg(target_os = "macos")]
+fn reflink_unsupported(e: &io::Error) -> bool {
+    // EXDEV は別経路で copy まで jump するのでここでは除外。
+    const ENOTSUP: i32 = 45;
+    const ENOSYS: i32 = 78;
+    const EOPNOTSUPP: i32 = 102;
+    matches!(
+        e.raw_os_error(),
+        Some(ENOTSUP) | Some(ENOSYS) | Some(EOPNOTSUPP)
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn reflink_unsupported(e: &io::Error) -> bool {
+    const ENOTTY: i32 = 25;
+    const ENOSYS: i32 = 38;
+    const EOPNOTSUPP: i32 = 95;
+    matches!(
+        e.raw_os_error(),
+        Some(ENOTTY) | Some(ENOSYS) | Some(EOPNOTSUPP)
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn reflink_unsupported(_e: &io::Error) -> bool {
+    // reflink 非対応プラットフォーム: 常に別方式へフォールバック。
+    true
+}
+
+/// reflink 試行の失敗が「別方式へフォールバック」すべきものか。
+fn reflink_should_fallback(e: &io::Error) -> bool {
+    reflink_unsupported(e) || e.raw_os_error() == Some(EXDEV)
+}
+
+/// 1ファイルを reflink で CoW clone する。対応環境でのみ成功。
+/// dst は未存在・親は存在が前提（実装が dst を新規作成する）。
+#[cfg(target_os = "macos")]
+async fn reflink_file(src: &Path, dst: &Path) -> io::Result<()> {
+    clonefile(src, dst).await
+}
+
+#[cfg(target_os = "linux")]
+async fn reflink_file(src: &Path, dst: &Path) -> io::Result<()> {
+    ficlone_file(src, dst).await
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+async fn reflink_file(_src: &Path, _dst: &Path) -> io::Result<()> {
+    // reflink 非対応: unsupported（hardlink/copy へフォールバック）。
+    Err(io::Error::from_raw_os_error(38)) // ENOSYS
+}
+
+/// 1ファイルを現在の戦略で配置。未対応/`EXDev` エラーで戦略を昇格して再試行する。
+async fn copy_file_with_strategy(src: &Path, dst: &Path) -> io::Result<()> {
+    loop {
+        match copy_strategy() {
+            s if s == STRATEGY_REFLINK => match reflink_file(src, dst).await {
+                Ok(()) => return Ok(()),
+                Err(e) if reflink_should_fallback(&e) => {
+                    advance_strategy(&e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
+            STRATEGY_HARDLINK => match tokio::fs::hard_link(src, dst).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                    advance_strategy(&e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
+            _ => {
+                tokio::fs::copy(src, dst).await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// `src`（file/dir/symlink）を `dst` に配置する。ディレクトリは `copy_tree`、それ以外は `copy_leaf`。
+async fn place_path(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = tokio::fs::symlink_metadata(src).await?;
+    if meta.is_dir() {
+        copy_tree(src, dst).await
+    } else {
+        copy_leaf(src, dst).await
+    }
+}
+
+/// leaf（ファイル/symlink）を `dst` に配置する。ディレクトリは扱わない（呼出元が mkdir 済み）。
+async fn copy_leaf(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = tokio::fs::symlink_metadata(src).await?;
+    if meta.is_symlink() {
+        let target = tokio::fs::read_link(src).await?;
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        #[cfg(unix)]
+        tokio::fs::symlink(&target, dst).await?;
+        // Windows は symlink 作成に権限が必要なため実体 copy にフォールバック。
+        #[cfg(not(unix))]
+        {
+            tokio::fs::copy(src, dst).await?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        copy_file_with_strategy(src, dst).await
+    }
+}
+
+/// ディレクトリを copy。macOS かつ reflink 戦略なら `clonefile(2)` でディレクトリ全体を
+/// 1 syscall・CoW で clone し、失敗時は再帰 per-file copy にフォールバックする
+/// （CoW かつ独立 inode なので元 snapshot を編集しても pack に影響しない）。
+/// フォールバック時はスタックでディレクトリを walk して leaf のみ `JoinSet` で並列 copy する
+/// （`copy_leaf` は非再帰なので、再帰的 future 型による Send 推論の破綻を避ける）。
+async fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if copy_strategy() == STRATEGY_REFLINK {
+        // clonefile は dst を新規作成するので親だけ作る。
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match clonefile(src, dst).await {
+            Ok(()) => return Ok(()),
+            Err(e) if reflink_should_fallback(&e) => {
+                advance_strategy(&e);
+                // フォールバック: dst は未作成のまま walk へ。
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    tokio::fs::create_dir_all(dst).await?;
+    let mut leaves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        let meta = tokio::fs::symlink_metadata(&s).await?;
+        if meta.is_dir() {
+            tokio::fs::create_dir_all(&d).await?;
+            let mut entries = tokio::fs::read_dir(&s).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name();
+                stack.push((s.join(&name), d.join(&name)));
+            }
+        } else {
+            leaves.push((s, d));
+        }
+    }
+    let mut sub = JoinSet::new();
+    for (s, d) in leaves {
+        sub.spawn(async move { copy_leaf(&s, &d).await });
+    }
+    while let Some(res) = sub.join_next().await {
+        res.map_err(|e| io::Error::other(format!("copy join failed: {e}")))??;
+    }
+    Ok(())
+}
+
+// ---- プラットフォーム固有 reflink 実装 ----
+
+/// macOS APFS の `clonefile(2)` で file/dir を1 syscall・CoW で clone する。
+/// 非 APFS・別 volume・カーネル未対応では失敗し、呼び出し元が再帰 copy にフォールバックする。
 /// dst は未存在・親は存在が前提（`clonefile` が dst を新規作成する）。
 #[cfg(target_os = "macos")]
-async fn clonefile_dir(src: &Path, dst: &Path) -> io::Result<()> {
+async fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int};
     use std::os::unix::ffi::OsStrExt;
@@ -591,110 +933,37 @@ async fn clonefile_dir(src: &Path, dst: &Path) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("clonefile join failed: {e}")))?
 }
 
-/// `clonefile` が「この環境では使えない」エラーか（フォールバック対象）。
-/// EXDEV=別 volume, ENOTSUP=非APFS/属性未対応, ENOSYS=未実装, EOPNOTSUPP=未サポート。
-/// いずれかなら以降のディレクトリ copy を再帰 copy に固定する。
-#[cfg(target_os = "macos")]
-fn clonefile_unsupported(e: &io::Error) -> bool {
-    const EXDEV: i32 = 18;
-    const ENOTSUP: i32 = 45;
-    const ENOSYS: i32 = 78;
-    const EOPNOTSUPP: i32 = 102;
-    matches!(
-        e.raw_os_error(),
-        Some(EXDEV) | Some(ENOTSUP) | Some(ENOSYS) | Some(EOPNOTSUPP)
-    )
-}
-
-/// `clonefile` が効くか（APFS・同 volume）を実行時にキャッシュ。
-/// 一度でも unsupported エラーなら false に固定し、無駄な syscall を避ける。
-#[cfg(target_os = "macos")]
-static CLONEFILE_AVAILABLE: AtomicBool = AtomicBool::new(true);
-
-/// ディレクトリを copy する。macOS かつ APFS 同 volume なら `clonefile(2)` で
-/// ディレクトリ全体を1 syscall・CoW で clone し、ファイル数分の syscall を削減する
-/// （CoW かつ独立 inode なので、元 snapshot を編集しても pack に影響しない）。
-/// clonefile 非対応環境（非 APFS・別 volume・非 macOS）では `copy_dir_all`（再帰 copy）にフォールバックする。
-async fn clone_dir(src: &Path, dst: &Path) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    if CLONEFILE_AVAILABLE.load(AtomicOrdering::Relaxed) {
-        // dst の親を作成（dst 自体は clonefile が新規作成するので未存在のまま）。
-        if let Some(parent) = dst.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        match clonefile_dir(src, dst).await {
-            Ok(()) => return Ok(()),
-            Err(e) if clonefile_unsupported(&e) => {
-                CLONEFILE_AVAILABLE.store(false, AtomicOrdering::Relaxed);
-                // フォールバック: dst は未作成のまま copy_dir_all へ（先頭で create_dir_all する）。
-            }
-            Err(e) => return Err(e),
-        }
+/// Linux の `ioctl(FICLONE)` で1ファイルを CoW clone（reflink）する。
+/// btrfs/xfs 等 reflink 対応 FS でのみ成功。dst は未存在・親は存在が前提。
+#[cfg(target_os = "linux")]
+async fn ficlone_file(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::raw::{c_int, c_ulong};
+    use std::os::unix::io::AsRawFd;
+    // FICLONE = _IOW(0x94, 9, int) = 0x40049409
+    const FICLONE: c_ulong = 0x40049409;
+    extern "C" {
+        fn ioctl(fd: c_int, request: c_ulong, arg: c_int) -> c_int;
     }
-    copy_dir_all(src, dst).await
-}
-
-/// ディレクトリを再帰的に copy（ファイル・ディレクトリ・symlink を保持）。
-/// `clone_dir` のフォールバック先、および非 macOS 既定のディレクトリ copy。
-async fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
-    tokio::fs::create_dir_all(dst).await?;
-    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
-    while let Some((s, d)) = stack.pop() {
-        let meta = tokio::fs::symlink_metadata(&s).await?;
-        if meta.is_dir() {
-            tokio::fs::create_dir_all(&d).await?;
-            let mut entries = tokio::fs::read_dir(&s).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let name = entry.file_name();
-                stack.push((s.join(&name), d.join(&name)));
-            }
-        } else if meta.is_symlink() {
-            let target = tokio::fs::read_link(&s).await?;
-            #[cfg(unix)]
-            tokio::fs::symlink(&target, &d).await?;
-            // Windows では symlink 作成に権限が必要なためファイル copy にフォールバック
-            #[cfg(not(unix))]
-            {
-                tokio::fs::copy(&s, &d).await?;
-            }
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let src_f = std::fs::File::open(&src)?;
+        let dst_f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&dst)?;
+        // SAFETY: FICLONE ioctl に src fd を渡し dst に reflink させる。3 引数固定呼出。
+        let ret = unsafe { ioctl(dst_f.as_raw_fd(), FICLONE, src_f.as_raw_fd()) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            let _ = std::fs::remove_file(&dst); // 部分作成した空 dst を掃除
+            Err(e)
         } else {
-            tokio::fs::copy(&s, &d).await?;
+            Ok(())
         }
-    }
-    Ok(())
-}
-
-/// マージされたディレクトリを統合 copy。dst は既存（clone_dir 済み）の前提で、
-/// src の各エントリを dst に上書きする。dirs_mergeable で子競合無しなので、
-/// 上書きされるのは「片方にだけ存在するエントリ」のみ。ファイル・ディレクトリ・symlink を再帰。
-async fn merge_copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
-    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
-    while let Some((s, d)) = stack.pop() {
-        let meta = tokio::fs::symlink_metadata(&s).await?;
-        if meta.is_dir() {
-            tokio::fs::create_dir_all(&d).await?;
-            let mut entries = tokio::fs::read_dir(&s).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let name = entry.file_name();
-                stack.push((s.join(&name), d.join(&name)));
-            }
-        } else if meta.is_symlink() {
-            let target = tokio::fs::read_link(&s).await?;
-            #[cfg(unix)]
-            {
-                // dst が既存（ファイル/symlink）なら削除してから再作成（ディレクトリは残す）。
-                let _ = tokio::fs::remove_file(&d).await;
-                tokio::fs::symlink(&target, &d).await?;
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::fs::copy(&s, &d).await?;
-            }
-        } else {
-            tokio::fs::copy(&s, &d).await?;
-        }
-    }
-    Ok(())
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("ficlone join failed: {e}")))?
 }
 
 fn manifest_entries(manifest: &GenerationManifest) -> HashSet<Box<[u8]>> {
@@ -796,8 +1065,7 @@ impl PackPathState {
                 for (path, item) in files {
                     let entry = self.files.entry(id_str.clone()).or_insert(Files {
                         is_plugctl,
-                        dirs: Vec::new(),
-                        files: Vec::new(),
+                        entries: Vec::new(),
                         dotgit,
                     });
                     // 同 id に複数 LoadedPlugin が統合される場合、最初にエントリを作った
@@ -805,24 +1073,9 @@ impl PackPathState {
                     // 既存エントリのフラグを update する（どれか1つでも true なら true）。
                     entry.is_plugctl = entry.is_plugctl || is_plugctl;
                     entry.dotgit = entry.dotgit || dotgit;
-                    // ディレクトリエントリ（snapshot_root/path がディレクトリ）は dirs、
-                    // ファイルエントリは files に振り分け。install で dirs→files 順に copy する。
-                    let is_dir = match item.source.as_ref() {
-                        FileSource::Directory { path: root } => std::fs::metadata(root.join(&path))
-                            .map(|m| m.is_dir())
-                            .unwrap_or(false),
-                        FileSource::File { .. } => false,
-                    };
-                    if is_dir {
-                        // 同 path のディレクトリエントリ（マージされた複数 source）は source を追加。
-                        if let Some(slot) = entry.dirs.iter_mut().find(|(p, _)| p == &path) {
-                            slot.1.push(item.source);
-                        } else {
-                            entry.dirs.push((path, vec![item.source]));
-                        }
-                    } else {
-                        entry.files.push((path, item.source));
-                    }
+                    // ファイル・sealed-dir を事前分類せずそのまま保持。
+                    // install で `source.yank` が種別（file/dir/symlink）を判定して配置する。
+                    entry.entries.push((path, item.source));
                 }
             }
         }
@@ -880,8 +1133,7 @@ impl PackPathState {
             id,
             Files {
                 is_plugctl: _,
-                dirs,
-                files,
+                entries,
                 dotgit,
             },
         ) in files
@@ -927,27 +1179,16 @@ impl PackPathState {
                     }
                 };
                 {
-                    // clone_dir は dst 未存在前提なので残骸を掃除（ディレクトリ/ファイル混在に備え remove_dir_all）。
+                    // copy は dst 未存在前提なので残骸を掃除（ディレクトリ/ファイル混在に備え remove_dir_all）。
                     tokio::fs::remove_dir_all(dir.as_path()).await.ok();
-                    // dotgit=true なら .git 複製元の snapshot_root を事前取得（dirs/files は into_iter で消費するため）
-                    let snapshot_root = if dotgit {
-                        dirs.iter()
-                            .flat_map(|(_, srcs)| srcs.iter())
-                            .chain(files.iter().map(|(_, s)| s))
-                            .find_map(|s| match s.as_ref() {
-                                FileSource::Directory { path } => Some(path.clone()),
-                                _ => None,
-                            })
-                    } else {
-                        None
-                    };
+                    // dotgit=true だが `.git` エントリが無い（snapshot に `.git` が無い）場合は、
+                    // `.git` 無しで install すると git 利用プラグインが壊れるため pack install を skip し、
+                    // `-u` での再 materialize を促す（plugin は lock に残る）。`.git` があれば通常エントリとして yank される。
                     if dotgit
-                        && snapshot_root
-                            .as_ref()
-                            .is_none_or(|root| !root.join(".git").is_dir())
+                        && !entries
+                            .iter()
+                            .any(|(p, _)| p.as_path() == Path::new(".git"))
                     {
-                        // dotgit copy cannot be faked from a snapshot without `.git`;
-                        // skip the pack install and let the user refresh the cache with `-u`.
                         msg(Message::PluginDotgitMissing(id.clone()));
                         continue;
                     }
@@ -955,28 +1196,9 @@ impl PackPathState {
                     // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
                     let yank_semaphore = yank_semaphore.clone();
                     tasks.spawn(async move {
-                        // 1. ディレクトリエントリを先に clone_dir / merge_copy_dir。
-                        //    clone_dir が後の yank ファイルを上書きしないよう、ディレクトリを先に配置する。
-                        for (which, sources) in &dirs {
-                            let dst = dir.join(which);
-                            for (i, source) in sources.iter().enumerate() {
-                                if let FileSource::Directory { path: root } = source.as_ref() {
-                                    let src = root.join(which);
-                                    if i == 0 {
-                                        clone_dir(&src, &dst).await?;
-                                    } else {
-                                        // マージされた2個目以降: dst が既存なので中身を統合 copy。
-                                        merge_copy_dir(&src, &dst).await?;
-                                    }
-                                }
-                            }
-                            msg(Message::InstallYank {
-                                id: id.clone(),
-                                which: which.clone(),
-                            });
-                        }
-                        // 2. ファイルエントリを yank（GeneratedFile 含む）。
-                        let mut copies = files
+                        // 各エントリ（ファイル・sealed-dir 不分別）を yank に任せる。
+                        // `yank` → `place_path` が種別（file/dir/symlink）を判定して配置する。
+                        let mut copies = entries
                             .into_iter()
                             .map(|(which, source)| {
                                 let dir = dir.clone();
@@ -995,15 +1217,6 @@ impl PackPathState {
                             .collect::<JoinSet<_>>();
                         while let Some(res) = copies.join_next().await {
                             res??;
-                        }
-                        // 3. dotgit=true なら snapshot の .git を pack に全体 copy（git 利用プラグイン用）。
-                        //    clone_dir は macOS/APFS 同 volume で clonefile(2) により .git 全体を
-                        //    1 syscall・CoW で配置する（object store 等のファイル数分の syscall を削減）。
-                        if let Some(root) = snapshot_root {
-                            let src_git = root.join(".git");
-                            if src_git.is_dir() {
-                                clone_dir(&src_git, &dir.join(".git")).await?;
-                            }
                         }
                         helptags(dir.as_path()).await
                     });
@@ -1228,16 +1441,13 @@ mod tests {
     fn repo_file(snapshot: RepoSnapshotIdentity, rel: &str, dir: &str) -> (PathBuf, FileItem) {
         (
             PathBuf::from(rel),
-            FileItem {
-                source: Arc::new(FileSource::Directory {
+            FileItem::new(
+                Arc::new(FileSource::Directory {
                     path: Arc::from(PathBuf::from(dir)),
                 }),
-                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
-                    snapshot,
-                    PathBuf::from(rel),
-                )),
-                merge_type: MergeType::Conflict,
-            },
+                FileIdentity::RepoFile(RepoFileIdentity::new(snapshot, PathBuf::from(rel))),
+                MergeType::Conflict,
+            ),
         )
     }
 
@@ -1458,16 +1668,16 @@ mod tests {
             let data_hash = crate::rsplug::util::hash::digest_hash(data);
             synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([(
                 PathBuf::from(path),
-                FileItem {
-                    source: Arc::new(FileSource::File {
+                FileItem::new(
+                    Arc::new(FileSource::File {
                         data: Cow::Borrowed(data),
                     }),
-                    identity: FileIdentity::GeneratedFile {
+                    FileIdentity::GeneratedFile {
                         path: PathBuf::from(path),
                         data_hash,
                     },
-                    merge_type: MergeType::Overwrite,
-                },
+                    MergeType::Overwrite,
+                ),
             )])))
             .plugin_id()
         };
@@ -1495,16 +1705,16 @@ mod tests {
         );
         let files = BTreeMap::from([(
             PathBuf::from("plugin/init.lua"),
-            FileItem {
-                source: Arc::new(FileSource::Directory {
+            FileItem::new(
+                Arc::new(FileSource::Directory {
                     path: Arc::from(snapshot_root.clone()),
                 }),
-                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
+                FileIdentity::RepoFile(RepoFileIdentity::new(
                     snapshot,
                     PathBuf::from("plugin/init.lua"),
                 )),
-                merge_type: MergeType::Conflict,
-            },
+                MergeType::Conflict,
+            ),
         )]);
         let loaded = LoadedPlugin {
             source_name: None,
@@ -1534,8 +1744,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_dir_preserves_files_dirs_and_symlinks() {
-        let root = std::env::temp_dir().join(format!("rsplug-clonedir-{}", std::process::id()));
+    async fn copy_tree_preserves_files_dirs_and_symlinks() {
+        let root = std::env::temp_dir().join(format!("rsplug-copytree-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let src = root.join("src");
         let dst = root.join("dst");
@@ -1545,7 +1755,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
 
-        clone_dir(&src, &dst).await.unwrap();
+        copy_tree(&src, &dst).await.unwrap();
 
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
         assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"world");
@@ -1559,8 +1769,8 @@ mod tests {
             );
         }
 
-        // 元 src を編集しても dst に影響しない（clonefile の CoW・独立 inode、
-        // または copy フォールバックの独立実体。hardlink で inode を共有しない）。
+        // 元 src を編集しても dst に影響しない（reflink(clonefile) の CoW・独立 inode、
+        // または copy フォールバックの独立実体）。reflink 戦略（macOS/APFS 同 volume）を前提とする。
         std::fs::write(src.join("a.txt"), b"changed").unwrap();
         assert_eq!(
             std::fs::read(dst.join("a.txt")).unwrap(),
@@ -1579,7 +1789,7 @@ mod tests {
         let packpath = dir.join("packpath");
         std::fs::create_dir_all(snapshot_root.join("plugin")).unwrap();
         std::fs::write(snapshot_root.join("plugin/init.lua"), "print('x')\n").unwrap();
-        // snapshot に .git を用意（dotgit copy の対象）。clone_dir が全体 copy する。
+        // snapshot に .git を用意（dotgit で通常エントリとして pack に copy される）。
         std::fs::create_dir_all(snapshot_root.join(".git/refs/heads")).unwrap();
         std::fs::write(snapshot_root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(
@@ -1595,19 +1805,34 @@ mod tests {
             Arc::<[String]>::from([]),
             None,
         );
-        let files = BTreeMap::from([(
-            PathBuf::from("plugin/init.lua"),
-            FileItem {
-                source: Arc::new(FileSource::Directory {
-                    path: Arc::from(snapshot_root.clone()),
-                }),
-                identity: FileIdentity::RepoFile(RepoFileIdentity::new(
-                    snapshot,
-                    PathBuf::from("plugin/init.lua"),
-                )),
-                merge_type: MergeType::Conflict,
-            },
-        )]);
+        // Plugin::load が dotgit=true で `.git` を通常 sealed-dir エントリとして加えた状態を再現。
+        let root_source = Arc::new(FileSource::Directory {
+            path: Arc::from(snapshot_root.clone()),
+        });
+        let files = BTreeMap::from([
+            (
+                PathBuf::from(".git"),
+                FileItem::new(
+                    root_source.clone(),
+                    FileIdentity::RepoFile(RepoFileIdentity::new(
+                        snapshot.clone(),
+                        PathBuf::from(".git"),
+                    )),
+                    MergeType::Conflict,
+                ),
+            ),
+            (
+                PathBuf::from("plugin/init.lua"),
+                FileItem::new(
+                    root_source,
+                    FileIdentity::RepoFile(RepoFileIdentity::new(
+                        snapshot,
+                        PathBuf::from("plugin/init.lua"),
+                    )),
+                    MergeType::Conflict,
+                ),
+            ),
+        ]);
         let loaded = LoadedPlugin {
             source_name: None,
             lazy_type: LazyType::Start,
@@ -1696,6 +1921,66 @@ mod tests {
         let (a, b, dir) = two_dir_plugins("disjoint", "a.lua", "b.lua");
         let (_merged, rest) = a + b;
         assert!(rest.is_none(), "disjoint directory children should merge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 6c データロス回帰テスト: 同 path の sealed-dir（`lua`）を子 disjoint で merge し、
+    /// install 後に**両方の** repo の子が pack に届くことを検証する。
+    /// 旧 `files.extend` は片側を上書きして消していた。
+    #[tokio::test]
+    async fn merge_union_directory_children_into_pack() {
+        let dir = std::env::temp_dir().join(format!("rsplug-mergeunion-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let snap_a = dir.join("a");
+        let snap_b = dir.join("b");
+        std::fs::create_dir_all(snap_a.join("lua")).unwrap();
+        std::fs::write(snap_a.join("lua/a.lua"), "-- a\n").unwrap();
+        std::fs::create_dir_all(snap_b.join("lua")).unwrap();
+        std::fs::write(snap_b.join("lua/b.lua"), "-- b\n").unwrap();
+
+        let snap_a_id = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/owner/a"),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let snap_b_id = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/owner/b"),
+            b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let root_a = snap_a.to_string_lossy().into_owned();
+        let root_b = snap_b.to_string_lossy().into_owned();
+        let a = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snap_a_id, "lua", &root_a,
+        )])));
+        let b = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snap_b_id, "lua", &root_b,
+        )])));
+        let (merged, rest) = a + b;
+        assert!(rest.is_none(), "disjoint lua children should merge");
+
+        let packpath = dir.join("packpath");
+        let plugin_id = merged.plugin_id();
+        let mut state = PackPathState::new();
+        state.insert(merged);
+        state.install(&packpath).await.unwrap();
+
+        let pkg = packpath.join("pack/_gen/opt").join(plugin_id.as_str());
+        assert_eq!(
+            std::fs::read(pkg.join("lua/a.lua")).unwrap(),
+            b"-- a\n",
+            "plugin A's lua child must land in pack after merge"
+        );
+        assert_eq!(
+            std::fs::read(pkg.join("lua/b.lua")).unwrap(),
+            b"-- b\n",
+            "plugin B's lua child must land in pack after merge"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -37,7 +37,8 @@ rsplug.nvim は2つの系を持つ:
 - [x] (2026-07-08) Phase 4: `dotgit` オプション実装（commit `78a9feb` + 修正 `98651d6`）。pack に `.git` 複製、dotgit=true は GitFetch 強制（`use_tarball = !dotgit && ...`）。blink.cmp で `git rev-parse HEAD` が version file と一致、fuzzy.rust が outdated/Lua-fallback 無しでロード（RUST_OK=true, messages 空）を確認。
 - [x] (2026-07-08) Phase 4b: `dotgit=true` なのに既存 snapshot に `.git` が無い場合、`PluginDotgitMissing` WARNING を出して pack への配置をスキップ（commit `854ac77`）。回復手段は `-u` を案内（`-i` は既存 cache の再生成には効かない）。テスト `dotgit_missing_snapshot_skips_install` / `warn_dotgit_missing_uses_refresh_hint` で検証。
 - [x] (2026-07-09) Phase 5: `clone_dir` プリミティブ実装。macOS APFS 同 volume で `clonefile(2)` によりディレクトリ階層全体を1 syscall・CoW で copy（ファイル数分の syscall を削減）。`AtomicBool CLONEFILE_AVAILABLE` で実行時キャッシュし、unsupported エラー（EXDEV/ENOTSUP/ENOSYS/EOPNOTSUPP）で再帰 copy（`copy_dir_all`）にフォールバック固定。dotgit `.git` copy に適用。テスト `clone_dir_preserves_files_dirs_and_symlinks`（ファイル/ディレクトリ/symlink 保持 + 独立 inode）・`dotgit_copies_git_dir_into_pack`（dotgit で .git が pack に copy される）。
-- [~] (2026-07-09) Phase 6: `CopyEachFile` をディレクトリ・ファイル不分別辞書に（snapshot ディレクトリ copy・merge 2a-2c）。**6a 完了**: `Plugin::load` read_dir 化・install `Files` dirs/files 分割（dirs→`clone_dir`/`merge_copy_dir`・files→`yank`）・util.rs `ls_files` 系削除・doc 盗み `doc` キー除外（6a 前倒し）・insert is_plugctl/dotgit `||` update。**6b 完了**: merge 2a-2c（`dirs_mergeable`/`entries_mergeable`/`snapshot_root_of`/`read_dir_children`・種別判定→ファイル競合→ディレクトリ子要素深度1再帰）。テスト `merge_disjoint_directory_children`・`merge_overlapping_directory_children`・`merge_directory_vs_file`。**6c 残**: PLANS 改訂。**plugin_id 非互換**（ルート直下エントリで hash 変更・既存 pack/lock は再生成）。
+- [~] (2026-07-09) Phase 6: `CopyEachFile` をディレクトリ・ファイル不分別辞書に（snapshot ディレクトリ copy・merge 2a-2c）。**6a 完了**: `Plugin::load` read_dir 化・install `Files` dirs/files 分割（dirs→`clone_dir`/`merge_copy_dir`・files→`yank`）・util.rs `ls_files` 系削除・doc 盗み `doc` キー除外（6a 前倒し）・insert is_plugctl/dotgit `||` update。**6b 完了**: merge 2a-2c（`dirs_mergeable`/`entries_mergeable`/`snapshot_root_of`/`read_dir_children`・種別判定→ファイル競合→ディレクトリ子要素深度1再帰）。テスト `merge_disjoint_directory_children`・`merge_overlapping_directory_children`・`merge_directory_vs_file`。**6c 残**: 下記「Phase 6c 方針修正」を実装してから Phase 7 へ進む。**plugin_id 非互換**（ルート直下エントリで hash 変更・既存 pack/lock は再生成）。
+- [x] (2026-07-09) Phase 6c 完了（3 step）。**Step1**: `FileItem` 種別キャッシュ（`AtomicU8`・Hash/Eq 除外の手動 impl）・`FileIdentity::relative_path`・merge `union_files`/`expand_dir_union`（sealed-dir 衝突を1段展開して子 key 化 = Phase 6a データロス修正）・回帰テスト `merge_union_directory_children_into_pack`。**Step2**: copy 戦略 `AtomicU8 { reflink, hardlink, copy }`（`EXDev` は copy まで 2段 jump）・`reflink_file`（macOS `clonefile`/Linux `FICLONE` FFI）・`yank`→`place_path`→`copy_tree`(反復 walk+leaf 並列)/`copy_leaf`/`copy_file_with_strategy` に統一・`clone_dir`/`copy_dir_all`/`merge_copy_dir`/`CLONEFILE_AVAILABLE` 削除・`Files { dirs, files }`→`entries` 事前分類廃止。**Step3**: dotgit の `.git` を通常 sealed-dir エントリ化（`Plugin::load` で ignore bypass）。`cargo test`/`clippy -D warnings`/`fmt --check` 緑。
 - [ ] Phase 7: FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更。
 
 
@@ -49,6 +50,7 @@ rsplug.nvim は2つの系を持つ:
 - Observation: `init.lua → generations/{ctl}.lua` の sym は系A内で閉じ、resolve+`:h:h` で pack 内完結する（テスト `init_template_resolves_symlink_and_goes_up_two_levels`）。これは「pack↔repos を繋ぐ sym」ではなく維持対象。
 - Observation: `yank`（`packpathstate.rs:440-447`）は非 macOS で `hard_link`、フォールバックなし。pack が Nix store 等 別FS だと失敗する。copy 統一のポータビリティ前提としてフォールバックが必須。
 - Observation: `CacheConfig`（`config.rs:51`）に `#[serde(deny_unknown_fields)]` が無い。よって `to_sym`/`manually_to_sym` を削除しても、既存 TOML の `sym = true` は無視されエラーにならない。
+- Discovery (2026-07-09): Phase 6a で `Plugin::load` が `ls_files`（個別ファイル key）→ `read_dir`（トップレメントリー sealed key）に切り替えた結果、`Add` merge の `files.extend(rfiles)` が同 path を上書きし**マージされたディレクトリの片側 source が消失するデータロス**が入っていた（両 plugin が `lua` を持つと片方の `lua/` 中身が pack に届かない）。旧 ls_files 時代は `lua/a.lua`/`lua/b.lua` が別 key なので extend が union として機能していた。`Files.dirs` の `Vec<Arc<FileSource>>` 累積は BTreeMap が既に1つに潰すため発火せず、テスト（`merge_disjoint_directory_children` は `rest.is_none()` のみ確認）でも未検出。Phase 6c の「衝突時1段展開して子 key 化」で修正。Evidence: `packpathstate.rs:316`（`files.extend`）, `:818`（発火しない累積）, `plugin.rs:603-633`（read_dir 化）。
 
 
 ## Decision Log
@@ -85,8 +87,17 @@ rsplug.nvim は2つの系を持つ:
   Rationale: 最近の Rust では `std::fs::copy` が macOS/APFS で `fclonefileat`/`clonefile`（CoW）を使用し、HFS+ では `fcopyfile` にフォールバックする（std が自動切替）。自前 clonefile と同等で、フォールバック含め std に委ねる方が保守負荷が低い。非 macOS は `hard_link` → `copy`（ExDev）を維持（hard_link が走るのは非 macOS 同一FS のみ）。
   Date: 2026-07-07.
 
-- Decision: **ディレクトリ単位** copy には macOS 限定で自前 `clonefile(2)` を再導入する（Phase 5）。ファイル単位の yank は引き続き std 任せ（触らない）。
-  Rationale: 2026-07-07 の revert は「**ファイル単位**なら std::fs::copy が CoW を使う」が理由。しかし `std::fs::copy` はディレクトリを copy できず、ディレクトリ階層全体を1 syscall・CoW で clone できるのは `clonefile(2)` のみ（man clonefile: src がディレクトリなら階屷全体を再帰 clone・symlink も保持）。`.git`（object store 等の多数ファイル）の copy で syscall 削減効果が大きい。戦略は `AtomicBool`（clonefile 可否の2値）で実行時キャッシュし、一度 unsupported（EXDEV/ENOTSUP/ENOSYS/EOPNOTSUPP）なら再帰 copy に固定して無駄な syscall を避ける。当初計画の `AtomicU8`（0=clonefile/1=hardlink/2=copy）でなく `AtomicBool` にした理由: ディレクトリ copy では hardlink が選択肢に入らない（ディレクトリの hardlink 不可＋inode 共有で元 snapshot 編集が pack に漏れる＝自己完結理念違反）。hardlink/copy のファイル単位切り替えはフォールバック先 `copy_dir_all` 内部（yank と同ロジック）に任せる。
+- Decision: **ディレクトリ単位** copy には macOS 限定 `clone_dir` を一度導入したが、Phase 6c で取り消し、`FileSource::yank` をファイル・ディレクトリ両対応の配置インタフェースに戻す。
+  Rationale: copy の入口を `yank` に統一すると install 側で dirs/files に分類する必要がなく、`CopyEachFile` の辞書が「ディレクトリ・ファイル不分別」であるという設計と一致する。実行時 copy 戦略は `AtomicU8`（clonefile: 0, hardlink: 1, copy: 2）で管理する。ディレクトリ hardlink は不可なので、その段階では子要素へ再帰して hardlink/copy を適用する。inode 共有の懸念は pack 側を編集不可にすることで扱う。macOS だけでなく、Linux 等の CoW syscall も対応対象にする。再帰 copy は並列性を維持する。
+  Date: 2026-07-09.
+
+- Decision: Phase 6c のデータモデルを確定。`CopyEachFile(BTreeMap<PathBuf, FileItem>)` の**値は1個のまま**（リスト化しない）。`Plugin::load` はトップレメントリー sealed 列挙のまま。同 path の sealed-dir 衝突は「**1段展開して子 key 化・再帰 union**」で解く（predicate + execute 二相）。各 `FileItem` は種別キャッシュ（`AtomicU8`・Hash 除外）で遅延解決。copy 戦略 `AtomicU8` は `EXDev` で **2(copy) まで jump**（hardlink も別 volume で失敗）。`yank` 統一・`Files { dirs, files }` 廃止。
+  Rationale: Phase 6a の sealed 列挙が `Add` の `files.extend` 上書きで片側 source を落とすデータロスを招いていた（下記 Discovery）。値を `Vec` 化する案（一度提案）は却下し、path-key + 衝突時展開で解く。clonefile 全体 copy は非衝突 sealed-dir に残る。`EXDev` の 1段-only 昇格は hardlink も失敗する別 volume では無駄になるため jump する。
+  Date: 2026-07-09.
+
+- Decision: `dotgit` を例外的扱いから廃止し、`.git` を**通常の sealed-dir エントリ**として扱う。`dotgit=true` は ignore の `.git` を列挙に含める（bypass）＋ GitFetch 強制、のみ。`.git` の identity は `RepoFileIdentity(snapshot, ".git")` で **byte 内容は hash に入らない**（決定論性保全）。install の `.git` 特別 copy は廃止し通常経路へ（yank/copy_tree）。
+  **`LoadedPlugin.dotgit` フィールドは残す（計画から変更）**: 当初は `.git` エントリ有無で代替し削除する計画だったが、欠落時の `PluginDotgitMissing` 警告と「`-u` で再 materialize」の回復は plugin を lock に残す前提（`Plugin::load` で `Ok(None)` を返すと repo プラグインは lock から削除され `-u` が効かなくなる: `main.rs:204-211`）。よって install 時の「dotgit=true だが `.git` エントリ無し → 警告 + skip」判定のためにフィールドを残す。`.git` エントリ有無が plugin_id に反映される点は計画通り（ユーザー要望の on/off 区別は達成）。`.git` 欠落 WARNING は install に留める（`Plugin::load` への移動は見送り）。
+  Rationale: `.git` を他ディレクトリと同経路で扱い install 特別扱いを無くす。clonefile 全体 copy も自然に適用。plugin_id が dotgit で変化するのは「.git 有無を区別」に必要（ユーザー確認済み）。byte 内容を入れないことで決定論性を保つ。
   Date: 2026-07-09.
 
 
@@ -100,6 +111,7 @@ rsplug.nvim は2つの系を持つ:
 - (2026-07-08) Phase 4（dotgit）実装・検証: `dotgit` オプション（デフォルト false）。`true` のプラグインは snapshot の `.git` を pack に全体 copy し、blink.cmp の `.git` チェック問題（outdated 判定 → Lua fallback）を根本解決。実機で `git rev-parse HEAD` が version file と一致、fuzzy.rust が正常ロード（RUST_OK=true, messages 空）。dotgit=true は GitFetch 強制だが、既存 snapshot（TarballFetch 由来等）があれば `snapshot_exists_for_oid` で source.git 作成をスキップし再利用（`98651d6`）。
 - (2026-07-08) Phase 4b（WARNING）実装・検証: `dotgit=true` で snapshot に `.git` が無い（= copy 不能）場合、`Message::PluginDotgitMissing` 警告を出して pack install を skip。回復は `-u` を案内（`-i` は既存 cache 再生成に非効力）。テスト `dotgit_missing_snapshot_skips_install`（pack に copy されない）と `warn_dotgit_missing_uses_refresh_hint`（メッセージ内容）で検証。
 - (2026-07-09) Phase 5（clone_dir）実装・検証: `clone_dir` プリミティブ（macOS `clonefile_dir` FFI + `CLONEFILE_AVAILABLE: AtomicBool` 実行時キャッシュ + `copy_dir_all` フォールバック）を追加。dotgit の `.git` copy（`packpathstate.rs` install 内）を `copy_dir_all` → `clone_dir` に切替。macOS/APFS 同 volume で `.git` 全体が1 syscall・CoW・独立 inode で配置される（object store 等のファイル数に比例した syscall を削減し、元 snapshot 編集の影響も受けない）。非 macOS・非 APFS・別 volume は自動で再帰 copy にフォールバック。テスト `clone_dir_preserves_files_dirs_and_symlinks`（ファイル/ディレクトリ/symlink 保持 + 元編集で dst 不変＝独立 inode）・`dotgit_copies_git_dir_into_pack`（dotgit で .git が pack に copy される）で検証。
+- (2026-07-09) Phase 6c 実装・検証: (1) `FileItem` 種別キャッシュ（`AtomicU8`、手動 Hash/Eq で除外）+ merge `union_files`/`expand_dir_union` により Phase 6a の「同 path sealed-dir 衝突で片側 source が消える」データロスを修正（回帰テスト `merge_union_directory_children_into_pack` で両 repo の子が pack に届くことを検証）。(2) copy 戦略 `AtomicU8{reflink,hardlink,copy}`（`EXDev` で copy まで 2段 jump）を導入し、配置入口を `FileSource::yank`→`place_path`→`copy_tree`(反復 walk + leaf 並列 `JoinSet`)/`copy_leaf`/`copy_file_with_strategy` に統一。`clone_dir`/`copy_dir_all`/`merge_copy_dir`/`clonefile_dir`/`CLONEFILE_AVAILABLE` を削除。macOS は `clonefile(2)`（ディレクトリ全体1発・CoW）、Linux は `ioctl(FICLONE)`（ファイル単位、btrfs/xfs 等）で reflink、失敗時 hardlink→copy へ単調フォールバック。(3) `Files{dirs,files}` 事前分類を `entries` に一本化。(4) dotgit の `.git` を通常 sealed-dir エントリ化（`Plugin::load` で ignore bypass、他ディレクトリと同一経路で copy・plugin_id に反映）。`LoadedPlugin.dotgit` は `-u` 回復の install 時欠落チェックのため残置（計画から変更、Decision Log 参照）。`cargo test`(全緑)/`clippy -D warnings`(清)/`fmt --check`(清)。**plugin_id 非互換**: ルート直下エントリ hash 変更（Phase 6a 由来）に加え、dotgit の `.git` エントリ追加により既存 pack/lock は再生成。
 
 
 ## Context and Orientation
@@ -188,6 +200,34 @@ Key files:
 - 辞書キーをディレクトリ・ファイル両方に拡張。
 - マージ時の競合チェック: (2a) X/Y のディレクトリ/ファイル種別を `OnceCell`/`Atomic` でキャッシュしつつ判定。(2b) いずれかがファイルなら競合。(2c) 両者ディレクトリなら深度1だけ子要素を探索し、子の競合を 2a-2c で再帰判定。
 
+### Phase 6c — Phase 5/6 方針修正（Phase 7 前提）
+
+**Goal**: 実装済みの `clone_dir` 分離・install 時 dirs/files 分類をやめ `yank` に統一するとともに、Phase 6a で入った merge データロス（下記 Discovery）を修正する。Phase 7 はこの修正後に着手する。
+
+データモデル（確定）:
+
+- `CopyEachFile(BTreeMap<PathBuf, FileItem>)` の**値は1個のまま**（`Vec` 化しない）。`Plugin::load` は snapshot ルートの**トップレベルエントリのみ**を sealed（深掘りなし）で列挙する（現状踏襲）。
+- 各 `FileItem` は種別キャッシュ（`AtomicU8`: 未分類/file/dir）を持つ。identity の relative_path に対する型を初回マージ時に限り filesystem で解決しキャッシュする。`#[derive(Hash,Eq)]` を外し**手動 impl でキャッシュは hash から除外**（plugin_id の非決定論化防止）。キャッシュは `&self` 経由で解決（merge で move しても追従）。
+- マージ `Add`（現状 sync だが既に `dirs_mergeable` が sync IO するので整合）は**二相**:
+  - predicate（`dirs_mergeable` 系）: 衝突 key で両者 `kind()` を解決し、file/file は `merge_type`、**dir/dir は1段展開して子の衝合を再帰判定**、file/dir は競合。
+  - execute（`files.extend` を修正）: 衝突 dir を**1段展開して子 key に置き換え**、union する。非衝突 sealed-dir はそのまま残し clonefile 全体 copy に回す。`Add` の「衝突時 rhs 無傷返却」のため二相が必要。
+
+copy 戦略（確定）:
+
+- 実行時状態 `AtomicU8 { 0=reflink(clonefile/FICLONE), 1=hardlink, 2=copy }`、単調昇格。`EXDev`（別 volume）は hardlink も失敗するため **2(copy) まで jump**。`ENOTSUP/ENOSYS` は 1(hardlink) へ。
+- `clone_dir`/`merge_copy_dir`/`copy_dir_all` を廃止し `FileSource::yank` をファイル・ディレクトリ両対応の唯一の配置入口に統一。sealed-dir（非衝突）は macOS clonefile で全体1発 → 失敗時 再帰 per-file、Linux は最初から再帰 per-file。再帰 copy は `JoinSet` で並列。
+- install の `Files { dirs, files }` 事前分類を廃止し、key ごとに `yank` に任せる。
+
+dotgit（確定）:
+
+- `.git` を例外的扱いから廃止し**通常の sealed-dir エントリ**として扱う。`dotgit=true` は ignore の `.git` を列挙に含める（bypass）＋ GitFetch 強制、のみ。
+- `.git` の identity は `RepoFileIdentity(snapshot, ".git")` で **byte 内容は hash に入らない**（決定論性保全）。`LoadedPlugin.dotgit` フィールドは**残す**（上記 Decision Log 参照: `-u` 回復のため install 時欠落チェックに必要）。`.git` エントリ有無が plugin_id に反映され dotgit on/off を区別（ユーザー要望、達成）。
+- install の `.git` 特別 copy は廃止し通常経路へ。`.git` 欠落時の `PluginDotgitMissing` WARNING は `Plugin::load` に移動（現行セマンティクス維持）。
+
+その他:
+
+- symlink は保持（現状踏襲）。inode 共有（hardlink）の抑止のための pack readonly 化はスコープ外（defer・文書化のみ）。
+
 ### Phase 7 — FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更
 
 **Goal**: Phase 5-6 で不要になる `ls-files` 等を削除しコードベースを縮減。FetchTarball リポジトリで `.git` を作らない（現在は git バックエンドでないのに `.git` が作られ誤解を生む）。
@@ -241,3 +281,6 @@ Unless noted, all commands run from the repository root.
 - 2026-07-08: 実機検証で blink.cmp の `.git` チェック問題を発見。Phase 4（`dotgit` オプション）を追加。Phase 5-7（clonefile yank / 辞書不分別 / FetchTarball `.git` 削除）を後続計画として追加。
 - 2026-07-09: Phase 3/4/4b 完了を Progress・Outcomes に反映。実装・検証は 2026-07-08 に完了済み（`78a9feb`/`98651d6`/`854ac77`）だが、レート制限でドキュメント更新が滞留していた。`cargo test`/`clippy -D warnings`/`fmt --check` すべて再確認グリーン。Phase 5-7 は後続計画として未着手。
 - 2026-07-09: Phase 5 実装（`clone_dir` + dotgit `.git` copy の clonefile 化）。Phase 6（`CopyEachFile` をディレクトリ・ファイル不分別辞書に）・Phase 7（FetchTarball の `.git` 削除 + ハッシュ計算変更）は後続。
+- 2026-07-09: Phase 7 の前に Phase 6c を追加。`clone_dir` 分離・`AtomicBool`・install 時 dirs/files 分類を取り消し、`FileSource::yank` 両対応・`AtomicU8` 戦略・非 macOS CoW・並列再帰 copy・item 種別キャッシュへ修正する方針に戻す。
+- 2026-07-09: Phase 6c 実装完了（3 step）。値のリスト化は却下し path-key + sealed-dir 衝突の「1段展開して子 key 化」で Phase 6a の merge データロスを修正。copy 戦略 `AtomicU8`（`EXDev` で copy まで jump）+ `yank`/`place_path`/`copy_tree`(反復 walk + leaf 並列) に統一・`Files{dirs,files}` 廃止。dotgit の `.git` を通常エントリ化（`LoadedPlugin.dotgit` は `-u` 回復のため残置）。Linux `ioctl(FICLONE)` FFI 追加（非テスト環境）。Phase 7（FetchTarball `.git` 削除 + ハッシュ計算変更）は後続。
+- 2026-07-09: Phase 6c のデータモデルをユーザー議論で確定。値のリスト化（`Vec<FileItem>`）は却下 → path-key のまま sealed-dir 衝突を「1段展開して子 key 化・再帰 union」で解く。Phase 6a が招いた merge データロスをこの方式で修正。`dotgit` も例外扱いを廃止し `.git` を通常 sealed-dir エントリ化（byte 内容は hash に入れない）。`EXDev` は copy まで 2段 jump。Decision Log・Surprises に反映。

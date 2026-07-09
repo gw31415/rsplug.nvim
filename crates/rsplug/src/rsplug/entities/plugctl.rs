@@ -72,14 +72,14 @@ pub struct PlugCtl {
 fn generated_file_item(path: impl Into<PathBuf>, data: Cow<'static, [u8]>) -> (PathBuf, FileItem) {
     let path = path.into();
     let data_hash = hash::digest_hash(&data);
-    let item = FileItem {
-        source: Arc::new(FileSource::File { data }),
-        identity: FileIdentity::GeneratedFile {
+    let item = FileItem::new(
+        Arc::new(FileSource::File { data }),
+        FileIdentity::GeneratedFile {
             path: path.clone(),
             data_hash,
         },
-        merge_type: MergeType::Overwrite,
-    };
+        MergeType::Overwrite,
+    );
     (path, item)
 }
 

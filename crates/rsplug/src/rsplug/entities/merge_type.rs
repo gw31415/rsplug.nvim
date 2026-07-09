@@ -1,4 +1,4 @@
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub enum MergeType {
     /// 競合したらマージしない
     Conflict,

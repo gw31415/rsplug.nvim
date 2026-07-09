@@ -596,10 +596,12 @@ impl Plugin {
             path: snapshot_root_path.clone(),
         });
         // ls-files 列挙を廃止し、snapshot ルート直下を read_dir で1階層列挙する。
-        // ディレクトリ（lua/plugin/doc 等）も1エントリにまとめ、install で clone_dir する
+        // ディレクトリ（lua/plugin/doc 等）も1エントリにまとめ、install で copy_tree する
         //（ファイル数分の syscall を削減）。target/ 等の build 成果物は ignore 対象外なので
-        // pack に残る（旧 ls_files_with_untracked と同等）。.git/.rsplug_build_success は
-        // ignore.gitignore で除外される。
+        // pack に残る（旧 ls_files_with_untracked と同等）。.rsplug_build_success は
+        // ignore.gitignore で除外される。`.git` は通常 ignore 対象だが、dotgit=true のときは
+        // 例外扱いせず通常ディレクトリと同じくエントリに含める（pack への copy・plugin_id への
+        // 反映は他のディレクトリと同一経路。snapshot に `.git` が無い場合は install で検知し警告）。
         let mut entries: Vec<PathBuf> = Vec::new();
         {
             let mut rd = tokio::fs::read_dir(snapshot_root_path.as_ref()).await?;
@@ -615,18 +617,16 @@ impl Plugin {
         let files: HowToPlaceFiles = HowToPlaceFiles::CopyEachFile(
             entries
                 .into_iter()
-                .filter(|name| !merge.ignore.matched(name))
+                // dotgit=true なら `.git` を ignore から救出して通常エントリに含める。
+                .filter(|name| dotgit && name == Path::new(".git") || !merge.ignore.matched(name))
                 .map(|name| {
                     (
                         name.clone(),
-                        FileItem {
-                            source: filesource.clone(),
-                            identity: FileIdentity::RepoFile(RepoFileIdentity::new(
-                                identity.clone(),
-                                name,
-                            )),
-                            merge_type: MergeType::Conflict,
-                        },
+                        FileItem::new(
+                            filesource.clone(),
+                            FileIdentity::RepoFile(RepoFileIdentity::new(identity.clone(), name)),
+                            MergeType::Conflict,
+                        ),
                     )
                 })
                 .collect(),
