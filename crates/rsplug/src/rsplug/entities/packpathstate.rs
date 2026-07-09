@@ -291,23 +291,7 @@ impl Add for LoadedPlugin {
         }
         match (&self.files, &rhs.files) {
             (HowToPlaceFiles::CopyEachFile(files), HowToPlaceFiles::CopyEachFile(rfiles)) => {
-                let mergeable = {
-                    let (small, large) = if files.len() <= rfiles.len() {
-                        (files, rfiles)
-                    } else {
-                        (rfiles, files)
-                    };
-                    // 重複ファイルの検出
-                    small.iter().all(|(path, item)| {
-                        let Some(other) = large.get(path) else {
-                            return true;
-                        };
-                        // 重複ファイルがあった場合
-                        let a = &item.merge_type;
-                        let b = &other.merge_type;
-                        !matches!((a, b), (MergeType::Conflict, _) | (_, MergeType::Conflict))
-                    })
-                };
+                let mergeable = dirs_mergeable(files, rfiles);
                 if mergeable {
                     let Self {
                         source_name,
@@ -351,6 +335,87 @@ impl Add for LoadedPlugin {
         };
         (self, Some(rhs))
     }
+}
+
+/// 同 path のエントリを 2a-2c で再帰的に競合判定し、全てマージ可能なら true。
+fn dirs_mergeable(
+    files: &BTreeMap<PathBuf, FileItem>,
+    rfiles: &BTreeMap<PathBuf, FileItem>,
+) -> bool {
+    let (small, large) = if files.len() <= rfiles.len() {
+        (files, rfiles)
+    } else {
+        (rfiles, files)
+    };
+    small.iter().all(|(path, item)| {
+        let Some(other) = large.get(path) else {
+            return true;
+        };
+        entries_mergeable(path, item, other)
+    })
+}
+
+/// path 配下の X(item)・Y(other) がマージ可能か（2a-2c 再帰）。
+///
+/// - 2a: X/Y がディレクトリかファイルか（`root.join(path).is_dir()`）。FileSource::File
+///   （GeneratedFile 等）は両方ファイル扱い。
+/// - 2b: 種別違い（ディレクトリ vs ファイル）は競合。両方ファイルは merge_type で判定。
+/// - 2c: 両方ディレクトリなら直下の子要素を取得し、共通の子で 2a-2c を再帰。
+fn entries_mergeable(path: &Path, item: &FileItem, other: &FileItem) -> bool {
+    let (Some(x_root), Some(y_root)) = (
+        snapshot_root_of(&item.source),
+        snapshot_root_of(&other.source),
+    ) else {
+        // FileSource::File 同士（GeneratedFile 等）は merge_type で判定。
+        return !matches!(
+            (&item.merge_type, &other.merge_type),
+            (MergeType::Conflict, _) | (_, MergeType::Conflict)
+        );
+    };
+    let x_dir = x_root.join(path).is_dir();
+    let y_dir = y_root.join(path).is_dir();
+    // 2b: 種別違い（ディレクトリ vs ファイル）は競合。
+    if x_dir != y_dir {
+        return false;
+    }
+    // 両方ファイル: 従来の merge_type 判定。
+    if !x_dir {
+        return !matches!(
+            (&item.merge_type, &other.merge_type),
+            (MergeType::Conflict, _) | (_, MergeType::Conflict)
+        );
+    }
+    // 2c: 両方ディレクトリ。直下の子要素で再帰。
+    let x_children = read_dir_children(&x_root.join(path));
+    if x_children.is_empty() {
+        return true;
+    }
+    let y_children = read_dir_children(&y_root.join(path));
+    for child in x_children {
+        if y_children.contains(&child) && !entries_mergeable(&path.join(&child), item, other) {
+            return false;
+        }
+    }
+    true
+}
+
+/// FileSource から snapshot_root（絶対パス）を取得。FileSource::File は None。
+fn snapshot_root_of(source: &FileSource) -> Option<&Path> {
+    match source {
+        FileSource::Directory { path } => Some(path),
+        FileSource::File { .. } => None,
+    }
+}
+
+/// ディレクトリ直下の子エントリ名を取得（merge の子要素再帰用）。
+fn read_dir_children(dir: &Path) -> HashSet<OsString> {
+    let mut set = HashSet::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            set.insert(entry.file_name());
+        }
+    }
+    set
 }
 
 /// ファイルの取得(生成)元。
@@ -1623,5 +1688,98 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2a-2c: 同 path ディレクトリで子要素が重複しない → マージ成立。
+    #[test]
+    fn merge_disjoint_directory_children() {
+        let (a, b, dir) = two_dir_plugins("disjoint", "a.lua", "b.lua");
+        let (_merged, rest) = a + b;
+        assert!(rest.is_none(), "disjoint directory children should merge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2a-2c: 同 path ディレクトリで子要素が重複（両方ファイル・Conflict）→ 非マージ。
+    #[test]
+    fn merge_overlapping_directory_children() {
+        let (a, b, dir) = two_dir_plugins("overlap", "x.lua", "x.lua");
+        let (_a, rest) = a + b;
+        assert!(rest.is_some(), "overlapping children should not merge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2b: 同 path で片方ディレクトリ・片方ファイル → 種別違いで非マージ。
+    #[test]
+    fn merge_directory_vs_file() {
+        let dir = std::env::temp_dir().join(format!("rsplug-mergedirfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let snap_a = dir.join("a");
+        let snap_b = dir.join("b");
+        // a: lua/ ディレクトリ
+        std::fs::create_dir_all(snap_a.join("lua")).unwrap();
+        // b: lua ファイル（snap_b を作ってから置く）
+        std::fs::create_dir_all(&snap_b).unwrap();
+        std::fs::write(snap_b.join("lua"), "not a dir\n").unwrap();
+
+        let snapshot = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/owner/repo"),
+            b"0123456789012345678901234567890123456789".to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let root_a = snap_a.to_string_lossy().into_owned();
+        let root_b = snap_b.to_string_lossy().into_owned();
+        let a = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot.clone(),
+            "lua",
+            &root_a,
+        )])));
+        let b = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot, "lua", &root_b,
+        )])));
+
+        let (_a, rest) = a + b;
+        assert!(
+            rest.is_some(),
+            "directory vs file at same path should not merge"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// merge 2a-2c テスト用: 各 snapshot の `lua/<child>` を持つ2つの LoadedPlugin を組む。
+    fn two_dir_plugins(
+        tag: &str,
+        child_a: &str,
+        child_b: &str,
+    ) -> (LoadedPlugin, LoadedPlugin, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("rsplug-mergedir-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let snap_a = dir.join("a");
+        let snap_b = dir.join("b");
+        std::fs::create_dir_all(snap_a.join("lua")).unwrap();
+        std::fs::write(snap_a.join("lua").join(child_a), "").unwrap();
+        std::fs::create_dir_all(snap_b.join("lua")).unwrap();
+        std::fs::write(snap_b.join("lua").join(child_b), "").unwrap();
+
+        let snapshot = RepoSnapshotIdentity::new(
+            PathBuf::from("github.com/owner/repo"),
+            b"0123456789012345678901234567890123456789".to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let root_a = snap_a.to_string_lossy().into_owned();
+        let root_b = snap_b.to_string_lossy().into_owned();
+        let a = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot.clone(),
+            "lua",
+            &root_a,
+        )])));
+        let b = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot, "lua", &root_b,
+        )])));
+        (a, b, dir)
     }
 }
