@@ -792,6 +792,12 @@ async fn copy_file_with_strategy(src: &Path, dst: &Path) -> io::Result<()> {
         match copy_strategy() {
             s if s == STRATEGY_REFLINK => match reflink_file(src, dst).await {
                 Ok(()) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // dst 既存在（マージで同名ファイルが複数 plugin 由来等）。copy で上書き。
+                    // 戦略は変更しない（AlreadyExists は環境起因ではない）。
+                    tokio::fs::copy(src, dst).await?;
+                    return Ok(());
+                }
                 Err(e) if reflink_should_fallback(&e) => {
                     advance_strategy(&e);
                     continue;
@@ -803,6 +809,10 @@ async fn copy_file_with_strategy(src: &Path, dst: &Path) -> io::Result<()> {
                 Err(e) if e.raw_os_error() == Some(EXDEV) => {
                     advance_strategy(&e);
                     continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    tokio::fs::copy(src, dst).await?;
+                    return Ok(());
                 }
                 Err(e) => return Err(e),
             },
@@ -833,7 +843,17 @@ async fn copy_leaf(src: &Path, dst: &Path) -> io::Result<()> {
             tokio::fs::create_dir_all(parent).await?;
         }
         #[cfg(unix)]
-        tokio::fs::symlink(&target, dst).await?;
+        {
+            if let Err(e) = tokio::fs::symlink(&target, dst).await {
+                if e.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+                // dst 既存在（マージ衝突等）。除去してから再作成（ファイル/dir 混在に備え両方試す）。
+                let _ = tokio::fs::remove_file(dst).await;
+                let _ = tokio::fs::remove_dir_all(dst).await;
+                tokio::fs::symlink(&target, dst).await?;
+            }
+        }
         // Windows は symlink 作成に権限が必要なため実体 copy にフォールバック。
         #[cfg(not(unix))]
         {
@@ -865,6 +885,10 @@ async fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             Err(e) if reflink_should_fallback(&e) => {
                 advance_strategy(&e);
                 // フォールバック: dst は未作成のまま walk へ。
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // dst 既存在（マージで sealed-dir と展開済み子エントリが同一 pack に混在等）。
+                // 内容を再帰 merge する walk へフォールバック（戦略は変更しない: 環境起因ではない）。
             }
             Err(e) => return Err(e),
         }
@@ -1767,6 +1791,35 @@ mod tests {
             b"hello",
             "editing source must not mutate the pack copy"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn copy_tree_merges_into_existing_destination() {
+        // マージで sealed-dir と展開済み子エントリが同一 pack に混在した場合など、
+        // `copy_tree` が既存在の dst ディレクトリへ配置される場合は EEXIST せず
+        // 内容を再帰 merge することを検証する（EEXIST 回帰対策）。
+        let root =
+            std::env::temp_dir().join(format!("rsplug-copytree-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let dst = root.join("dst");
+        // dst は既に存在し、別プラグイン由来（展開済み子）のファイルを含む。
+        std::fs::create_dir_all(dst.join("mstdn")).unwrap();
+        std::fs::write(dst.join("edisch.vim"), b"edisch").unwrap();
+        // src は異なるファイルを持つ sealed-dir。
+        std::fs::create_dir_all(src.join("gin")).unwrap();
+        std::fs::write(src.join("gin/util.vim"), b"gin").unwrap();
+        std::fs::write(src.join("README.md"), b"gin-readme").unwrap();
+
+        copy_tree(&src, &dst).await.unwrap();
+
+        // dst は元のファイルと src のファイルの両方（union）を持つ。
+        assert_eq!(std::fs::read(dst.join("edisch.vim")).unwrap(), b"edisch");
+        assert!(dst.join("mstdn").is_dir());
+        assert_eq!(std::fs::read(dst.join("gin/util.vim")).unwrap(), b"gin");
+        assert_eq!(std::fs::read(dst.join("README.md")).unwrap(), b"gin-readme");
 
         let _ = std::fs::remove_dir_all(&root);
     }
