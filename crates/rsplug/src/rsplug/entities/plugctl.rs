@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     iter::Sum,
     ops::AddAssign,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -64,7 +64,9 @@ pub struct PlugCtl {
     source_name2pkgid: BTreeMap<String, Vec<PluginIDStr>>,
     source_target2pkgid: BTreeMap<String, PluginIDStr>,
     keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
-    overwrite_files: BTreeMap<PluginID, HowToPlaceFiles>,
+    /// `_rsplug:doc` プラグインへ集約する盗み doc ファイル（マージ前に `LoadedPlugin::steal_doc`
+    /// で抜き出したもの）。`From<PlugCtl>` が1つの start/control プラグインを生成する。
+    pub(super) overwrite_files: BTreeMap<PathBuf, FileItem>,
 }
 
 /// 生成ファイル（`FileSource::File`）の `(install_path, FileItem)` を作る。
@@ -399,25 +401,18 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             }
         }
 
-        // Processing overwrite_files
-        {
-            let mut overwrite_copies = BTreeMap::new();
-            for (_id, files) in overwrite_files {
-                let HowToPlaceFiles::CopyEachFile(files) = files;
-                overwrite_copies.extend(files);
-            }
-            if !overwrite_copies.is_empty() {
-                plugs.push(LoadedPlugin {
-                    source_name: Some(DOC_PLUGIN_NAME.to_string()),
-                    lazy_type: LazyType::Start,
-                    files: HowToPlaceFiles::CopyEachFile(overwrite_copies),
-                    script: Default::default(),
-                    order: usize::MAX,
-                    merge_enabled: true,
-                    is_plugctl: true,
-                    dotgit: false,
-                });
-            }
+        // Processing overwrite_files（盗み doc を1つの _rsplug:doc start/control プラグインに集約）
+        if !overwrite_files.is_empty() {
+            plugs.push(LoadedPlugin {
+                source_name: Some(DOC_PLUGIN_NAME.to_string()),
+                lazy_type: LazyType::Start,
+                files: HowToPlaceFiles::CopyEachFile(overwrite_files),
+                script: Default::default(),
+                order: usize::MAX,
+                merge_enabled: true,
+                is_plugctl: true,
+                dotgit: false,
+            });
         }
 
         plugs
@@ -522,28 +517,7 @@ impl PlugCtl {
         lazy_type: LazyType,
         script: SetupScript,
         order: usize,
-        files: &mut HowToPlaceFiles,
     ) -> Self {
-        // Steal `doc/**` files
-        let mut overwrite_files = move |id: PluginID| {
-            BTreeMap::from([(id, {
-                let HowToPlaceFiles::CopyEachFile(map) = files;
-                let doc_keys: Vec<PathBuf> = map
-                    .keys()
-                    .filter(|p| p.starts_with("doc/") && p.as_path() != Path::new("doc"))
-                    .cloned()
-                    .collect();
-                let mut extracted = BTreeMap::new();
-                for key in doc_keys {
-                    if let Some(mut file) = map.remove(&key) {
-                        file.merge_type = MergeType::Overwrite;
-                        extracted.insert(key, file);
-                    }
-                }
-                HowToPlaceFiles::CopyEachFile(extracted)
-            })])
-        };
-
         let id_str = id.as_str();
         let source_target2pkgid = source_name
             .map(|source_name| BTreeMap::from([(source_name, id_str.clone())]))
@@ -558,7 +532,6 @@ impl PlugCtl {
                     start: true,
                 }],
                 source_target2pkgid,
-                overwrite_files: overwrite_files(id),
                 ..Default::default()
             };
         };
@@ -627,7 +600,7 @@ impl PlugCtl {
             source_name2pkgid,
             source_target2pkgid,
             keypattern2pkgid,
-            overwrite_files: overwrite_files(id),
+            ..Default::default()
         }
     }
 }

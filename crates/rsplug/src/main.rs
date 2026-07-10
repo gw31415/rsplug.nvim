@@ -153,7 +153,7 @@ async fn app() -> Result<(), Error> {
         })?;
     // reqwest::Client は内部が Arc なので clone は安価。FnMut closure 内に move するため先に clone。
     let http_client = http_client.clone();
-    let (mut plugins, lock_infos, urls_to_remove) = {
+    let (plugins, lock_infos, urls_to_remove) = {
         let res = plugins
             .into_iter()
             .map(|plugin| {
@@ -266,12 +266,10 @@ async fn app() -> Result<(), Error> {
         .await?;
     }
 
-    // Create PackPathState and insert packages into it
+    // Create PackPathState and load packages into it.
+    // doc 盗みはマージ前に行う（doc が source 間マージの対象にならないよう）。
     let mut state = rsplug::PackPathState::new();
-    rsplug::LoadedPlugin::merge(&mut plugins);
-    for plugin in plugins {
-        state.insert(plugin);
-    }
+    state.load(plugins);
     msg(Message::MergeFinished {
         total: total_count,
         merged: state.len(),

@@ -112,6 +112,9 @@ snapshot を symlink 参照していた（`RepoSnapshotLink`）。これが pack
   統一、`CopyEachFile` をディレクトリ・ファイル不分別辞書化、merge データロス修正（1段展開して子 key 化）、
   dotgit `.git` を通常 sealed-dir エントリ化。**plugin_id 非互換**（既存 pack/lock は再生成）。
 - [x] (2026-07-10) Phase 7: FetchTarball の `.git` ワークアラウンド削除 + ハッシュ計算変更。**下記 Phase 7 詳細参照**。
+- [x] (2026-07-10) doc 盗み復活: Phase 6a で列挙が read_dir（`doc` sealed-dir）になり盗みが no-op 化していたのを、`doc` を個別ファイルに展開して復元（`_rsplug:doc` start/control プラグインへ集約・helptags 1件）。
+- [x] (2026-07-10) EEXIST 暫定対応: install copy を dst 既存在でマージ/上書きするよう堅牢化（Phase 8 で根本対応、本対応は safety net として残置）。
+- [ ] (2026-07-10) Phase 8: doc 盗みをマージ前に移行 + マージの sealed/子混在を推移的に正規化。**下記 Phase 8 詳細参照**。
 
 ## Phase 7 詳細（2026-07-10 完了）
 
@@ -152,6 +155,41 @@ snapshot を symlink 参照していた（`RepoSnapshotLink`）。これが pack
 - 生成 init.lua を nvim headless でロード → messages 空（エラーなし）。
 - `cargo test --workspace`（81+件）/ `clippy -D warnings` / `fmt --check` すべて緑。
 
+## Phase 8 詳細（2026-07-10 実装）
+
+**背景（EEXIST 回帰）**: doc 盗み復活で `doc` 衝突（マージ阻害要因）が消えた結果、`autoload/` 等の
+sealed-dir を共有するプラグインが新たにマージするようになった。Phase 6c の `union_files`/
+`expand_dir_union` の sealed-dir 展開は**非推移的**で、3+ プラグインのマージで同一 pack に
+「sealed `autoload`」と「展開済み `autoload/子`」が混在し、install の `copy_tree` が既存 `autoload/` に
+clonefile して `EEXIST (os error 17)` になっていた。
+
+**変更1: doc 盗みをマージ前に移行**（doc を merge 対象から除外し、merge を clean に）。
+- `LoadedPlugin::steal_doc(&mut self) -> BTreeMap<PathBuf, FileItem>` 新設: `self.files` から `doc/**`
+  を抜き出し（`MergeType::Overwrite`）て返す。`PlugCtl::create` 内の盗み closure は削除。
+- `main.rs`: `LoadedPlugin::merge` の**前**に全プラグインから doc を盗んで `doc_acc` に集約。
+  マージは doc 無しの source プラグイン群で行う。`state.set_doc(doc_acc)` で注入 → `From<PlugCtl>` が
+  `_rsplug:doc` プラグインを生成（従来通り rsplug 自身の `doc/rsplug.txt` と merge）。
+- `PlugCtl.overwrite_files` を `BTreeMap<PluginID, HowToPlaceFiles>` → フラット `BTreeMap<PathBuf, FileItem>`
+  に簡素化（`From<PlugCtl>` は元から `_id` を無視して flatten していたため）。
+- **plugin_id 非互換**: source プラグインの id が doc 有り→無しで変化（既存 pack/lock は再生成）。
+
+**変更2: マージの sealed/子混在を推移的に正規化**（autoload 系 EEXIST の根本対応）。
+- `union_files` のマージ後、`normalize_sealed(&mut files)` を実行: sealed-dir `X` が同じ map 内に
+  子孫 `X/...` を持つ場合、その sealed `X` を展開（子を個別エントリ化）して混在を解消。子孫を持つ
+  sealed のみ展開し、nesting はループで処理。
+- **IO は最低限**: 展開判定は BTreeMap range で O(log n)（IO 無し）。実際の展開（`read_dir`）は
+  「子孫を持つ sealed」のみ。深さは当該 sealed の1階層（nesting は必要分だけループ）。
+- `dirs_mergeable` は変更不要（sealed/子はキー不同のため衝突と見なされず、元から merge 可能。
+  `union_files` が正しく処理すればよい）。
+
+**safety net**: install copy の dst 既存在→マージ/上書き堅牢化（`copy_tree` は再帰 walk で既存 dst に merge、
+`copy_file_with_strategy`/symlink は上書き）は残置。マージ正規化漏れや dotgit `.git` 等の例外でも
+EEXIST で install が落ない保険。
+
+**検証**: 隔離 HOME + ユーザ実設定（128 plugin）で再現していた EEXIST が解消（exit 0）。vim-gin pack の
+`autoload/` が `gin edisch.vim mstdn` の完全 union になることを確認。doc 集約・tags 1件・help 参照は維持。
+単体テスト `normalize_sealed_*`/`steal_doc_*`/`copy_tree_merges_into_existing_destination` 追加。
+
 ## Surprises & Discoveries
 
 - `to_sym()` はユーザ明示だけでなく build/lua_build/lua_post_update で自動 true。sym の役割は build 成果物
@@ -163,6 +201,11 @@ snapshot を symlink 参照していた（`RepoSnapshotLink`）。これが pack
   「衝突時1段展開して子 key 化・再帰 union」で修正。
 - Phase 6a/6c で `git ls-files`/`init_git_worktree` の git 依存が削除された結果、Phase 7 で tarball の
   `.git` を完全に外せるようになった（dirty も内容ハッシュで代替）。
+- **Phase 6c sealed 展開の非推移性（Phase 8 で発見）**: `union_files`/`expand_dir_union` の sealed-dir 展開は
+  pairwise のみ完全。3+ プラグインが `autoload/` 等を共有するマージで「sealed X」と「展開済み X/子」が
+  同一 pack に混在し得る。長らく潜在していたが、doc 盗み復活で `doc` 衝突（マージ阻害要因）が消え、
+  `autoload` 系プラグインが新たにマージするようになって顕在化（EEXIST）。Evidence: `packpathstate.rs`
+  `union_files`/`expand_dir_union`/`dirs_mergeable`。
 
 ## Decision Log
 
@@ -255,3 +298,7 @@ repos GC の削除範囲はユーザー確認済で **「両方」**:
 - 2026-07-10: 旧 `PLANS.md`（§A）と `PLANS-copy-unification.md`（§B）を本ファイルに統合。§B の
   「ExecPlan は別ファイルに置く」Decision（2026-07-07）は、ユーザー指示（1つの PLANS.md に集約）により
   **上書き**。§C（`--gc` 拡張）を未実装プランとして追加。
+- 2026-07-10: doc 盗み復活（read_dir sealed-dir で no-op 化していたのを個別ファイル展開で修復）。
+  その副作用で autoload 系マージの非推移性が顕在化し EEXIST。install 堅牢化（dst 既存在→マージ/上書き）
+  で暫定対応後、**Phase 8** で根本対応（doc 盗みをマージ前に移行＋`union_files` の sealed/子混在を
+  推移的正規化、IO 最小）。install 堅牢化は safety net として残置。

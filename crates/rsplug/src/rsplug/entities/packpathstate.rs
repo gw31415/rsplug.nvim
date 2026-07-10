@@ -200,6 +200,26 @@ impl LoadedPlugin {
                 FileSource::File { .. } => None,
             })
     }
+
+    /// `doc/**` を `files` から抜き出し（盗み）、`_rsplug:doc` プラグインへ集約するために返す。
+    /// マージ**前**に呼ぶことで doc がマージ対象から外れ、source プラグイン間のマージが
+    /// doc に影響されず clean に行われる（Phase 8）。抜き出したファイルは `MergeType::Overwrite`。
+    pub(super) fn steal_doc(&mut self) -> BTreeMap<PathBuf, FileItem> {
+        let HowToPlaceFiles::CopyEachFile(map) = &mut self.files;
+        let doc_keys: Vec<PathBuf> = map
+            .keys()
+            .filter(|p| p.starts_with("doc/") && p.as_path() != Path::new("doc"))
+            .cloned()
+            .collect();
+        let mut extracted = BTreeMap::new();
+        for key in doc_keys {
+            if let Some(mut file) = map.remove(&key) {
+                file.merge_type = MergeType::Overwrite;
+                extracted.insert(key, file);
+            }
+        }
+        extracted
+    }
 }
 
 /// FileItem の種別（file/dir）。実行時に遅延解決され `FileItem.kind` にキャッシュされる。
@@ -513,6 +533,8 @@ fn read_dir_children(dir: &Path) -> HashSet<OsString> {
 /// `files` と `rfiles` を union する。同 path の sealed-dir 衝突は1段展開して
 /// 子 key に置換する（Phase 6a で入った `extend` 上書きによる片側消失を防ぐ）。
 /// `dirs_mergeable(files, rfiles)` が true（全衝突が解決可能）の前提で呼ぶ。
+/// 3+ プラグインのマージで sealed `X` と展開済み `X/子` が混在する（非推移的）のを防ぐため、
+/// union 後に `normalize_sealed` で推移的正規化する（Phase 8）。
 fn union_files(
     mut files: BTreeMap<PathBuf, FileItem>,
     rfiles: BTreeMap<PathBuf, FileItem>,
@@ -533,7 +555,65 @@ fn union_files(
             }
         }
     }
+    normalize_sealed(&mut files);
     files
+}
+
+/// sealed-dir `X` が同一 map 内に子孫 `X/...` を持つ場合、その sealed `X` を展開して混在を解消する。
+/// 3+ プラグインのマージで「sealed X」と「展開済み X/子」が混在する（Phase 6c の非推移性）のを
+/// 正規化し、install copy での EEXIST を根本回避する（Phase 8）。子孫を持つ sealed のみ展開し、
+/// nesting はループで処理。展開判定は IO 無し（BTreeMap range）、`read_dir` は展開時のみ。
+fn normalize_sealed(files: &mut BTreeMap<PathBuf, FileItem>) {
+    loop {
+        // 子孫を持つ sealed-dir を1つ見つける（無ければ正規化完了）。
+        let Some(sealed_path) = files
+            .iter()
+            .filter(|(_, v)| v.kind() == FileKind::Directory)
+            .find(|(k, _)| has_descendant(files, k))
+            .map(|(k, _)| k.clone())
+        else {
+            return;
+        };
+        let Some(sealed) = files.remove(&sealed_path) else {
+            return;
+        };
+        expand_sealed_into(files, &sealed_path, sealed);
+    }
+}
+
+/// `files` 内に `path` の子孫（`path/...`）が存在するか。IO 無し・BTreeMap range で O(log n)。
+fn has_descendant(files: &BTreeMap<PathBuf, FileItem>, path: &Path) -> bool {
+    use std::ops::Bound;
+    files
+        .range::<Path, _>((Bound::Excluded(path), Bound::Unbounded))
+        .next()
+        .map(|(k, _)| k.starts_with(path))
+        .unwrap_or(false)
+}
+
+/// sealed-dir `sealed`（`path` にある）の子を `files` に union する。既存の子孫と衝突すれば
+/// sealed 同士は `expand_dir_union`、file/file は rhs 勝ち。sealed `path` 自体は置かない。
+fn expand_sealed_into(files: &mut BTreeMap<PathBuf, FileItem>, path: &Path, sealed: FileItem) {
+    let Some(root) = snapshot_root_of(&sealed.source) else {
+        return;
+    };
+    let children = read_dir_children(&root.join(path));
+    for child in &children {
+        let cpath = path.join(child);
+        let citem = child_item(&sealed, cpath.clone());
+        match files.remove(&cpath) {
+            None => {
+                files.insert(cpath, citem);
+            }
+            Some(existing) => {
+                if existing.kind() == FileKind::Directory && citem.kind() == FileKind::Directory {
+                    expand_dir_union(files, &cpath, existing, citem);
+                } else {
+                    files.insert(cpath, citem); // file/file: rhs 勝ち
+                }
+            }
+        }
+    }
 }
 
 /// 同 path の sealed-dir 同士（`litem`, `ritem`）を1段展開し、子 key を `out` に union する。
@@ -1045,6 +1125,20 @@ impl PackPathState {
     pub fn new() -> Self {
         Default::default()
     }
+    /// source プラグイン群を受け取る。**マージ前に各プラグインから doc を盗み** `_rsplug:doc`
+    /// 用に集約し、doc 無しのプラグイン群をマージして登録する（Phase 8: doc をマージ対象から外し、
+    /// source 間のマージが doc に影響されないようにする）。
+    pub fn load(&mut self, mut plugins: BinaryHeap<LoadedPlugin>) {
+        let drained: Vec<LoadedPlugin> = plugins.drain().collect();
+        for mut p in drained {
+            self.ctl.overwrite_files.extend(p.steal_doc());
+            plugins.push(p);
+        }
+        LoadedPlugin::merge(&mut plugins);
+        for plugin in plugins {
+            self.insert(plugin);
+        }
+    }
     /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な PlugCtl を返す。
     pub fn insert(&mut self, loaded_plugin: LoadedPlugin) {
         let id = loaded_plugin.plugin_id();
@@ -1057,7 +1151,7 @@ impl PackPathState {
         let LoadedPlugin {
             source_name,
             lazy_type,
-            mut files,
+            files,
             script,
             order,
             merge_enabled: _,
@@ -1066,7 +1160,9 @@ impl PackPathState {
         } = loaded_plugin;
 
         if !is_plugctl {
-            self.ctl += PlugCtl::create(id, source_name, lazy_type, script, order, &mut files);
+            // doc 盗みはマージ前に `PackPathState::load` → `LoadedPlugin::steal_doc` で済ませているため、
+            // ここでは lazy 実行制御（PlugCtl）の生成のみ。files は変更しない。
+            self.ctl += PlugCtl::create(id, source_name, lazy_type, script, order);
         }
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
@@ -2025,6 +2121,99 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 8: sealed-dir `X` と子孫 `X/...` が混在する map を正規化（sealed 側を展開）。
+    /// 3+ プラグインのマージで生じる非推移的混在（EEXIST 原因）を解消する。
+    #[test]
+    fn normalize_sealed_expands_sealed_dir_coexisting_with_descendants() {
+        let dir = std::env::temp_dir().join(format!("rsplug-normsealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // snapA: autoload/gin/util.vim（sealed `autoload` として表現）
+        std::fs::create_dir_all(dir.join("a/autoload/gin")).unwrap();
+        std::fs::write(dir.join("a/autoload/gin/util.vim"), "gin\n").unwrap();
+        // snapB: autoload/edisch.vim（展開済み子として表現）
+        std::fs::create_dir_all(dir.join("b/autoload")).unwrap();
+        std::fs::write(dir.join("b/autoload/edisch.vim"), "edisch\n").unwrap();
+
+        let snap_a = snap(
+            "github.com/owner/a",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let snap_b = snap(
+            "github.com/owner/b",
+            b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let root_a = dir.join("a").to_string_lossy().into_owned();
+        let root_b = dir.join("b").to_string_lossy().into_owned();
+
+        // 非推移的マージ結果を模倣: sealed `autoload`(A) + 展開済み `autoload/edisch.vim`(B) が混在。
+        let mut files = BTreeMap::from([
+            repo_file(snap_a, "autoload", &root_a),
+            repo_file(snap_b, "autoload/edisch.vim", &root_b),
+        ]);
+
+        normalize_sealed(&mut files);
+
+        // sealed `autoload` は展開されて消え、子 `autoload/gin`(sealed) と `autoload/edisch.vim` になる。
+        assert!(
+            !files.contains_key(Path::new("autoload")),
+            "sealed autoload must be expanded"
+        );
+        assert!(
+            files.contains_key(Path::new("autoload/gin")),
+            "autoload/gin (A's child) must remain"
+        );
+        assert!(
+            files.contains_key(Path::new("autoload/edisch.vim")),
+            "autoload/edisch.vim (B's descendant) must remain"
+        );
+        // 最終状態で sealed/子混在は無い。
+        for (k, v) in &files {
+            if v.kind() == FileKind::Directory {
+                assert!(
+                    !has_descendant(&files, k),
+                    "no sealed dir with descendants after normalize: {k:?}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 8: `steal_doc` が files から `doc/**` を抜き出し（Overwrite）、非 doc を残す。
+    #[test]
+    fn steal_doc_extracts_doc_and_leaves_rest() {
+        let snapshot = snap(
+            "github.com/owner/repo",
+            b"0123456789012345678901234567890123456789",
+        );
+        let files = HowToPlaceFiles::CopyEachFile(BTreeMap::from([
+            repo_file(snapshot.clone(), "doc/foo.txt", "/cache"),
+            repo_file(snapshot.clone(), "doc/sub/bar.txt", "/cache"),
+            repo_file(snapshot, "lua/x.lua", "/cache"),
+        ]));
+        let mut loaded = synth(files);
+
+        let stolen = loaded.steal_doc();
+
+        assert_eq!(stolen.len(), 2, "doc/foo.txt and doc/sub/bar.txt stolen");
+        assert!(stolen.contains_key(Path::new("doc/foo.txt")));
+        assert!(stolen.contains_key(Path::new("doc/sub/bar.txt")));
+        for v in stolen.values() {
+            assert_eq!(
+                v.merge_type,
+                MergeType::Overwrite,
+                "stolen doc must be Overwrite"
+            );
+        }
+        // 非 doc は残る。
+        match &loaded.files {
+            HowToPlaceFiles::CopyEachFile(remaining) => {
+                assert_eq!(remaining.len(), 1, "only lua/x.lua remains");
+                assert!(remaining.contains_key(Path::new("lua/x.lua")));
+            }
+        }
     }
 
     /// 2a-2c: 同 path ディレクトリで子要素が重複（両方ファイル・Conflict）→ 非マージ。

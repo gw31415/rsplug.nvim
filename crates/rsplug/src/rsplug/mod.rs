@@ -9,5 +9,5 @@ pub use entities::plugin;
 pub use entities::config::Config;
 pub use entities::error::Error;
 pub use entities::lockfile::{LockFile, LockedResource, LockedResourceType};
-pub use packpathstate::{LoadedPlugin, PackPathState};
+pub use packpathstate::PackPathState;
 pub use plugin::Plugin;
