@@ -49,6 +49,7 @@
                 pkg-config
               ] ++ lib.optional stdenv.isLinux autoPatchelfHook;
               buildInputs = with pkgs; [
+                gcc-unwrapped.lib
                 libgit2
                 openssl
               ];
