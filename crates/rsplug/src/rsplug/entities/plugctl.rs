@@ -64,9 +64,6 @@ pub struct PlugCtl {
     source_name2pkgid: BTreeMap<String, Vec<PluginIDStr>>,
     source_target2pkgid: BTreeMap<String, PluginIDStr>,
     keypattern2pkgid: BTreeMap<ModeChar, BTreeMap<Arc<String>, Vec<PluginIDStr>>>,
-    /// `_rsplug:doc` プラグインへ集約する盗み doc ファイル（マージ前に `LoadedPlugin::steal_doc`
-    /// で抜き出したもの）。`From<PlugCtl>` が1つの start/control プラグインを生成する。
-    pub(super) overwrite_files: BTreeMap<PathBuf, FileItem>,
 }
 
 /// 生成ファイル（`FileSource::File`）の `(install_path, FileItem)` を作る。
@@ -117,7 +114,6 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             source_name2pkgid,
             source_target2pkgid,
             keypattern2pkgid,
-            overwrite_files,
         } = value;
 
         let mut plugs = vec![instant_startup_pkg(
@@ -401,19 +397,9 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             }
         }
 
-        // Processing overwrite_files（盗み doc を1つの _rsplug:doc start/control プラグインに集約）
-        if !overwrite_files.is_empty() {
-            plugs.push(LoadedPlugin {
-                source_name: Some(DOC_PLUGIN_NAME.to_string()),
-                lazy_type: LazyType::Start,
-                files: HowToPlaceFiles::CopyEachFile(overwrite_files),
-                script: Default::default(),
-                order: usize::MAX,
-                merge_enabled: true,
-                is_plugctl: true,
-                dotgit: false,
-            });
-        }
+        // NOTE: doc 盗みは `LoadedPlugin::split_doc`（`PackPathState::load`）で LoadedPlugin として
+        // 扱い、ここ（control マージ）で rsplug-doc・lazy loader と統一マージされる。
+        // PlugCtl 自体は lazy 実行制御のみを担う。
 
         plugs
     }
@@ -431,7 +417,6 @@ impl AddAssign for PlugCtl {
             source_name2pkgid,
             source_target2pkgid,
             keypattern2pkgid,
-            overwrite_files,
         } = other;
         for (event, ids) in event2pkgid {
             self.event2pkgid.entry(event).or_default().extend(ids);
@@ -462,7 +447,6 @@ impl AddAssign for PlugCtl {
                 mode_entry.entry(pattern).or_default().extend(ids);
             }
         }
-        self.overwrite_files.extend(overwrite_files);
     }
 }
 
@@ -493,7 +477,6 @@ impl PlugCtl {
             source_name2pkgid,
             source_target2pkgid,
             keypattern2pkgid,
-            overwrite_files,
         } = self;
         event2pkgid.is_empty()
             && scripts.is_empty()
@@ -504,7 +487,6 @@ impl PlugCtl {
             && source_name2pkgid.is_empty()
             && source_target2pkgid.is_empty()
             && keypattern2pkgid.values().all(|v| v.is_empty())
-            && overwrite_files.is_empty()
     }
 
     /// パッケージ情報を読み込み、 PlugCtl を作成する。
@@ -600,7 +582,6 @@ impl PlugCtl {
             source_name2pkgid,
             source_target2pkgid,
             keypattern2pkgid,
-            ..Default::default()
         }
     }
 }

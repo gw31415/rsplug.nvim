@@ -201,24 +201,59 @@ impl LoadedPlugin {
             })
     }
 
-    /// `doc/**` を `files` から抜き出し（盗み）、`_rsplug:doc` プラグインへ集約するために返す。
-    /// マージ**前**に呼ぶことで doc がマージ対象から外れ、source プラグイン間のマージが
-    /// doc に影響されず clean に行われる（Phase 8）。抜き出したファイルは `MergeType::Overwrite`。
-    pub(super) fn steal_doc(&mut self) -> BTreeMap<PathBuf, FileItem> {
-        let HowToPlaceFiles::CopyEachFile(map) = &mut self.files;
+    /// self を `(rest, doc)` に分割する。`rest` は `doc/**` を除外した元プラグイン。
+    /// `doc` は抜き出した `doc/**` を持つ `_rsplug:doc` プラグイン（doc が無ければ `None`）。
+    /// doc を「LoadedPlugin のまま」扱い、control マージで rsplug-doc・lazy loader と統一的に
+    /// 1つの `_rsplug:doc` に集約する（Phase 8: `PlugCtl.overwrite_files` 中間表現を廃止）。
+    pub(super) fn split_doc(self) -> (LoadedPlugin, Option<LoadedPlugin>) {
+        let LoadedPlugin {
+            source_name,
+            lazy_type,
+            files,
+            script,
+            order,
+            merge_enabled,
+            is_plugctl,
+            dotgit,
+        } = self;
+        let HowToPlaceFiles::CopyEachFile(mut map) = files;
         let doc_keys: Vec<PathBuf> = map
             .keys()
             .filter(|p| p.starts_with("doc/") && p.as_path() != Path::new("doc"))
             .cloned()
             .collect();
-        let mut extracted = BTreeMap::new();
+        let mut doc_map = BTreeMap::new();
         for key in doc_keys {
             if let Some(mut file) = map.remove(&key) {
                 file.merge_type = MergeType::Overwrite;
-                extracted.insert(key, file);
+                doc_map.insert(key, file);
             }
         }
-        extracted
+        let rest = LoadedPlugin {
+            source_name,
+            lazy_type,
+            files: HowToPlaceFiles::CopyEachFile(map),
+            script,
+            order,
+            merge_enabled,
+            is_plugctl,
+            dotgit,
+        };
+        let doc = if doc_map.is_empty() {
+            None
+        } else {
+            Some(LoadedPlugin {
+                source_name: Some(super::plugctl::DOC_PLUGIN_NAME.to_string()),
+                lazy_type: LazyType::Start,
+                files: HowToPlaceFiles::CopyEachFile(doc_map),
+                script: SetupScript::default(),
+                order: usize::MAX,
+                merge_enabled: true,
+                is_plugctl: true,
+                dotgit: false,
+            })
+        };
+        (rest, doc)
     }
 }
 
@@ -1115,6 +1150,9 @@ pub struct PackPathState {
     installing: HashSet<Box<[u8]>>,
     files: HashMap<PluginIDStr, Files>,
     ctl: PlugCtl,
+    /// `split_doc` で分割された doc プラグイン群（LoadedPlugin のまま）。install の control
+    /// マージで rsplug-doc・lazy loader と統一マージされ、1つの `_rsplug:doc` に集約される（Phase 8）。
+    doc_plugins: Vec<LoadedPlugin>,
 }
 
 impl PackPathState {
@@ -1125,14 +1163,18 @@ impl PackPathState {
     pub fn new() -> Self {
         Default::default()
     }
-    /// source プラグイン群を受け取る。**マージ前に各プラグインから doc を盗み** `_rsplug:doc`
-    /// 用に集約し、doc 無しのプラグイン群をマージして登録する（Phase 8: doc をマージ対象から外し、
-    /// source 間のマージが doc に影響されないようにする）。
+    /// source プラグイン群を受け取る。**マージ前に各プラグインを `split_doc` で (rest, doc) に分割**し、
+    /// doc 無しの rest 群をマージして登録する。doc 部は LoadedPlugin のまま `doc_plugins` に集め、
+    /// install の control マージで rsplug-doc・lazy loader と統一的に1つの `_rsplug:doc` に集約する
+    /// （Phase 8: doc をマージ対象から外し、LoadedPlugin 分割インタフェースで統一表現）。
     pub fn load(&mut self, mut plugins: BinaryHeap<LoadedPlugin>) {
         let drained: Vec<LoadedPlugin> = plugins.drain().collect();
-        for mut p in drained {
-            self.ctl.overwrite_files.extend(p.steal_doc());
-            plugins.push(p);
+        for p in drained {
+            let (rest, doc) = p.split_doc();
+            if let Some(doc) = doc {
+                self.doc_plugins.push(doc);
+            }
+            plugins.push(rest);
         }
         LoadedPlugin::merge(&mut plugins);
         for plugin in plugins {
@@ -1190,12 +1232,16 @@ impl PackPathState {
     /// {packpath}/pack/_gen/opt/{id}/
     pub async fn install(mut self, packpath: &Path) -> io::Result<()> {
         {
-            // Load PlugCtl
+            // PlugCtl（lazy 実行制御）と分割された doc プラグイン群を control マージで統一する。
+            // rsplug-doc・lazy loader・doc 分割群が1つの `_rsplug:doc`（+ 制御パック）に集約される。
             let plugins = {
                 let plugins: Vec<LoadedPlugin> = std::mem::take(&mut self.ctl).into();
-                let mut plugins: BinaryHeap<_> = plugins.into();
-                LoadedPlugin::merge(&mut plugins);
-                plugins
+                let mut heap: BinaryHeap<_> = plugins.into();
+                for doc in std::mem::take(&mut self.doc_plugins) {
+                    heap.push(doc);
+                }
+                LoadedPlugin::merge(&mut heap);
+                heap
             };
             for plugin in plugins {
                 self.insert(plugin);
@@ -1207,6 +1253,7 @@ impl PackPathState {
             installing: _,
             files,
             ctl: _,
+            doc_plugins: _,
         } = self;
         let mut generation_entries: Vec<String> = files
             .iter()
@@ -2182,8 +2229,10 @@ mod tests {
     }
 
     /// Phase 8: `steal_doc` が files から `doc/**` を抜き出し（Overwrite）、非 doc を残す。
+    /// Phase 8: `split_doc` が self を `(rest, doc)` に分割。rest は doc/** 以外、doc は
+    /// `_rsplug:doc` プラグイン（doc/** を Overwrite 保持）。doc 無しは None。
     #[test]
-    fn steal_doc_extracts_doc_and_leaves_rest() {
+    fn split_doc_separates_doc_into_own_plugin() {
         let snapshot = snap(
             "github.com/owner/repo",
             b"0123456789012345678901234567890123456789",
@@ -2193,26 +2242,29 @@ mod tests {
             repo_file(snapshot.clone(), "doc/sub/bar.txt", "/cache"),
             repo_file(snapshot, "lua/x.lua", "/cache"),
         ]));
-        let mut loaded = synth(files);
+        let loaded = synth(files);
 
-        let stolen = loaded.steal_doc();
+        let (rest, doc) = loaded.split_doc();
 
-        assert_eq!(stolen.len(), 2, "doc/foo.txt and doc/sub/bar.txt stolen");
-        assert!(stolen.contains_key(Path::new("doc/foo.txt")));
-        assert!(stolen.contains_key(Path::new("doc/sub/bar.txt")));
-        for v in stolen.values() {
+        // rest は doc/** 以外のみ。
+        let HowToPlaceFiles::CopyEachFile(rest_files) = &rest.files;
+        assert_eq!(rest_files.len(), 1, "only lua/x.lua remains in rest");
+        assert!(rest_files.contains_key(Path::new("lua/x.lua")));
+
+        // doc は `_rsplug:doc` プラグイン（is_plugctl, Start 相当）で doc/** を Overwrite 保持。
+        let doc = doc.expect("doc plugin must be Some when doc/** present");
+        assert_eq!(doc.source_name.as_deref(), Some("_rsplug:doc"));
+        assert!(doc.is_plugctl, "doc plugin must be a control package");
+        let HowToPlaceFiles::CopyEachFile(doc_files) = &doc.files;
+        assert_eq!(doc_files.len(), 2, "doc/foo.txt and doc/sub/bar.txt");
+        assert!(doc_files.contains_key(Path::new("doc/foo.txt")));
+        assert!(doc_files.contains_key(Path::new("doc/sub/bar.txt")));
+        for v in doc_files.values() {
             assert_eq!(
                 v.merge_type,
                 MergeType::Overwrite,
                 "stolen doc must be Overwrite"
             );
-        }
-        // 非 doc は残る。
-        match &loaded.files {
-            HowToPlaceFiles::CopyEachFile(remaining) => {
-                assert_eq!(remaining.len(), 1, "only lua/x.lua remains");
-                assert!(remaining.contains_key(Path::new("lua/x.lua")));
-            }
         }
     }
 

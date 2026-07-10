@@ -164,13 +164,17 @@ sealed-dir を共有するプラグインが新たにマージするようにな
 clonefile して `EEXIST (os error 17)` になっていた。
 
 **変更1: doc 盗みをマージ前に移行**（doc を merge 対象から除外し、merge を clean に）。
-- `LoadedPlugin::steal_doc(&mut self) -> BTreeMap<PathBuf, FileItem>` 新設: `self.files` から `doc/**`
-  を抜き出し（`MergeType::Overwrite`）て返す。`PlugCtl::create` 内の盗み closure は削除。
-- `main.rs`: `LoadedPlugin::merge` の**前**に全プラグインから doc を盗んで `doc_acc` に集約。
-  マージは doc 無しの source プラグイン群で行う。`state.set_doc(doc_acc)` で注入 → `From<PlugCtl>` が
-  `_rsplug:doc` プラグインを生成（従来通り rsplug 自身の `doc/rsplug.txt` と merge）。
-- `PlugCtl.overwrite_files` を `BTreeMap<PluginID, HowToPlaceFiles>` → フラット `BTreeMap<PathBuf, FileItem>`
-  に簡素化（`From<PlugCtl>` は元から `_id` を無視して flatten していたため）。
+LoadedPlugin 分割インタフェースで doc 盗みを統一表現する（doc を生の Map ではなく LoadedPlugin のまま扱う）。
+- `LoadedPlugin::split_doc(self) -> (LoadedPlugin /*rest*/, Option<LoadedPlugin> /*doc*/)` 新設:
+  self を消費して `doc/**` を抜き出した `_rsplug:doc` プラグイン（`is_plugctl`, `LazyType::Start`,
+  `MergeType::Overwrite`）と、doc 以外の rest に分割。doc 無しは `None`。
+- `PackPathState::load`: `LoadedPlugin::merge` の**前**に各プラグインを `split_doc` で分割。rest 群を
+  マージして登録し、doc 部は `doc_plugins: Vec<LoadedPlugin>` に集める。
+- `PackPathState::install`: control マージ（`PlugCtl` 由来の rsplug-doc・lazy loader）に `doc_plugins` を
+  加えて統一マージ → 1つの `_rsplug:doc`（+ 制御パック）に集約。
+- `PlugCtl::create` の盗み closure を削除（`files` パラメータも除去）。`PlugCtl.overwrite_files`
+  （`BTreeMap<PluginID, HowToPlaceFiles>` → フラット Map）は**廃止**（中間表現を経由せず doc は
+  LoadedPlugin のまま control マージへ）。PlugCtl は lazy 実行制御専用に戻る。
 - **plugin_id 非互換**: source プラグインの id が doc 有り→無しで変化（既存 pack/lock は再生成）。
 
 **変更2: マージの sealed/子混在を推移的に正規化**（autoload 系 EEXIST の根本対応）。
@@ -188,7 +192,7 @@ EEXIST で install が落ない保険。
 
 **検証**: 隔離 HOME + ユーザ実設定（128 plugin）で再現していた EEXIST が解消（exit 0）。vim-gin pack の
 `autoload/` が `gin edisch.vim mstdn` の完全 union になることを確認。doc 集約・tags 1件・help 参照は維持。
-単体テスト `normalize_sealed_*`/`steal_doc_*`/`copy_tree_merges_into_existing_destination` 追加。
+単体テスト `normalize_sealed_*`/`split_doc_*`/`copy_tree_merges_into_existing_destination` 追加。
 
 ## Surprises & Discoveries
 
