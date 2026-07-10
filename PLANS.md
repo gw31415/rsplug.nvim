@@ -2,13 +2,12 @@
 
 本ファイルは `AGENTS.md`（ExecPlans セクション）の慣習に従う living document である。
 2026-07-10 に旧 `PLANS.md`（lock/cache 同期）と `PLANS-copy-unification.md`（pack copy 統一）を
-1ファイルに統合した。`§C` に `--gc` 拡張の未実装プランを追加した。
+1ファイルに統合した。
 
 ## 目次
 
 - [§A — lock file / cache directory 同期](#a--lock-file--cache-directory-同期)
 - [§B — sym 廃止 / pack copy 統一](#b--sym-廃止--pack-copy-統一)
-- [§C — `--gc` 拡張（未実装プラン）](#c----gc-拡張未実装プラン)
 - [Revision Notes](#revision-notes)
 
 ---
@@ -23,20 +22,20 @@ rsplug.nvim は `~/.cache/rsplug/repos/<repo>/worktrees/<snapshot_key>/` に sna
 
 完了後の観測:
 - デフォルト実行（flag 無し）でも lock の `rev` が on-disk snapshot と一致する。
-- orphane snapshot は `--gc` で削除される。
 - lock は存在しない snapshot を主張しない。
 
 `repos/` は不変でない（build/lua_post_update/外部で snapshot worktree が変わりうる）。本 plan は不変性
-を仮定しない範囲（on-disk 状態の読取りのみ）を実装し、不変性に依存する部分は §C / 将来に委ねる。
+を仮定しない範囲（on-disk 状態の読取りのみ）を実装し、不変性に依存する部分は将来に委ねる。
 
 ## Progress
 
 - [x] (2026-07-07) Phase 1: lock を on-disk snapshot から再構築。`locked_map` を常にロックファイルから
   初期化（NotFound は空）。`Plugin::load` の `Ok(None)`（repo 有り・未インストール）URL を
   `urls_to_remove` に集めて lock から削除 → `lock_infos` を overlay。
-- [x] (2026-07-07) Phase 2: `--gc` で orphane snapshot 削除。URL→cachedir 正方向変換
-  （`rsplug::plugin::cachedir_from_url`）で lock と照合。`main.rs:gc_tests` で Acceptance 4/5 検証済み。
 - [ ] Phase 3（deferred）: 不変 snapshot 設計（read-only 化）。
+
+> **GC は一旦削除（2026-07-10）**: 旧 Phase 2 の `--gc`（orphane snapshot 削除）とその拡張案はコード・
+> 本ファイルから一旦除去した。再実装時は git 履歴の旧 `§C` 設計（pack GC + repos GC）を参照。
 
 ## Surprises & Discoveries
 
@@ -46,30 +45,21 @@ rsplug.nvim は `~/.cache/rsplug/repos/<repo>/worktrees/<snapshot_key>/` に sna
   を初期化しなかったため、設定に無い既存 plugin のエントリが欠落していた（Phase 1 で修正）。
 - snapshot dir 名が commit hash を符号化: `<40-hex>` or `<40-hex>__v1_<hash>`（`packpathstate.rs:71`）。
   `latest_snapshot_oid`（`plugin.rs:928`）がこの prefix を parse する。git repo を開かずに commit が復元可能。
-- **GC 逆変換バグ**: 初版 GC は dir→URL 逆変換だったが `walk_repos_for_gc` が絶対パスを渡すため
-  `parts[0]==/` となり host 判定不可 → 全件不一致で何も削除しなかった。`default_cachedir` は `.git` 末尾を
-  剥がすが lock key（`repo.url()`）は剥がさないため `.git` 付き URL でも不一致。正方向変換（URL→cachedir）
-  で統一して解決。Evidence: `plugin.rs:default_cachedir`, `util.rs:github::url`, `main.rs:garbage_collect`。
 
 ## Decision Log
 
-- Phase 1/2 は on-disk 状態の読取りのみで安全 → 即実装。Phase 3（不変性）は設計変更を要するため defer。
-- `--gc` は opt-in（破壊的）。ユーザーが手動 snapshot を保持したい場合を考慮。
-- GC は逆変換でなく URL→cachedir 正方向変換で照合する（`cachedir_from_url`）。逆変換は `.git`/scheme/auth
-  扱いが脆弱。GC ロジックは `main.rs` に維持し、変換ヘルパのみライブラリに共有。
+- Phase 1 は on-disk 状態の読取りのみで安全 → 即実装。Phase 3（不変性）は設計変更を要するため defer。
 
 ## Outcomes & Retrospective
 
-- Phase 1/2 実装済み（`main.rs` + `plugin.rs`）。デフォルト実行後に lock `rev` が snapshot と一致し、
-  設定にあって未インストールの repo は lock から除去される（Acceptance 1/2/3）。`--gc` は orphane snapshot
-  を削除（Acceptance 4/5）。
-- 検証: `cargo test --workspace`（`gc_tests` 5件追加）/ `clippy -D warnings` / `fmt --check` すべて緑。
-- Retrospective: GC 逆変換バグはテスト不在で発見が遅れた。Acceptance をテストで先書きすべきだった。
+- Phase 1 実装済み（`main.rs` + `plugin.rs`）。デフォルト実行後に lock `rev` が snapshot と一致し、
+  設定にあって未インストールの repo は lock から除去される（Acceptance 1/2/3）。
+- 検証: `cargo test --workspace` / `clippy -D warnings` / `fmt --check` すべて緑。
 
 ## Context / Key files
 
-- `main.rs` — `locked_map` 初期化（111-120）、load 収集（156-241）、lock 書込み（244-267）、`garbage_collect`（297-410）、`gc_tests`（413-561）。
-- `plugin.rs` — `Plugin::load`、`latest_snapshot_oid`（928）、`cachedir_from_url`。
+- `main.rs` — `locked_map` 初期化、load 収集、lock 書込み。
+- `plugin.rs` — `Plugin::load`、`latest_snapshot_oid`。
 - `lockfile.rs` — `LockFile` read/write。
 - `packpathstate.rs` — `RepoSnapshotIdentity`、`snapshot_key()`。
 
@@ -81,9 +71,7 @@ lock 形式: `{"version":"1","locked":{"<url>":{"type":"git","rev":"<40hex>"}}}`
 1. デフォルト実行後、各 plugin の lock `rev` が `repos/<repo>/worktrees/` の最新 snapshot dir 名の commit と一致。
 2. 設定から削除済みだが cache 残存 plugin の lock エントリは保全される。
 3. 設定に有るが未インストール（cache 無し）plugin のエントリは lock から削除される。
-4. `--gc` が lock の `rev` に一致しない snapshot を削除する。
-5. `--gc` が lock の `rev` に一致する snapshot を保全する。
-6. `cargo test --workspace` / `clippy -D warnings` / `fmt --check` 通過。
+4. `cargo test --workspace` / `clippy -D warnings` / `fmt --check` 通過。
 
 ---
 
@@ -96,8 +84,8 @@ rsplug は2系を持つ:
 - **系B（キャッシュ）**: `repos/<repo>/{source.git/,worktrees/{snapshot_key}/}`, `rsplug.lock.json`。マシン固有。
 
 かつて `to_sym`（`sym` 明示 or `build`/`lua_build`/`lua_post_update` で自動）のとき、系A の pack が系B の
-snapshot を symlink 参照していた（`RepoSnapshotLink`）。これが pack の非自己完結・Nix 非安全・GC との
-絡みを生んでいた。本 plan は `RepoSnapshotLink` を廃止し pack に常に copy 実体を置く。
+snapshot を symlink 参照していた（`RepoSnapshotLink`）。これが pack の非自己完結・Nix 非安全を
+生んでいた。本 plan は `RepoSnapshotLink` を廃止し pack に常に copy 実体を置く。
 
 ## Progress（Phase 0-7）
 
@@ -235,74 +223,19 @@ EEXIST で install が落ない保険。
 
 ---
 
-# §C — `--gc` 拡張（未実装プラン）
-
-> **状態: 未実装（プランのみ）。** 2026-07-10 設計。実装時に本セクションを Progress/Outcomes に昇格させる。
-
-## Purpose / Big Picture
-
-現行 `--gc`（`main.rs:garbage_collect`）は「in-lock repo の orphane snapshot 削除」のみ。pack 側の
-クリーンアップは `install` の副作用（`retained_manifest_entries` で現世代 + 過去 `RETAIN_GENERATIONS` 世代
-の pack を保持、それ以外削除）でのみ行われ、`--gc` 単体では扱わない。
-
-ユーザー要望: `--gc` を以下 **2 動作を同時に** 行うよう拡張する。
-1. **generations に参照されていない pack のクリーンアップ**（pack GC）。
-2. **使われていない repos のクリーンアップ**（repos GC）。
-
-repos GC の削除範囲はユーザー確認済で **「両方」**:
-- (a) **lock 外リポジトリ全体削除** — lock に含まれない repo ディレクトリ（worktrees + source.git 含む）を丸ごと削除。
-- (b) **in-lock で snapshot 0 の source.git 削除** — GC 後 `worktrees/` が空（locked snapshot が disk に無い drift）なら `source.git` と空 repo ディレクトリを削除。
-
-## Plan of Work
-
-### 1. pack GC（generations 非参照 pack の削除）
-
-- `pack/_gen/opt/*/manifest.json` をすべて読み、`entries`（`opt/<id>`）の**和集合** = 参照 pack 集合を構築。
-  （`install` は現+過去 RETAIN_GENERATIONS 世代に pruning 済みなので、on-disk manifest の和集合が参照集合。）
-- **安全策**: manifest が1つも無ければ pack GC をスキップ（全削除防止。空 lock refuse と同思想）。
-- `pack/_gen/{start,opt}/<id>/` で参照集合に無いものを削除（`install` cleanup ループ
-  `packpathstate.rs:1265-1293` と同等）。
-- anchor pack が無い `generations/<id>.lua` を刈り取り（`packpathstate.rs:1301-1317` と同等）。
-
-### 2. repos GC（`garbage_collect` 拡張）
-
-- lock 空 → refuse（既存）。各 repo ディレクトリ（cachedir = `repos/` からの相対パス）:
-  - **cachedir が lock に無い** → repo 全体（`worktrees/` + `source.git` + ディレクトリ）を削除。【新(a)】
-  - **cachedir が lock にある** → 既存 orphane snapshot 削除（locked `rev` に一致しないもの）。GC 後
-    `worktrees/` が空なら `source.git` と空 repo ディレクトリを削除。【新(b)】
-- 両動作を1回の `--gc` で同時実行。削除対象はログで明示（破壊的のため）。
-
-### 注意点（文書化必須）
-
-- 複数 lockfile を同一 `~/.cache/rsplug` に切り替えて使う運用では、`--gc` 実行時の lockfile に無い repo
-  （他設定由来）も (a) で削除されるリスクがある。`--gc` は「渡した lockfile が唯一の正」とみなす。
-- pack GC / repos GC とも「参照情報が空」なら refuse / skip する安全設計を維持する。
-
-## Validation / Acceptance（実装時）
-
-- pack GC: orphane pack 削除 / 参照 pack 保全 / manifest 無しで skip。
-- repos GC: lock 外 repo 全削除 / in-lock orphane snapshot / drift で source.git 削除 / 空 lock refuse。
-- 既存 `gc_tests`（`main.rs:413`）を拡張し、pack GC 用の manifest/on-disk pack フィクスチャを追加。
-
-## Concrete files（実装時）
-
-- `main.rs` — `garbage_collect` 拡張（pack GC 追加・repos GC の (a)/(b) 追加）、`gc_tests` 拡張。
-- pack GC の manifest 読取りは `packpathstate.rs` の `GenerationManifest`/`retained_manifest_entries`
-  相当のロジックを `--gc` 向けに再構築（current manifest 無しで on-disk manifest 全走査）。
-
----
-
 # Revision Notes
 
-- 2025-07-07: §A 初版（Phase 1/2 safe-now、Phase 3 defer）。
-- 2026-07-07: §A Phase 1/2 実装完了。GC 逆変換バグを正方向変換で根本修正し `gc_tests` 追加。
+- 2025-07-07: §A 初版（Phase 1 safe-now、Phase 3 defer）。
+- 2026-07-07: §A Phase 1 実装完了（lock を on-disk snapshot から再構築）。
 - 2026-07-07..09: §B Phase 0-6c 実装（sym 廃止・copy 統一・dotgit・`AtomicU8` copy 戦略）。
 - 2026-07-10: **§B Phase 7 完了**（tarball `.git` 廃止・`MaterializedRepo` enum・`dirty_diff_from_content`
   内容ハッシュ）。併せて libc 採用（reflink FFI）と E138 修正（`-i NONE`）を実施。実機検証済み。
 - 2026-07-10: 旧 `PLANS.md`（§A）と `PLANS-copy-unification.md`（§B）を本ファイルに統合。§B の
   「ExecPlan は別ファイルに置く」Decision（2026-07-07）は、ユーザー指示（1つの PLANS.md に集約）により
-  **上書き**。§C（`--gc` 拡張）を未実装プランとして追加。
+  **上書き**。
 - 2026-07-10: doc 盗み復活（read_dir sealed-dir で no-op 化していたのを個別ファイル展開で修復）。
   その副作用で autoload 系マージの非推移性が顕在化し EEXIST。install 堅牢化（dst 既存在→マージ/上書き）
   で暫定対応後、**Phase 8** で根本対応（doc 盗みをマージ前に移行＋`union_files` の sealed/子混在を
   推移的正規化、IO 最小）。install 堅牢化は safety net として残置。
+- 2026-07-10: **`--gc` を一旦削除**（CLI flag・`garbage_collect`/`walk_repos_for_gc`/`gc_worktrees`・
+  `gc_tests`・`cachedir_from_url`・§C 拡張プラン）。再実装時は git 履歴の旧 §C 設計を参照。
