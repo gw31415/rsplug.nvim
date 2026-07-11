@@ -1,181 +1,91 @@
-# rsplug.nvim ExecPlan — performance, merge, and domain-model reconstruction
+# rsplug.nvim ExecPlan
 
-This is the active living plan. The previous lock/cache and copy-unification
-plans are complete; Git history is their authoritative record. Keep this file
-current as each phase is implemented, including discoveries and validation.
+This living plan tracks the remaining work after the `main...HEAD` changes.
+Completed implementation details belong in Git history; keep this file focused
+on decisions, open work, and validation.
 
 ## Goal
 
-Make installs, updates, pack generation, and lazy loading scale predictably;
-make `merge = false` apply to every user plugin; and separate configuration,
-repository identity, materialization, runtime registration, and pack output
-into explicit models. The generated pack remains self-contained and portable.
+Keep installation, update, pack generation, and lazy loading predictable at
+large plugin counts. Separate configuration, repository identity, materialized
+snapshots, runtime registration, and pack output without making the generated
+pack depend on the source cache.
 
-## Progress
+## Current status
 
-- [x] Phase 1: bound network/archive/build/copy resources; stage tarball
-  extraction; enforce `merge = false` for all user plugins.
-- [x] Phase 2: persist snapshot manifests and use them for merge/copy/doc/index
-  planning instead of repeated filesystem walks.
-- [ ] Phase 3: introduce `PluginSpec`, `ResolvedGraph`, `MaterializationPlan`,
-  `LazyRegistration`, `PackPlan`, stable configuration IDs, and canonical
-  repository identity.
-- [ ] Phase 4: atomically publish pack generations and lockfile v2; make lazy
-  runtime handlers manifest/registration driven.
+- [x] Bound fetch, Git, extraction, build, and copy concurrency; stage tarballs
+      and publish snapshots only after successful extraction/build.
+- [x] Make `merge = false` apply to both start and lazy plugins; preserve every
+      `on_source` name and all files when compatible plugins merge.
+- [x] Persist snapshot manifests and use them as a best-effort cache for merge
+      probes and copy planning, with filesystem fallback for missing/stale data.
+- [x] Add internal plugin identity: `name`, repository basename, or a
+      deterministic script-content hash for anonymous script-only entries.
+- [ ] Replace the remaining flattened lifecycle plumbing with explicit models
+      (`PluginSpec`, `ResolvedGraph`, `MaterializationPlan`, `LazyRegistration`,
+      `PackPlan`) and canonical repository identity.
+- [ ] Publish pack generations and lockfile updates atomically; make runtime
+      handlers consume manifest/registration data directly.
 
-## Phase 1 — bounded work and immediate merge semantics
+## Decisions already implemented
 
-### Design
+### Resource bounds and snapshots
 
-Tarballs download to a temporary archive and extract into a temporary snapshot
-directory. Reject archive members that escape the destination. Rename the
-completed staging directory into the final snapshot only after extraction and
-build succeed; remove staging data before a Git fallback.
+Use independent limits for HTTP fetches, Git work, archive extraction, builds,
+and copy fan-out. Tarball extraction occurs in a temporary directory and only a
+complete snapshot is renamed into place. Archive paths must remain inside the
+destination. A failed tarball path is removed before Git fallback.
 
-Use independent semaphores for fetch, archive extraction, Git materialization,
-build processes, and copy work. CPU capacity is `available_parallelism()` or
-four when unavailable. Fetch starts at `min(16, CPU * 2)` and never exceeds 64;
-archive extraction is `min(4, CPU)`; Git work is `CPU`; builds are
-`max(1, CPU / 2)`; copy workers are `min(16, max(2, CPU * 2))`.
+`.rsplug-manifest-v1.json` records snapshot-relative paths, entry kinds, and
+symlink targets. It intentionally remains a cache: invalid or absent manifests
+fall back to filesystem inspection. Build digests and copy eligibility are
+derived from configuration/build state and are not part of schema v1.
 
-`merge = false` means a user artifact may not merge with any other user
-artifact, whether it is start or opt. Generated control and help artifacts are
-not governed by a user setting. Preserve all source registrations through a
-merge; never retain only the left-hand `source_name`.
+### Identity and loading
 
-### Acceptance
+The internal ID is not a TOML field. It is `name`, repository basename, or a
+content hash for an anonymous script-only entry. `depends` and `on_source`
+resolve using that identity/name model. `start = true` wins over lazy triggers;
+the triggers are ignored so users can toggle a plugin without editing them.
 
-- No archive body is accumulated in RAM before extraction.
-- Failed tarball downloads/extractions leave no partial final snapshot and Git
-  fallback works.
-- Copy, build, extraction, and fetch fan-out cannot exceed their resource
-  budgets.
-- Start and opt plugins with `merge = false` are distinct packs; `on_source`
-  remains valid after a compatible merge.
+`merge = false` isolates a user artifact in either start or lazy output.
+Generated control/help artifacts are internal and are not governed by a user
+setting.
 
-### Status (2026-07-11)
+## Remaining phases
 
-Implemented and validated (`cargo test --workspace`, `cargo clippy --workspace
---all-targets -- -D warnings`, `cargo fmt --all -- --check` all green).
+### Model and repository identity
 
-- Tarball staging + containment + rename-on-success and Git-fallback isolation
-  were already in the working tree (`util::fetch::TarballFetch`).
-- Bounded budgets centralized in `rsplug::util::resources`: `available_cpus()`,
-  `GIT_SEMAPHORE` (CPU), `BUILD_SEMAPHORE` (`max(1, CPU/2)`). `fetch` stays in
-  `main.rs` (`min(16, CPU*2)`, max 64) and tarball extraction in
-  `fetch::EXTRACTION_SEMAPHORE` (`min(4, CPU)`). Git operations
-  (`init_source`/`fetch_oid`/`init_snapshot`) moved off the fetch semaphore onto
-  `GIT_SEMAPHORE`; builds (`run_repo_build` + `lua_post_update`) gated by
-  `BUILD_SEMAPHORE`.
-- Copy fan-out bounded on two axes: the entry-level `yank_semaphore` is now
-  capped at `min(16, max(2, CPU*2))` (was unbounded to 256), and `copy_tree`'s
-  leaf fan-out is gated by `resources::COPY_LEAF`.
-- `LoadedPlugin.source_name: Option<String>` → `source_names: BTreeSet<String>`;
-  merge takes the union so both sides' `on_source` names survive. `PlugCtl::create`
-  registers every name. **plugin_id-incompatible** (existing pack/lock regenerates).
-- `merge = false` already applied to both start and opt; kept. Added tests
-  `merge_preserves_all_source_names` plus the start/opt merge-disabled tests.
-- Deferred: a live end-to-end `generate` smoke test (needs network + token) and
-  the Phase-spanning synthetic benchmarks (32 tarballs / 10,000-file copies /
-  128-plugin merge) listed under Validation.
+Introduce the explicit models above, keeping public TOML behavior stable.
+Separate remote URL parsing from repository identity. Canonical identity should
+normalize scheme/host, remove default ports and trailing `.git`, exclude
+userinfo, and retain the meaningful path. Use it for lock keys and collision-
+resistant cache paths. Read existing lock entries compatibly, reject conflicting
+revisions, and write the new representation only when the design is settled.
 
-## Phase 2 — immutable snapshot manifests and merge planner
+### Atomic generation publication
 
-Write `.rsplug-manifest-v1.json` after each staged snapshot is ready. It lists
-relative path, kind, symlink target, copy eligibility, and (for builds) one
-persisted output digest. Exclude `.git`, build-success state, and the manifest
-itself unless `dotgit` explicitly requests `.git`. Store a per-repository
-latest-snapshot index atomically.
+Build under `pack/_gen/.staging-*`; publish only after manifests, generated
+loader code, and copies succeed. Write the lock file with temp-file + rename
+(and fsync where supported). Keep old generations addressable until no retained
+manifest refers to their generated runtime modules.
 
-Replace sealed-directory entries and recursive merge probes with a flat trie
-from that manifest. Bucket artifacts by load policy and merge eligibility;
-stable source ID order determines first-fit selection. `MergePlan` contains the
-copy source/destination entries and is the only input to bounded copying. Docs
-are manifest entries aggregated once before a single helptags invocation.
+### Runtime hot paths
 
-### Status (2026-07-11)
-
-Implemented and validated (`cargo test --workspace`, `cargo clippy --workspace
---all-targets -- -D warnings`, `cargo fmt --all -- --check` all green).
-
-- `entities::manifest::SnapshotManifest` writes `.rsplug-manifest-v1.json` at
-  snapshot-ready (`Plugin::load`, after the build-success marker), plus a
-  per-repo `<repo>/latest-snapshot` index. Both are best-effort caches; reuse
-  runs skip the manifest rewrite to avoid redundant walks.
-- Manifest is a **pure filesystem record** (path, kind, symlink target).
-  `copy_eligible` and the build-output `build_digest` are config/build-cache
-  derived, not filesystem facts, so they are intentionally omitted from schema
-  v1 (added when consumed).
-- Merge probes (`entries_mergeable` `is_dir`, and `read_dir_children` in
-  `entries_mergeable`/`expand_dir_union`/`expand_sealed_into`) now consult a
-  process-global manifest cache via `merge_is_dir`/`merge_children`. **Filesystem
-  fallback** preserves exact behavior when the manifest is absent, stale, or for
-  symlinks (manifest does not follow; `is_dir`/`read_dir` do). Sealed-dir
-  representation and macOS clonefile copy are unchanged.
-- Docs are already aggregated into a single `_rsplug:doc` package (Phase 8
-  `split_doc`), so helptags already runs once — no separate work needed.
-- Deferred from the Phase 2 text: an explicit `MergePlan` struct (the merged
-  `LoadedPlugin` files already are the copy plan; introducing the name is
-  ceremonial) and the `copy_eligible`/`build_digest` manifest fields.
-
-## Phase 3 — explicit public and internal models
-
-Identity is **internal** (`id` = `name` ?? repository basename ?? script-content
-hash; not exposed in TOML). `depends` and `on_source` resolve against it. `name`
-is the user-facing optional override (default: basename) for disambiguating
-basename collisions; anonymous script-only entries are allowed and get a
-content-hash id. `start=true` wins over lazy triggers (triggers silently
-ignored), so users can toggle/test with `start=true` while leaving triggers in
-place.
-
-Replace flattened lifecycle handling with `PluginSpec`, `ResolvedGraph`,
-`MaterializationPlan`, `LazyRegistration`, `Artifact`, and `PackPlan`.
-`propagate_to_dependency()` replaces the overloaded `LazyType` bit-and.
-
-Separate `RemoteUrl` from `RepoIdentity`. Canonical identity lowercases scheme
-and host, removes default ports and trailing `.git`, excludes userinfo, and
-retains scheme/host/non-default-port/path. Use it as the lock v2 key and in a
-cache path with a 128-bit hash suffix. Read lock v1 by normalizing configured
-keys in memory; reject conflicting revisions; write v2 on non-locked runs.
-
-### Status (2026-07-11) — partial (3A done, revised)
-
-Implemented and validated (test/clippy/fmt green; e2e: id-less repo configs
-infer by basename, anonymous script-only generates successfully).
-
-- **3A — internal identity (done, revised per Vim-plugin culture):** `id` is an
-  **internal** identity (`PluginConfig.id`, `#[serde(skip)]`, NOT in TOML).
-  Computed in `Plugin::new` as `name` ?? repo **basename** ?? script-content
-  hash (the last for anonymous script-only). Vim plugins are identified by
-  basename by default; `name` (user-facing, optional) disambiguates basename
-  collisions; anonymous script-only (e.g. start scripts that nothing references)
-  is **allowed** and gets a content-hash internal id. `depends`/`on_source`/DAG
-  resolve against the internal id; `source_name` = `dep_name` (name ?? basename,
-  `None` for anonymous script-only). `start=true` + lazy trigger is **allowed**
-  (start wins, triggers silently ignored) — the earlier 3A rejection was reverted
-  so users can toggle/test with `start=true`. Duplicate ids via DAG.
-- **Known separate bug (not 3A):** `LuaStartPluginTemplate` emits consecutive
-  `(function()…end)()` with no separator, so 2+ `lua_start` scripts hit Lua
-  "ambiguous syntax". Pre-existing; surfaced now that anonymous script-only is
-  allowed. Fix is a template separator — deferred.
-- **3B — `RemoteUrl`/`RepoIdentity` + canonical identity + lock v2:** not started.
-- **3C — explicit models (`PluginSpec`/`ResolvedGraph`/...) + `propagate_to_dependency`:** not started (largest piece).
-
-## Phase 4 — atomic publish and runtime hot paths
-
-Build each pack generation under `pack/_gen/.staging-*`, then publish it only
-after manifest, loader, and copies succeed. Write lock after generation publish
-using temp-file, fsync, rename, and parent-directory fsync.
-
-Generated event code tracks rsplug-owned groups/callbacks rather than comparing
-all autocmds. Filetype loading uses manifest paths, require uses a registered
-module-root set and removes its loader after all roots load, and mappings use
-reverse indices rather than scanning every pattern on a mode change.
+Have generated event handlers track rsplug-owned groups/callbacks, use manifest
+paths for filetype loading, and maintain a module-root index for `require`
+loading. Remove one-shot loaders after use and avoid scanning every mapping on
+each mode change.
 
 ## Validation
 
-Run `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, and
-`cargo fmt --check` after every phase. Add synthetic tests for 32 tarballs,
-10,000-file copies, 128-plugin merge plans, manifest/index reuse, lock v1/v2,
-and every lazy trigger. Add a JSON benchmark harness reporting wall time, peak
-RSS, maximum in-flight work, and filesystem scan count so CI detects regressions.
+After implementation changes, run:
+
+    cargo test --workspace
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo fmt --all -- --check
+
+Do not run `cargo check -q`. Add focused coverage for lock compatibility,
+manifest reuse/fallback, anonymous scripts, all lazy triggers, generation
+publication failure, and merge behavior. Network-dependent end-to-end and
+large synthetic benchmarks remain optional follow-up work.

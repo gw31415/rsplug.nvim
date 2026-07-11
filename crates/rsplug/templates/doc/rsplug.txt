@@ -1,1284 +1,278 @@
-*rsplug.txt*  A blazingly fast Neovim plugin manager written in Rust
+*rsplug.txt*  External Rust plugin manager for Neovim
 
-Author:  gw31415
-License: Apache License 2.0
+Author: gw31415                 License: Apache-2.0
 Repository: https://github.com/gw31415/rsplug.nvim
 
-==============================================================================
-CONTENTS                                                      *rsplug-contents*
+=============================================================================
+CONTENTS                                                    *rsplug-contents*
 
-    1. Introduction ........................... |rsplug-introduction|
+    1. Overview ................................ |rsplug-overview|
     2. Installation ........................... |rsplug-installation|
-    3. Quick Start ............................ |rsplug-quickstart|
-    4. Command-Line Usage ..................... |rsplug-cli|
-    5. Configuration File ..................... |rsplug-config|
-        5.1 Plugin Fields ..................... |rsplug-plugin-fields|
-        5.2 Repository Format ................. |rsplug-repo-format|
-        5.3 Lazy Loading ...................... |rsplug-lazy-loading|
-        5.4 Lifecycle Hooks ................... |rsplug-hooks|
-        5.5 Dependencies ...................... |rsplug-dependencies|
-    6. Lock File .............................. |rsplug-lockfile|
-    7. Plugin Lifecycle ....................... |rsplug-lifecycle|
-    8. Runtime Integration .................... |rsplug-runtime|
-        8.1 Startup Generation Manifests ...... |rsplug-runtime-generation|
-        8.2 Selecting a generation with `RSPLUG_GENERATION` .. |rsplug-runtime-generation-select|
-    9. Migration Notes ........................ |rsplug-migration|
-    10. Advanced Topics ....................... |rsplug-advanced|
-        10.1 Plugin Merging ................... |rsplug-merging|
-        10.2 Build Caching .................... |rsplug-build-cache|
-        10.3 GitHub Authentication ............ |rsplug-github-auth|
-        10.4 Fast Download .................... |rsplug-fast-download|
-    11. Troubleshooting ....................... |rsplug-troubleshooting|
-    12. Examples .............................. |rsplug-examples|
+    3. Quick start ............................ |rsplug-quickstart|
+    4. CLI .................................... |rsplug-cli|
+    5. Configuration .......................... |rsplug-config|
+       5.1 Fields ............................. |rsplug-fields|
+       5.2 Loading ............................ |rsplug-loading|
+       5.3 Hooks and dependencies ............. |rsplug-hooks|
+    6. Lockfile ................................ |rsplug-lockfile|
+    7. Runtime and generations ................ |rsplug-runtime|
+    8. Troubleshooting and updates ............ |rsplug-troubleshooting|
 
-==============================================================================
-1. Introduction                                           *rsplug-introduction*
+=============================================================================
+1. Overview                                                   *rsplug-overview*
 
-rsplug.nvim is a Neovim plugin manager implemented as an external Rust binary
-to build a Vim pack package rather than a traditional Vimscript or Lua plugin.
-Instead of installing plugins directly, rsplug synchronizes Vim pack packages
-from TOML configuration files. This architectural decision provides several
-advantages:
+rsplug is a standalone Rust binary. It reads TOML configuration, resolves
+dependencies, fetches Git repositories, and generates a standard Neovim pack.
+Neovim only loads the generated result; it does not run rsplug itself.
 
-- Say goodbye to launching Neovim just to manage plugins
-- Fast, parallel Git operations using shallow clones
-- Deterministic, reproducible builds via lock files
-- Minimal runtime overhead through plugin merging
+The default application directory is `~/.cache/rsplug/`:
 
-Key Concepts:~
+    init.lua                 Neovim bootstrap
+    repos/                   repository cache
+    pack/_gen/               generated pack generations
+    rsplug.lock.json         resolved commit lockfile
 
-External Binary Model~
-    Unlike traditional plugin managers that run inside Neovim, rsplug operates
-    as a standalone CLI tool. You run it from your shell to synchronize your
-    pack packages from TOML configuration, then Neovim loads the generated
-    plugin structure.
+IMPORTANT: The generated pack reflects exactly the configuration file set
+passed to the current command. Keep that set stable, or use
+|RSPLUG_CONFIG_FILES|. A different file list can remove entries that were only
+present in the previous list.
 
-Pack System Integration~
-    rsplug generates a standard Neovim |packages| directory structure. Plugins
-    are placed in `pack/_gen/opt/` and loaded through rsplug's generated
-    runtime. rsplug's own generated control package is also placed in
-    `pack/_gen/opt/` and explicitly loaded by `~/.cache/rsplug/init.lua`.
+=============================================================================
+2. Installation                                             *rsplug-installation*
 
-Configuration-Driven~
-    All plugin definitions live in TOML configuration files. Changes to your
-    plugin setup require editing TOML and re-running the rsplug CLI tool.
-    
-    IMPORTANT: rsplug synchronizes the pack directory to match the
-    configuration file(s) you provide. If you change which configuration file
-    you specify as an argument, plugins defined in other files will no longer
-    be loaded. Use the RSPLUG_CONFIG_FILES environment variable with glob
-    patterns for consistency.
-
-==============================================================================
-2. Installation                                           *rsplug-installation*
-
-Neovim Configuration:~
-
-First, add this line to your Neovim configuration (`init.lua`):
->lua
+Add the generated bootstrap to `init.lua`:
+>
     dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
 <
 
-Binary Installation:~
-
-Requirements:~
-    - Neovim 0.9+ (for lazy-loading features)
-    - Git 2.0+
-    - Rust 1.89+ (for building from source)
-
-From Source:~
->bash
+Build from source (Rust 1.89+ and Git are required):
+>
     git clone https://github.com/gw31415/rsplug.nvim.git
     cd rsplug.nvim
     cargo build --release
-    # Binary: target/release/rsplug
+    install target/release/rsplug ~/.local/bin/rsplug
 <
 
-Using Nix Flakes:~
->bash
+Or use Nix:
+>
     nix build github:gw31415/rsplug.nvim
-    # Binary: result/bin/rsplug
 <
 
-Or add to your flake inputs:~
->nix
-    {
-      inputs.rsplug.url = "github:gw31415/rsplug.nvim";
-      # Then use: inputs.rsplug.packages.${system}.default
-    }
-<
-
-Verification:~
->bash
-    rsplug --help
-<
-
-==============================================================================
-3. Quick Start                                              *rsplug-quickstart*
-
-Step 1: Create a configuration file~
+=============================================================================
+3. Quick start                                               *rsplug-quickstart*
 
 Create `~/.config/nvim/rsplug.toml`:
->toml
+>
     [[plugins]]
     repo = "nvim-lua/plenary.nvim"
-    
+
     [[plugins]]
     repo = "neovim/nvim-lspconfig"
     on_event = "BufReadPre"
     lua_after = "require 'lspconfig'.rust_analyzer.setup {}"
 <
 
-Step 2: Synchronize plugins~
-
-WARNING: rsplug synchronizes pack packages based on the configuration
-file(s) you provide. If you change which configuration file you specify as
-an argument, plugins defined in other files will no longer be loaded.
-Always use the same configuration file pattern or use the RSPLUG_CONFIG_FILES
-environment variable to ensure consistency.
-
->bash
-    rsplug -iu ~/.config/nvim/rsplug.toml
-<
-
-TIP: Use environment variable for convenience!
-Instead of specifying the config file every time, set RSPLUG_CONFIG_FILES
-in your shell profile:
-
->bash
-    export RSPLUG_CONFIG_FILES="~/.config/nvim/rsplug.toml"
-    # Or use glob patterns:
-    export RSPLUG_CONFIG_FILES="~/.config/nvim/plugins/*.toml"
-    # Run rsplug without positional arguments:
-    rsplug -iu
-<
-
-CLI Options:~
-
-- To install new plugins: `-i` or `--install`
->bash
-    rsplug --install ~/.config/nvim/rsplug.toml
-    rsplug -i ~/.config/nvim/rsplug.toml
-<
-
-- To update existing plugins: `-u` or `--update`
->bash
-    rsplug --update ~/.config/nvim/rsplug.toml
-    rsplug -u ~/.config/nvim/rsplug.toml
-<
-
-- To sync hooks or scripts only (no git operations):
->bash
-    rsplug ~/.config/nvim/rsplug.toml
-<
-
-- To use the lock file for exact versions: `--locked`
->bash
-    rsplug --locked ~/.config/nvim/rsplug.toml
-<
-
-==============================================================================
-4. Command-Line Usage                                            *rsplug-cli*
-
-Synopsis:~
+Install and generate:
 >
-    A blazingly fast Neovim plugin manager written in Rust
-    
-    Usage: rsplug [OPTIONS] <CONFIG_FILES>...
+    rsplug --install ~/.config/nvim/rsplug.toml
 <
 
-Arguments:~
-
-    <CONFIG_FILES>...
-        Glob-patterns of the config files. Split by ':' to specify multiple
-        patterns [env: RSPLUG_CONFIG_FILES]
-        
-        Examples:
-            rsplug ~/.config/nvim/rsplug.toml
-            rsplug '~/.config/nvim/plugins/*.toml'
-            rsplug 'base.toml:plugins/*.toml'
-
-Options:~
-
-    -i, --install
-        Install plugins which are not installed yet
-
-    -u, --update
-        Access remote and update repositories
-        
-        Note: Cannot be used with --locked.
-
-    --locked
-        Fix the repo version with rev in the lockfile
-        
-        Note: Conflicts with --update.
-
-    --lockfile <LOCKFILE>
-        Specify the lockfile path
-        Default: `~/.cache/rsplug/rsplug.lock.json`
-
-    -h, --help
-        Print help
-
-Environment Variables:~
-
-    RSPLUG_CONFIG_FILES
-        Default config file pattern(s). Overridden by command-line arguments.
-        
-        RECOMMENDED: Set this environment variable to avoid specifying config
-        files every time you run rsplug. Supports glob patterns.
-        
-        Example:
->bash
-            export RSPLUG_CONFIG_FILES="~/.config/nvim/plugins/*.toml"
-            rsplug --install
-            rsplug --update
+Set a persistent file pattern if desired:
+>
+    export RSPLUG_CONFIG_FILES="$HOME/.config/nvim/plugins/*.toml"
+    rsplug --install
 <
 
-Default Paths:~
+After editing configuration, use `rsplug` to regenerate hooks without remote
+access, `rsplug --update` to fetch new revisions, or |rsplug-locked| for an
+exact build.
 
-    App directory:     `~/.cache/rsplug/`
-    Bootstrap script:  `~/.cache/rsplug/init.lua`
-    Repository cache:  `~/.cache/rsplug/repos/`
-    Pack output:       `~/.cache/rsplug/pack/_gen/`
-    Lock file:         `~/.cache/rsplug/rsplug.lock.json`
+=============================================================================
+4. CLI                                                       *rsplug-cli*
 
-==============================================================================
-5. Configuration File                                           *rsplug-config*
+Usage: `rsplug [OPTIONS] <CONFIG_FILES>...`
 
-Configuration files use TOML format with a simple structure:
->toml
+    -i, --install              Install repositories missing from the cache
+    -u, --update               Fetch and update repositories
+        --locked               Use revisions recorded in the lockfile
+        --lockfile <LOCKFILE>  Override the lockfile path
+    -h, --help                 Show help
+
+`CONFIG_FILES` are glob patterns. Separate multiple patterns with `:`. They
+may also be supplied by `RSPLUG_CONFIG_FILES`; command-line arguments take
+precedence. `--update` and `--locked` are mutually exclusive.
+
+=============================================================================
+5. Configuration                                             *rsplug-config*
+
+Configuration is TOML. Each `[[plugins]]` entry describes a Git repository or
+a configuration-only script:
+>
     [[plugins]]
-    # Each [[plugins]] section defines one plugin
-    repo = "owner/repository"
-    # ... additional fields ...
+    repo = "owner/plugin"
+    on_cmd = "PluginCommand"
+    lua_after = "require 'plugin'.setup {}"
 <
 
-Multiple configuration files can be combined. Settings are merged in the
-order files are processed.
+Multiple files are combined in sorted path order. A script-only entry omits
+`repo` and can still use `lua_start`, `lua_before`, or `lua_after`.
 
-------------------------------------------------------------------------------
-5.1 Plugin Fields                                      *rsplug-plugin-fields*
+5.1 Fields                                                   *rsplug-fields*
 
-repo~
-    Type: String
+Repository and identity:
 
-    GitHub repository in the format `owner/repo` or `owner/repo@version`, or
-    any Git URL containing `://`. Omit `repo` for config-only script entries.
-    See |rsplug-repo-format| for details.
-    
-    Examples:
->toml
-        repo = "nvim-lua/plenary.nvim"
-        repo = "neovim/nvim-lspconfig@v0.1.0"
-        repo = "j-hui/fidget.nvim@v*"
-<
+    repo        `owner/repo[@revision]`, or any Git URL containing `://`.
+    name        Public name used by `depends` and `on_source`; defaults to the
+                repository basename. It disambiguates equal basenames.
+    depends     String or array of plugin names loaded with this entry.
 
-start~
-    Type: Boolean
-    Default: `false`
-    
-    If `true`, plugin is loaded during rsplug startup through the controlled
-    `lua_before` -> `:packadd!` -> `lua_after` path. Managed plugins are placed
-    in `pack/_gen/opt/`; rsplug's generated runtime decides whether to load
-    them at startup or lazily.
-    
-    Example:
->toml
-        [[plugins]]
-        repo = "folke/tokyonight.nvim"
-        start = true
-<
+Loading:
 
-on_event~
-    Type: String or Array of Strings
-    
-    Autocmd event(s) that trigger plugin loading. Uses Neovim's |autocmd-events|.
-    
-    Examples:
->toml
-        on_event = "BufReadPre"
-        on_event = ["BufEnter", "CursorHold"]
-<
+    start       Load during startup instead of lazily. Default: false.
+    on_event    Autocmd event or events.
+    on_cmd      User command or commands.
+    on_ft       Filetype or filetypes.
+    on_func     Vim function or functions.
+    on_map      Key or mode-to-key(s) table.
+    on_source   Plugin name or names to load after.
 
-on_cmd~
-    Type: String or Array of Strings
-    
-    User command(s) that trigger plugin loading. Command names must start
-    with an uppercase letter (Neovim requirement).
-    
-    Examples:
->toml
-        on_cmd = "Telescope"
-        on_cmd = ["Git", "Gitsigns"]
-<
+Hooks and output:
 
-on_func~
-    Type: String or Array of Strings
+    lua_start       Lua at startup before controlled startup loads.
+    lua_before      Lua immediately before `:packadd`.
+    lua_after       Lua immediately after `:packadd`.
+    build           Argument array run in the repository after install/update.
+    lua_build       Headless-Neovim script after install/update.
+    lua_post_update Headless-Neovim script after an existing repo changes in
+                    `--update`.
+    sym             Use a symlink for the generated entry.
+    ignore          Gitignore-style files to exclude.
+    merge           Allow compatible user entries to share a pack. Default:
+                    true; false works for both startup and lazy entries.
 
-    Vim function name(s) that trigger plugin loading. This is useful for
-    plugins exposing autoload-style Vim functions.
+5.2 Loading                                                  *rsplug-loading*
 
-    Example:
->toml
-        on_func = "MyFunc"
-        on_func = ["MyFunc", "autoload#Func"]
-<
+Entries are lazy unless `start = true`. If both are specified, `start` wins
+and the lazy triggers are ignored. A plugin may have several triggers; the
+first one loads it.
 
-on_source~
-    Type: String or Array of Strings
-
-    Plugin name(s) that trigger this plugin to load immediately after they have
-    been sourced by rsplug. Use the source plugin's `name` when it has one,
-    otherwise use its repository-derived name.
-
-    Example:
->toml
-        [[plugins]]
-        repo = "owner/host.nvim"
-        name = "host.nvim"
-
-        [[plugins]]
-        repo = "owner/extension.nvim"
-        on_source = "host.nvim"
-<
-
-on_ft~
-    Type: String or Array of Strings
-    
-    Filetype(s) that trigger plugin loading. Uses Neovim's |filetype|.
-    
-    Examples:
->toml
-        on_ft = "rust"
-        on_ft = ["python", "lua", "vim"]
-<
-
-on_map~
-    Type: String or Table
-    
-    Key mapping(s) that trigger plugin loading. Can specify modes and
-    multiple keys.
-    
-    Simple form (all modes):
->toml
-        on_map = "<leader>f"
-<
-    
-    Mode-specific:
->toml
-        on_map = { n = "<leader>f" }
-        on_map = { nx = "<leader>f" }
-<
-    
-    Multiple keys:
->toml
-        on_map = { n = ["<leader>f", "<leader>g"] }
-<
-    
-    Mode abbreviations: n (normal), v (visual), x (visual), i (insert),
-    c (command), t (terminal), o (operator-pending)
-    
-depends~
-    Type: Array of Strings
-    
-    Dependency plugin names that load simultaneously with this plugin. The
-    dependency plugins must be defined elsewhere in the configuration.
-    
-    Example:
->toml
-        [[plugins]]
-        repo = "nvim-telescope/telescope.nvim"
-        depends = ["plenary.nvim"]
-<
-
-lua_start~
-    Type: String
-
-    Lua code executed once during rsplug startup before `start = true` plugins
-    are loaded. Use this for startup-time Lua that is associated with a plugin
-    entry but does not require loading that plugin.
-
-    Example:
->toml
-        lua_start = "vim.g.some_startup_flag = true"
-        lua_start = '''
-        vim.api.nvim_create_user_command('Hello', function()
-            print('hello from startup')
-        end, {})
-        '''
-<
-
-lua_before~
-    Type: String
-    
-    Lua code executed before the plugin is loaded (before `:packadd`). Useful
-    for setting up global variables or configuration.
-    
-    Example:
->toml
-        lua_before = "vim.g.mapleader = ' '"
-        lua_before = '''
-        vim.g.which_key_timeout = 300
-        vim.g.which_key_display_names = true
-        '''
-<
-
-lua_after~
-    Type: String
-    
-    Lua code executed after the plugin is loaded (after `:packadd`). Commonly
-    used for calling plugin setup functions and defining keymaps.
-    
-    Example:
->toml
-        lua_after = "require 'lualine'.setup {}"
-        lua_after = '''
-        require 'telescope'.setup {
-            defaults = {
-                file_ignore_patterns = {"node_modules"}
-            }
-        }
-        '''
-<
-
-build~
-    Type: Array of Strings
-    
-    Subprocess commands executed after the plugin is installed or updated.
-    Each string is a separate command argument (not shell command).
-    Runs in the plugin's repository directory. Useful for compiling native
-    components or running post-install scripts.
-    
-    Example:
->toml
-        build = ["make"]
-        build = ["cargo", "build", "--release"]
-<
-    
-    Build results are cached (see |rsplug-build-cache|).
-
-lua_build~
-    Type: String
-
-    Lua script executed after the plugin is installed or updated.
-    Runs in the plugin's repository directory under headless Neovim.
-
-    Example:
->toml
-        lua_build = "vim.fn.system({'make'})"
-        lua_build = '''
-        vim.fn.system({'cargo', 'build', '--release'})
-        '''
-<
-
-    Build results are cached (see |rsplug-build-cache|).
-
-lua_post_update~
-    Type: String
-
-    Lua script executed under headless Neovim only when `--update` fetches a new
-    revision for an existing repository. The plugin and its `depends` chain are
-    added to `runtimepath` while the script runs.
-
-    Example:
->toml
-        lua_post_update = "require 'plugin'.post_update()"
-<
-
-name~
-    Type: String
-    Default: Last component of repo path
-    
-    Custom name for the plugin. Useful when the repository name conflicts
-    with another plugin or for clarity.
-    
-    Example:
->toml
-        [[plugins]]
-        repo = "someone/nvim-cmp"
-        name = "custom-cmp"
-<
-
-sym~
-    Type: Boolean
-    Default: `false` (or `true` if `build`, `lua_build`, or
-    `lua_post_update` is specified)
-    
-    If `true`, creates a symbolic link to the repository instead of copying
-    files. Automatically set to `true` when `build`, `lua_build`, or
-    `lua_post_update` is specified.
-    
-    Example:
->toml
-        [[plugins]]
-        repo = "some/plugin"
-        sym = true
-<
-
-ignore~
-    Type: String
-    
-    Gitignore-style patterns for files to exclude during installation.
-    Multiple patterns can be separated by newlines.
-    
-    Example:
->toml
-        ignore = """
-        tests/
-        *.md
-        .github/
-        """
-<
-
-merge~
-    Type: Boolean
-    Default: `true`
-
-    If `false`, prevents a startup plugin from being merged with compatible
-    startup plugins.
-
-    Example:
->toml
-        [[plugins]]
-        repo = "some/plugin"
-        merge = false
-<
-
-------------------------------------------------------------------------------
-5.2 Repository Format                                    *rsplug-repo-format*
-
-The `repo` field supports several formats:
-
-Basic format:~
->toml
-    repo = "owner/repository"
-<
-    Uses the default branch (usually `main` or `master`).
-
-With exact version tag:~
->toml
-    repo = "j-hui/fidget.nvim@v1.2.0"
-<
-    Checks out the exact tag `v1.2.0`.
-
-With version wildcard:~
->toml
-    repo = "j-hui/fidget.nvim@v*"
-<
-    Finds the latest tag matching the pattern `v*` (lexicographically sorted).
-
-With branch name:~
->toml
-    repo = "neovim/nvim-lspconfig@main"
-<
-    Uses the `main` branch instead of the default branch.
-
-General Git URL:~
->toml
-    repo = "https://gitlab.com/owner/plugin"
-    repo = "https://codeberg.org/owner/plugin@v1.0"
-<
-    Any string containing `://` is treated as a Git URL. The optional `@rev`
-    suffix is split from the URL path, so userinfo like `https://user@host/...`
-    is preserved.
-
-Cache path for URL repositories:~
-    Scheme, authentication, port, and a trailing `.git` are stripped, leaving
-    `host/path` under `~/.cache/rsplug/repos/`.
-
-Version resolution happens during the fetch phase. The resolved commit SHA
-is stored in the lock file (see |rsplug-lockfile|).
-
-------------------------------------------------------------------------------
-5.3 Lazy Loading                                        *rsplug-lazy-loading*
-
-By default, all plugins are lazy-loaded (unless `start = true`). Lazy loading
-means plugins are not loaded at Neovim startup; instead, they load when
-specific triggers occur.
-
-Lazy-loading triggers:~
-
-    1. Autocmd events (on_event)
-    2. User commands (on_cmd)
-    3. Filetypes (on_ft)
-    4. Vim functions (on_func)
-    5. Source hooks (on_source)
-    6. Key mappings (on_map)
-    7. Lua module require (automatic)
-
-Automatic Lua module detection:~
-
-If a plugin contains files like `lua/modulename.lua` or
-`lua/modulename/init.lua`, rsplug automatically creates a lazy-load trigger
-for `require 'modulename'`. No configuration needed.
-
-Example:
->toml
-    [[plugins]]
-    repo = "nvim-lua/plenary.nvim"
-    # No on_* specified, but will load on require 'plenary'
-<
-
-Loading behavior:~
-
-When a trigger occurs:
-    1. Execute `lua_before` code (if specified)
-    2. Run `:packadd <plugin-name>`
-    3. Execute `lua_after` code (if specified)
-
-For `start = true` plugins the same order is used during startup, except the
-load command is `:packadd!` so it follows Neovim's startup package semantics.
-
-Multiple triggers:~
-
-A plugin can have multiple triggers. It loads on the first trigger that
-occurs.
-
-Example:
->toml
+>
     [[plugins]]
     repo = "nvim-telescope/telescope.nvim"
-    on_event = "VimEnter"
-    on_cmd = ["Telescope", "TelescopeFindFiles"]
+    on_event = ["BufReadPre", "InsertEnter"]
+    on_cmd = "Telescope"
+    on_ft = ["lua", "vim"]
+    on_map = { n = "<leader>ff" }
 <
 
-------------------------------------------------------------------------------
-5.4 Lifecycle Hooks                                            *rsplug-hooks*
+Supported `on_map` forms include a key for all modes, `{ n = "<key>" }`, and
+`{ nx = ["<key1>", "<key2>"] }`. Lua files below `lua/` are inspected so a
+matching `require 'module'` can trigger a plugin without explicit configuration.
 
-Hooks allow you to execute Lua code or subprocesses at different points in a
-plugin's lifecycle.
+5.3 Hooks and dependencies                                   *rsplug-hooks*
 
-lua_before~
-
-Executed before the plugin loads (before `:packadd`). Useful for:
-    - Setting global variables that the plugin checks
-    - Configuring environment
-    - Preparing state
-
-Example:
->toml
+Before and after hooks surround the pack load:
+>
     [[plugins]]
     repo = "folke/which-key.nvim"
-    lua_before = '''
-    vim.g.which_key_timeout = 300
-    vim.g.which_key_floating_opts = { border = "single" }
-    '''
+    lua_before = "vim.g.which_key_timeout = 300"
+    lua_after = "require 'which-key'.setup {}"
 <
 
-lua_after~
-
-Executed after the plugin loads (after `:packadd`). Useful for:
-    - Calling plugin setup functions
-    - Defining keymaps
-    - Configuring plugin behavior
-
-Example:
->toml
-    [[plugins]]
-    repo = "hrsh7th/nvim-cmp"
-    lua_after = '''
-    local cmp = require 'cmp'
-    cmp.setup {
-        mapping = cmp.mapping.preset.insert({
-            ['<C-Space>'] = cmp.mapping.complete(),
-        })
-    }
-    '''
-<
-
-Build subprocess~
-
-The `build` field specifies subprocess commands to run after install/update.
-Each element in the array is a command argument (not a shell command string).
-
-Example:
->toml
-    [[plugins]]
-    repo = "yetone/avante.nvim"
+`build` is an argument array, not a shell command string:
+>
     build = ["make"]
+    lua_build = "vim.fn.system({'make', 'docs'})"
 <
 
-Build commands run in the plugin's repository directory. See
-|rsplug-build-cache| for caching behavior.
+Build results are cached. `lua_post_update` runs only when `--update` obtains a
+new revision for an existing repository. `depends` entries must be defined in
+the configuration; dependencies can be transitive but cycles are errors.
+They load together with the entry that triggered them.
 
-Build Lua script~
+The internal identity is not a TOML field. It is derived from `name`, the
+repository basename, or a deterministic content hash for anonymous script-only
+entries. Anonymous script-only entries are allowed but have no public name to
+reference.
 
-The `lua_build` field specifies Lua code to run after install/update.
-It runs in headless Neovim with the plugin repository as current directory.
+=============================================================================
+6. Lockfile                                                 *rsplug-lockfile*
 
-Example:
->toml
-    [[plugins]]
-    repo = "yetone/avante.nvim"
-    lua_build = "vim.fn.system({'make'})"
-<
-
-`build` and `lua_build` share the same cache behavior.
-
-------------------------------------------------------------------------------
-5.5 Dependencies                                        *rsplug-dependencies*
-
-The `depends` field declares plugins that should load simultaneously with the
-current plugin.
-
-Basic dependency:~
->toml
-    [[plugins]]
-    repo = "nvim-telescope/telescope.nvim"
-    depends = ["plenary.nvim"]
-    on_cmd = "Telescope"
-    
-    [[plugins]]
-    repo = "nvim-lua/plenary.nvim"
-<
-
-When `Telescope` command is invoked, both telescope.nvim and plenary.nvim
-load together.
-
-Dependency resolution:~
-
-rsplug uses a DAG (Directed Acyclic Graph) to resolve dependencies and ensure:
-    - No circular dependencies
-    - Correct loading order
-    - Transitive dependencies are handled
-
-Lazy-loading with dependencies:~
-
-When a plugin with dependencies is lazy-loaded, its dependencies are also
-lazy-loaded with the same trigger (intersection of triggers).
-
-Multiple dependencies:~
->toml
-    [[plugins]]
-    repo = "some/plugin"
-    depends = ["dep1", "dep2", "dep3"]
-<
-
-==============================================================================
-6. Lock File                                                  *rsplug-lockfile*
-
-Every time you run `rsplug`, a lock file is generated at
-`~/.cache/rsplug/rsplug.lock.json` by default. This file records the exact
-commit hashes of all installed plugins.
-
-Location:~
-    Default: `~/.cache/rsplug/rsplug.lock.json`
-    Custom: Use `--lockfile <path>` option
-
-Format:~
-
-JSON structure:
->json
+The default lockfile is `~/.cache/rsplug/rsplug.lock.json`; use `--lockfile`
+to change it. It stores resolved Git commits:
+>
     {
       "version": "1",
       "locked": {
-        "https://github.com/owner/repo": {
+        "https://github.com/owner/plugin": {
           "type": "git",
-          "rev": "abc123def456..."
+          "rev": "40-character-commit-sha"
         }
       }
     }
 <
 
-The `rev` field contains the full 40-character Git commit SHA.
+`--locked` requires all configured repositories to have lock entries and does
+not contact remotes. It is intended for CI and reproducible builds.
 
-Using the lock file:~
-
-To sync plugins to the exact versions from the lock file, use the `--locked`
-flag:
-
->bash
-    rsplug --locked
+Repository forms:
+>
+    repo = "owner/plugin"
+    repo = "owner/plugin@v1.2.0"
+    repo = "owner/plugin@v*"
+    repo = "https://gitlab.com/owner/plugin@main"
 <
 
-This ensures reproducible builds by preventing any updates and using only
-the exact commit SHAs stored in the lock file.
+An `@revision` suffix is split from the URL path; `@` in URL userinfo is
+preserved. URL repositories are cached using host and path below `repos/`.
 
-When to use --locked:~
-    - CI/CD pipelines (reproducible builds)
-    - Team environments (same plugin versions)
-    - Production deployments
+=============================================================================
+7. Runtime and generations                                  *rsplug-runtime*
 
-Note: `--locked` and `--update` are mutually exclusive.
+The generated `init.lua` prepends the packpath and explicitly loads the current
+control package. Managed entries live in `pack/_gen/opt/`; rsplug then installs
+its event, command, filetype, function, mapping, source, and require handlers.
+A lazy load runs `lua_before`, `:packadd`, and `lua_after` in that order.
 
-==============================================================================
-7. Plugin Lifecycle                                           *rsplug-lifecycle*
-
-Understanding the plugin lifecycle helps debug issues and optimize
-configurations.
-
-Phase 1: Configuration parsing~
-    1. Read TOML file(s)
-    2. Parse plugin definitions
-    3. Merge multiple config files if specified
-
-Phase 2: Dependency resolution~
-    1. Build dependency graph (DAG)
-    2. Detect circular dependencies (error if found)
-    3. Compute transitive dependencies
-    4. Determine loading order
-
-Phase 3: Repository management~
-    1. Check if plugin exists in cache (`~/.cache/rsplug/repos/`)
-    2. If missing and --install: initialize Git repo and clone
-    3. If exists and --update: fetch from remote and update
-    4. If --locked: synchronize to specific commit from lock file
-    5. Resolve version (tag, branch, wildcard)
-    6. Checkout to target commit
-    7. Update lock file with commit SHA
-
-Phase 4: Build execution~
-    1. Check build cache (see |rsplug-build-cache|)
-    2. If cache miss: run `build` and `lua_build`
-    3. Store success marker
-
-Phase 5: File installation~
-    1. Determine installation mode (symlink vs. copy)
-    2. If sym=true or build/lua_build exists: create symlink
-    3. Otherwise: copy/hard-link files
-    4. Apply ignore patterns
-    5. Place managed plugins in `pack/_gen/opt/`
-    6. Place rsplug's generated control package in `pack/_gen/opt/`
-    7. Write `manifest.json` inside the generated control package
-    8. Generate `init.lua` so it explicitly `packadd`s the current control package
-
-Phase 6: Lazy-loading infrastructure~
-    1. Scan for Lua modules (auto-detect requires)
-    2. Generate lazy-load handlers in `_rsplug/`
-    3. Create command wrappers (on_cmd)
-    4. Create autocmd handlers (on_event, on_ft)
-    5. Create keymap handlers (on_map)
-
-Phase 7: Plugin merging~
-    1. Group plugins by lazy-load type
-    2. Check for file conflicts
-    3. Merge compatible plugins
-    4. Reduces runtimepath entries
-
-Runtime: Plugin loading~
-    1. User triggers event/command/keymap
-    2. rsplug handler intercepts
-    3. Execute lua_before hook
-    4. Run :packadd <plugin-name>
-    5. Execute lua_after hook
-    6. Remove trigger (one-time load)
-
-==============================================================================
-8. Runtime Integration                                        *rsplug-runtime*
-
-After running the rsplug CLI tool, you need to integrate the generated output
-into Neovim.
-
-Basic setup in init.lua:~
->lua
-    dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
-<
-
-What happens:~
-
-1. The generated `init.lua` prepends the rsplug output directory to 'packpath'
-2. It explicitly loads the current generated control package with `:packadd`
-3. It requires `_rsplug` from that control package
-4. Lazy-loading triggers are registered (autocmds, commands, keymaps)
-5. `start = true` plugins are loaded through the controlled `:packadd!` path
-6. Lazy plugins in `pack/_gen/opt/` wait for triggers
-
-Startup generation manifests:~
-
-rsplug stores each generated control package under `pack/_gen/opt/<hash>/`.
-The current root `init.lua` explicitly `packadd`s the current control package,
-so retained older control packages are not loaded by native startup scanning.
-
-Each control package contains a `manifest.json` listing the shared `_gen` entries
-that generation references. The runtime exposes this data as `_rsplug.manifest`.
-rsplug keeps the latest few control manifests and only removes `_gen` plugin
-directories when no retained manifest references them. This prevents an already-
-running Neovim from failing because an update deleted hook/runtime modules that
-its loaded control package still refers to.
-
-Selecting a generation with `RSPLUG_GENERATION`:~
-
-Because retained generations stay addressable, you can boot Neovim with an older
-generation by setting the `RSPLUG_GENERATION` environment variable to a
-generation id (the `<hash>` of a control package). List the available ids with:
-
->bash
+Each generation retains a manifest of the generated control modules. Older
+generations are kept while referenced runtime files may still be in use. To
+select a retained generation:
+>
     ls ~/.cache/rsplug/generations/
+    RSPLUG_GENERATION=<32-character-id> nvim
 <
 
-Each `~/.cache/rsplug/generations/<hash>.lua` names a retained generation; pass
-its `<hash>` (a 32-character hex string) to `RSPLUG_GENERATION` and rsplug's
-`init.lua` will `:packadd` that control package instead of the latest one:
+An invalid or pruned ID falls back to the latest generation. `:scriptnames`,
+`:echo &packpath`, and `:echo &runtimepath` are useful for inspecting output.
 
->bash
-    RSPLUG_GENERATION=<hash> nvim
-<
+=============================================================================
+8. Troubleshooting and updates                       *rsplug-troubleshooting*
 
-When unset, the latest generation is used (the default behavior). If the value
-is malformed or names a generation that has already been pruned (rsplug keeps
-only the latest few), rsplug logs a warning and falls back to the latest
-generation.
+No plugin appears: verify that the same configuration patterns are passed on
+every run and that a trigger or `start = true` is configured. Check that
+`init.lua` uses the generated `dofile` bootstrap.
 
-Custom packpath:~
+Locked build fails: every configured repository needs an entry in the selected
+lockfile. Run without `--locked` once to resolve revisions, then commit the
+lockfile for CI.
 
-If you use a custom lock file location or output directory, adjust
-accordingly:
->lua
-    dofile(vim.fn.expand '~/my-custom-path/init.lua')
-<
+GitHub rate limits: set `GITHUB_TOKEN` (or `GH_TOKEN`). Authenticated GitHub
+HTTPS uses API revision resolution and CDN tarballs when possible, with Git
+fallback on failure.
 
-Checking loaded plugins:~
->vim
-    :scriptnames       " List all loaded scripts
-    :echo &packpath    " Show packpath
-    :echo &runtimepath " Show runtimepath
-<
-
-Debugging lazy-loading:~
->lua
-    -- Enable verbose logging
-    vim.o.verbose = 1
-    
-    -- Or check if plugin loaded
-    vim.cmd("echo &runtimepath =~ 'plugin-name'")
-<
-
-==============================================================================
-9. Migration Notes                                         *rsplug-migration*
-
-v0.2.0 Breaking Change~
-
-rsplug v0.2.0 changes the Neovim bootstrap line and the generated package
-layout so `start = true` plugins can run `lua_before` and `lua_after`
-deterministically.
-Update your `init.lua` from:
->lua
+The current package layout requires the generated bootstrap. Replace the old
+line:
+>
     vim.opt.packpath:prepend '~/.cache/rsplug'
 <
-
-to:
-
->lua
+with:
+>
     dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
 <
 
-Managed plugins, including `start = true` plugins, are now placed under
-`pack/_gen/opt/` and loaded by rsplug's generated runtime.
-
-To preserve deterministic `lua_before` / `lua_after` ordering, managed
-`start = true` plugins are not merged with other managed startup plugins.
-
-==============================================================================
-10. Advanced Topics                                           *rsplug-advanced*
-
-------------------------------------------------------------------------------
-10.1 Plugin Merging                                           *rsplug-merging*
-
-To reduce the number of entries in 'runtimepath', rsplug automatically merges
-compatible plugins.
-
-Merge conditions:~
-    - Plugins have the same lazy-loading trigger type
-    - No file path conflicts
-    - Not marked as conflicting
-
-Benefits:~
-    - Fewer runtimepath entries (faster Vim startup)
-    - Reduced directory scanning overhead
-    - Cleaner plugin structure
-
-Example:~
-
-If you have:
->toml
-    [[plugins]]
-    repo = "plugin-a"
-    on_event = "BufEnter"
-    
-    [[plugins]]
-    repo = "plugin-b"
-    on_event = "BufEnter"
-<
-
-And they don't have conflicting files, they may be merged into a single
-plugin directory.
-
-Preventing merging:~
-
-Use `merge = false` on a startup plugin that must stay separate.
-
-------------------------------------------------------------------------------
-10.2 Build Caching                                       *rsplug-build-cache*
-
-Build commands can be slow, so rsplug caches build results.
-
-Cache key components:~
-    - Git HEAD commit SHA
-    - Git working directory diff hash
-    - Build command string (`build` / `lua_build`)
-
-If all components match a previous build, the build is skipped.
-
-Cache invalidation:~
-
-Build cache is invalidated when:
-    - Git HEAD changes (plugin updated)
-    - Working directory changes (local modifications)
-    - Build command changes (config updated)
-
-Cache storage:~
-
-Success marker: `.rsplug_build_success` in plugin directory
-Contains: Hash of cache key components
-
-Manual cache clearing:~
->bash
-    # Remove build cache for specific plugin
-    rm ~/.cache/rsplug/repos/github.com/owner/repo/.rsplug_build_success
-    
-    # Remove all build caches
-    find ~/.cache/rsplug/repos -name ".rsplug_build_success" -delete
-<
-
-------------------------------------------------------------------------------
-10.3 GitHub Authentication                                *rsplug-github-auth*
-
-GitHub API and Git requests are anonymous by default, which may hit GitHub's
-rate limits (60 requests per hour per IP). Setting a token avoids this.
-
-Token environment variables:~
-
-    rsplug checks the following environment variables, in order:
-
-    1. GITHUB_TOKEN  (checked first; takes precedence)
-    2. GH_TOKEN      (used if GITHUB_TOKEN is unset)
-
-    This is the same convention used by the `gh` CLI.
-
-    Example:
->bash
-        export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
-<
-
-    If neither variable is set, rsplug falls back to anonymous access.
-
-------------------------------------------------------------------------------
-10.4 Fast Download                                        *rsplug-fast-download*
-
-When a GitHub token is available, rsplug uses the fastest available download
-path instead of the Git smart-HTTP protocol:
-
-1. REST API rev resolution — commit SHAs are resolved via `api.github.com`
-   JSON endpoints instead of the Git ref advertisement. The `X-RateLimit-Remaining`
-   header is monitored; if the budget is low or a wildcard revision (`@v*`) is
-   requested, rsplug falls back to Git `ls-remote`.
-2. Tarball download — the repository snapshot is fetched as a `.tar.gz` archive
-   from `codeload.github.com` (Fastly CDN, outside the core API rate limit)
-   rather than cloning the Git object store.
-3. Connection reuse — a single shared HTTP client with connection pooling and
-   HTTP/2 multiplexing handles all downloads.
-4. High parallelism — up to 32 concurrent tarball downloads, automatically
-   halved on error-rate spikes.
-
-Tarball downloads are not counted against the GitHub API rate limit, so this
-path can sustain high throughput even with many plugins.
-
-If the tarball download fails (for example, a private repo without token or a
-network error), rsplug automatically falls back to the Git smart-HTTP clone
-path.
-
-==============================================================================
-11. Troubleshooting                                   *rsplug-troubleshooting*
-
-Common issues and solutions:
-
-Plugin not loading:~
-
-1. Check if plugin is in packpath:
->vim
-    :echo &packpath
-<
-
-2. Verify lazy-loading trigger is correct:
->vim
-    " For on_cmd
-    :command  " List all commands
-    
-    " For autocmd
-    :autocmd  " List all autocmds
-<
-
-3. Check for errors:
->vim
-    :messages  " View error messages
-<
-
-Build fails:~
-
-1. Check build command is correct
-2. Verify build dependencies are installed
-3. Run build command manually in repo:
->bash
-    cd ~/.cache/rsplug/repos/github.com/owner/repo
-    make  # or whatever build command
-<
-
-4. Clear build cache and retry:
->bash
-    rm ~/.cache/rsplug/repos/github.com/owner/repo/.rsplug_build_success
-    rsplug --install config.toml
-<
-
-Lock file conflicts:~
-
-If you have lock file conflicts (e.g., in version control):
-
-1. Choose one version:
->bash
-    git checkout --ours rsplug.lock.json   # or --theirs
-<
-
-2. Re-run install:
->bash
-    rsplug --locked --install config.toml
-<
-
-Git fetch fails:~
-
-1. Check network connectivity
-2. Verify repository exists and is public
-3. Try fetching manually:
->bash
-    cd ~/.cache/rsplug/repos
-    git clone https://github.com/owner/repo
-<
-
-Known limitations:~
-
-    - Plugin merging may occur unexpectedly between sibling dependencies
-
-For other issues, please check:
-    - GitHub issues: https://github.com/gw31415/rsplug.nvim/issues
-    - Repository documentation
-
-==============================================================================
-12. Examples                                                  *rsplug-examples*
-
-Example 1: Basic LSP setup~
->toml
-    [[plugins]]
-    repo = "neovim/nvim-lspconfig"
-    on_event = "BufReadPre"
-    lua_after = '''
-    require 'lspconfig'.rust_analyzer.setup {}
-    require 'lspconfig'.lua_ls.setup {}
-    '''
-    
-    [[plugins]]
-    repo = "hrsh7th/nvim-cmp"
-    on_event = "InsertEnter"
-    lua_after = "require 'cmp'.setup {}"
-<
-
-Example 2: Telescope with dependencies~
->toml
-    [[plugins]]
-    repo = "nvim-lua/plenary.nvim"
-    
-    [[plugins]]
-    repo = "nvim-telescope/telescope.nvim"
-    depends = ["plenary.nvim"]
-    on_cmd = "Telescope"
-    lua_after = '''
-    require 'telescope'.setup {
-        defaults = {
-            file_ignore_patterns = {"node_modules", ".git/"}
-        }
-    }
-    '''
-<
-
-Example 3: Plugin with build subprocess~
->toml
-    [[plugins]]
-    repo = "yetone/avante.nvim"
-    on_event = "BufReadPost"
-    build = ["make"]
-    lua_after = "require 'avante'.setup {}"
-<
-
-Example 3.1: Plugin with lua_build~
->toml
-    [[plugins]]
-    repo = "yetone/avante.nvim"
-    on_event = "BufReadPost"
-    lua_build = "vim.fn.system({'make'})"
-    lua_after = "require 'avante'.setup {}"
-<
-
-Example 4: Color scheme~
->toml
-    [[plugins]]
-    repo = "folke/tokyonight.nvim"
-    start = true
-    lua_after = "vim.cmd.colorscheme 'tokyonight'"
-<
-
-Example 5: Git signs with version pinning~
->toml
-    [[plugins]]
-    repo = "lewis6991/gitsigns.nvim@v0.7"
-    on_event = "BufReadPre"
-    lua_after = "require 'gitsigns'.setup {}"
-<
-
-Example 6: Multiple lazy-load triggers~
->toml
-    [[plugins]]
-    repo = "kyazdani42/nvim-tree.lua"
-    on_event = "VimEnter"
-    on_cmd = ["NvimTreeToggle", "NvimTreeFocus"]
-    lua_after = "require 'nvim-tree'.setup {}"
-<
-
-Example 7: Build with multiple arguments~
->toml
-    [[plugins]]
-    repo = "some/plugin"
-    build = ["cargo", "build", "--release"]
-<
-
-Example 8: Global variables before load~
->toml
-    [[plugins]]
-    repo = "preservim/nerdtree"
-    on_cmd = "NERDTree"
-    lua_before = '''
-    vim.g.NERDTreeShowHidden = 1
-    vim.g.NERDTreeIgnore = {'\\.git$', 'node_modules'}
-    '''
-<
-
-Example 9: Using wildcard version~
->toml
-    [[plugins]]
-    repo = "j-hui/fidget.nvim@v*"
-    on_event = "LspAttach"
-    lua_after = "require 'fidget'.setup {}"
-<
-
-Example 10: Complex keymapping~
->toml
-    [[plugins]]
-    repo = "numToStr/Comment.nvim"
-    lua_after = '''
-    require 'Comment'.setup()
-    local api = require 'Comment.api'
-    vim.keymap.set('n', '<leader>c', api.toggle.linewise.current)
-    vim.keymap.set('x', '<leader>c', api.toggle.linewise)
-    '''
-<
+Recent releases also added bounded parallel work, staged snapshots and
+manifests, anonymous script-only entries, preserved `on_source` names during
+merge, and consistent `merge = false` behavior for startup and lazy entries.
 
 ==============================================================================
 vim:tw=78:ts=8:ft=help:norl:
