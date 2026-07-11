@@ -93,6 +93,14 @@ impl RepoSource {
         }
     }
 
+    /// rev（branch/tag/commit/wildcard）。未指定は None（default branch）。
+    pub(crate) fn rev(&self) -> Option<Arc<str>> {
+        match self {
+            RepoSource::GitHub { rev, .. } => rev.clone(),
+            RepoSource::Git { rev, .. } => rev.clone(),
+        }
+    }
+
     /// Canonical repository identity（PLANS「Model and repository identity」）。
     /// `host[:port]/path` 形式で、host は小文字化、デフォルトポート・userinfo・scheme・
     /// 末尾 `.git` は削除される。GitHub shorthand は `github.com/owner/repo`。
@@ -385,7 +393,7 @@ impl Plugin {
         //   - install: 未インストールならリモートから新規 fetch する。
         //   - それ以外(通常起動): 既存 snapshot の commit をそのまま使い、無ければスキップ。
         let (oid, was_updated, was_installed) = if let Some(locked_rev) = locked_rev.as_deref() {
-            if !is_full_hex_hash(locked_rev) {
+            if !util::github::is_full_hex_hash(locked_rev) {
                 return Err(invalid_data(format!(
                     "Locked revision must be full hash for {}: got {}",
                     url, locked_rev
@@ -1171,10 +1179,6 @@ async fn build_repo_snapshot_identity(
         Arc::<[String]>::from(build),
         lua_build.map(Into::into),
     ))
-}
-
-fn is_full_hex_hash(value: &str) -> bool {
-    value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn lua_build_nvim_command(lua_script_path: &OsStr) -> [Cow<'_, OsStr>; 8] {

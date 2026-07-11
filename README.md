@@ -274,9 +274,12 @@ downloads with Git fallback, snapshot manifests, anonymous script-only entries,
 preserved `on_source` names after merging, consistent `merge = false`
 semantics for startup and lazy plugins, a canonical repository identity
 shared by the lockfile and cache path so URL variants of one repository no
-longer split into separate entries, and atomic generation publication (each
+longer split into separate entries, atomic generation publication (each
 generation is built in a staging directory and published via an atomic
-`init.lua` swap, so a failed run cannot leave the pack half-written). The
+`init.lua` swap, so a failed run cannot leave the pack half-written), and
+batched update resolution (`--update`/`--install` resolves all repository
+revisions in one phase — the GitHub GraphQL API for GitHub repos and parallel
+git ls-remote for the rest — instead of one request per repository). The
 generated bootstrap is required for
 the v0.2 package layout; older configurations using only
 `vim.opt.packpath:prepend '~/.cache/rsplug'` should switch to the `dofile` line

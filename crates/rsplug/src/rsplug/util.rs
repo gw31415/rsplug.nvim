@@ -492,6 +492,41 @@ pub mod git {
         .await
         .unwrap()
     }
+
+    /// ls-remote 並列解決の入力: (canonical, url, rev, token)。
+    pub(crate) type LsRemoteEntry = (String, Arc<str>, Option<Arc<str>>, Option<Arc<str>>);
+
+    /// 複数リポジトリの最新 rev を ls-remote で並列解決する。
+    /// 各 entry は (canonical, url, rev, token)。`semaphore` で fan-out を制御。
+    /// 失敗した entry は None（呼出側で per-repo フォールバック）。
+    pub(crate) async fn resolve_revs_via_ls_remote(
+        entries: Vec<LsRemoteEntry>,
+        semaphore: &adaptive_semaphore::AdaptiveSemaphore,
+    ) -> std::collections::HashMap<String, Option<Arc<str>>> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (canonical, url, rev, token) in entries {
+            let semaphore = semaphore.clone();
+            tasks.spawn(async move {
+                let permit = semaphore.acquire().await;
+                let result = ls_remote(url, rev, token).await;
+                let is_error = result.is_err();
+                permit.finish(is_error);
+                (
+                    canonical,
+                    result.ok().map(|oid| Arc::<str>::from(oid.to_string())),
+                )
+            });
+        }
+        let mut out: std::collections::HashMap<String, Option<Arc<str>>> =
+            std::collections::HashMap::new();
+        while let Some(res) = tasks.join_next().await {
+            if let Ok((canonical, oid)) = res {
+                out.insert(canonical, oid);
+            }
+        }
+        out
+    }
+
     /// Constant representing files to be ignored by rsplug
     pub const RSPLUG_BUILD_SUCCESS_FILE: &str = ".rsplug_build_success";
 }
@@ -674,7 +709,6 @@ pub mod github {
     /// REST API で rev 解決を試みた結果のエラー種別。
     /// 呼出元は `RateLimited` と `Other` のどちらでも git protocol へフォールバックする。
     #[derive(Debug)]
-    #[allow(dead_code)]
     pub enum ApiError {
         /// API rate limit 残量が少ない（閾値以下）。
         RateLimited,
@@ -783,6 +817,304 @@ pub mod github {
             .map_err(|e| ApiError::Other(e.to_string()))?;
         super::json_extract_string(&body2, "sha")
             .ok_or_else(|| ApiError::Other("missing sha in API response".into()))
+    }
+
+    /// 40 桁 16 進数のコミットハッシュか。
+    pub(crate) fn is_full_hex_hash(value: &str) -> bool {
+        value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// GraphQL バッチ rev 解決の入力（owner/repo + ref）。
+    pub(crate) struct GithubRev {
+        pub owner: String,
+        pub repo: String,
+        pub rev: Option<String>,
+    }
+
+    /// GraphQL レスポンス解析用の alias → (owner, repo, kind) 対応表。
+    enum AliasKind {
+        DefaultBranch,
+        Heads,
+        Tags,
+    }
+    struct AliasMapping {
+        alias: String,
+        owner: String,
+        repo: String,
+        kind: AliasKind,
+    }
+
+    /// GraphQL 文字列リテラルのエスケープ（`"`・`\`・制御文字）。rev はユーザー供給のため必須。
+    fn escape_graphql_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// N リポジトリの rev 解決を1つの GraphQL クエリに組み立てる。
+    /// - rev=None → `defaultBranchRef`
+    /// - rev=Some(name) → heads/tags 2フィールド（非 null を採用、heads 優先 = REST/git と同順序）
+    fn build_graphql_query(chunk: &[GithubRev]) -> (String, Vec<AliasMapping>) {
+        let mut fields = String::new();
+        let mut mapping = Vec::new();
+        for (i, g) in chunk.iter().enumerate() {
+            let owner = escape_graphql_string(&g.owner);
+            let repo = escape_graphql_string(&g.repo);
+            match &g.rev {
+                None => {
+                    let alias = format!("r{i}");
+                    fields.push_str(&format!(
+                        "  {alias}: repository(owner: \"{owner}\", name: \"{repo}\") {{ defaultBranchRef {{ target {{ ... on Commit {{ oid }} }} }} }}\n"
+                    ));
+                    mapping.push(AliasMapping {
+                        alias,
+                        owner: g.owner.clone(),
+                        repo: g.repo.clone(),
+                        kind: AliasKind::DefaultBranch,
+                    });
+                }
+                Some(name) => {
+                    let name = escape_graphql_string(name);
+                    let alias_h = format!("r{i}h");
+                    let alias_t = format!("r{i}t");
+                    fields.push_str(&format!(
+                        "  {alias_h}: repository(owner: \"{owner}\", name: \"{repo}\") {{ ref(qualifiedName: \"refs/heads/{name}\") {{ target {{ ... on Commit {{ oid }} }} }} }}\n"
+                    ));
+                    fields.push_str(&format!(
+                        "  {alias_t}: repository(owner: \"{owner}\", name: \"{repo}\") {{ ref(qualifiedName: \"refs/tags/{name}\") {{ target {{ ... on Commit {{ oid }} }} }} }}\n"
+                    ));
+                    mapping.push(AliasMapping {
+                        alias: alias_h,
+                        owner: g.owner.clone(),
+                        repo: g.repo.clone(),
+                        kind: AliasKind::Heads,
+                    });
+                    mapping.push(AliasMapping {
+                        alias: alias_t,
+                        owner: g.owner.clone(),
+                        repo: g.repo.clone(),
+                        kind: AliasKind::Tags,
+                    });
+                }
+            }
+        }
+        (format!("{{\n{fields}}}"), mapping)
+    }
+
+    /// GraphQL レスポンスを解析し (owner,repo) → Option<oid> を返す。
+    /// - `errors[]` 非空 → ApiError（`RATE_LIMITED` 判定含む）
+    /// - alias の `null` → None（そのリポジトリは解決失敗＝個別 fallback）
+    /// - heads/tags ペア → 非 null を採用（heads 優先）
+    fn parse_graphql_response(
+        body: &str,
+        mapping: &[AliasMapping],
+    ) -> Result<std::collections::HashMap<(String, String), Option<String>>, ApiError> {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| ApiError::Other(format!("invalid JSON: {e}")))?;
+        if let Some(errors) = value.get("errors").and_then(|v| v.as_array())
+            && !errors.is_empty()
+        {
+            let rate_limited = errors
+                .iter()
+                .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("RATE_LIMITED"));
+            return Err(if rate_limited {
+                ApiError::RateLimited
+            } else {
+                ApiError::Other(format!("GraphQL errors: {errors:?}"))
+            });
+        }
+        let data = value
+            .get("data")
+            .ok_or_else(|| ApiError::Other("missing data in GraphQL response".into()))?;
+        let oid_of = |alias: &str, kind: &AliasKind| -> Option<String> {
+            let repo = data.get(alias)?;
+            let target = match kind {
+                AliasKind::DefaultBranch => {
+                    repo.get("defaultBranchRef").and_then(|r| r.get("target"))
+                }
+                AliasKind::Heads | AliasKind::Tags => repo.get("ref").and_then(|r| r.get("target")),
+            };
+            target
+                .and_then(|t| t.get("oid"))
+                .and_then(|o| o.as_str())
+                .map(|s| s.to_string())
+        };
+        let mut result: std::collections::HashMap<(String, String), Option<String>> =
+            std::collections::HashMap::new();
+        let mut heads_tags: std::collections::HashMap<
+            (String, String),
+            (Option<String>, Option<String>),
+        > = std::collections::HashMap::new();
+        for m in mapping {
+            let oid = oid_of(&m.alias, &m.kind);
+            let key = (m.owner.clone(), m.repo.clone());
+            match m.kind {
+                AliasKind::DefaultBranch => {
+                    result.insert(key, oid);
+                }
+                AliasKind::Heads => {
+                    heads_tags.entry(key).or_default().0 = oid;
+                }
+                AliasKind::Tags => {
+                    heads_tags.entry(key).or_default().1 = oid;
+                }
+            }
+        }
+        for (key, (heads, tags)) in heads_tags {
+            result.insert(key, heads.or(tags));
+        }
+        Ok(result)
+    }
+
+    /// 全 GitHub リポジトリの最新 rev を1つの GraphQL リクエスト（chunk=50）で解決する。
+    /// 40-hex commit は呼出側で map に seed 済みを想定。`errors[]`/rate-limit は ApiError
+    /// （呼出側で per-repo フォールバック）。認証済み（token 有り）が前提。
+    pub(crate) async fn resolve_revs_via_graphql(
+        client: &reqwest::Client,
+        token: &str,
+        batch: &[GithubRev],
+    ) -> Result<std::collections::HashMap<(String, String), Option<String>>, ApiError> {
+        const GRAPHQL_URL: &str = "https://api.github.com/graphql";
+        const RATE_LIMIT_THRESHOLD: u64 = 50;
+        const CHUNK: usize = 50;
+        let mut result: std::collections::HashMap<(String, String), Option<String>> =
+            std::collections::HashMap::new();
+        for chunk in batch.chunks(CHUNK) {
+            let (query, mapping) = build_graphql_query(chunk);
+            let body = serde_json::json!({ "query": query });
+            let body_bytes = serde_json::to_vec(&body)
+                .map_err(|e| ApiError::Other(format!("serialize GraphQL query: {e}")))?;
+            let resp = client
+                .post(GRAPHQL_URL)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/vnd.github+json")
+                .body(body_bytes)
+                .send()
+                .await
+                .map_err(|e| ApiError::Other(e.to_string()))?;
+            if let Some(remaining) = resp
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                && remaining < RATE_LIMIT_THRESHOLD
+            {
+                return Err(ApiError::RateLimited);
+            }
+            if !resp.status().is_success() {
+                return Err(ApiError::Other(format!("GraphQL HTTP {}", resp.status())));
+            }
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ApiError::Other(e.to_string()))?;
+            result.extend(parse_graphql_response(&text, &mapping)?);
+        }
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    mod graphql_tests {
+        use super::*;
+
+        fn rev(owner: &str, repo: &str, rev: Option<&str>) -> GithubRev {
+            GithubRev {
+                owner: owner.into(),
+                repo: repo.into(),
+                rev: rev.map(|s| s.to_string()),
+            }
+        }
+
+        #[test]
+        fn build_graphql_query_default_branch() {
+            let (q, m) = build_graphql_query(&[rev("o", "r", None)]);
+            assert!(q.contains("r0: repository(owner: \"o\", name: \"r\") { defaultBranchRef"));
+            assert_eq!(m.len(), 1);
+            assert_eq!(m[0].alias, "r0");
+            assert!(matches!(m[0].kind, AliasKind::DefaultBranch));
+        }
+
+        #[test]
+        fn build_graphql_query_named_ref_emits_heads_and_tags() {
+            let (q, m) = build_graphql_query(&[rev("o", "r", Some("main"))]);
+            assert!(q.contains("r0h: repository") && q.contains("refs/heads/main"));
+            assert!(q.contains("r0t: repository") && q.contains("refs/tags/main"));
+            assert_eq!(m.len(), 2);
+        }
+
+        #[test]
+        fn build_graphql_query_escapes_special_chars() {
+            let (q, _) = build_graphql_query(&[rev("o", "r", Some("a\"b"))]);
+            assert!(q.contains("refs/heads/a\\\"b"), "rev must be escaped: {q}");
+        }
+
+        #[test]
+        fn parse_graphql_response_default_branch_oid() {
+            let (_, m) = build_graphql_query(&[rev("o", "r", None)]);
+            let body = r#"{"data":{"r0":{"defaultBranchRef":{"target":{"oid":"abc123"}}}}}"#;
+            let res = parse_graphql_response(body, &m).unwrap();
+            assert_eq!(
+                res.get(&("o".to_string(), "r".to_string())),
+                Some(&Some("abc123".to_string()))
+            );
+        }
+
+        #[test]
+        fn parse_graphql_response_null_alias_is_none() {
+            let (_, m) = build_graphql_query(&[rev("o", "r", None)]);
+            let body = r#"{"data":{"r0":null}}"#;
+            let res = parse_graphql_response(body, &m).unwrap();
+            assert_eq!(res.get(&("o".to_string(), "r".to_string())), Some(&None));
+        }
+
+        #[test]
+        fn parse_graphql_response_rate_limited() {
+            let (_, m) = build_graphql_query(&[rev("o", "r", None)]);
+            let body = r#"{"errors":[{"type":"RATE_LIMITED","message":"x"}]}"#;
+            let err = parse_graphql_response(body, &m).unwrap_err();
+            assert!(matches!(err, ApiError::RateLimited));
+        }
+
+        #[test]
+        fn parse_graphql_response_other_error() {
+            let (_, m) = build_graphql_query(&[rev("o", "r", None)]);
+            let body = r#"{"errors":[{"type":"FORBIDDEN","message":"x"}]}"#;
+            let err = parse_graphql_response(body, &m).unwrap_err();
+            assert!(matches!(err, ApiError::Other(_)));
+        }
+
+        #[test]
+        fn parse_graphql_response_heads_null_falls_back_to_tags() {
+            let (_, m) = build_graphql_query(&[rev("o", "r", Some("v1"))]);
+            let body = r#"{"data":{"r0h":{"ref":null},"r0t":{"ref":{"target":{"oid":"tagoid"}}}}}"#;
+            let res = parse_graphql_response(body, &m).unwrap();
+            assert_eq!(
+                res.get(&("o".to_string(), "r".to_string())),
+                Some(&Some("tagoid".to_string()))
+            );
+        }
+
+        #[test]
+        fn parse_graphql_response_heads_present_wins_over_tags() {
+            let (_, m) = build_graphql_query(&[rev("o", "r", Some("v1"))]);
+            let body = r#"{"data":{"r0h":{"ref":{"target":{"oid":"headoid"}}},"r0t":{"ref":{"target":{"oid":"tagoid"}}}}}"#;
+            let res = parse_graphql_response(body, &m).unwrap();
+            assert_eq!(
+                res.get(&("o".to_string(), "r".to_string())),
+                Some(&Some("headoid".to_string()))
+            );
+        }
     }
 }
 

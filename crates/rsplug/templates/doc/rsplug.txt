@@ -905,10 +905,13 @@ tarball downloads with Git fallback, bounded parallel fetch/build/copy work,
 staged immutable snapshots, snapshot manifests, anonymous script-only entries,
 deterministic conflict-aware merging, preserved `on_source` names after merge,
 `merge = false` applying to both startup and lazy user entries, a canonical
-repository identity shared by the lockfile and cache path, and atomic
-generation publication: each generation is built under a private staging
-directory and published only after all files, manifests, and the loader succeed,
-with `init.lua` swapped atomically and the lockfile updated only on success.
+repository identity shared by the lockfile and cache path, atomic generation
+publication (each generation built under a private staging directory and
+published only after all files, manifests, and the loader succeed, with
+`init.lua` swapped atomically and the lockfile updated only on success), and
+batched update resolution (`--update`/`--install` resolves all repository
+revisions in one phase — the GitHub GraphQL API for GitHub repos and parallel
+git ls-remote for the rest — instead of one request per repository).
 
 The lockfile format is JSON version `"2"`, keyed by canonical repository
 identity; older `"1"` files with raw-URL keys are normalized on read.  Cache

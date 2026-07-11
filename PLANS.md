@@ -30,6 +30,9 @@ pack depend on the source cache.
       `PackPlan`).
 - [x] Publish pack generations atomically via a staging directory and tie
       lockfile-write timing to successful publication.
+- [x] Resolve revs for `--update`/`--install` in a single batched phase:
+      GitHub repos via one GraphQL query (chunked), arbitrary Git URLs and
+      wildcards via parallel ls-remote, run concurrently.
 
 ## Decisions already implemented
 
@@ -99,6 +102,19 @@ Pack generations (up to `RETAIN_GENERATIONS = 3`) coexist under `generations/`,
 each addressable as `generations/<id>.lua` with `init.lua` symlinked to the
 current one — old generations stay reachable until no retained manifest refers
 to them.
+
+### Batched rev resolution
+
+`--update`/`--install` resolves every repo's latest OID in one pre-fan-out phase
+instead of per-plugin inside the load fan-out. GitHub repos go through a single
+GraphQL query (chunked at 50; `defaultBranchRef` when no rev, or
+`ref(qualifiedName)` with heads/tags disambiguation); arbitrary Git URLs and
+wildcard refs go through parallel `git ls-remote` under the fetch semaphore; the
+two run concurrently via `tokio::join`. 40-hex commit revs are seeded directly.
+Resolved OIDs flow into `load` through the existing `locked_rev` parameter (zero
+changes to `Plugin::load`/`resolve_remote_oid`), so any repo the batch misses —
+GraphQL error, null alias, wildcard, non-GitHub, or conflicting revs on the same
+canonical identity — still resolves via the per-repo fallback exactly as before.
 
 ## Remaining phases
 
