@@ -221,9 +221,7 @@ async fn app() -> Result<(), Error> {
                         rsplug::util::github::ApiError::RateLimited => "rate-limited".into(),
                         rsplug::util::github::ApiError::Other(s) => s,
                     };
-                    eprintln!(
-                        "[rsplug] GitHub GraphQL batch failed ({reason}); falling back to per-repo resolution"
-                    );
+                    msg(Message::GraphQLBatchFailed { reason });
                 }
             }
         }

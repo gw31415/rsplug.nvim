@@ -66,6 +66,10 @@ pub enum Message {
         merged: usize,
     },
     DetectLockFile(PathBuf),
+    /// GitHub GraphQL バッチ rev 解決が失敗し、per-repo 解決へフォールバックした。
+    GraphQLBatchFailed {
+        reason: String,
+    },
     InstallSkipped(Arc<str>),
     InstallYank {
         id: Arc<str>,
@@ -1174,6 +1178,15 @@ impl ProgressManager {
                         "{} {}",
                         summary_prefix("Lockfile", true),
                         style(path.to_string_lossy()).dim()
+                    ))
+                    .unwrap();
+            }
+            Message::GraphQLBatchFailed { reason } => {
+                self.multipb
+                    .println(format!(
+                        "{} batch failed ({}); falling back to per-repo resolution",
+                        summary_prefix("GraphQL", false),
+                        reason
                     ))
                     .unwrap();
             }
