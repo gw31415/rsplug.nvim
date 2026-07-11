@@ -13,9 +13,9 @@ into explicit models. The generated pack remains self-contained and portable.
 
 ## Progress
 
-- [ ] Phase 1: bound network/archive/build/copy resources; stage tarball
+- [x] Phase 1: bound network/archive/build/copy resources; stage tarball
   extraction; enforce `merge = false` for all user plugins.
-- [ ] Phase 2: persist snapshot manifests and use them for merge/copy/doc/index
+- [x] Phase 2: persist snapshot manifests and use them for merge/copy/doc/index
   planning instead of repeated filesystem walks.
 - [ ] Phase 3: introduce `PluginSpec`, `ResolvedGraph`, `MaterializationPlan`,
   `LazyRegistration`, `PackPlan`, stable configuration IDs, and canonical
@@ -53,6 +53,32 @@ merge; never retain only the left-hand `source_name`.
 - Start and opt plugins with `merge = false` are distinct packs; `on_source`
   remains valid after a compatible merge.
 
+### Status (2026-07-11)
+
+Implemented and validated (`cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo fmt --all -- --check` all green).
+
+- Tarball staging + containment + rename-on-success and Git-fallback isolation
+  were already in the working tree (`util::fetch::TarballFetch`).
+- Bounded budgets centralized in `rsplug::util::resources`: `available_cpus()`,
+  `GIT_SEMAPHORE` (CPU), `BUILD_SEMAPHORE` (`max(1, CPU/2)`). `fetch` stays in
+  `main.rs` (`min(16, CPU*2)`, max 64) and tarball extraction in
+  `fetch::EXTRACTION_SEMAPHORE` (`min(4, CPU)`). Git operations
+  (`init_source`/`fetch_oid`/`init_snapshot`) moved off the fetch semaphore onto
+  `GIT_SEMAPHORE`; builds (`run_repo_build` + `lua_post_update`) gated by
+  `BUILD_SEMAPHORE`.
+- Copy fan-out bounded on two axes: the entry-level `yank_semaphore` is now
+  capped at `min(16, max(2, CPU*2))` (was unbounded to 256), and `copy_tree`'s
+  leaf fan-out is gated by `resources::COPY_LEAF`.
+- `LoadedPlugin.source_name: Option<String>` → `source_names: BTreeSet<String>`;
+  merge takes the union so both sides' `on_source` names survive. `PlugCtl::create`
+  registers every name. **plugin_id-incompatible** (existing pack/lock regenerates).
+- `merge = false` already applied to both start and opt; kept. Added tests
+  `merge_preserves_all_source_names` plus the start/opt merge-disabled tests.
+- Deferred: a live end-to-end `generate` smoke test (needs network + token) and
+  the Phase-spanning synthetic benchmarks (32 tarballs / 10,000-file copies /
+  128-plugin merge) listed under Validation.
+
 ## Phase 2 — immutable snapshot manifests and merge planner
 
 Write `.rsplug-manifest-v1.json` after each staged snapshot is ready. It lists
@@ -66,6 +92,31 @@ from that manifest. Bucket artifacts by load policy and merge eligibility;
 stable source ID order determines first-fit selection. `MergePlan` contains the
 copy source/destination entries and is the only input to bounded copying. Docs
 are manifest entries aggregated once before a single helptags invocation.
+
+### Status (2026-07-11)
+
+Implemented and validated (`cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo fmt --all -- --check` all green).
+
+- `entities::manifest::SnapshotManifest` writes `.rsplug-manifest-v1.json` at
+  snapshot-ready (`Plugin::load`, after the build-success marker), plus a
+  per-repo `<repo>/latest-snapshot` index. Both are best-effort caches; reuse
+  runs skip the manifest rewrite to avoid redundant walks.
+- Manifest is a **pure filesystem record** (path, kind, symlink target).
+  `copy_eligible` and the build-output `build_digest` are config/build-cache
+  derived, not filesystem facts, so they are intentionally omitted from schema
+  v1 (added when consumed).
+- Merge probes (`entries_mergeable` `is_dir`, and `read_dir_children` in
+  `entries_mergeable`/`expand_dir_union`/`expand_sealed_into`) now consult a
+  process-global manifest cache via `merge_is_dir`/`merge_children`. **Filesystem
+  fallback** preserves exact behavior when the manifest is absent, stale, or for
+  symlinks (manifest does not follow; `is_dir`/`read_dir` do). Sealed-dir
+  representation and macOS clonefile copy are unchanged.
+- Docs are already aggregated into a single `_rsplug:doc` package (Phase 8
+  `split_doc`), so helptags already runs once — no separate work needed.
+- Deferred from the Phase 2 text: an explicit `MergePlan` struct (the merged
+  `LoadedPlugin` files already are the copy plan; introducing the name is
+  ceremonial) and the `copy_eligible`/`build_digest` manifest fields.
 
 ## Phase 3 — explicit public and internal models
 

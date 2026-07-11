@@ -120,12 +120,16 @@ async fn app() -> Result<(), Error> {
     // 依存先 snapshot は各依存先 repo の worktrees/ から best-effort で解決する (PLANS §10.3)。
     let locked_map = Arc::new(locked_map);
     // 全 plugin のネットワークフェッチ並列度を制限する。
-    // 初期値32、min=1、max=512。tarball (codeload CDN) はレート制限の対象外なので高めに設定。
+    // 初期値は CPU 数に応じて抑え、最大 64 に制限する。tarball は CDN 経由でも
+    // download 後に展開・materialize が続くため、数百本の同時接続は総スループットを
+    // 下げ、FD/RSS を不必要に消費する。
     // エラー率上昇時に自動的に並列度を半減させる。
+    let cpu_count = rsplug::util::resources::available_cpus();
+    let fetch_initial_limit = (cpu_count * 2).min(16);
     let fetch_semaphore = adaptive_semaphore::AdaptiveSemaphore::with_limits(
-        32,
+        fetch_initial_limit,
         1,
-        512,
+        64,
         std::time::Duration::from_millis(64),
     );
 

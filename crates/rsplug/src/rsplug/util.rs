@@ -3,6 +3,53 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::error::Error;
 
+/// プロセス全体で共有する、リソース別の並列度予算（PLANS Phase 1）。
+/// 予算: fetch=min(16, CPU*2)・上限64（main.rs の AdaptiveSemaphore）・
+/// tarball 展開=min(4, CPU)（`fetch::EXTRACTION_SEMAPHORE`）・Git 実体化=CPU・
+/// build=max(1, CPU/2)・copy=min(16, max(2, CPU*2))。fetch/展開以外はここで集中管理する。
+pub(crate) mod resources {
+    use once_cell::sync::Lazy;
+    use tokio::sync::Semaphore;
+
+    use crate::rsplug::error::Error;
+
+    /// 利用可能 CPU コア数。取得失敗時は 4。
+    pub(crate) fn available_cpus() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    }
+
+    /// Git 実体化（source.git の init/fetch・worktree 作成）。ローカル CPU と git2 の
+    /// 内部スレッド消費を抑えるため CPU 数に制限する。
+    pub(crate) static GIT_SEMAPHORE: Lazy<Semaphore> =
+        Lazy::new(|| Semaphore::new(available_cpus()));
+
+    /// build プロセス（sh build・lua_build・lua_post_update）。CPU+IO が重いので
+    /// CPU の半分（最低1）に制限し、fetch/展開/copy を飢えさせない。
+    pub(crate) static BUILD_SEMAPHORE: Lazy<Semaphore> =
+        Lazy::new(|| Semaphore::new((available_cpus() / 2).max(1)));
+
+    /// pack copy の leaf コピー（reflink 非対応/fallback 時の per-file copy）。
+    /// copy 予算 min(16, max(2, CPU*2)) で fan-out を抑える。
+    pub(crate) static COPY_LEAF: Lazy<Semaphore> =
+        Lazy::new(|| Semaphore::new((available_cpus() * 2).clamp(2, 16)));
+
+    pub(crate) async fn git() -> Result<tokio::sync::SemaphorePermit<'static>, Error> {
+        GIT_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|_| Error::Io(std::io::Error::other("git semaphore closed")))
+    }
+
+    pub(crate) async fn build() -> Result<tokio::sync::SemaphorePermit<'static>, Error> {
+        BUILD_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|_| Error::Io(std::io::Error::other("build semaphore closed")))
+    }
+}
+
 pub mod hash {
     //! Utilities for hashing arbitrary data.
 
@@ -637,6 +684,20 @@ pub mod fetch {
 
     use std::path::Path;
 
+    use once_cell::sync::Lazy;
+    use tokio::io::AsyncWriteExt;
+
+    /// Archive decompression is CPU and disk intensive.  It must not scale with the
+    /// number of concurrent HTTP requests: on a large plugin set that otherwise
+    /// creates a blocking task per response and makes both the runtime and disk
+    /// scheduler thrash.
+    static EXTRACTION_SEMAPHORE: Lazy<tokio::sync::Semaphore> = Lazy::new(|| {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(cpus.min(4))
+    });
+
     use super::super::error::Error;
     use super::github;
 
@@ -663,18 +724,38 @@ pub mod fetch {
             })?;
             let tarball_url = github::tarball_url(&owner, &repo, oid);
 
-            tokio::fs::create_dir_all(snapshot_root).await?;
-            Self::download_and_extract(client, &tarball_url, snapshot_root, token).await?;
+            let parent = snapshot_root.parent().ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "snapshot root has no parent",
+                ))
+            })?;
+            tokio::fs::create_dir_all(parent).await?;
+
+            // Keep both the archive and the extracted tree outside the final
+            // snapshot.  A failed HTTP transfer or malformed archive therefore
+            // cannot poison the subsequent Git fallback or a later retry.
+            let staging = tempfile::Builder::new()
+                .prefix(".rsplug-tarball-")
+                .tempdir_in(parent)
+                .map_err(Error::Io)?;
+            let extract_dir = staging.path().join("extract");
+            tokio::fs::create_dir(&extract_dir).await?;
+            Self::download_and_extract(client, &tarball_url, &extract_dir, token).await?;
+
+            let extracted_root = Self::single_archive_root(&extract_dir)?;
+            tokio::fs::rename(extracted_root, snapshot_root).await?;
 
             Ok(())
         }
 
-        /// tarball を共有 `Client` でダウンロードし、gzip 展開 + tar 展開を1回の
-        /// `spawn_blocking` で行う。temp file を使わずメモリ上で展開する。
+        /// tarball を共有 `Client` で staging file にストリーミング保存してから展開する。
+        /// レスポンス全体をメモリに保持しないため、大きな repository を多数同時に取得しても
+        /// RSS が archive size の合計に比例しない。
         async fn download_and_extract(
             client: &reqwest::Client,
             url: &str,
-            dest: &Path,
+            staging: &Path,
             token: Option<&str>,
         ) -> Result<(), Error> {
             let mut req = client.get(url);
@@ -693,33 +774,49 @@ pub mod fetch {
                 ))));
             }
 
-            // レスポンス全体を bytes::Bytes として受信（reqwest が再エクスポート）。
-            let body = response.bytes().await.map_err(|e| {
+            // Store the compressed body beside (not inside) the extraction root:
+            // a malformed archive must never be able to overwrite the source file
+            // that is still being read by the decoder.
+            let archive_path = staging
+                .parent()
+                .ok_or_else(|| Error::Io(std::io::Error::other("extraction root has no parent")))?
+                .join("archive.tar.gz");
+            let mut archive_file = tokio::fs::File::create(&archive_path).await?;
+            let mut response = response;
+            while let Some(chunk) = response.chunk().await.map_err(|e| {
                 Error::Io(std::io::Error::other(format!(
                     "tarball read body failed: {e}"
                 )))
-            })?;
+            })? {
+                archive_file.write_all(&chunk).await?;
+            }
+            archive_file.flush().await?;
+            archive_file.sync_all().await?;
+            drop(archive_file);
 
             // gzip 展開 + tar 展開を1回の spawn_blocking で実行。
             // flate2 (zlib-ng) は純 Rust の async-compression より高速。
-            let dest = dest.to_path_buf();
+            let _permit = EXTRACTION_SEMAPHORE.acquire().await.map_err(|_| {
+                Error::Io(std::io::Error::other("tarball extraction semaphore closed"))
+            })?;
+            let archive_path = archive_path.clone();
+            let staging = staging.to_path_buf();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let cursor = std::io::Cursor::new(body);
-                let decoder = flate2::read::GzDecoder::new(cursor);
+                let archive_file = std::fs::File::open(&archive_path)?;
+                let decoder = flate2::read::GzDecoder::new(archive_file);
                 let mut archive = tar::Archive::new(decoder);
                 for entry in archive.entries()? {
                     let mut entry = entry?;
-                    let path = entry.path()?.into_owned();
-                    // GitHub tarball のトップレベルディレクトリ（owner-repo-ref/）を strip
-                    let rel: std::path::PathBuf = path.components().skip(1).collect();
-                    if rel.as_os_str().is_empty() {
-                        continue;
+                    // `unpack_in` performs the tar crate's path and symlink
+                    // containment checks.  We retain GitHub's one top-level
+                    // directory and strip it only by atomically moving that
+                    // verified directory after extraction.
+                    if !entry.unpack_in(&staging)? {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "tarball entry escapes staging directory",
+                        ));
                     }
-                    let dest_path = dest.join(&rel);
-                    if let Some(parent) = dest_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    entry.unpack(&dest_path)?;
                 }
                 Ok(())
             })
@@ -727,6 +824,22 @@ pub mod fetch {
             .map_err(|e| Error::Io(std::io::Error::other(format!("join error: {e}"))))??;
 
             Ok(())
+        }
+
+        /// GitHub archives contain exactly one top-level directory.  Requiring
+        /// that shape makes the final rename atomic and rejects archives which
+        /// would otherwise place files beside the expected repository root.
+        pub(crate) fn single_archive_root(staging: &Path) -> Result<std::path::PathBuf, Error> {
+            let entries = std::fs::read_dir(staging)?
+                .filter_map(|entry| entry.ok())
+                .collect::<Vec<_>>();
+            if entries.len() != 1 || !entries[0].file_type()?.is_dir() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "tarball must contain exactly one top-level directory",
+                )));
+            }
+            Ok(entries[0].path())
         }
     }
 }
@@ -896,6 +1009,21 @@ pub fn truncate(val: &impl ToString, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tarball_requires_one_top_level_directory_before_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extract = tmp.path().join("extract");
+        std::fs::create_dir(&extract).unwrap();
+        std::fs::create_dir(extract.join("owner-repo-rev")).unwrap();
+        assert_eq!(
+            fetch::TarballFetch::single_archive_root(&extract).unwrap(),
+            extract.join("owner-repo-rev")
+        );
+
+        std::fs::write(extract.join("unexpected"), b"not an archive root").unwrap();
+        assert!(fetch::TarballFetch::single_archive_root(&extract).is_err());
+    }
 
     #[tokio::test]
     async fn dirty_diff_from_content_is_deterministic_and_excludes_marker_and_git() {

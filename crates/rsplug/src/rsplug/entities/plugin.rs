@@ -336,7 +336,7 @@ impl Plugin {
 
         let Some(repo) = repo else {
             let loaded = LoadedPlugin {
-                source_name,
+                source_names: source_name.into_iter().collect(),
                 files: HowToPlaceFiles::CopyEachFile(Default::default()),
                 lazy_type,
                 script,
@@ -512,6 +512,7 @@ impl Plugin {
                     let id = id.clone();
                     async {
                         let path = create_lua_build_script(lua_post_update, &rtp).await?;
+                        let _build = super::util::resources::build().await?;
                         let code = execute(
                             lua_build_nvim_command(path.as_os_str()),
                             building.clone(),
@@ -592,6 +593,28 @@ impl Plugin {
             .await?;
         }
 
+        // Phase 2: snapshot が ready になったので manifest を記録する（best-effort cache）。
+        // 以降の merge/copy 計画は manifest からパス集合を引ける（Part B）。欠損時は filesystem
+        // fallback。既存 snapshot の再利用時は書き込みを省き、重複 walk を避ける。
+        let manifest_path = snapshot_root_path.join(MANIFEST_FILE);
+        if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
+            let _ = SnapshotManifest::build_and_write(
+                snapshot_root_path.as_ref(),
+                dotgit,
+                RSPLUG_BUILD_SUCCESS_FILE,
+            )
+            .await;
+        }
+        // per-repo latest-snapshot index: `<repo>/latest-snapshot` に snapshot_key を記録する。
+        // worktrees/ を scan せずに最新 snapshot を特定できる（best-effort）。
+        if let (Some(worktrees), Some(key)) =
+            (snapshot_root_path.parent(), snapshot_root_path.file_name())
+            && let Some(repo_root) = worktrees.parent()
+        {
+            let key = key.to_string_lossy();
+            let _ = tokio::fs::write(repo_root.join("latest-snapshot"), key.as_bytes()).await;
+        }
+
         let filesource = Arc::new(FileSource::Directory {
             path: snapshot_root_path.clone(),
         });
@@ -655,7 +678,7 @@ impl Plugin {
         }
 
         let loaded = LoadedPlugin {
-            source_name,
+            source_names: source_name.into_iter().collect(),
             files,
             lazy_type,
             script,
@@ -732,7 +755,7 @@ async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
     let mut repo = match git::open_source(ctx.source_git).await {
         Ok(r) => r,
         Err(_) if ctx.install || ctx.update => {
-            let _permit = ctx.semaphore.acquire().await;
+            let _git = super::util::resources::git().await?;
             msg(Message::Cache("Initializing", ctx.url.clone()));
             git::init_source(ctx.source_git, ctx.url).await?
         }
@@ -751,7 +774,7 @@ async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
         }
     };
     {
-        let _permit = ctx.semaphore.acquire().await;
+        let _git = super::util::resources::git().await?;
         msg(Message::Cache("Fetching", ctx.url.clone()));
         repo.fetch_oid(ctx.oid, ctx.token.clone()).await?;
         msg(Message::Cache("Fetching:done", ctx.url.clone()));
@@ -812,6 +835,7 @@ async fn materialize(
         }
     }
 
+    let _git = super::util::resources::git().await?;
     Ok(Some(MaterializedRepo::Git(
         git::init_snapshot(dest.to_path_buf(), ctx.source_git, ctx.oid).await?,
     )))
@@ -870,6 +894,9 @@ async fn run_repo_build(
         log::{Message, msg},
         rsplug::util::execute,
     };
+    // build プロセスは CPU+IO 重めなので CPU の半分（最低1）に制限する（Phase 1）。
+    // run_repo_build は build(sh) と lua_build を順に実行するので、関数先頭で1つ取得する。
+    let _build = super::util::resources::build().await?;
 
     if !build.is_empty() {
         let id = Arc::new(format!("{logid} (sh)"));

@@ -1,14 +1,14 @@
 use std::{
     borrow::Cow,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
     ffi::OsString,
     hash::{Hash, Hasher},
     io,
     ops::Add,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
     time::SystemTime,
@@ -17,6 +17,7 @@ use std::{
 use crate::log::{Message, msg};
 use adaptive_semaphore::AdaptiveSemaphore;
 use hashbrown::{HashMap, HashSet};
+use once_cell::sync::Lazy;
 use sailfish::TemplateSimple;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -161,8 +162,9 @@ impl Default for HowToPlaceFiles {
 /// PluginLoadedに変換する。
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct LoadedPlugin {
-    /// `on_source` から参照される設定上の名前
-    pub(super) source_name: Option<String>,
+    /// `on_source` から参照される設定上の名前。マージ時に和集合で蓄積し、両側の
+    /// 参照名をすべて残す（Phase 1: マージで source_name を潰さない）。
+    pub(super) source_names: BTreeSet<String>,
     /// プラグインの遅延実行タイプ
     pub lazy_type: LazyType,
     /// 配置するファイル
@@ -207,7 +209,7 @@ impl LoadedPlugin {
     /// 1つの `_rsplug:doc` に集約する（Phase 8: `PlugCtl.overwrite_files` 中間表現を廃止）。
     pub(super) fn split_doc(self) -> (LoadedPlugin, Option<LoadedPlugin>) {
         let LoadedPlugin {
-            source_name,
+            source_names,
             lazy_type,
             files,
             script,
@@ -230,7 +232,7 @@ impl LoadedPlugin {
             }
         }
         let rest = LoadedPlugin {
-            source_name,
+            source_names,
             lazy_type,
             files: HowToPlaceFiles::CopyEachFile(map),
             script,
@@ -243,7 +245,7 @@ impl LoadedPlugin {
             None
         } else {
             Some(LoadedPlugin {
-                source_name: Some(super::plugctl::DOC_PLUGIN_NAME.to_string()),
+                source_names: BTreeSet::from([super::plugctl::DOC_PLUGIN_NAME.to_string()]),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(doc_map),
                 script: SetupScript::default(),
@@ -431,8 +433,12 @@ impl Add for LoadedPlugin {
         if self.lazy_type != rhs.lazy_type {
             return (self, Some(rhs));
         }
-        if self.lazy_type.is_start()
-            && (self.is_plugctl != rhs.is_plugctl || !(self.merge_enabled && rhs.merge_enabled))
+        // `merge = false` is a user-plugin policy, independent of whether the
+        // plugin is start- or opt-loaded.  Generated PlugCtl artifacts retain
+        // their internal aggregation behavior, but must never merge with user
+        // plugins.
+        if self.is_plugctl != rhs.is_plugctl
+            || !(self.is_plugctl || self.merge_enabled && rhs.merge_enabled)
         {
             return (self, Some(rhs));
         }
@@ -441,7 +447,7 @@ impl Add for LoadedPlugin {
                 let mergeable = dirs_mergeable(files, rfiles);
                 if mergeable {
                     let Self {
-                        source_name,
+                        mut source_names,
                         lazy_type,
                         files: HowToPlaceFiles::CopyEachFile(mut files),
                         mut script,
@@ -451,7 +457,7 @@ impl Add for LoadedPlugin {
                         dotgit,
                     } = self;
                     let Self {
-                        source_name: _,
+                        source_names: r_source_names,
                         lazy_type: _,
                         files: HowToPlaceFiles::CopyEachFile(rfiles),
                         script: rscript,
@@ -463,10 +469,12 @@ impl Add for LoadedPlugin {
                     files = union_files(files, rfiles);
                     script += rscript;
                     let order = order.min(r_order);
+                    // マージで source_name を潰さず、両側の on_source 参照名をすべて保持する。
+                    source_names.extend(r_source_names);
 
                     return (
                         Self {
-                            source_name,
+                            source_names,
                             lazy_type,
                             files: HowToPlaceFiles::CopyEachFile(files),
                             script,
@@ -482,6 +490,52 @@ impl Add for LoadedPlugin {
         };
         (self, Some(rhs))
     }
+}
+
+/// snapshot_root → manifest のプロセス全局キャッシュ（Phase 2 Part B: merge の
+/// filesystem walk 削減）。best-effort: 読み込めなければ `None` をキャッシュし、
+/// 呼出元は filesystem に fallback する。snapshot は manifest 書き込み後不変を仮定する。
+static MANIFEST_CACHE: Lazy<Mutex<HashMap<PathBuf, Option<Arc<SnapshotManifest>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// `root` の manifest を（あれば）キャッシュ付きで読み込む。
+fn manifest_for(root: &Path) -> Option<Arc<SnapshotManifest>> {
+    let mut cache = MANIFEST_CACHE.lock().unwrap();
+    if let Some(m) = cache.get(root) {
+        return m.clone();
+    }
+    let m = std::fs::read(root.join(MANIFEST_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SnapshotManifest>(&b).ok())
+        .map(Arc::new);
+    cache.insert(root.to_path_buf(), m.clone());
+    m
+}
+
+/// `root` 配下の `rel` がディレクトリか。manifest があればそれを使い、symlink・不在・
+/// manifest 無しの場合は filesystem の `is_dir()`（follow）に fallback する。
+/// `entries_mergeable` の `is_dir()` を置き換える（Phase 2 Part B）。
+fn merge_is_dir(root: &Path, rel: &Path) -> bool {
+    if let Some(m) = manifest_for(root) {
+        match m.kind_of(rel) {
+            Some(ManifestKind::Dir) => return true,
+            Some(ManifestKind::File) => return false,
+            // Symlink: manifest は follow しないが is_dir() は follow する → filesystem に聞く。
+            Some(ManifestKind::Symlink) | None => {}
+        }
+    }
+    root.join(rel).is_dir()
+}
+
+/// `root/rel` 直下の子エントリ名集合。manifest があればそれを使い、無ければ `read_dir` に
+/// fallback する（Phase 2 Part B）。`read_dir_children` を置き換える。
+fn merge_children(root: &Path, rel: &Path) -> HashSet<OsString> {
+    if let Some(m) = manifest_for(root)
+        && let Some(set) = m.child_names(rel)
+    {
+        return set;
+    }
+    read_dir_children(&root.join(rel))
 }
 
 /// 同 path のエントリを 2a-2c で再帰的に競合判定し、全てマージ可能なら true。
@@ -519,8 +573,8 @@ fn entries_mergeable(path: &Path, item: &FileItem, other: &FileItem) -> bool {
             (MergeType::Conflict, _) | (_, MergeType::Conflict)
         );
     };
-    let x_dir = x_root.join(path).is_dir();
-    let y_dir = y_root.join(path).is_dir();
+    let x_dir = merge_is_dir(x_root, path);
+    let y_dir = merge_is_dir(y_root, path);
     // 2b: 種別違い（ディレクトリ vs ファイル）は競合。
     if x_dir != y_dir {
         return false;
@@ -533,11 +587,11 @@ fn entries_mergeable(path: &Path, item: &FileItem, other: &FileItem) -> bool {
         );
     }
     // 2c: 両方ディレクトリ。直下の子要素で再帰。
-    let x_children = read_dir_children(&x_root.join(path));
+    let x_children = merge_children(x_root, path);
     if x_children.is_empty() {
         return true;
     }
-    let y_children = read_dir_children(&y_root.join(path));
+    let y_children = merge_children(y_root, path);
     for child in x_children {
         if y_children.contains(&child) && !entries_mergeable(&path.join(&child), item, other) {
             return false;
@@ -632,7 +686,7 @@ fn expand_sealed_into(files: &mut BTreeMap<PathBuf, FileItem>, path: &Path, seal
     let Some(root) = snapshot_root_of(&sealed.source) else {
         return;
     };
-    let children = read_dir_children(&root.join(path));
+    let children = merge_children(root, path);
     for child in &children {
         let cpath = path.join(child);
         let citem = child_item(&sealed, cpath.clone());
@@ -661,8 +715,8 @@ fn expand_dir_union(
 ) {
     let lroot = snapshot_root_of(&litem.source).expect("directory item has Directory source");
     let rroot = snapshot_root_of(&ritem.source).expect("directory item has Directory source");
-    let lchildren = read_dir_children(&lroot.join(path));
-    let rchildren = read_dir_children(&rroot.join(path));
+    let lchildren = merge_children(lroot, path);
+    let rchildren = merge_children(rroot, path);
     for child in &lchildren {
         let cpath = path.join(child);
         let lc = child_item(&litem, cpath.clone());
@@ -1026,7 +1080,16 @@ async fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     }
     let mut sub = JoinSet::new();
     for (s, d) in leaves {
-        sub.spawn(async move { copy_leaf(&s, &d).await });
+        // copy 予算で leaf copy の fan-out を抑える（Phase 1）。permit 取得でこのループが
+        // ブロックするため、copy_leaf の並列度が COPY_LEAF のサイズに張り付く。
+        let permit = crate::rsplug::util::resources::COPY_LEAF
+            .acquire()
+            .await
+            .map_err(|e| io::Error::other(format!("copy leaf semaphore closed: {e}")))?;
+        sub.spawn(async move {
+            let _permit = permit;
+            copy_leaf(&s, &d).await
+        });
     }
     while let Some(res) = sub.join_next().await {
         res.map_err(|e| io::Error::other(format!("copy join failed: {e}")))??;
@@ -1191,7 +1254,7 @@ impl PackPathState {
         }
 
         let LoadedPlugin {
-            source_name,
+            source_names,
             lazy_type,
             files,
             script,
@@ -1204,7 +1267,7 @@ impl PackPathState {
         if !is_plugctl {
             // doc 盗みはマージ前に `PackPathState::load` → `LoadedPlugin::steal_doc` で済ませているため、
             // ここでは lazy 実行制御（PlugCtl）の生成のみ。files は変更しない。
-            self.ctl += PlugCtl::create(id, source_name, lazy_type, script, order);
+            self.ctl += PlugCtl::create(id, source_names, lazy_type, script, order);
         }
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
@@ -1278,7 +1341,16 @@ impl PackPathState {
         control_ids.sort();
         let init_content = render_init(&control_ids);
         let mut tasks = JoinSet::new();
-        let yank_semaphore = AdaptiveSemaphore::new();
+        // copy 予算 min(16, max(2, CPU*2))。entry（パッケージ単位の yank）の fan-out 上限。
+        // 旧実装は AdaptiveSemaphore::new()（上限256）で copy が過剰 fan-out していたのを抑える。
+        // leaf コピーの fan-out は copy_tree 内で COPY_LEAF で別途抑える（Phase 1）。
+        let copy_budget = (crate::rsplug::util::resources::available_cpus() * 2).clamp(2, 16);
+        let yank_semaphore = AdaptiveSemaphore::with_limits(
+            copy_budget,
+            copy_budget,
+            copy_budget,
+            std::time::Duration::from_millis(64),
+        );
 
         for (
             id,
@@ -1610,7 +1682,7 @@ mod tests {
 
     fn synth(files: HowToPlaceFiles) -> LoadedPlugin {
         LoadedPlugin {
-            source_name: None,
+            source_names: BTreeSet::new(),
             lazy_type: LazyType::Start,
             files,
             script: SetupScript::default(),
@@ -1619,6 +1691,113 @@ mod tests {
             is_plugctl: false,
             dotgit: false,
         }
+    }
+
+    #[test]
+    fn merge_disabled_start_user_plugins_are_not_merged() {
+        let snapshot_a = snap("github.com/owner/a", b"rev-a");
+        let snapshot_b = snap("github.com/owner/b", b"rev-b");
+        let mut disabled = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot_a,
+            "plugin/a.lua",
+            "/cache/a",
+        )])));
+        disabled.merge_enabled = false;
+        let enabled = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot_b,
+            "plugin/b.lua",
+            "/cache/b",
+        )])));
+
+        let (_left, rest) = disabled + enabled;
+        assert!(
+            rest.is_some(),
+            "merge=false must prevent start-plugin merging"
+        );
+    }
+
+    #[test]
+    fn merge_disabled_opt_user_plugins_are_not_merged() {
+        let snapshot_a = snap("github.com/owner/a", b"rev-a");
+        let snapshot_b = snap("github.com/owner/b", b"rev-b");
+        let mut disabled = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot_a,
+            "plugin/a.lua",
+            "/cache/a",
+        )])));
+        disabled.lazy_type = LazyType::Opt(Default::default());
+        disabled.merge_enabled = false;
+        let mut enabled = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot_b,
+            "plugin/b.lua",
+            "/cache/b",
+        )])));
+        enabled.lazy_type = LazyType::Opt(Default::default());
+
+        let (_left, rest) = disabled + enabled;
+        assert!(
+            rest.is_some(),
+            "merge=false must prevent opt-plugin merging"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_all_source_names() {
+        // マージで片側の on_source 参照名 (source_name) を潰さないこと（Phase 1）。
+        let snapshot_a = snap("github.com/owner/a", b"rev-a");
+        let snapshot_b = snap("github.com/owner/b", b"rev-b");
+        let mut a = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot_a,
+            "plugin/a.lua",
+            "/cache/a",
+        )])));
+        a.source_names.insert("a".to_string());
+        let mut b = synth(HowToPlaceFiles::CopyEachFile(BTreeMap::from([repo_file(
+            snapshot_b,
+            "plugin/b.lua",
+            "/cache/b",
+        )])));
+        b.source_names.insert("b".to_string());
+
+        let (merged, rest) = a + b;
+        assert!(rest.is_none(), "disjoint start plugins should merge");
+        assert_eq!(
+            merged.source_names,
+            BTreeSet::from(["a".to_string(), "b".to_string()]),
+            "merge must preserve both sides' on_source names"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_driven_merge_probes_prefer_manifest_over_filesystem() {
+        // Phase 2 Part B: manifest があれば種別/子集合を manifest から引き、filesystem
+        // walk（is_dir / read_dir）を省く。manifest 無し・symlink・不在は fallback。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        tokio::fs::create_dir_all(root.join("lua/sub"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("lua/a.lua"), b"a")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("lua/sub/b.lua"), b"b")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("file.txt"), b"f").await.unwrap();
+        SnapshotManifest::build_and_write(&root, false, ".rsplug_build_success")
+            .await
+            .unwrap();
+
+        // manifest 由来の種別・子集合が filesystem と一致する。
+        assert!(merge_is_dir(&root, Path::new("lua")));
+        assert!(!merge_is_dir(&root, Path::new("file.txt")));
+        let lua = merge_children(&root, Path::new("lua"));
+        assert!(lua.contains(&OsString::from("a.lua")));
+        assert!(lua.contains(&OsString::from("sub")));
+        let sub = merge_children(&root, Path::new("lua/sub"));
+        assert!(sub.contains(&OsString::from("b.lua")));
+        // manifest に無いパスは filesystem fallback（実パスを参照）。
+        assert!(!merge_is_dir(&root, Path::new("does-not-exist")));
     }
 
     #[test]
@@ -1874,7 +2053,7 @@ mod tests {
             ),
         )]);
         let loaded = LoadedPlugin {
-            source_name: None,
+            source_names: BTreeSet::new(),
             lazy_type: LazyType::Start,
             files: HowToPlaceFiles::CopyEachFile(files),
             script: SetupScript::default(),
@@ -2020,7 +2199,7 @@ mod tests {
             ),
         ]);
         let loaded = LoadedPlugin {
-            source_name: None,
+            source_names: BTreeSet::new(),
             lazy_type: LazyType::Start,
             files: HowToPlaceFiles::CopyEachFile(files),
             script: SetupScript::default(),
@@ -2253,7 +2432,10 @@ mod tests {
 
         // doc は `_rsplug:doc` プラグイン（is_plugctl, Start 相当）で doc/** を Overwrite 保持。
         let doc = doc.expect("doc plugin must be Some when doc/** present");
-        assert_eq!(doc.source_name.as_deref(), Some("_rsplug:doc"));
+        assert_eq!(
+            doc.source_names,
+            BTreeSet::from(["_rsplug:doc".to_string()])
+        );
         assert!(doc.is_plugctl, "doc plugin must be a control package");
         let HowToPlaceFiles::CopyEachFile(doc_files) = &doc.files;
         assert_eq!(doc_files.len(), 2, "doc/foo.txt and doc/sub/bar.txt");

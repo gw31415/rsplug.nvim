@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, btree_map::Keys},
+    collections::{BTreeMap, BTreeSet, btree_map::Keys},
     fmt::Display,
     iter::Sum,
     ops::AddAssign,
@@ -84,11 +84,11 @@ fn generated_file_item(path: impl Into<PathBuf>, data: Cow<'static, [u8]>) -> (P
 
 /// 単スクリプトをランタイムパスに配置するためのパッケージを作成する。
 fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> LoadedPlugin {
-    let source_name = Some(format!("_rsplug:{path}"));
+    let source_names = BTreeSet::from([format!("_rsplug:{path}")]);
     let (path, item) = generated_file_item(PathBuf::from(path), data.into());
     let files = BTreeMap::from([(path, item)]);
     LoadedPlugin {
-        source_name,
+        source_names,
         lazy_type: LazyType::Start,
         files: HowToPlaceFiles::CopyEachFile(files),
         script: Default::default(),
@@ -209,7 +209,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 files.insert(ls_path, ls_item);
             }
             plugs.push(LoadedPlugin {
-                source_name: Some("_rsplug:init".to_string()),
+                source_names: BTreeSet::from(["_rsplug:init".to_string()]),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -264,7 +264,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             ]);
             plugs.push({
                 LoadedPlugin {
-                    source_name: Some("_rsplug:on_event".to_string()),
+                    source_names: BTreeSet::from(["_rsplug:on_event".to_string()]),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
@@ -298,7 +298,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 generated_file_item(on_func_setup_path, on_func_setup),
             ]);
             plugs.push(LoadedPlugin {
-                source_name: Some("_rsplug:on_func".to_string()),
+                source_names: BTreeSet::from(["_rsplug:on_func".to_string()]),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -333,7 +333,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     generated_file_item(on_cmd_setup_path, on_cmd_setup),
                 ]);
                 LoadedPlugin {
-                    source_name: Some("_rsplug:on_cmd".to_string()),
+                    source_names: BTreeSet::from(["_rsplug:on_cmd".to_string()]),
                     lazy_type: LazyType::Start,
                     files: HowToPlaceFiles::CopyEachFile(files),
                     script: Default::default(),
@@ -362,7 +362,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 generated_file_item(plugin_on_lua_path, plugin_on_lua.into()),
             ]);
             plugs.push(LoadedPlugin {
-                source_name: Some("_rsplug:on_lua".to_string()),
+                source_names: BTreeSet::from(["_rsplug:on_lua".to_string()]),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(files),
                 script: Default::default(),
@@ -495,15 +495,18 @@ impl PlugCtl {
     /// その他必要な情報のみ引数に取る。
     pub(super) fn create(
         id: PluginID,
-        source_name: Option<String>,
+        source_names: BTreeSet<String>,
         lazy_type: LazyType,
         script: SetupScript,
         order: usize,
     ) -> Self {
         let id_str = id.as_str();
-        let source_target2pkgid = source_name
-            .map(|source_name| BTreeMap::from([(source_name, id_str.clone())]))
-            .unwrap_or_default();
+        // 全 source_name を自身の id に紐付ける。マージで集約された複数名すべてが
+        // on_source 参照できるようにする（Phase 1: source_name を潰さない）。
+        let source_target2pkgid = source_names
+            .into_iter()
+            .map(|source_name| (source_name, id_str.clone()))
+            .collect::<BTreeMap<_, _>>();
 
         let LazyType::Opt(events) = lazy_type else {
             return Self {
