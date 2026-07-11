@@ -179,10 +179,12 @@ impl From<LazyType> for LazyTypeDeserializer {
 #[serde_as]
 #[derive(Deserialize)]
 pub(super) struct PluginConfig {
-    /// 安定 id（Phase 3A）。`depends`/`on_source` はこの id を参照する。
-    /// 省略時は非推奨の `name`、さらに repo basename から推論する（互換リリース）。
-    #[serde(default)]
-    pub id: Option<String>,
+    /// 内部的同一性 id（Phase 3A）。**ユーザーには公開しない**（TOML には現れない）。
+    /// `name` ?? repo basename ?? script 内容ハッシュ。`Plugin::new` で計算して格納する。
+    /// Vim 文化では basename でプラグインを識別するのが基本だが、basename 衝突時は
+    /// `name` で、無名 script-only は内容ハッシュで一意にする。
+    #[serde(skip)]
+    pub(super) id: Option<String>,
     #[serde(flatten)]
     pub cache: CacheConfig,
     #[serde(flatten)]
@@ -201,12 +203,9 @@ pub(super) struct PluginConfig {
 }
 
 impl PluginConfig {
-    /// depends/on_source/DAG で参照される安定 id（Phase 3A）。
-    /// 明示 `id` > 非推奨 `name` > repo basename。いずれも無ければ `None`。
-    pub(super) fn stable_id(&self) -> Option<&str> {
-        if let Some(id) = &self.id {
-            return Some(id.as_str());
-        }
+    /// ユーザー公開の名前（on_source の表示/対象名）。`name` ?? repo basename。
+    /// script-only で `name` が無ければ `None`（参照されない start スクリプト等も許す）。
+    pub(super) fn dep_name(&self) -> Option<&str> {
         if let Some(name) = &self.custom_name {
             return Some(name.as_str());
         }
@@ -215,6 +214,17 @@ impl PluginConfig {
             Some(RepoSource::Git { url, .. }) => Some(repo_basename(url.as_ref())),
             None => None,
         }
+    }
+
+    /// 内部的同一性 id（Phase 3A）。`dep_name()` ?? script 内容ハッシュ。
+    /// 常に確定し、無名 script-only は内容ハッシュで一意に識別される。
+    /// **ユーザーには触らせない**内部表現（TOML の `id` は存在しない）。
+    pub(super) fn compute_internal_id(&self) -> String {
+        if let Some(name) = self.dep_name() {
+            return name.to_string();
+        }
+        // script-only で name 無し: script 内容のハッシュを内部 id にする。
+        crate::rsplug::util::hash::digest_hash_hex_string(&self.script)
     }
 }
 
@@ -232,7 +242,8 @@ fn repo_basename(url: &str) -> &str {
 
 impl DagNode for PluginConfig {
     fn id(&self) -> Option<&str> {
-        self.stable_id()
+        // 内部 id（name ?? basename ?? 内容ハッシュ）。Plugin::new で格納済み。
+        self.id.as_deref()
     }
     fn depends(&self) -> impl IntoIterator<Item = &impl AsRef<str>> {
         &self.depends
@@ -367,7 +378,7 @@ mod tests {
         .unwrap();
 
         assert!(config.plugins[0].cache.repo.is_none());
-        assert_eq!(config.plugins[0].stable_id(), None);
+        assert_eq!(config.plugins[0].dep_name(), None);
         assert!(
             config.plugins[0]
                 .script
@@ -433,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_id_uses_repo_basename_for_git_url() {
+    fn dep_name_uses_repo_basename_for_git_url() {
         let config: Config = toml::from_str(
             r#"
             [[plugins]]
@@ -441,11 +452,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.plugins[0].stable_id(), Some("plugin.nvim"));
+        assert_eq!(config.plugins[0].dep_name(), Some("plugin.nvim"));
     }
 
     #[test]
-    fn stable_id_custom_name_overrides_repo_basename() {
+    fn dep_name_custom_name_overrides_repo_basename() {
         let config: Config = toml::from_str(
             r#"
             [[plugins]]
@@ -454,21 +465,38 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.plugins[0].stable_id(), Some("my-plugin"));
+        assert_eq!(config.plugins[0].dep_name(), Some("my-plugin"));
     }
 
     #[test]
-    fn stable_id_prefers_explicit_id() {
+    fn anonymous_script_only_derives_internal_id_from_content_hash() {
+        // Phase 3A: 無名 script-only（name/repo 無し）は許容し、内部 id を script
+        // 内容ハッシュから生成する。dep_name は None（参照されない）。
         let config: Config = toml::from_str(
             r#"
             [[plugins]]
-            repo = "https://gitlab.com/owner/plugin.nvim.git"
-            id = "explicit-id"
-            name = "legacy-name"
+            lua_start = "vim.g.x = true"
             "#,
         )
         .unwrap();
-        assert_eq!(config.plugins[0].stable_id(), Some("explicit-id"));
+        let plug = &config.plugins[0];
+        assert_eq!(plug.dep_name(), None);
+        let id = plug.compute_internal_id();
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "content-hash id must be hex: {id}"
+        );
+        // 同じ内容なら同じ id（決定論的）。
+        assert_eq!(id, plug.compute_internal_id());
+        // 異なる内容なら異なる id。
+        let other: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            lua_start = "vim.g.y = true"
+            "#,
+        )
+        .unwrap();
+        assert_ne!(id, other.plugins[0].compute_internal_id());
     }
 
     #[test]

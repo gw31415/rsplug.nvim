@@ -229,39 +229,23 @@ impl FromStr for RepoSource {
 impl Plugin {
     /// 設定ファイルから Plugin のコレクションを構築する
     pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, Error> {
-        let Config { plugins } = config;
+        let Config { mut plugins } = config;
 
-        // Phase 3A: 設定バリデーション。script-only（repo 無し）は安定 id が必須で、
-        // build/lua_build/lua_post_update/dotgit を持ってはならない。
-        for plug in &plugins {
-            if plug.cache.repo.is_none() {
-                if plug.stable_id().is_none() {
-                    return Err(Error::ConfigValidation {
-                        msg: "script-only plugin (no `repo`) requires an explicit `id` (or legacy `name`)"
-                            .into(),
-                    });
-                }
-                if !plug.cache.build.is_empty()
-                    || plug.cache.lua_build.is_some()
-                    || plug.cache.lua_post_update.is_some()
-                    || plug.cache.dotgit
-                {
-                    return Err(Error::ConfigValidation {
-                        msg: "script-only plugin (no `repo`) cannot have `build`/`lua_build`/`lua_post_update`/`dotgit`"
-                            .into(),
-                    });
-                }
-            }
+        // Phase 3A: 内部的同一性 id を各プラグインに算出して格納する。
+        // id = name ?? repo basename ?? script 内容ハッシュ（無名 script-only 用）。
+        // ユーザーには公開しない内部表現。無名 script-only（start スクリプト等）も許す。
+        for plug in &mut plugins {
+            plug.id = Some(plug.compute_internal_id());
         }
 
         // order は (depth, config_index) の複合キー。depth と index は dag 側で
         // 計算して map 関数に渡される。tiebreak は config 出現順。
         let total = plugins.len();
-        // 依存先の cachedir を（dep_name → index で）引くための表。
+        // 依存先の cachedir を（内部 id → index で）引くための表。
         // 重複チェック・UnknownDependency 検出は dag 側に委譲する。
         let mut id_to_index = hashbrown::HashMap::new();
         for (index, plug) in plugins.iter().enumerate() {
-            if let Some(id) = plug.stable_id() {
+            if let Some(id) = plug.id.as_deref() {
                 id_to_index.insert(id.to_string(), index);
             }
         }
@@ -278,7 +262,7 @@ impl Plugin {
                       dependents_iter,
                   }| {
                 let order = depth * (total + 1) + index;
-                let source_name = inner.stable_id().map(str::to_string);
+                let source_name = inner.dep_name().map(str::to_string);
                 let PluginConfig {
                     cache,
                     lazy_type,
@@ -1374,7 +1358,7 @@ mod tests {
             repo = "owner/plugin"
 
             [[plugins]]
-            id = "scriptdep"
+            name = "scriptdep"
             depends = ["dep"]
             lua_start = "vim.g.script_only = true"
             "#,
@@ -1387,27 +1371,26 @@ mod tests {
             .iter()
             .find(|plugin| plugin.cache.repo.is_none())
             .unwrap();
-        // Phase 3A: script-only は id を持ち source addressable になる。
+        // name を持つ script-only は source addressable。
         assert_eq!(script_only.source_name.as_deref(), Some("scriptdep"));
         assert_eq!(script_only.dependency_cachedirs.len(), 1);
     }
 
     #[test]
-    fn unnamed_script_only_plugin_is_rejected() {
-        // Phase 3A: script-only（repo 無し）は id（または非推奨 name）が必須。
+    fn unnamed_script_only_plugin_is_allowed() {
+        // Phase 3A: 無名 script-only（start スクリプト等、参照されないもの）は許容。
+        // 内部 id は内容ハッシュから生成され、Plugin::new は成功する。
         let config: Config = toml::from_str(
             r#"
             [[plugins]]
-            depends = ["dep"]
-            lua_start = "vim.g.script_only = true"
-
-            [[plugins]]
-            name = "dep"
-            repo = "owner/plugin"
+            lua_start = "vim.g.anonymous = true"
             "#,
         )
         .unwrap();
-        assert!(Plugin::new(config).is_err());
+        let plugins = Plugin::new(config).unwrap().collect::<Vec<_>>();
+        assert_eq!(plugins.len(), 1);
+        // dep_name 無し → source_name は None（on_source で参照されない）。
+        assert_eq!(plugins[0].source_name, None);
     }
 
     #[tokio::test]

@@ -136,22 +136,25 @@ retains scheme/host/non-default-port/path. Use it as the lock v2 key and in a
 cache path with a 128-bit hash suffix. Read lock v1 by normalizing configured
 keys in memory; reject conflicting revisions; write v2 on non-locked runs.
 
-### Status (2026-07-11) — partial (3A done)
+### Status (2026-07-11) — partial (3A done, revised)
 
-Implemented and validated (test/clippy/fmt green; e2e backward-compat
-confirmed: id-less configs still infer, explicit `id` works, generated
-init.lua loads in nvim headless).
+Implemented and validated (test/clippy/fmt green; e2e: id-less repo configs
+infer by basename, anonymous script-only generates successfully).
 
-- **3A — `id` field (done):** `PluginConfig.id: Option<String>`;
-  `stable_id()` = explicit `id` > legacy `name` > repo basename. `depends`/
-  `on_source`/DAG/source_name all reference `stable_id` (so existing configs
-  keep working via inference). Validation in `Plugin::new` (routed via a new
-  `Error::ConfigValidation` + `Error::Dag(#[from])`): script-only (no repo)
-  requires a stable id and rejects `build`/`lua_build`/`lua_post_update`/
-  `dotgit`; duplicate ids via DAG (`DagError::DuplicateName`). `start=true` +
-  lazy trigger rejected at deserialize (`LazyType: TryFrom<LazyTypeDeserializer>`).
-- **Deferred from 3A:** the `name` deprecation *warning* (needs a log Message
-  variant + rendering; non-fatal, deferred).
+- **3A — internal identity (done, revised per Vim-plugin culture):** `id` is an
+  **internal** identity (`PluginConfig.id`, `#[serde(skip)]`, NOT in TOML).
+  Computed in `Plugin::new` as `name` ?? repo **basename** ?? script-content
+  hash (the last for anonymous script-only). Vim plugins are identified by
+  basename by default; `name` (user-facing, optional) disambiguates basename
+  collisions; anonymous script-only (e.g. start scripts that nothing references)
+  is **allowed** and gets a content-hash internal id. `depends`/`on_source`/DAG
+  resolve against the internal id; `source_name` = `dep_name` (name ?? basename,
+  `None` for anonymous script-only). `start=true` + lazy trigger rejected at
+  deserialize (`LazyType: TryFrom<LazyTypeDeserializer>`); duplicate ids via DAG.
+- **Known separate bug (not 3A):** `LuaStartPluginTemplate` emits consecutive
+  `(function()…end)()` with no separator, so 2+ `lua_start` scripts hit Lua
+  "ambiguous syntax". Pre-existing; surfaced now that anonymous script-only is
+  allowed. Fix is a template separator — deferred.
 - **3B — `RemoteUrl`/`RepoIdentity` + canonical identity + lock v2:** not started.
 - **3C — explicit models (`PluginSpec`/`ResolvedGraph`/...) + `propagate_to_dependency`:** not started (largest piece).
 
