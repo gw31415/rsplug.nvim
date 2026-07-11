@@ -202,7 +202,6 @@ repo = "yetone/avante.nvim"
 build = ["make"]
 lua_build = "vim.fn.system({'make', 'docs'})"
 lua_post_update = "require 'avante'.post_update()"
-sym = true
 ignore = "tests/\n*.md\n.github/"
 merge = false
 ```
@@ -215,8 +214,6 @@ merge = false
 - `lua_build` runs in headless Neovim after install/update.
 - `lua_post_update` runs in headless Neovim only when an existing repository
   receives a new revision during `--update`.
-- `sym` requests a symlink instead of copying files. Build-related hooks may
-  require the repository to remain the source of the generated entry.
 - `ignore` contains Gitignore-style patterns.
 - `merge` defaults to `true`; `false` keeps the entry separate from compatible
   user plugins in both startup and lazy output.

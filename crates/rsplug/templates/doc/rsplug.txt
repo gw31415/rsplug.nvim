@@ -1,51 +1,94 @@
-*rsplug.txt*  External Rust plugin manager for Neovim
+*rsplug.txt*  rsplug.nvim reference
 
-Author: gw31415                 License: Apache-2.0
+External Rust Neovim plugin manager.  This file describes the behavior of the
+current implementation, including the accepted TOML syntax and generated
+runtime.  The source of this help file is embedded in the generated control
+package; it is not read from the user's plugin repositories.
+
+Author:     gw31415
+License:    Apache License 2.0
 Repository: https://github.com/gw31415/rsplug.nvim
 
-=============================================================================
+==============================================================================
 CONTENTS                                                    *rsplug-contents*
 
-    1. Overview ................................ |rsplug-overview|
-    2. Installation ........................... |rsplug-installation|
-    3. Quick start ............................ |rsplug-quickstart|
-    4. CLI .................................... |rsplug-cli|
-    5. Configuration .......................... |rsplug-config|
-       5.1 Fields ............................. |rsplug-fields|
-       5.2 Loading ............................ |rsplug-loading|
-       5.3 Hooks and dependencies ............. |rsplug-hooks|
-    6. Lockfile ................................ |rsplug-lockfile|
-    7. Runtime and generations ................ |rsplug-runtime|
-    8. Troubleshooting and updates ............ |rsplug-troubleshooting|
+ 1. Model .................................... |rsplug-model|
+ 2. Requirements and installation ........... |rsplug-installation|
+ 3. Command line ............................ |rsplug-cli|
+    3.1 Configuration file arguments ......... |rsplug-config-files|
+    3.2 Modes and default paths .............. |rsplug-modes|
+ 4. TOML configuration ...................... |rsplug-config|
+    4.1 Root table ........................... |rsplug-config-root|
+    4.2 Plugin identity and repository ....... |rsplug-repository|
+    4.3 Loading fields ....................... |rsplug-loading-fields|
+    4.4 Lua hooks ............................ |rsplug-lua-fields|
+    4.5 Build and cache fields ................ |rsplug-build-fields|
+    4.6 File selection and merge fields ....... |rsplug-file-fields|
+ 5. Loading semantics ....................... |rsplug-loading|
+    5.1 Startup loading ...................... |rsplug-start|
+    5.2 Event, command, filetype, function ... |rsplug-triggers|
+    5.3 Mapping loading ...................... |rsplug-on-map|
+    5.4 Lua require loading .................. |rsplug-require|
+    5.5 Source hooks and dependencies ........ |rsplug-dependencies|
+    5.6 Hook order and generated runtime ..... |rsplug-hook-order|
+ 6. Repository and snapshot lifecycle ........ |rsplug-lifecycle|
+    6.1 Revision resolution .................. |rsplug-revisions|
+    6.2 Fetch strategies ..................... |rsplug-fetch|
+    6.3 Builds and build cache ................ |rsplug-build-cache|
+    6.4 Snapshot contents .................... |rsplug-snapshots|
+ 7. Lock file ................................ |rsplug-lockfile|
+ 8. Pack generation .......................... |rsplug-pack|
+    8.1 Merging .............................. |rsplug-merging|
+    8.2 Help files ........................... |rsplug-help-files|
+    8.3 Generations and cleanup .............. |rsplug-generations|
+ 9. Environment variables and paths .......... |rsplug-environment|
+10. Errors and troubleshooting ................ |rsplug-troubleshooting|
+11. Updates and compatibility ................ |rsplug-updates|
 
-=============================================================================
-1. Overview                                                   *rsplug-overview*
+==============================================================================
+1. Model                                                        *rsplug-model*
 
-rsplug is a standalone Rust binary. It reads TOML configuration, resolves
-dependencies, fetches Git repositories, and generates a standard Neovim pack.
-Neovim only loads the generated result; it does not run rsplug itself.
+rsplug is a command-line program, not a Vim or Neovim plugin.  It transforms
+TOML configuration and an optional JSON lock file into a standard Neovim
+package:
 
-The default application directory is `~/.cache/rsplug/`:
+    TOML files + lock file + repository cache
+        -> resolved repositories and snapshots
+        -> pack/_gen/opt/<package-id>/
+        -> generated init.lua and control package
 
-    init.lua                 Neovim bootstrap
-    repos/                   repository cache
-    pack/_gen/               generated pack generations
-    rsplug.lock.json         resolved commit lockfile
+The default application directory is `~/.cache/rsplug/`.  The repository cache
+is an implementation cache; the generated pack contains the files selected for
+the current configuration and is the artifact Neovim uses.
 
-IMPORTANT: The generated pack reflects exactly the configuration file set
-passed to the current command. Keep that set stable, or use
-|RSPLUG_CONFIG_FILES|. A different file list can remove entries that were only
-present in the previous list.
+The generated package is added to 'packpath' by `init.lua`.  rsplug places both
+user entries and its generated control files below `pack/_gen/opt/`, then
+explicitly loads the control package.  This avoids relying on Neovim's native
+startup scan for managed packages and gives rsplug control of `lua_before` and
+`lua_after` ordering.
 
-=============================================================================
-2. Installation                                             *rsplug-installation*
+Configuration is synchronized, not incrementally appended.  A repository that
+is absent from the current set of configuration files is absent from the new
+pack, although unrelated old lock entries are retained unless they are being
+replaced or explicitly removed by the run.
 
-Add the generated bootstrap to `init.lua`:
->
-    dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
-<
+==============================================================================
+2. Requirements and installation                             *rsplug-installation*
 
-Build from source (Rust 1.89+ and Git are required):
+Runtime requirements:
+
+  - Neovim with the APIs used by the generated Lua runtime (Neovim 0.9 or
+    later is recommended).
+  - Git for non-tarball fetches, Git URLs, and `dotgit = true`.
+  - `nvim` on PATH for `lua_build`, `lua_post_update`, and helptags generation.
+
+Build requirements when compiling rsplug itself:
+
+  - Rust 1.89 or later;
+  - Git;
+  - network access only when fetching source dependencies or repositories.
+
+Build from source:
 >
     git clone https://github.com/gw31415/rsplug.nvim.git
     cd rsplug.nvim
@@ -53,226 +96,805 @@ Build from source (Rust 1.89+ and Git are required):
     install target/release/rsplug ~/.local/bin/rsplug
 <
 
-Or use Nix:
+With Nix:
 >
     nix build github:gw31415/rsplug.nvim
 <
 
-=============================================================================
-3. Quick start                                               *rsplug-quickstart*
+Add the generated bootstrap to `init.lua`:
+>
+    dofile(vim.fn.expand('~/.cache/rsplug/init.lua'))
+<
 
-Create `~/.config/nvim/rsplug.toml`:
+The old form `vim.opt.packpath:prepend '~/.cache/rsplug'` does not load the
+current controlled generation and should be replaced with the `dofile` form.
+
+==============================================================================
+3. Command line                                                  *rsplug-cli*
+
+Synopsis:
+>
+    rsplug [OPTIONS] <CONFIG_FILES>...
+<
+
+Options:
+
+    -i, --install
+        Install repositories that do not yet have a usable cached snapshot.
+        This option causes remote revision resolution and fetching for missing
+        repositories.  It does not update an already installed repository.
+
+    -u, --update
+        Resolve and fetch a new revision for repositories that already have a
+        snapshot.  An uninstalled repository is skipped; `--update` is not an
+        install-all operation.  Conflicts with `--locked`.
+
+    --locked
+        Use the full commit revisions recorded in the lock file.  No remote
+        revision resolution is performed.  Every configured repository must
+        have a valid lock entry.  Conflicts with `--update`.
+
+    --lockfile <LOCKFILE>
+        Use this JSON lock file instead of the default
+        `~/.cache/rsplug/rsplug.lock.json`.
+
+    -h, --help
+        Print the command-line help and exit.
+
+There is no separate `--sync` flag.  A run without `--install`, `--update`, or
+`--locked` reuses existing snapshots, regenerates the pack and runtime files,
+and skips repositories that are not already installed.
+
+3.1 Configuration file arguments                           *rsplug-config-files*
+
+`<CONFIG_FILES>` is one or more file names or glob patterns.  A pattern can
+contain the walker syntax supported by rsplug, and multiple patterns may be
+separated with `:`:
+>
+    rsplug ~/.config/nvim/rsplug.toml
+    rsplug '~/.config/nvim/plugins/*.toml'
+    rsplug 'base.toml:plugins/*.toml'
+<
+
+An argument that names an existing regular file is read directly.  `-` reads
+TOML from standard input once and materializes it as a temporary file for the
+same path-based pipeline:
+>
+    printf '[[plugins]]\nrepo = "owner/plugin"\n' | rsplug - --install
+<
+
+The environment variable |RSPLUG_CONFIG_FILES| supplies the argument list when
+no positional arguments are given.  Command-line arguments take precedence.
+Patterns are expanded, only files are accepted, and discovered paths are
+sorted before reading.  The contents of all files are concatenated in that
+order; duplicate `[[plugins]]` entries are not deduplicated.
+
+Missing paths and ordinary permission/not-a-directory walk errors are ignored
+by glob discovery.  A direct file read or TOML parse failure is an error.
+
+3.2 Modes and default paths                                      *rsplug-modes*
+
+Each invocation performs these logical stages:
+
+  1. create `~/.cache/rsplug/` if necessary;
+  2. discover and parse TOML files;
+  3. read the lock file (missing lock files are allowed unless `--locked` later
+     needs an entry);
+  4. resolve the dependency graph;
+  5. load, fetch, update, or skip each repository according to the flags;
+  6. write the lock file unless `--locked`;
+  7. merge loaded entries, generate control files, install the pack, generate
+     helptags, and remove unreferenced generated packages.
+
+Default locations:
+
+    application root  ~/.cache/rsplug/
+    repositories      ~/.cache/rsplug/repos/
+    pack output       ~/.cache/rsplug/pack/_gen/
+    bootstrap         ~/.cache/rsplug/init.lua
+    generations       ~/.cache/rsplug/generations/
+    lock file         ~/.cache/rsplug/rsplug.lock.json
+
+The application root is fixed by the current binary.  `--lockfile` changes
+only the lockfile location; it does not change the repository or pack paths.
+
+==============================================================================
+4. TOML configuration                                          *rsplug-config*
+
+The root TOML value is a table with an optional `plugins` array of tables:
+>
+    [[plugins]]
+    repo = "owner/plugin"
+<
+
+An empty file is valid and produces no user plugin entries.  Each plugin field
+is optional; a repository is not required when the entry is used only for Lua
+setup.  Unknown TOML fields are ignored by the current deserializer.
+
+Fields accepting one or many values (`on_event`, `on_cmd`, `on_ft`, `on_func`,
+`on_source`, and `depends`) accept either a scalar string or an array of
+strings.  `on_map` has its own forms described in |rsplug-on-map|.  TOML basic
+strings, literal strings, and multiline strings are all suitable for Lua code.
+
+4.1 Root table                                               *rsplug-config-root*
+
+`plugins`:
+
+    Type:     array of tables
+    Default:  empty array
+    Meaning:  ordered plugin/configuration entries.  Dependency ordering is
+              computed separately; configuration order is used as a stable
+              tie-breaker for deterministic output.
+
+Example with a script-only entry:
+>
+    [[plugins]]
+    lua_start = "vim.g.my_global = true"
+<
+
+4.2 Plugin identity and repository                         *rsplug-repository*
+
+`repo`:
+
+    Type:     string
+    Default:  absent
+    Meaning:  GitHub shorthand or a Git URL.  If absent, the entry has no
+              repository and produces no repository files.
+
+GitHub shorthand is recognized when the entire value matches
+`owner/repo[@revision]`.  The owner and repository use GitHub-like ASCII
+identifier restrictions; the repository may contain letters, digits, `_`,
+`.`, and `-`.  Examples:
+>
+    repo = "nvim-lua/plenary.nvim"
+    repo = "neovim/nvim-lspconfig@main"
+    repo = "j-hui/fidget.nvim@v1.2.0"
+    repo = "j-hui/fidget.nvim@v*"
+<
+
+Any value containing `://` is treated as a general Git URL, without validating
+its scheme or host:
+>
+    repo = "https://gitlab.com/owner/plugin"
+    repo = "ssh://git@git.example/owner/plugin.git@main"
+<
+
+For a URL, the optional revision is the last `@` in the path portion.  An `@`
+inside the authority/userinfo portion is not a revision separator:
+>
+    repo = "https://user@example.com/owner/plugin@main"
+<
+
+The URL passed to Git is the URL with the revision suffix removed.  A revision
+is a branch, tag, commit, or wildcard understood by the remote resolution
+logic.  Wildcard revisions containing `*` are resolved through Git ref listing.
+
+`name`:
+
+    Type:     string
+    Default:  repository basename; absent for anonymous script-only entries
+    Meaning:  public configuration name used by `depends` and `on_source`.
+
+For GitHub shorthand, the default is the `repo` component.  For a URL, the
+default is the last path component after removing trailing `/` and `.git`.
+`name` is not an exposed internal numeric/hash package ID.  It is useful when
+two repositories have the same basename:
+>
+    [[plugins]]
+    repo = "one/common.nvim"
+    name = "common-one"
+
+    [[plugins]]
+    repo = "two/common.nvim"
+    name = "common-two"
+<
+
+Internally, rsplug derives an identity from `name`, repository basename, or a
+deterministic hash of the script contents.  The internal ID is not a valid TOML
+field.  A script-only entry without `name` is allowed, but it has no public
+name and therefore cannot be the target of `depends` or `on_source`.
+
+Duplicate public/internal names and unknown dependency names are rejected by
+dependency graph construction.  Dependencies form a directed acyclic graph;
+cycles are errors.
+
+4.3 Loading fields                                          *rsplug-loading-fields*
+
+`start`:
+
+    Type:     boolean
+    Default:  false
+    Meaning:  load the entry during rsplug's generated startup routine.
+
+When `start = true`, all lazy fields on that entry are silently ignored and the
+entry becomes a startup entry.  This is intentional and allows toggling an
+entry without removing its lazy configuration.
+
+`on_event`:
+
+    Type:     string or array of strings
+    Default:  empty
+    Meaning:  load on a Neovim autocmd event.  A real event name is registered
+              directly.  If Neovim does not provide that event, rsplug uses a
+              `User` autocmd with the requested name as its pattern.
+
+Each event name must be non-empty and must not contain control characters,
+Unicode whitespace, or `*`.
+
+`on_cmd`:
+
+    Type:     string or array of strings
+    Default:  empty
+    Meaning:  load when the named user command is invoked or its completion is
+              requested.
+
+Each command name must be non-empty, start with an ASCII uppercase letter, and
+contain ASCII letters only.  rsplug registers a temporary command with
+`nargs = '?'`, `bang = true`, `bar = true`, and `range = true`.  On first use it
+removes the wrapper, loads all associated entries, and replays the command and
+its arguments.  Command completion also causes loading.
+
+`on_ft`:
+
+    Type:     string or array of strings
+    Default:  empty
+    Meaning:  load on a matching filetype.
+
+Each filetype contains only ASCII letters, digits, `_`, `-`, or `.`.  On a
+filetype trigger, rsplug loads the entries, sources newly available matching
+`ftplugin/<ft>` files, and re-executes newly registered `Syntax`, `BufEnter`,
+and `BufWinEnter` autocmds where applicable.
+
+`on_func`:
+
+    Type:     string or array of strings
+    Default:  empty
+    Meaning:  load when a Vim function is called.
+
+Names match `[A-Za-z_][A-Za-z0-9_#]*`.  A normal function is temporarily
+defined as a forwarding wrapper and then called with its original arguments.
+An autoload-style name containing `#` uses `FuncUndefined`; this avoids
+defining an autoload function in the wrong script and loads the entry when Vim
+reports it undefined.  The autoload prefix is handled only once per Neovim
+process.
+
+`on_source`:
+
+    Type:     string or array of strings
+    Default:  empty
+    Meaning:  load this entry immediately after an entry with the named public
+              source name has been loaded.
+
+The target is the target entry's `name`, or its repository basename when
+`name` is omitted.  An anonymous script-only entry cannot be targeted.  Source
+hooks are preserved when compatible entries are merged.
+
+`on_map`:
+
+    Type:     string, array of strings, or table of mode keys to string/array
+    Default:  empty
+    Meaning:  load on the first use of a mapping pattern.
+
+Examples:
+>
+    on_map = "<leader>f"                 # all modes
+    on_map = ["<leader>f", "<leader>g"]   # all modes, two keys
+    on_map = { n = "<leader>f" }          # one mode
+    on_map = { nx = ["<leader>f", "<leader>g"] }
+<
+
+In a mode table, every character in the key is treated as one mode.  The
+generated runtime recognizes normal, operator-pending, visual/select,
+insert/replace, command-line, and terminal mode variants and installs a
+temporary expression mapping.  The first keypress loads all entries attached
+to that pattern, removes related temporary mappings, and feeds the original
+keys back to Neovim.  Duplicate mapping declarations for a pattern are grouped
+so one trigger loads all associated entries.
+
+4.4 Lua hooks                                                *rsplug-lua-fields*
+
+`lua_start`:
+
+    Type:     string
+    Default:  absent
+    Meaning:  execute Lua once during generated startup, before startup plugin
+              entries are loaded.  It does not require a repository.
+
+`lua_before`:
+
+    Type:     string
+    Default:  absent
+    Meaning:  execute immediately before this entry is loaded by `:packadd` or
+              `:packadd!`.
+
+`lua_after`:
+
+    Type:     string
+    Default:  absent
+    Meaning:  execute immediately after this entry is loaded.
+
+Lua hook text is written to generated Lua modules and loaded with `require`.
+For multiple configuration entries that are merged into one package, hook
+modules are retained in deterministic order and all hooks are executed.
+
+4.5 Build and cache fields                                   *rsplug-build-fields*
+
+`build`:
+
+    Type:     array of strings
+    Default:  empty array
+    Meaning:  execute a subprocess after materializing the repository.  The
+              array is argv, not a shell command string; the first element is
+              the executable and subsequent elements are arguments.  The
+              current working directory is the temporary/build snapshot.
+
+An empty array disables this hook.  A non-zero exit status fails the run and
+the incomplete snapshot is not published as the final snapshot.
+
+`lua_build`:
+
+    Type:     string
+    Default:  absent
+    Meaning:  execute Lua in a headless `nvim` after `build` (if present).
+
+rsplug invokes `nvim --headless -u NONE -i NONE -l <temporary-script>`.  The
+temporary script prepends the repository snapshot and best-effort latest
+dependency snapshots to 'runtimepath', then evaluates the configured Lua.
+`nvim`'s exit status is checked.  `build` and `lua_build` share one build cache
+identity and are run sequentially in that order.
+
+`lua_post_update`:
+
+    Type:     string
+    Default:  absent
+    Meaning:  execute a headless Lua migration script when `--update` resolves
+              a different revision for an already installed repository.
+
+The script receives the same snapshot/dependency 'runtimepath' as
+`lua_build`.  In the current implementation it is executed while a new
+build-enabled snapshot is being materialized; repositories without `build` or
+`lua_build` do not enter that build path.  A failure aborts the snapshot.
+
+4.6 File selection and merge fields                           *rsplug-file-fields*
+
+`dotgit`:
+
+    Type:     boolean
+    Default:  false
+    Meaning:  include the repository's `.git` directory in the generated pack.
+
+`dotgit = true` forces the Git fetch path because a tarball has no `.git`
+directory.  If the selected snapshot has no `.git` entry, installation of that
+package is skipped and a warning is emitted.  The repository remains in the
+lock state; run an update/install through the Git path to materialize it.
+
+`ignore`:
+
+    Type:     multiline string
+    Default:  the built-in ignore list shown below
+    Meaning:  Gitignore-like ordered patterns used when selecting top-level
+              repository entries for the pack.
+
+The built-in list is:
+>
+    COPYING
+    COPYING.txt
+    LICENSE
+    LICENSE.md
+    LICENSE.txt
+    Makefile
+    README
+    README.md
+    README.txt
+    .git
+    .gitattributes
+    .github
+    .gitignore
+    .gitmessage
+    .luacheckrc
+    .rsplug_build_success
+    .tool-versions
+    .vscode
+<
+
+Patterns are processed in order.  Empty lines and lines beginning with `#`
+are ignored.  A leading `!` negates the current match.  A pattern without `/`
+matches any path component; a pattern containing `/` is path-oriented; a
+trailing `/` matches a directory and all descendants; a leading `/` anchors it
+to the snapshot root.  Backslash-normalized `/` separators are used for
+matching.  For example:
+>
+    ignore = '''
+    tests/
+    *.md
+    !README.md
+    /doc/private/
+    '''
+<
+
+The built-in `.git` rule is overridden only for `dotgit = true`; the `.git`
+tree is then copied as a normal entry.  The internal manifest and build-success
+marker are never copied to the pack.
+
+`merge`:
+
+    Type:     boolean
+    Default:  true
+    Meaning:  allow this user entry to merge with another compatible user
+              entry having the same load policy.
+
+`merge = false` prevents merging for both startup and lazy entries.  Generated
+rsplug control/help entries are internal and can merge regardless of this
+setting.  There is no `sym` configuration field in the current parser; files
+are copied into the generated pack (while preserving source symlinks).
+
+==============================================================================
+5. Loading semantics                                           *rsplug-loading*
+
+5.1 Startup loading                                             *rsplug-start*
+
+Entries with `start = true` are represented as optional packages under
+`pack/_gen/opt/`, not native `pack/*/start/` entries.  The generated bootstrap
+loads the control packages and calls the generated `_rsplug` runtime's startup
+function.  Startup entries are then loaded in deterministic dependency/config
+order using `:packadd!`.
+
+The order for independent entries is stable.  Dependencies are ordered by the
+dependency graph; an entry's configuration position is used as a tie-breaker.
+`lua_start` scripts are executed before the startup package list, in the same
+stable order.  `lua_before`, `:packadd!`, and `lua_after` surround each startup
+entry.
+
+5.2 Event, command, filetype, and function triggers                 *rsplug-triggers*
+
+All non-start entries are optional packages.  A trigger is registered in a
+small generated control package that is itself loaded at startup.  When a
+trigger fires, the relevant package IDs are loaded once.  A package whose
+dependency was propagated to the same trigger loads its dependency at the same
+time.
+
+Autocmd triggers are one-shot wrappers.  After loading, rsplug compares the
+autocmd set before and after `:packadd` and replays newly registered callbacks
+for the event where possible.  This preserves the triggering event for plugins
+that define their autocmds only after loading.  `User` events are represented
+by a pattern rather than a native event name.
+
+Command wrappers remove themselves before loading and then replay the original
+command, bang, range, and arguments.  Function wrappers remove/replace
+themselves before forwarding the original arguments.  Filetype handlers also
+source newly visible ftplugin files and replay relevant newly registered
+autocmds.
+
+5.3 Mapping loading                                             *rsplug-on-map*
+
+Mapping triggers are installed at startup for the modes that are currently
+relevant and are extended on `ModeChanged`.  The expression mapping returns an
+empty string after feeding the original key sequence, so the user's key is
+processed again after the package is loaded.  If multiple packages claim the
+same pattern, all are loaded together and all temporary mappings associated
+with them are removed.
+
+The mapping value is not interpreted as a Lua pattern.  It is passed to
+Neovim's keymap APIs, so special key notation such as `<leader>` and `<C-x>`
+has Neovim's normal meaning.
+
+5.4 Lua require loading                                         *rsplug-require*
+
+For each repository snapshot, rsplug inspects the immediate children of `lua/`:
+
+  - `lua/name.lua` registers the module root `name`;
+  - `lua/name/` registers the module root `name`.
+
+The generated require hook checks the first component of a requested module.
+If that root is registered and the module is not already loaded, all associated
+packages are loaded before Lua continues its normal search.  This means a
+configuration such as the following is sufficient:
+>
+    [[plugins]]
+    repo = "nvim-lua/plenary.nvim"
+    lua_after = "vim.notify 'plenary loaded'"
+<
+
+`require 'plenary'` or another registered module below that root triggers the
+load.  Module roots are derived from the snapshot; there is no TOML field for
+them.
+
+5.5 Source hooks and dependencies                              *rsplug-dependencies*
+
+Dependencies are named references resolved against the public `name`/basename
+identity.  The dependency graph rejects unknown names and cycles.  A dependent
+entry propagates its load policy to dependencies so a dependency is available
+when the dependent entry loads.  Repository paths for script-only dependencies
+are omitted from build 'runtimepath' because they have no repository snapshot.
+
 >
     [[plugins]]
     repo = "nvim-lua/plenary.nvim"
 
     [[plugins]]
-    repo = "neovim/nvim-lspconfig"
-    on_event = "BufReadPre"
-    lua_after = "require 'lspconfig'.rust_analyzer.setup {}"
-<
-
-Install and generate:
->
-    rsplug --install ~/.config/nvim/rsplug.toml
-<
-
-Set a persistent file pattern if desired:
->
-    export RSPLUG_CONFIG_FILES="$HOME/.config/nvim/plugins/*.toml"
-    rsplug --install
-<
-
-After editing configuration, use `rsplug` to regenerate hooks without remote
-access, `rsplug --update` to fetch new revisions, or |rsplug-locked| for an
-exact build.
-
-=============================================================================
-4. CLI                                                       *rsplug-cli*
-
-Usage: `rsplug [OPTIONS] <CONFIG_FILES>...`
-
-    -i, --install              Install repositories missing from the cache
-    -u, --update               Fetch and update repositories
-        --locked               Use revisions recorded in the lockfile
-        --lockfile <LOCKFILE>  Override the lockfile path
-    -h, --help                 Show help
-
-`CONFIG_FILES` are glob patterns. Separate multiple patterns with `:`. They
-may also be supplied by `RSPLUG_CONFIG_FILES`; command-line arguments take
-precedence. `--update` and `--locked` are mutually exclusive.
-
-=============================================================================
-5. Configuration                                             *rsplug-config*
-
-Configuration is TOML. Each `[[plugins]]` entry describes a Git repository or
-a configuration-only script:
->
-    [[plugins]]
-    repo = "owner/plugin"
-    on_cmd = "PluginCommand"
-    lua_after = "require 'plugin'.setup {}"
-<
-
-Multiple files are combined in sorted path order. A script-only entry omits
-`repo` and can still use `lua_start`, `lua_before`, or `lua_after`.
-
-5.1 Fields                                                   *rsplug-fields*
-
-Repository and identity:
-
-    repo        `owner/repo[@revision]`, or any Git URL containing `://`.
-    name        Public name used by `depends` and `on_source`; defaults to the
-                repository basename. It disambiguates equal basenames.
-    depends     String or array of plugin names loaded with this entry.
-
-Loading:
-
-    start       Load during startup instead of lazily. Default: false.
-    on_event    Autocmd event or events.
-    on_cmd      User command or commands.
-    on_ft       Filetype or filetypes.
-    on_func     Vim function or functions.
-    on_map      Key or mode-to-key(s) table.
-    on_source   Plugin name or names to load after.
-
-Hooks and output:
-
-    lua_start       Lua at startup before controlled startup loads.
-    lua_before      Lua immediately before `:packadd`.
-    lua_after       Lua immediately after `:packadd`.
-    build           Argument array run in the repository after install/update.
-    lua_build       Headless-Neovim script after install/update.
-    lua_post_update Headless-Neovim script after an existing repo changes in
-                    `--update`.
-    sym             Use a symlink for the generated entry.
-    ignore          Gitignore-style files to exclude.
-    merge           Allow compatible user entries to share a pack. Default:
-                    true; false works for both startup and lazy entries.
-
-5.2 Loading                                                  *rsplug-loading*
-
-Entries are lazy unless `start = true`. If both are specified, `start` wins
-and the lazy triggers are ignored. A plugin may have several triggers; the
-first one loads it.
-
->
-    [[plugins]]
     repo = "nvim-telescope/telescope.nvim"
-    on_event = ["BufReadPre", "InsertEnter"]
+    depends = ["plenary.nvim"]
     on_cmd = "Telescope"
-    on_ft = ["lua", "vim"]
-    on_map = { n = "<leader>ff" }
 <
 
-Supported `on_map` forms include a key for all modes, `{ n = "<key>" }`, and
-`{ nx = ["<key1>", "<key2>"] }`. Lua files below `lua/` are inspected so a
-matching `require 'module'` can trigger a plugin without explicit configuration.
+`on_source` is different from `depends`: it loads after the named source has
+actually been loaded.  Multiple source references and both sides of a merge
+are preserved.  A source hook can therefore load an extension after a host
+plugin even when the host and another plugin share one generated package.
 
-5.3 Hooks and dependencies                                   *rsplug-hooks*
+5.6 Hook order and generated runtime                              *rsplug-hook-order*
 
-Before and after hooks surround the pack load:
+For a lazy or source-triggered package:
+
+  1. mark the package as loaded (recursive duplicate loads are suppressed);
+  2. execute every `lua_before` module;
+  3. run `:packadd <package-id>`;
+  4. execute every `lua_after` module;
+  5. recursively load entries registered with `on_source` for this source.
+
+For a startup package, step 3 uses `:packadd!`.  `lua_start` is separate and
+runs before the startup package loop.  Hook source files are generated under
+`lua/` and loaded with `require`; they are not evaluated by the shell.
+
+==============================================================================
+6. Repository and snapshot lifecycle                         *rsplug-lifecycle*
+
+6.1 Revision resolution                                           *rsplug-revisions*
+
+For a repository entry, rsplug first determines the target commit:
+
+  - `--locked`: use the lockfile's full 40-character hexadecimal commit;
+  - existing snapshot + `--update`: resolve the configured branch/tag/wildcard
+    against the remote and compare it with the existing commit;
+  - missing snapshot + `--install`: resolve and fetch the configured revision;
+  - no applicable flag: use the latest existing snapshot and skip an absent
+    repository.
+
+An exact commit or tag still resolves to a commit before materialization.  A
+locked revision that is not a full 40-character hexadecimal hash is rejected.
+An update that resolves to the same commit is not reported as an update and
+reuses the snapshot/build result when its build identity matches.
+
+6.2 Fetch strategies                                               *rsplug-fetch*
+
+Without a suitable authenticated GitHub HTTPS path, rsplug uses a Git object
+store at:
 >
-    [[plugins]]
-    repo = "folke/which-key.nvim"
-    lua_before = "vim.g.which_key_timeout = 300"
-    lua_after = "require 'which-key'.setup {}"
+    ~/.cache/rsplug/repos/<host-and-path>/source.git
 <
 
-`build` is an argument array, not a shell command string:
->
-    build = ["make"]
-    lua_build = "vim.fn.system({'make', 'docs'})"
-<
+It materializes a detached snapshot below that repository's `worktrees/`.
+Git URLs strip scheme, userinfo, port, and trailing `.git` for the relative
+cache path; GitHub shorthand uses `github.com/owner/repo`.  Credentials are
+not included in the cache path.
 
-Build results are cached. `lua_post_update` runs only when `--update` obtains a
-new revision for an existing repository. `depends` entries must be defined in
-the configuration; dependencies can be transitive but cycles are errors.
-They load together with the entry that triggered them.
+When `GITHUB_TOKEN` or `GH_TOKEN` is available and the source is GitHub HTTPS,
+rsplug can resolve revisions through the GitHub API and download a tarball from
+`codeload.github.com`.  Wildcard revisions and API failures fall back to Git
+resolution.  Tarball extraction is staged and path-contained; a failed or
+partial extraction is removed before Git fallback.  `dotgit = true` disables
+the tarball path because tarballs do not contain `.git`.
 
-The internal identity is not a TOML field. It is derived from `name`, the
-repository basename, or a deterministic content hash for anonymous script-only
-entries. Anonymous script-only entries are allowed but have no public name to
-reference.
+Fetch, Git, archive extraction, build, and copy operations are bounded and
+performed in parallel where independent.  The concurrency policy is an
+implementation detail, but a failure in one repository is reported as a run
+failure rather than silently producing a partial entry.
 
-=============================================================================
-6. Lockfile                                                 *rsplug-lockfile*
+6.3 Builds and build cache                                        *rsplug-build-cache*
 
-The default lockfile is `~/.cache/rsplug/rsplug.lock.json`; use `--lockfile`
-to change it. It stores resolved Git commits:
+A repository with neither `build` nor `lua_build` is materialized directly.  A
+repository with either is first materialized in a temporary hidden worktree.
+After the build hooks succeed, the completed directory is renamed into its
+final snapshot location.  A success marker is written inside the snapshot but
+is not copied to the pack.
+
+The snapshot key includes the relative repository cache identity, resolved
+commit, `build` argv, and `lua_build` text.  It does not include an absolute
+cache path.  A matching snapshot is reused and its build hooks are skipped.
+Build output changes affect the generated package identity, so distinct build
+results do not overwrite one another.
+
+`build` and `lua_build` run in the repository directory.  `lua_build` receives
+the repository and best-effort latest dependency snapshots on 'runtimepath'.
+`lua_post_update` is a migration hook for an update that changes an installed
+revision and runs before the normal build hooks in the build-enabled path.
+
+6.4 Snapshot contents                                             *rsplug-snapshots*
+
+A snapshot is treated as immutable after it becomes ready.  rsplug writes a
+best-effort `.rsplug-manifest-v1.json` containing relative paths, file/directory
+types, and symlink targets.  It also writes `latest-snapshot` in the repository
+cache root.  These are caches used to reduce filesystem walks; missing, stale,
+or invalid manifests fall back to filesystem inspection.
+
+The manifest, build-success marker, and (unless `dotgit`) `.git` are excluded
+from normal pack selection.  Top-level directories are copied as trees, while
+`doc/` is recursively expanded into individual `doc/<path>` entries so help
+files from multiple repositories can be aggregated.
+
+==============================================================================
+7. Lock file                                                   *rsplug-lockfile*
+
+The default lockfile is `~/.cache/rsplug/rsplug.lock.json`.  The current format
+is JSON version `"1"`:
 >
     {
       "version": "1",
       "locked": {
         "https://github.com/owner/plugin": {
           "type": "git",
-          "rev": "40-character-commit-sha"
+          "rev": "0123456789abcdef0123456789abcdef01234567"
         }
       }
     }
 <
 
-`--locked` requires all configured repositories to have lock entries and does
-not contact remotes. It is intended for CI and reproducible builds.
+`locked` is a map keyed by the repository URL used internally after parsing.
+Each resource currently has `type = "git"` and a full commit hash in `rev`.
 
-Repository forms:
+Every non-locked run writes the lockfile atomically through a temporary file.
+Existing entries are used as the baseline, then configured repositories are
+replaced by their resolved commits.  A configured repository that is skipped
+because it has no usable cache is removed from the output lock map.  Entries
+for repositories not in the current configuration are otherwise retained.
+
+`--locked` reads but does not write the lockfile.  A missing lock entry, wrong
+resource type, malformed revision, or repository that cannot be materialized
+at the locked revision is an error.  Locking does not make the source cache
+self-contained: a missing repository snapshot still requires the corresponding
+Git object/tarball materialization to be available through the normal fetch
+path, subject to the locked revision.
+
+==============================================================================
+8. Pack generation                                               *rsplug-pack*
+
+The generated pack uses this layout:
 >
-    repo = "owner/plugin"
-    repo = "owner/plugin@v1.2.0"
-    repo = "owner/plugin@v*"
-    repo = "https://gitlab.com/owner/plugin@main"
+    ~/.cache/rsplug/
+      init.lua -> generations/<control-id>.lua
+      generations/<control-id>.lua
+      pack/_gen/opt/<package-id>/...
 <
 
-An `@revision` suffix is split from the URL path; `@` in URL userinfo is
-preserved. URL repositories are cached using host and path below `repos/`.
+The control package contains the generated `_rsplug` runtime, trigger handlers,
+hook modules, and this help file at `doc/rsplug.txt`.  `init.lua` prepends the
+application root to 'packpath', loads the selected control package, and calls
+its startup routine.  If no control package is needed, a plain `init.lua` is
+written instead.
 
-=============================================================================
-7. Runtime and generations                                  *rsplug-runtime*
+Package IDs are deterministic hashes of package identity and contents.  An
+absolute cache path is not part of repository package identity, so moving the
+cache root does not by itself change package IDs.  Generated file contents,
+repository revision, selected build inputs, hooks, and merged source files do
+affect IDs.
 
-The generated `init.lua` prepends the packpath and explicitly loads the current
-control package. Managed entries live in `pack/_gen/opt/`; rsplug then installs
-its event, command, filetype, function, mapping, source, and require handlers.
-A lazy load runs `lua_before`, `:packadd`, and `lua_after` in that order.
+8.1 Merging                                                     *rsplug-merging*
 
-Each generation retains a manifest of the generated control modules. Older
-generations are kept while referenced runtime files may still be in use. To
-select a retained generation:
+rsplug first separates repository help files, then performs deterministic
+first-fit merging.  Two entries can merge only when:
+
+  - their complete `LazyType` is equal (startup with startup, or exactly the
+    same trigger set);
+  - both are generated control entries, or both user entries have
+    `merge = true`;
+  - neither is a control entry on one side only; and
+  - every file path is compatible.
+
+File compatibility is recursive.  A file and directory at the same path
+conflict.  Two ordinary files conflict.  Two directories can merge when every
+common descendant is itself compatible; disjoint directory children are
+unioned.  Generated control files use overwrite semantics where appropriate.
+The resulting package retains all files, hook scripts, source names, and the
+earliest deterministic load order.  `merge = false` therefore controls package
+co-location, not whether the entry is loaded.
+
+Merging reduces the number of 'runtimepath' entries but does not change the
+public dependency/source names or the trigger behavior.
+
+8.2 Help files                                                  *rsplug-help-files*
+
+Repository files below `doc/` are expanded and collected into one internal
+start package named `_rsplug:doc`.  The generated `doc/rsplug.txt` is included
+in the same help package.  After copying a package, rsplug invokes:
 >
-    ls ~/.cache/rsplug/generations/
-    RSPLUG_GENERATION=<32-character-id> nvim
+    nvim --headless -u NONE -i NONE -n -c 'helptags <package>/doc/' -c q
 <
 
-An invalid or pruned ID falls back to the latest generation. `:scriptnames`,
-`:echo &packpath`, and `:echo &runtimepath` are useful for inspecting output.
+Help generation is skipped when the package is already installed.  A help
+filename collision uses overwrite semantics in the aggregated help package;
+normal repository file collisions remain conflicts for merging.
 
-=============================================================================
-8. Troubleshooting and updates                       *rsplug-troubleshooting*
+8.3 Generations and cleanup                                  *rsplug-generations*
 
-No plugin appears: verify that the same configuration patterns are passed on
-every run and that a trigger or `start = true` is configured. Check that
-`init.lua` uses the generated `dofile` bootstrap.
+The first control package ID is used as the generation ID.  Its loader is
+stored at `generations/<id>.lua`, and `init.lua` is a symlink to that loader.
+The loader's control manifest lists the `pack/_gen/opt/` entries it references.
 
-Locked build fails: every configured repository needs an entry in the selected
-lockfile. Run without `--locked` once to resolve revisions, then commit the
-lockfile for CI.
+During installation rsplug retains entries referenced by the current and the
+small set of previous generation manifests.  Unreferenced package directories
+are removed from generated `start/` and `opt/` output.  Generation loader files
+whose control package has been removed are also deleted.  Cleanup is best
+effort after a successful install; a current/retained generation is not
+removed merely because a newer generation was created.
 
-GitHub rate limits: set `GITHUB_TOKEN` (or `GH_TOKEN`). Authenticated GitHub
-HTTPS uses API revision resolution and CDN tarballs when possible, with Git
-fallback on failure.
+==============================================================================
+9. Environment variables and paths                         *rsplug-environment*
 
-The current package layout requires the generated bootstrap. Replace the old
-line:
+`RSPLUG_CONFIG_FILES`:
+
+    Default configuration file patterns when no positional arguments are
+    supplied.  Command-line arguments override it.  Values use `:` as the
+    pattern delimiter.
+
+`GITHUB_TOKEN` and `GH_TOKEN`:
+
+    GitHub authentication tokens.  `GITHUB_TOKEN` takes precedence.  They are
+    used for GitHub API/tarball access and are not written into cache paths or
+    lockfile entries.  Without a token, GitHub access is anonymous Git access.
+
+`RSPLUG_GENERATION`:
+
+    Optional 32-character hexadecimal generation ID read by the generated
+    bootstrap.  If it names an existing `generations/<id>.lua`, that loader is
+    used instead of the default current generation.  Invalid, missing, or
+    pruned IDs produce a warning and fall back to the default.
+
+==============================================================================
+10. Errors and troubleshooting                              *rsplug-troubleshooting*
+
+Configuration parse errors identify the config path and offending value.
+Common causes include invalid repository syntax, invalid `on_cmd`, `on_func`,
+`on_ft`, or `on_event` characters, malformed TOML arrays, and wrong value
+types.  A direct config read failure aborts the run.
+
+If a plugin is not present:
+
+  - confirm the same configuration patterns are passed on every run;
+  - use `--install` for a repository that has never been cached;
+  - remember that `--update` skips uninstalled repositories;
+  - verify the bootstrap is the generated `dofile` line;
+  - verify either `start = true`, an explicit trigger, or a matching automatic
+    Lua module root.
+
+If `--locked` fails, check that every configured repository has a lock entry
+with a full 40-character commit and that the repository can be materialized.
+Run once without `--locked` to create/update the lockfile, then commit it for
+CI.
+
+If `dotgit = true` causes a skip, the selected snapshot came from a source
+without `.git` (usually a tarball).  Run an install/update that uses Git, or
+remove `dotgit` if the repository metadata is not needed in the pack.
+
+Build failures report the repository and subprocess exit status.  Check that
+the executable in `build` is on PATH and that `nvim` is available for Lua
+build hooks.  Build output is streamed to the rsplug log; a failed staged build
+does not become the final snapshot.
+
+For runtime inspection use:
 >
-    vim.opt.packpath:prepend '~/.cache/rsplug'
-<
-with:
->
-    dofile(vim.fn.expand '~/.cache/rsplug/init.lua')
+    :scriptnames
+    :echo &packpath
+    :echo &runtimepath
+    :echo require('_rsplug').manifest
 <
 
-Recent releases also added bounded parallel work, staged snapshots and
-manifests, anonymous script-only entries, preserved `on_source` names during
-merge, and consistent `merge = false` behavior for startup and lazy entries.
+==============================================================================
+11. Updates and compatibility                                     *rsplug-updates*
+
+The current generated package layout requires `~/.cache/rsplug/init.lua` to be
+loaded explicitly.  This is the important v0.2 migration from prepending only
+the application directory to 'packpath'.
+
+Recent implementation behavior documented here includes authenticated GitHub
+tarball downloads with Git fallback, bounded parallel fetch/build/copy work,
+staged immutable snapshots, snapshot manifests, anonymous script-only entries,
+deterministic conflict-aware merging, preserved `on_source` names after merge,
+and `merge = false` applying to both startup and lazy user entries.
+
+The lockfile format currently remains JSON version `"1"`.  Internal package IDs
+and snapshot cache details are implementation outputs; do not put an `id` or
+`sym` field in TOML and do not depend on generated hash values being stable
+across unrelated implementation changes.
 
 ==============================================================================
 vim:tw=78:ts=8:ft=help:norl:
