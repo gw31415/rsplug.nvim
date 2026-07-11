@@ -238,6 +238,24 @@ async fn app() -> Result<(), Error> {
     };
     let total_count = plugins.len();
 
+    // Create PackPathState and load packages into it.
+    // doc 盗みはマージ前に行う（doc が source 間マージの対象にならないよう）。
+    let mut state = rsplug::PackPathState::new();
+    state.load(plugins);
+    msg(Message::MergeFinished {
+        total: total_count,
+        merged: state.len(),
+    });
+
+    // Install the packages into the packpath.
+    state
+        .install(DEFAULT_APP_DIR.as_path())
+        .await
+        .map_err(rsplug::Error::Io)?;
+
+    // lock の更新は publication 成功の後に行う（pack と lock の一貫）。install が失敗した場合は
+    // lock を更新せず、次回実行で再試行できるようにする（PLANS「tie lockfile-write timing to
+    // successful publication」）。
     if !locked {
         let mut merged_locked =
             Arc::try_unwrap(locked_map).expect("No other references to locked_map");
@@ -262,21 +280,6 @@ async fn app() -> Result<(), Error> {
         .write(lockfile.as_path())
         .await?;
     }
-
-    // Create PackPathState and load packages into it.
-    // doc 盗みはマージ前に行う（doc が source 間マージの対象にならないよう）。
-    let mut state = rsplug::PackPathState::new();
-    state.load(plugins);
-    msg(Message::MergeFinished {
-        total: total_count,
-        merged: state.len(),
-    });
-
-    // Install the packages into the packpath.
-    state
-        .install(DEFAULT_APP_DIR.as_path())
-        .await
-        .map_err(rsplug::Error::Io)?;
     Ok(())
 }
 

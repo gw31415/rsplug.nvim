@@ -28,7 +28,7 @@ pack depend on the source cache.
 - [ ] Replace the remaining flattened lifecycle plumbing with explicit models
       (`PluginSpec`, `ResolvedGraph`, `MaterializationPlan`, `LazyRegistration`,
       `PackPlan`).
-- [ ] Publish pack generations atomically via a staging directory and tie
+- [x] Publish pack generations atomically via a staging directory and tie
       lockfile-write timing to successful publication.
 
 ## Decisions already implemented
@@ -77,14 +77,28 @@ separate because fetching, tarball download, and auth need the real URL.
 > or non-default ports (now retained); the cache is rebuildable. This is the
 > intended normalization, not a regression.
 
-### Atomic lock write and coexisting generations
+### Atomic generation publication
 
 The lock file is written via temp-file + rename + fsync (parent dir synced
 best-effort), so a second rsplug invocation or Nix tooling never observes a
-half-written file. Pack generations (up to `RETAIN_GENERATIONS = 3`) coexist
-under `generations/`, each addressable as `generations/<id>.lua` with `init.lua`
-symlinked to the current one — old generations stay reachable until no retained
-manifest refers to them.
+half-written file. The lock write runs only after `install()` succeeds, so a
+failed publication does not advance the lock.
+
+`install()` builds each new generation entirely under a private staging dir
+`pack/_gen/.staging-<control_id>-<pid>-<nonce>/` and never touches the published
+`opt/` while copying. Packages whose id already exists are reused (ids are
+content hashes, so same id ≡ same content) instead of recopied. After copy,
+manifest, and loader all succeed, new packages are `rename`d into `opt/` (each
+atomic, no collisions because ids are new) and `init.lua` is swapped by `rename`
+over a temp symlink — the single atomic publication point. Any failure before
+that leaves `init.lua` pointing at the previous generation, so the published
+tree stays bootable. A `flock` on `pack/_gen/.lock` serializes concurrent
+invocations (Unix); stale `.staging-*` dirs are cleaned on entry and exit.
+
+Pack generations (up to `RETAIN_GENERATIONS = 3`) coexist under `generations/`,
+each addressable as `generations/<id>.lua` with `init.lua` symlinked to the
+current one — old generations stay reachable until no retained manifest refers
+to them.
 
 ## Remaining phases
 
@@ -94,14 +108,6 @@ Replace the remaining flattened lifecycle plumbing with `PluginSpec`,
 `ResolvedGraph`, `MaterializationPlan`, `LazyRegistration`, and `PackPlan`,
 keeping public TOML behavior stable. (Repository identity is already canonical
 — see above.)
-
-### Atomic generation publication
-
-Build under `pack/_gen/.staging-*`; publish only after manifests, generated
-loader code, and copies succeed. Keep old generations addressable until no
-retained manifest refers to their generated runtime modules. The lock write
-itself and multi-generation coexistence are already done; the remaining work is
-the staging step and making publication failure leave the published tree intact.
 
 ### Runtime hot paths
 

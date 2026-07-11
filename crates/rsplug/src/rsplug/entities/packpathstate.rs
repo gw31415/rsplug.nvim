@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering as AtomicOrdering},
+        atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering},
     },
     time::SystemTime,
 };
@@ -850,6 +850,59 @@ async fn symlink_file(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io:
     tokio::fs::symlink_file(original, link).await
 }
 
+/// staging ディレクトリ名の衝突を避ける単調カウンタ（PID と組み合わせる）。
+static STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// 新世代を構築する一時ディレクトリ。
+/// `pack/_gen/.staging-<control_id>-<pid>-<nonce>/` 配下にパッケージを置き、
+/// 公開（`opt/` への rename）されるまで Neovim からは参照されない。失敗時は丸ごと破棄できる。
+fn staging_root(gen_root: &Path, control_id: &str) -> PathBuf {
+    let nonce = STAGING_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
+    gen_root.join(format!(
+        ".staging-{}-{}-{}",
+        control_id,
+        std::process::id(),
+        nonce
+    ))
+}
+
+/// 前回クラッシュ等で残った `.staging-*` を best-effort で削除する。
+/// staging は init.lua / manifest のいずれからも参照されないため、任何時点で安全に消せる。
+async fn cleanup_stale_staging(gen_root: &Path) {
+    let Ok(mut rd) = tokio::fs::read_dir(gen_root).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if let Some(name) = entry.file_name().to_str()
+            && name.starts_with(".staging-")
+        {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
+}
+
+/// 並行 rsplug 実行による publish 競合を直列化するための排他ロック（Unix）。
+/// `pack/_gen/.lock` に対する flock(LOCK_EX)。返した File が drop すると解放される。
+#[cfg(unix)]
+async fn acquire_install_lock(gen_root: &Path) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let lock_path = gen_root.join(".lock");
+    tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("install lock join failed: {e}")))?
+}
+
 const RETAIN_GENERATIONS: usize = 3;
 
 #[derive(Serialize, Deserialize)]
@@ -1312,6 +1365,11 @@ impl PackPathState {
         }
         let gen_root = packpath.join("pack").join("_gen");
         tokio::fs::create_dir_all(&gen_root).await?;
+        // 並行 rsplug 実行による publish 競合を直列化（Unix flock）し、前回クラッシュの
+        // staging 残骸を掃除する。staging は init.lua/manifest のいずれからも参照されない。
+        #[cfg(unix)]
+        let _install_lock = acquire_install_lock(&gen_root).await?;
+        cleanup_stale_staging(&gen_root).await;
         let Self {
             installing: _,
             files,
@@ -1340,6 +1398,14 @@ impl PackPathState {
             .collect();
         control_ids.sort();
         let init_content = render_init(&control_ids);
+        // 新世代は staging 配下に構築し、copy/manifest/loader 全成功後に opt/ へ rename で
+        // 公開する（publication 失敗が公開ツリーを壊さないようにする）。
+        let staging_control_id = control_ids
+            .first()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let staging = staging_root(&gen_root, &staging_control_id);
+        tokio::fs::create_dir_all(staging.join("opt")).await?;
         let mut tasks = JoinSet::new();
         // copy 予算 min(16, max(2, CPU*2))。entry（パッケージ単位の yank）の fan-out 上限。
         // 旧実装は AdaptiveSemaphore::new()（上限256）で copy が過剰 fan-out していたのを抑える。
@@ -1362,95 +1428,94 @@ impl PackPathState {
         ) in files
         {
             let id: Arc<str> = id.into();
-            let dir = gen_root.join("opt").join(id.as_ref());
-            let installed = dir.is_dir() && !dir.is_symlink();
-            if installed {
+            let published = gen_root.join("opt").join(id.as_ref());
+            // 既存パッケージは内容ハッシュで識別（同じ id ≡ 同じ内容）なので再利用し copy を skip。
+            // 公開 opt/ には触らず、新規パッケージを staging に構築することで、copy 失敗が
+            // 公開ツリーを壊さないようにする。
+            if published.is_dir() && !published.is_symlink() {
                 msg(Message::InstallSkipped(id));
-            } else {
-                let helptags = {
-                    // NOTE: make helptags closure FnOnce forcely.
-                    // Because multiple asynchronous starts do not work properly
-                    let nvim = tokio::process::Command::new("nvim");
-                    async move |dir: &Path| -> io::Result<()> {
-                        let mut nvim = nvim;
-                        let help_dir = dir.join("doc/");
-                        if help_dir.is_dir() {
-                            let cmd = format!("helptags {}", help_dir.to_string_lossy());
-                            msg(Message::InstallHelp { help_dir });
-                            nvim.arg("--headless")
-                                .arg("-u")
-                                .arg("NONE")
-                                // ShaDa を無効化しないと、並列 helptags で複数 nvim が
-                                // 同一 main.shada の書き込みを奪い合い E138 が出る（`-u NONE`
-                                // だけでは ShaDa は抑制されない）。`-n` で swap も切る。
-                                .arg("-i")
-                                .arg("NONE")
-                                .arg("-n")
-                                .arg("-c")
-                                // TODO: escape help_dir properly
-                                .arg(&cmd)
-                                .arg("-c")
-                                .arg("q")
-                                .status()
-                                .await
-                                .and_then(|code| {
-                                    if code.success() {
-                                        Ok(())
-                                    } else {
-                                        Err(io::Error::other(format!(
-                                            "Failed to run nvim command: {}",
-                                            cmd
-                                        )))
-                                    }
-                                })?;
-                        }
-                        Ok(())
-                    }
-                };
-                {
-                    // copy は dst 未存在前提なので残骸を掃除（ディレクトリ/ファイル混在に備え remove_dir_all）。
-                    tokio::fs::remove_dir_all(dir.as_path()).await.ok();
-                    // dotgit=true だが `.git` エントリが無い（snapshot に `.git` が無い）場合は、
-                    // `.git` 無しで install すると git 利用プラグインが壊れるため pack install を skip し、
-                    // `-u` での再 materialize を促す（plugin は lock に残る）。`.git` があれば通常エントリとして yank される。
-                    if dotgit
-                        && !entries
-                            .iter()
-                            .any(|(p, _)| p.as_path() == Path::new(".git"))
-                    {
-                        msg(Message::PluginDotgitMissing(id.clone()));
-                        continue;
-                    }
-                    let dir = Arc::new(dir);
-                    // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
-                    let yank_semaphore = yank_semaphore.clone();
-                    tasks.spawn(async move {
-                        // 各エントリ（ファイル・sealed-dir 不分別）を yank に任せる。
-                        // `yank` → `place_path` が種別（file/dir/symlink）を判定して配置する。
-                        let mut copies = entries
-                            .into_iter()
-                            .map(|(which, source)| {
-                                let dir = dir.clone();
-                                let id = id.clone();
-                                let yank_semaphore = yank_semaphore.clone();
-                                async move {
-                                    let permit = yank_semaphore.acquire().await;
-                                    let result = source.yank(&which, dir.as_path()).await;
-                                    let is_error = result.is_err();
-                                    permit.finish(is_error);
-                                    result?;
-                                    msg(Message::InstallYank { id, which });
-                                    Ok::<_, io::Error>(())
-                                }
-                            })
-                            .collect::<JoinSet<_>>();
-                        while let Some(res) = copies.join_next().await {
-                            res??;
-                        }
-                        helptags(dir.as_path()).await
-                    });
-                }
+                continue;
             }
+            let dir = staging.join("opt").join(id.as_ref());
+            let helptags = {
+                // NOTE: make helptags closure FnOnce forcely.
+                // Because multiple asynchronous starts do not work properly
+                let nvim = tokio::process::Command::new("nvim");
+                async move |dir: &Path| -> io::Result<()> {
+                    let mut nvim = nvim;
+                    let help_dir = dir.join("doc/");
+                    if help_dir.is_dir() {
+                        let cmd = format!("helptags {}", help_dir.to_string_lossy());
+                        msg(Message::InstallHelp { help_dir });
+                        nvim.arg("--headless")
+                            .arg("-u")
+                            .arg("NONE")
+                            // ShaDa を無効化しないと、並列 helptags で複数 nvim が
+                            // 同一 main.shada の書き込みを奪い合い E138 が出る（`-u NONE`
+                            // だけでは ShaDa は抑制されない）。`-n` で swap も切る。
+                            .arg("-i")
+                            .arg("NONE")
+                            .arg("-n")
+                            .arg("-c")
+                            // TODO: escape help_dir properly
+                            .arg(&cmd)
+                            .arg("-c")
+                            .arg("q")
+                            .status()
+                            .await
+                            .and_then(|code| {
+                                if code.success() {
+                                    Ok(())
+                                } else {
+                                    Err(io::Error::other(format!(
+                                        "Failed to run nvim command: {}",
+                                        cmd
+                                    )))
+                                }
+                            })?;
+                    }
+                    Ok(())
+                }
+            };
+            // dotgit=true だが `.git` エントリが無い（snapshot に `.git` が無い）場合は、
+            // `.git` 無しで install すると git 利用プラグインが壊れるため pack install を skip し、
+            // `-u` での再 materialize を促す（plugin は lock に残る）。`.git` があれば通常エントリとして yank される。
+            if dotgit
+                && !entries
+                    .iter()
+                    .any(|(p, _)| p.as_path() == Path::new(".git"))
+            {
+                msg(Message::PluginDotgitMissing(id.clone()));
+                continue;
+            }
+            let dir = Arc::new(dir);
+            // パッケージ単位でも JoinSet に載せ、複数パッケージのコピーを直列化しない。
+            let yank_semaphore = yank_semaphore.clone();
+            tasks.spawn(async move {
+                // 各エントリ（ファイル・sealed-dir 不分別）を yank に任せる。
+                // `yank` → `place_path` が種別（file/dir/symlink）を判定して配置する。
+                let mut copies = entries
+                    .into_iter()
+                    .map(|(which, source)| {
+                        let dir = dir.clone();
+                        let id = id.clone();
+                        let yank_semaphore = yank_semaphore.clone();
+                        async move {
+                            let permit = yank_semaphore.acquire().await;
+                            let result = source.yank(&which, dir.as_path()).await;
+                            let is_error = result.is_err();
+                            permit.finish(is_error);
+                            result?;
+                            msg(Message::InstallYank { id, which });
+                            Ok::<_, io::Error>(())
+                        }
+                    })
+                    .collect::<JoinSet<_>>();
+                while let Some(res) = copies.join_next().await {
+                    res??;
+                }
+                helptags(dir.as_path()).await
+            });
         }
 
         tasks
@@ -1459,6 +1524,19 @@ impl PackPathState {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
+        // === Publish: staging で構築した新規パッケージを opt/ へ原子 rename で公開する。 ===
+        // パッケージ id は内容ハッシュなので、staging にあるものは全て「新規」（既存は再利用され
+        // staging に無い）で、opt/ との衝突はない。各 rename は POSIX 原子。
+        tokio::fs::create_dir_all(gen_root.join("opt")).await?;
+        if let Ok(mut rd) = tokio::fs::read_dir(staging.join("opt")).await {
+            while let Some(entry) = rd.next_entry().await? {
+                let name = entry.file_name();
+                tokio::fs::rename(entry.path(), gen_root.join("opt").join(name)).await?;
+            }
+        }
+
+        // generation manifest を各コントロールパッケージに書く（コントロールは再利用 or
+        // 新規 rename 済みで、いずれも opt/<id> にある）。manifest 内容は世代固有。
         for id in &control_ids {
             let manifest_path = gen_root
                 .join("opt")
@@ -1471,8 +1549,10 @@ impl PackPathState {
         tokio::fs::create_dir_all(&generations_dir).await?;
         if control_ids.is_empty() {
             // ponytail: no control package to anchor a generation file; fall back to a plain init.lua.
-            tokio::fs::remove_file(packpath.join("init.lua")).await.ok();
-            tokio::fs::write(packpath.join("init.lua"), &init_content).await?;
+            // temp 経由の rename で原子置換する。
+            let tmp = packpath.join(".init.lua.swap");
+            tokio::fs::write(&tmp, &init_content).await?;
+            tokio::fs::rename(&tmp, packpath.join("init.lua")).await?;
         } else {
             // Each generation's loader lives at generations/<control_id>.lua; init.lua is a
             // pure symlink to it, so older retained generations stay addressable by name.
@@ -1480,9 +1560,17 @@ impl PackPathState {
                 .join(<PluginIDStr as AsRef<Path>>::as_ref(&control_ids[0]))
                 .with_extension("lua");
             tokio::fs::write(&gen_path, &init_content).await?;
+            // remove+symlink には init.lua が一時消失する窓があるため、temp symlink を作って
+            // rename で原子置換する（POSIX では既存ファイルへの rename は原子）。これが唯一の
+            // ブータビリティ公開点で、これより前の失敗は init.lua → 旧世代のまま（公開ツリー intact）。
             let init_path = packpath.join("init.lua");
-            tokio::fs::remove_file(&init_path).await.ok();
-            symlink_file(&gen_path, &init_path).await?;
+            let tmp = packpath.join(".init.lua.swap");
+            symlink_file(&gen_path, &tmp).await?;
+            if tokio::fs::rename(&tmp, &init_path).await.is_err() {
+                // Windows 等で既存ファイルへの rename が失敗する場合は remove+rename に fallback。
+                let _ = tokio::fs::remove_file(&init_path).await;
+                tokio::fs::rename(&tmp, &init_path).await?;
+            }
         }
 
         let retained_entries =
@@ -1544,6 +1632,8 @@ impl PackPathState {
                 }
             }
         }
+        // staging は成功・失敗を問わず掃除（残れば次回のクラッシュ残骸になる）。
+        cleanup_stale_staging(&gen_root).await;
         msg(Message::InstallDone);
         res
     }
@@ -2563,5 +2653,144 @@ mod tests {
             snapshot, "lua", &root_b,
         )])));
         (a, b, dir)
+    }
+
+    // === Atomic generation publication（staging + 原子 publish） ===
+
+    /// 実スナップショットディレクトリ `src_root` から1ファイルの LoadedPlugin を作る。
+    fn one_file_plugin(repo: &str, rev: &[u8], rel: &str, src_root: &Path) -> LoadedPlugin {
+        let snapshot = RepoSnapshotIdentity::new(
+            PathBuf::from(repo),
+            rev.to_vec(),
+            None,
+            Arc::<[String]>::from([]),
+            None,
+        );
+        let files = BTreeMap::from([(
+            PathBuf::from(rel),
+            FileItem::new(
+                Arc::new(FileSource::Directory {
+                    path: Arc::from(src_root.to_path_buf()),
+                }),
+                FileIdentity::RepoFile(RepoFileIdentity::new(snapshot, PathBuf::from(rel))),
+                MergeType::Conflict,
+            ),
+        )]);
+        synth(HowToPlaceFiles::CopyEachFile(files))
+    }
+
+    /// `pack/_gen/` 配下に `.staging-*` が残っていないか。
+    fn no_staging_dirs(gen_root: &Path) -> bool {
+        let Ok(mut rd) = std::fs::read_dir(gen_root) else {
+            return true;
+        };
+        while let Some(Ok(e)) = rd.next() {
+            if let Some(n) = e.file_name().to_str()
+                && n.starts_with(".staging-")
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 同一パッケージの2回目 install は既存を再利用し（copy skip）、staging も残さない。
+    #[tokio::test]
+    async fn install_reuses_existing_package_and_leaves_no_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let packpath = dir.path().to_path_buf();
+        let genpath = packpath.join("pack/_gen");
+        let snap_root = dir.path().join("snap");
+        std::fs::create_dir_all(snap_root.join("plugin")).unwrap();
+        std::fs::write(snap_root.join("plugin/a.lua"), b"-- a\n").unwrap();
+
+        let plugin = one_file_plugin("github.com/owner/a", b"rev-a", "plugin/a.lua", &snap_root);
+        let id = plugin.plugin_id().as_str().to_string();
+
+        // 1回目: publish。
+        let mut state = PackPathState::new();
+        state.insert(plugin);
+        state.install(&packpath).await.unwrap();
+        let opt_a = packpath
+            .join("pack/_gen/opt")
+            .join(&id)
+            .join("plugin/a.lua");
+        assert_eq!(std::fs::read(&opt_a).unwrap(), b"-- a\n");
+
+        // snapshot ソースを書き換えても、2回目は既存 opt/<id> を再利用（copy skip）するので
+        // 公開内容は不変。staging にも残骸が残らない。
+        std::fs::write(snap_root.join("plugin/a.lua"), b"-- CHANGED\n").unwrap();
+        let plugin2 = one_file_plugin("github.com/owner/a", b"rev-a", "plugin/a.lua", &snap_root);
+        let mut state2 = PackPathState::new();
+        state2.insert(plugin2);
+        state2.install(&packpath).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&opt_a).unwrap(),
+            b"-- a\n",
+            "reuse must not recopy the changed snapshot"
+        );
+        assert!(no_staging_dirs(&genpath), "no staging dirs must remain");
+    }
+
+    /// install 入口で前回クラッシュの `.staging-*` 残骸が掃除される。
+    #[tokio::test]
+    async fn install_cleans_stale_staging_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let packpath = dir.path().to_path_buf();
+        let genpath = packpath.join("pack/_gen");
+        std::fs::create_dir_all(genpath.join(".staging-leftover/opt")).unwrap();
+        std::fs::write(genpath.join(".staging-leftover/opt/junk"), b"x").unwrap();
+
+        // プラグインが空でも install 入口の staging 掃除は走る。
+        let state = PackPathState::new();
+        state.install(&packpath).await.unwrap();
+
+        assert!(
+            !genpath.join(".staging-leftover").exists(),
+            "stale staging must be cleaned at install entry"
+        );
+        assert!(no_staging_dirs(&genpath));
+    }
+
+    /// 別パッケージの copy 失敗で install が Err になっても、公開済み世代は破壊されない。
+    #[tokio::test]
+    async fn install_failure_preserves_published_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let packpath = dir.path().to_path_buf();
+        let snap_a = dir.path().join("snapA");
+        std::fs::create_dir_all(snap_a.join("plugin")).unwrap();
+        std::fs::write(snap_a.join("plugin/a.lua"), b"-- a\n").unwrap();
+
+        // 1回目: A を publish しておく。
+        let plugin_a = one_file_plugin("github.com/owner/a", b"rev-a", "plugin/a.lua", &snap_a);
+        let id_a = plugin_a.plugin_id().as_str().to_string();
+        let mut state = PackPathState::new();
+        state.insert(plugin_a);
+        state.install(&packpath).await.unwrap();
+        let opt_a = packpath.join("pack/_gen/opt").join(&id_a);
+        assert!(opt_a.is_dir(), "A must be published");
+
+        // 2回目: B を staged copy するがコピー元を削除し ENOENT 失敗を起こす。
+        let snap_b = dir.path().join("snapB");
+        std::fs::create_dir_all(snap_b.join("plugin")).unwrap();
+        std::fs::write(snap_b.join("plugin/b.lua"), b"-- b\n").unwrap();
+        let plugin_b = one_file_plugin("github.com/owner/b", b"rev-b", "plugin/b.lua", &snap_b);
+        std::fs::remove_file(snap_b.join("plugin/b.lua")).unwrap();
+
+        let mut state2 = PackPathState::new();
+        state2.insert(plugin_b);
+        let result = state2.install(&packpath).await;
+        assert!(result.is_err(), "copy failure must fail install");
+
+        // 公開済みの A は破壊されず残る（publication 失敗が公開ツリーを壊さない）。
+        assert!(
+            opt_a.is_dir(),
+            "published generation A must survive a failed B install"
+        );
+        assert_eq!(
+            std::fs::read(opt_a.join("plugin/a.lua")).unwrap(),
+            b"-- a\n"
+        );
     }
 }

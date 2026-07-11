@@ -223,11 +223,13 @@ merge = false
 
 ## How loading works
 
-The CLI builds a generation under `pack/_gen/opt/`, writes a generated control
-package and `init.lua`, and retains a small set of previous generations. The
-bootstrap prepends the generated packpath and explicitly loads the current
-control package. At runtime, a trigger runs `lua_before`, loads the plugin, then
-runs `lua_after`.
+The CLI builds a generation under a private staging directory and publishes it
+into `pack/_gen/opt/` only after all files, manifests, and the loader succeed,
+swapping `init.lua` atomically — so a failed run leaves the previous generation
+bootable. It writes a generated control package and `init.lua`, and retains a
+small set of previous generations. The bootstrap prepends the generated
+packpath and explicitly loads the current control package. At runtime, a
+trigger runs `lua_before`, loads the plugin, then runs `lua_after`.
 
 Compatible entries with non-conflicting files can share one pack entry. Help
 files are collected for a single helptags pass. Snapshot manifests make the
@@ -270,9 +272,12 @@ Default paths below `~/.cache/rsplug/` are `init.lua`, `repos/`,
 The current release includes bounded parallel work, staged GitHub tarball
 downloads with Git fallback, snapshot manifests, anonymous script-only entries,
 preserved `on_source` names after merging, consistent `merge = false`
-semantics for startup and lazy plugins, and a canonical repository identity
+semantics for startup and lazy plugins, a canonical repository identity
 shared by the lockfile and cache path so URL variants of one repository no
-longer split into separate entries. The generated bootstrap is required for
+longer split into separate entries, and atomic generation publication (each
+generation is built in a staging directory and published via an atomic
+`init.lua` swap, so a failed run cannot leave the pack half-written). The
+generated bootstrap is required for
 the v0.2 package layout; older configurations using only
 `vim.opt.packpath:prepend '~/.cache/rsplug'` should switch to the `dofile` line
 shown above.

@@ -769,6 +769,14 @@ application root to 'packpath', loads the selected control package, and calls
 its startup routine.  If no control package is needed, a plain `init.lua` is
 written instead.
 
+Publication is atomic.  rsplug builds each new generation under a private
+staging directory `pack/_gen/.staging-*` and never modifies the published
+`opt/` while copying.  Only after all packages, manifests, and the loader are
+written does it `rename` the new packages into `opt/` and swap `init.lua` via a
+temp-symlink `rename`.  A failure before that swap leaves the previous
+generation bootable.  The lockfile is written only after publication succeeds.
+On Unix a `flock` on `pack/_gen/.lock` serializes concurrent invocations.
+
 Package IDs are deterministic hashes of package identity and contents.  An
 absolute cache path is not part of repository package identity, so moving the
 cache root does not by itself change package IDs.  Generated file contents,
@@ -896,8 +904,11 @@ Recent implementation behavior documented here includes authenticated GitHub
 tarball downloads with Git fallback, bounded parallel fetch/build/copy work,
 staged immutable snapshots, snapshot manifests, anonymous script-only entries,
 deterministic conflict-aware merging, preserved `on_source` names after merge,
-`merge = false` applying to both startup and lazy user entries, and a canonical
-repository identity shared by the lockfile and cache path.
+`merge = false` applying to both startup and lazy user entries, a canonical
+repository identity shared by the lockfile and cache path, and atomic
+generation publication: each generation is built under a private staging
+directory and published only after all files, manifests, and the loader succeed,
+with `init.lua` swapped atomically and the lockfile updated only on success.
 
 The lockfile format is JSON version `"2"`, keyed by canonical repository
 identity; older `"1"` files with raw-URL keys are normalized on read.  Cache
