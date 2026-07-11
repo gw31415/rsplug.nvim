@@ -150,10 +150,11 @@ async fn app() -> Result<(), Error> {
         })?;
     // reqwest::Client は内部が Arc なので clone は安価。FnMut closure 内に move するため先に clone。
     let http_client = http_client.clone();
-    // --update/--install 時、fan-out 前に全リポジトリの最新 rev を一括解決する。
-    // GitHub は GraphQL 1リクエスト/chunk、任意 Git URL と wildcard は ls-remote 並列、
-    // tokio::join で並行。解決済み OID は既存の locked_rev スロット経由で各 plugin へ渡すため
-    // plugin.rs load はゼロ変更、未解決 plugin は従来通り resolve_remote_oid で個別解決する。
+    // --update/--install 時、fan-out 前に GitHub リポジトリ（Git バックエンドの GitHub HTTPS URL
+    // 含む）の最新 rev を GraphQL 1リクエスト/chunk で一括解決する。非 GitHub・wildcard・token なし・
+    // GraphQL 失敗時は preresolved に載せず、各 plugin の load 内で従来通り resolve_remote_oid で
+    // 解決する（パイプライン維持、ボトルネックを fetch から rev 解決に移動させない）。
+    // 解決済み OID は既存の locked_rev スロット経由で渡すため plugin.rs load はゼロ変更。
     let preresolved_map: Arc<HashMap<String, Arc<str>>> = if !locked && (install || update) {
         // 同一 canonical・異 rev の衝突を検出（該当 plugin は batch 対外＝個別 fallback）。
         let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
@@ -175,7 +176,6 @@ async fn app() -> Result<(), Error> {
         }
         let token = rsplug::util::github::token();
         let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
-        let mut ls_remote_entries: Vec<rsplug::util::git::LsRemoteEntry> = Vec::new();
         let mut seeded: HashMap<String, Arc<str>> = HashMap::new();
         for p in plugins.iter() {
             let Some(repo) = p.cache.repo.as_ref() else {
@@ -186,7 +186,6 @@ async fn app() -> Result<(), Error> {
                 continue;
             }
             let rev = repo.rev();
-            let url = repo.url();
             if rev
                 .as_deref()
                 .is_some_and(rsplug::util::github::is_full_hex_hash)
@@ -195,62 +194,37 @@ async fn app() -> Result<(), Error> {
             } else if repo.is_github_https()
                 && !rev.as_deref().is_some_and(|r| r.contains('*'))
                 && token.is_some()
+                && let Some((owner, rname)) = rsplug::util::github::parse_github_url(&repo.url())
             {
-                if let Some((owner, rname)) = rsplug::util::github::parse_github_url(&url) {
-                    graphql_batch.push(rsplug::util::github::GithubRev {
-                        owner,
-                        repo: rname,
-                        rev: rev.as_deref().map(ToString::to_string),
-                    });
-                }
-            } else {
-                ls_remote_entries.push((
-                    canonical,
-                    Arc::from(url.as_str()),
-                    rev,
-                    token.map(Arc::<str>::from),
-                ));
+                graphql_batch.push(rsplug::util::github::GithubRev {
+                    owner,
+                    repo: rname,
+                    rev: rev.as_deref().map(ToString::to_string),
+                });
             }
+            // 非 GitHub・wildcard・token なし はここでは解決せず load 内へ（preresolved に載せない）。
         }
-        let graphql = async {
-            match token {
-                Some(tok) => {
-                    rsplug::util::github::resolve_revs_via_graphql(
-                        &http_client,
-                        tok,
-                        &graphql_batch,
-                    )
-                    .await
-                }
-                None => Ok(HashMap::new()),
-            }
-        };
-        let (graphql_res, ls_remote_res) = tokio::join!(
-            graphql,
-            rsplug::util::git::resolve_revs_via_ls_remote(ls_remote_entries, &fetch_semaphore),
-        );
         let mut map: HashMap<String, Arc<str>> = seeded;
-        match graphql_res {
-            Ok(oids) => {
-                for ((o, r), maybe_oid) in oids {
-                    if let Some(oid) = maybe_oid {
-                        map.insert(format!("github.com/{o}/{r}"), Arc::<str>::from(oid));
+        if let Some(tok) = token {
+            match rsplug::util::github::resolve_revs_via_graphql(&http_client, tok, &graphql_batch)
+                .await
+            {
+                Ok(oids) => {
+                    for ((o, r), maybe_oid) in oids {
+                        if let Some(oid) = maybe_oid {
+                            map.insert(format!("github.com/{o}/{r}"), Arc::<str>::from(oid));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                let reason = match e {
-                    rsplug::util::github::ApiError::RateLimited => "rate-limited".into(),
-                    rsplug::util::github::ApiError::Other(s) => s,
-                };
-                eprintln!(
-                    "[rsplug] GitHub GraphQL batch failed ({reason}); falling back to per-repo resolution"
-                );
-            }
-        }
-        for (canonical, maybe_oid) in ls_remote_res {
-            if let Some(oid) = maybe_oid {
-                map.insert(canonical, oid);
+                Err(e) => {
+                    let reason = match e {
+                        rsplug::util::github::ApiError::RateLimited => "rate-limited".into(),
+                        rsplug::util::github::ApiError::Other(s) => s,
+                    };
+                    eprintln!(
+                        "[rsplug] GitHub GraphQL batch failed ({reason}); falling back to per-repo resolution"
+                    );
+                }
             }
         }
         Arc::new(map)

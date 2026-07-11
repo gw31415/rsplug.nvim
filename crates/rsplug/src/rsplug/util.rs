@@ -493,40 +493,6 @@ pub mod git {
         .unwrap()
     }
 
-    /// ls-remote 並列解決の入力: (canonical, url, rev, token)。
-    pub(crate) type LsRemoteEntry = (String, Arc<str>, Option<Arc<str>>, Option<Arc<str>>);
-
-    /// 複数リポジトリの最新 rev を ls-remote で並列解決する。
-    /// 各 entry は (canonical, url, rev, token)。`semaphore` で fan-out を制御。
-    /// 失敗した entry は None（呼出側で per-repo フォールバック）。
-    pub(crate) async fn resolve_revs_via_ls_remote(
-        entries: Vec<LsRemoteEntry>,
-        semaphore: &adaptive_semaphore::AdaptiveSemaphore,
-    ) -> std::collections::HashMap<String, Option<Arc<str>>> {
-        let mut tasks = tokio::task::JoinSet::new();
-        for (canonical, url, rev, token) in entries {
-            let semaphore = semaphore.clone();
-            tasks.spawn(async move {
-                let permit = semaphore.acquire().await;
-                let result = ls_remote(url, rev, token).await;
-                let is_error = result.is_err();
-                permit.finish(is_error);
-                (
-                    canonical,
-                    result.ok().map(|oid| Arc::<str>::from(oid.to_string())),
-                )
-            });
-        }
-        let mut out: std::collections::HashMap<String, Option<Arc<str>>> =
-            std::collections::HashMap::new();
-        while let Some(res) = tasks.join_next().await {
-            if let Ok((canonical, oid)) = res {
-                out.insert(canonical, oid);
-            }
-        }
-        out
-    }
-
     /// Constant representing files to be ignored by rsplug
     pub const RSPLUG_BUILD_SUCCESS_FILE: &str = ".rsplug_build_success";
 }

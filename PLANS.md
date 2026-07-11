@@ -30,9 +30,9 @@ pack depend on the source cache.
       `PackPlan`).
 - [x] Publish pack generations atomically via a staging directory and tie
       lockfile-write timing to successful publication.
-- [x] Resolve revs for `--update`/`--install` in a single batched phase:
-      GitHub repos via one GraphQL query (chunked), arbitrary Git URLs and
-      wildcards via parallel ls-remote, run concurrently.
+- [x] Resolve GitHub revs for `--update`/`--install` in a single batched
+      GraphQL query (Git backend GitHub HTTPS URLs included; wildcards and
+      non-GitHub repos resolve per-repo inside load as before).
 
 ## Decisions already implemented
 
@@ -105,16 +105,18 @@ to them.
 
 ### Batched rev resolution
 
-`--update`/`--install` resolves every repo's latest OID in one pre-fan-out phase
-instead of per-plugin inside the load fan-out. GitHub repos go through a single
-GraphQL query (chunked at 50; `defaultBranchRef` when no rev, or
-`ref(qualifiedName)` with heads/tags disambiguation); arbitrary Git URLs and
-wildcard refs go through parallel `git ls-remote` under the fetch semaphore; the
-two run concurrently via `tokio::join`. 40-hex commit revs are seeded directly.
-Resolved OIDs flow into `load` through the existing `locked_rev` parameter (zero
-changes to `Plugin::load`/`resolve_remote_oid`), so any repo the batch misses —
-GraphQL error, null alias, wildcard, non-GitHub, or conflicting revs on the same
-canonical identity — still resolves via the per-repo fallback exactly as before.
+`--update`/`--install` resolves GitHub repos' latest OID in one pre-fan-out
+GraphQL query instead of per-repo REST calls inside the load fan-out. This covers
+both `RepoSource::GitHub` and Git-backend `https://github.com/...` URLs
+(`is_github_https` + `parse_github_url`). The query is chunked at 50; default
+branch uses `defaultBranchRef`, a named ref uses `ref(qualifiedName)` with
+heads/tags disambiguation. 40-hex commit revs are seeded directly. Resolved OIDs
+flow into `load` through the existing `locked_rev` parameter (zero changes to
+`Plugin::load`/`resolve_remote_oid`). Non-GitHub repos, wildcard refs, token-less
+runs, and any GraphQL error/null keep the existing per-repo path inside `load`
+(`resolve_remote_oid` → REST/git ls-remote), so the fetch fan-out starts as soon
+as GitHub revs are resolved and the bottleneck stays on fetch (download/extract),
+not on rev resolution.
 
 ## Remaining phases
 

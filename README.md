@@ -277,10 +277,10 @@ shared by the lockfile and cache path so URL variants of one repository no
 longer split into separate entries, atomic generation publication (each
 generation is built in a staging directory and published via an atomic
 `init.lua` swap, so a failed run cannot leave the pack half-written), and
-batched update resolution (`--update`/`--install` resolves all repository
-revisions in one phase — the GitHub GraphQL API for GitHub repos and parallel
-git ls-remote for the rest — instead of one request per repository). The
-generated bootstrap is required for
+batched GitHub rev resolution (`--update`/`--install` resolves GitHub repos'
+revisions in one GraphQL query — including Git-backend `https://github.com/...`
+URLs — instead of one REST request per repository; other repos resolve as
+before). The generated bootstrap is required for
 the v0.2 package layout; older configurations using only
 `vim.opt.packpath:prepend '~/.cache/rsplug'` should switch to the `dofile` line
 shown above.
