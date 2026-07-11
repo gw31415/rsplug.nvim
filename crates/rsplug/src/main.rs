@@ -99,7 +99,10 @@ async fn app() -> Result<(), Error> {
     // output lock file so that entries for plugins not in the config are
     // preserved.
     let locked_map = match rsplug::LockFile::read(lockfile.as_path()).await {
-        Ok(rsplug::LockFile { locked: map, .. }) => {
+        Ok(lock) => {
+            // 全キーを canonical identity に正規化（旧形式の生 URL キーを含む）。
+            // 以降の get/insert/remove はすべて canonical キーで行う。
+            let rsplug::LockFile { locked: map, .. } = lock.normalize_keys()?;
             if locked {
                 msg(Message::DetectLockFile(lockfile.clone()));
             }
@@ -147,7 +150,7 @@ async fn app() -> Result<(), Error> {
         })?;
     // reqwest::Client は内部が Arc なので clone は安価。FnMut closure 内に move するため先に clone。
     let http_client = http_client.clone();
-    let (plugins, lock_infos, urls_to_remove) = {
+    let (plugins, lock_infos, remove_canons) = {
         let res = plugins
             .into_iter()
             .map(|plugin| {
@@ -155,29 +158,29 @@ async fn app() -> Result<(), Error> {
                 let fetch_semaphore = fetch_semaphore.clone();
                 let http_client = http_client.clone();
                 async move {
-                    let (locked_rev, repo_url): (Option<Arc<str>>, Option<String>) =
+                    let (locked_rev, repo_canon): (Option<Arc<str>>, Option<String>) =
                         if let Some(repo) = plugin.cache.repo.as_ref() {
-                            let url = repo.url();
+                            let canonical = repo.canonical();
                             if locked {
-                                if let Some(entry) = locked_map.get(&url) {
+                                if let Some(entry) = locked_map.get(&canonical) {
                                     if entry.kind != rsplug::LockedResourceType::Git {
                                         return Err(Error::Io(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
                                             format!(
                                                 "Unsupported lock type for {}: {:?}",
-                                                url, entry.kind
+                                                canonical, entry.kind
                                             ),
                                         )));
                                     }
-                                    (Some(Arc::<str>::from(entry.rev.as_str())), Some(url))
+                                    (Some(Arc::<str>::from(entry.rev.as_str())), Some(canonical))
                                 } else {
                                     return Err(Error::Io(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
-                                        format!("Missing locked revision for {}", url),
+                                        format!("Missing locked revision for {}", canonical),
                                     )));
                                 }
                             } else {
-                                (None, Some(url))
+                                (None, Some(canonical))
                             }
                         } else {
                             (None, None)
@@ -195,15 +198,15 @@ async fn app() -> Result<(), Error> {
                     msg(Message::LoadPluginDone);
                     // Distinguish: repo present but load returned None means
                     // not-installed (cache missing) → mark for lock removal.
-                    let url_to_remove = if repo_url.is_some()
+                    let canon_to_remove = if repo_canon.is_some()
                         && result.is_ok()
                         && result.as_ref().unwrap().is_none()
                     {
-                        repo_url
+                        repo_canon
                     } else {
                         None
                     };
-                    Ok((result?, url_to_remove))
+                    Ok((result?, canon_to_remove))
                 }
             })
             .collect::<JoinSet<_>>()
@@ -212,26 +215,26 @@ async fn app() -> Result<(), Error> {
         // Wait until all loading is complete.
         // NOTE: It does not abort if an error occurs (because of the build process).
         msg(Message::LoadDone);
-        let (plugins, locks, remove_urls) = res
+        let (plugins, locks, remove_canons) = res
             .into_iter()
             .try_fold(
                 (BinaryHeap::new(), Vec::new(), Vec::new()),
-                |(mut plugins, mut locks, mut remove_urls), res| {
-                    let (result, url_to_remove) = res?;
+                |(mut plugins, mut locks, mut remove_canons), res| {
+                    let (result, canon_to_remove) = res?;
                     if let Some((loaded, lock_info)) = result {
                         plugins.push(loaded);
                         if let Some(lock_info) = lock_info {
                             locks.push(lock_info);
                         }
                     }
-                    if let Some(url) = url_to_remove {
-                        remove_urls.push(url);
+                    if let Some(canon) = canon_to_remove {
+                        remove_canons.push(canon);
                     }
-                    Ok::<_, Box<Error>>((plugins, locks, remove_urls))
+                    Ok::<_, Box<Error>>((plugins, locks, remove_canons))
                 },
             )
             .map_err(|e| *e)?;
-        (plugins, locks, remove_urls)
+        (plugins, locks, remove_canons)
     };
     let total_count = plugins.len();
 
@@ -240,8 +243,8 @@ async fn app() -> Result<(), Error> {
             Arc::try_unwrap(locked_map).expect("No other references to locked_map");
         // Remove entries for plugins that are in the config but not installed
         // (cache missing). This keeps the lock file in sync with the cache.
-        for url in &urls_to_remove {
-            merged_locked.remove(url);
+        for canon in &remove_canons {
+            merged_locked.remove(canon);
         }
         for (url, resolved_rev) in lock_infos {
             merged_locked.insert(
@@ -253,7 +256,7 @@ async fn app() -> Result<(), Error> {
             );
         }
         rsplug::LockFile {
-            version: "1".into(),
+            version: "2".into(),
             locked: merged_locked,
         }
         .write(lockfile.as_path())

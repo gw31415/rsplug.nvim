@@ -496,6 +496,131 @@ pub mod git {
     pub const RSPLUG_BUILD_SUCCESS_FILE: &str = ".rsplug_build_success";
 }
 
+/// リポジトリの canonical identity 正規化（PLANS「Model and repository identity」）。
+///
+/// lock key と cache path を同一の identity で統一し、scheme/userinfo/デフォルトポート/
+/// 末尾 `.git` の違いによる同一リポジトリの重複エントリを防ぐ。
+pub mod repo {
+    /// URL を canonical identity `host[:port][/path]` へ正規化する。
+    ///
+    /// - scheme は削除（ただしデフォルトポート判定に使用）
+    /// - userinfo（`user[:pw]@`）は除外
+    /// - host は ASCII 小文字化
+    /// - scheme のデフォルトポート（https=443, http=80, ssh=22, git=9418）は削除、それ以外は保持
+    /// - 末尾 `.git`・末尾 `/`・空パスセグメントは削除
+    ///
+    /// `scheme://` を含まない入力（既に `host/path` 形式）も host/path として処理する。
+    pub fn canonicalize_url(url: &str) -> String {
+        let (scheme, after_scheme) = match url.find("://") {
+            Some(i) => (&url[..i], &url[i + 3..]),
+            None => ("", url),
+        };
+        let (authority, path) = match after_scheme.find('/') {
+            Some(slash) => (&after_scheme[..slash], &after_scheme[slash..]),
+            None => (after_scheme, ""),
+        };
+        // userinfo を除外（最後の `@` より後ろが host:port）
+        let hostport = authority.rsplit('@').next().unwrap_or(authority);
+        let (host, port) = match hostport.rfind(':') {
+            Some(i) => (&hostport[..i], Some(&hostport[i + 1..])),
+            None => (hostport, None),
+        };
+        let host = host.to_ascii_lowercase();
+        let port = port.filter(|p| !is_default_port(scheme, p));
+
+        let path = path.trim_end_matches(".git");
+        let path = path.trim_end_matches('/');
+
+        let mut result = String::with_capacity(host.len() + path.len() + 6);
+        result.push_str(&host);
+        if let Some(p) = port {
+            result.push(':');
+            result.push_str(p);
+        }
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            result.push('/');
+            result.push_str(seg);
+        }
+        result
+    }
+
+    /// lock file のキーを canonical identity へ正規化する。
+    ///
+    /// 3 つの入力形式を受け入れる（後方互換のため生 URL キーも正規化）:
+    /// - 生 URL（`://` を含む）→ [`canonicalize_url`]
+    /// - 既に canonical な `host/path`（第1セグメントに `.` を含む）→ [`canonicalize_url`]
+    /// - GitHub shorthand `owner/repo`（第1セグメントに `.` を含まない）→ `github.com/owner/repo`
+    pub fn canonicalize_lock_key(key: &str) -> String {
+        if key.contains("://") {
+            canonicalize_url(key)
+        } else {
+            let first = key.split('/').next().unwrap_or(key);
+            if first.contains('.') {
+                canonicalize_url(key)
+            } else {
+                format!("github.com/{}", key)
+            }
+        }
+    }
+
+    fn is_default_port(scheme: &str, port: &str) -> bool {
+        matches!(
+            (scheme, port),
+            ("https", "443") | ("http", "80") | ("ssh", "22") | ("git", "9418")
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn canonicalize_url_normalizes_identity() {
+            let cases: &[(&str, &str)] = &[
+                ("https://github.com/o/r", "github.com/o/r"),
+                ("https://github.com/o/r.git", "github.com/o/r"),
+                ("ssh://git@github.com/o/r.git", "github.com/o/r"),
+                ("https://user:pwx@github.com/o/r", "github.com/o/r"),
+                ("https://GitHub.COM/o/r", "github.com/o/r"),
+                ("https://gitlab.com/o/r", "gitlab.com/o/r"),
+                ("https://gitlab.com:443/o/r", "gitlab.com/o/r"),
+                ("https://gitlab.com:2222/o/r", "gitlab.com:2222/o/r"),
+                ("ssh://git@gitlab.com:2222/o/r.git", "gitlab.com:2222/o/r"),
+                ("http://example.com:80/foo/bar", "example.com/foo/bar"),
+                ("git://host.com:9418/repo", "host.com/repo"),
+                ("https://host.com/repo/", "host.com/repo"),
+                // scheme なし（既に canonical）も host/path として処理
+                ("github.com/o/r", "github.com/o/r"),
+                ("gitlab.com:2222/o/r", "gitlab.com:2222/o/r"),
+            ];
+            for (input, expected) in cases {
+                assert_eq!(canonicalize_url(input), *expected, "input={:?}", input);
+            }
+        }
+
+        #[test]
+        fn canonicalize_lock_key_dispatches_three_forms() {
+            // 生 URL（`://` を含む）
+            assert_eq!(
+                canonicalize_lock_key("https://github.com/o/r"),
+                "github.com/o/r"
+            );
+            assert_eq!(
+                canonicalize_lock_key("ssh://git@github.com/o/r.git"),
+                "github.com/o/r"
+            );
+            // 既に canonical（第1セグメントに `.` を含む host/path）
+            assert_eq!(canonicalize_lock_key("github.com/o/r"), "github.com/o/r");
+            assert_eq!(
+                canonicalize_lock_key("gitlab.com:2222/o/r"),
+                "gitlab.com:2222/o/r"
+            );
+            // GitHub shorthand（第1セグメントに `.` を含まない）
+            assert_eq!(canonicalize_lock_key("owner/repo"), "github.com/owner/repo");
+        }
+    }
+}
+
 pub mod github {
     //! GitHub関連のユーティリティ
 

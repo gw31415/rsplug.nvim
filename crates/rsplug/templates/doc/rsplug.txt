@@ -664,9 +664,10 @@ store at:
 <
 
 It materializes a detached snapshot below that repository's `worktrees/`.
-Git URLs strip scheme, userinfo, port, and trailing `.git` for the relative
-cache path; GitHub shorthand uses `github.com/owner/repo`.  Credentials are
-not included in the cache path.
+The cache path and lockfile key share one canonical identity: scheme and
+userinfo are removed, the host is lowercased, default ports (80/443/22/9418)
+are removed but non-default ports are kept, and trailing `.git` is removed.
+GitHub shorthand uses `github.com/owner/repo`.  Credentials are not included.
 
 When `GITHUB_TOKEN` or `GH_TOKEN` is available and the source is GitHub HTTPS,
 rsplug can resolve revisions through the GitHub API and download a tarball from
@@ -716,12 +717,12 @@ files from multiple repositories can be aggregated.
 7. Lock file                                                   *rsplug-lockfile*
 
 The default lockfile is `~/.cache/rsplug/rsplug.lock.json`.  The current format
-is JSON version `"1"`:
+is JSON version `"2"`:
 >
     {
-      "version": "1",
+      "version": "2",
       "locked": {
-        "https://github.com/owner/plugin": {
+        "github.com/owner/plugin": {
           "type": "git",
           "rev": "0123456789abcdef0123456789abcdef01234567"
         }
@@ -729,8 +730,14 @@ is JSON version `"1"`:
     }
 <
 
-`locked` is a map keyed by the repository URL used internally after parsing.
-Each resource currently has `type = "git"` and a full commit hash in `rev`.
+`locked` is a map keyed by the repository's canonical identity (the same
+`host[:port]/path` form used for the cache path; see |rsplug-fetch|).  GitHub
+shorthand and URL variants of one repository therefore share one entry.  Each
+resource currently has `type = "git"` and a full commit hash in `rev`.
+
+For backward compatibility, keys from an older lockfile written with raw URLs
+are normalized on read.  Two keys that collapse to one canonical identity must
+record the same revision; conflicting revisions are an error.
 
 Every non-locked run writes the lockfile atomically through a temporary file.
 Existing entries are used as the baseline, then configured repositories are
@@ -889,12 +896,16 @@ Recent implementation behavior documented here includes authenticated GitHub
 tarball downloads with Git fallback, bounded parallel fetch/build/copy work,
 staged immutable snapshots, snapshot manifests, anonymous script-only entries,
 deterministic conflict-aware merging, preserved `on_source` names after merge,
-and `merge = false` applying to both startup and lazy user entries.
+`merge = false` applying to both startup and lazy user entries, and a canonical
+repository identity shared by the lockfile and cache path.
 
-The lockfile format currently remains JSON version `"1"`.  Internal package IDs
-and snapshot cache details are implementation outputs; do not put an `id` or
-`sym` field in TOML and do not depend on generated hash values being stable
-across unrelated implementation changes.
+The lockfile format is JSON version `"2"`, keyed by canonical repository
+identity; older `"1"` files with raw-URL keys are normalized on read.  Cache
+paths now lowercase the host and keep non-default ports, so a host written in
+mixed case or a non-default port may change the cache location and trigger a
+refetch.  Internal package IDs and snapshot cache details are implementation
+outputs; do not put an `id` or `sym` field in TOML and do not depend on
+generated hash values being stable across unrelated implementation changes.
 
 ==============================================================================
 vim:tw=78:ts=8:ft=help:norl:

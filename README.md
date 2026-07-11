@@ -121,16 +121,19 @@ repo = "https://codeberg.org/owner/plugin@main"
 
 The optional `@revision` is taken from the URL path; `@` in URL userinfo is not
 treated as a revision separator. URL repositories are cached below
-`~/.cache/rsplug/repos/` using their host and path.
+`~/.cache/rsplug/repos/` under a canonical identity shared with the lockfile:
+scheme and userinfo are removed, the host is lowercased, default ports
+(80/443/22/9418) are dropped but non-default ports are kept, and trailing
+`.git` is removed.
 
 The default lockfile is `~/.cache/rsplug/rsplug.lock.json`. Set another path
 with `--lockfile`. It records the resolved Git commit for each repository:
 
 ```json
 {
-  "version": "1",
+  "version": "2",
   "locked": {
-    "https://github.com/owner/plugin": {
+    "github.com/owner/plugin": {
       "type": "git",
       "rev": "40-character-commit-sha"
     }
@@ -266,8 +269,10 @@ Default paths below `~/.cache/rsplug/` are `init.lua`, `repos/`,
 
 The current release includes bounded parallel work, staged GitHub tarball
 downloads with Git fallback, snapshot manifests, anonymous script-only entries,
-preserved `on_source` names after merging, and consistent `merge = false`
-semantics for startup and lazy plugins. The generated bootstrap is required for
+preserved `on_source` names after merging, consistent `merge = false`
+semantics for startup and lazy plugins, and a canonical repository identity
+shared by the lockfile and cache path so URL variants of one repository no
+longer split into separate entries. The generated bootstrap is required for
 the v0.2 package layout; older configurations using only
 `vim.opt.packpath:prepend '~/.cache/rsplug'` should switch to the `dofile` line
 shown above.

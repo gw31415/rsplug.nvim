@@ -85,7 +85,7 @@ impl Serialize for RepoSource {
 }
 
 impl RepoSource {
-    /// git url
+    /// git url（fetch/tarball/error 表示用の実際 URL）。
     pub fn url(&self) -> String {
         match self {
             RepoSource::GitHub { owner, repo, .. } => util::github::url(owner, repo),
@@ -93,45 +93,27 @@ impl RepoSource {
         }
     }
 
-    /// Relative to the `repos` cache namespace.
-    /// GitHub: `github.com/owner/repo`; URL: `host/path`.
-    pub(crate) fn default_cachedir(&self) -> PathBuf {
+    /// Canonical repository identity（PLANS「Model and repository identity」）。
+    /// `host[:port]/path` 形式で、host は小文字化、デフォルトポート・userinfo・scheme・
+    /// 末尾 `.git` は削除される。GitHub shorthand は `github.com/owner/repo`。
+    /// lock key と cache path をこの同一 identity で統一し、表記揺れによる重複を防ぐ。
+    pub(crate) fn canonical(&self) -> String {
         match self {
             RepoSource::GitHub { owner, repo, .. } => {
-                let mut path = PathBuf::new();
-                path.push("github.com");
-                path.push(owner);
-                path.push(repo.as_ref());
-                path
+                format!("github.com/{}/{}", owner, repo)
             }
-            RepoSource::Git { url, .. } => {
-                // scheme://[userinfo@]host[:port]/path → host/path (no scheme, auth, port, or .git)
-                let s = url.as_ref();
-                let after_scheme = s.find("://").map(|i| &s[i + 3..]).unwrap_or(s);
-                let normalized = if let Some(slash) = after_scheme.find('/') {
-                    let authority = &after_scheme[..slash];
-                    let host_start = authority.rfind('@').map(|at| at + 1).unwrap_or(0);
-                    let host = authority[host_start..]
-                        .split(':')
-                        .next()
-                        .unwrap_or(&authority[host_start..]);
-                    format!("{}{}", host, &after_scheme[slash..])
-                } else {
-                    let host_start = after_scheme.rfind('@').map(|at| at + 1).unwrap_or(0);
-                    after_scheme[host_start..]
-                        .split(':')
-                        .next()
-                        .unwrap_or(&after_scheme[host_start..])
-                        .to_string()
-                };
-                let path_str = normalized.trim_end_matches(".git");
-                let mut result = PathBuf::new();
-                for comp in path_str.split('/').filter(|s| !s.is_empty()) {
-                    result.push(comp);
-                }
-                result
-            }
+            RepoSource::Git { url, .. } => util::repo::canonicalize_url(url),
         }
+    }
+
+    /// Relative to the `repos` cache namespace.
+    /// GitHub: `github.com/owner/repo`; URL: `host[:port]/path`。[`canonical`] の PathBuf 版。
+    pub(crate) fn default_cachedir(&self) -> PathBuf {
+        let mut path = PathBuf::new();
+        for comp in self.canonical().split('/').filter(|s| !s.is_empty()) {
+            path.push(comp);
+        }
+        path
     }
 
     /// token 認証の対象となる GitHub HTTPS URL かどうか。
@@ -363,6 +345,8 @@ impl Plugin {
         let source_git = source_git_dir(&r_root);
         let worktrees = worktrees_dir(&r_root);
         let url: Arc<str> = Arc::from(repo.url());
+        // lock key 用の canonical identity（fetch/tarball/error 表示用の実 URL とは別）。
+        let canonical = repo.canonical();
 
         // GitHub HTTPS URL かつ環境変数に token があれば認証フェッチする。
         let token = if repo.is_github_https() {
@@ -699,7 +683,7 @@ impl Plugin {
             is_plugctl: false,
             dotgit,
         };
-        let lock_info = Some((url.to_string(), head_rev_str));
+        let lock_info = Some((canonical, head_rev_str));
 
         Ok(Some((loaded, lock_info)))
     }
@@ -1269,6 +1253,69 @@ mod tests {
             repo.default_cachedir(),
             PathBuf::from("gitlab.com/owner/plugin")
         );
+    }
+
+    #[test]
+    fn canonical_normalizes_repo_identity() {
+        // GitHub shorthand（owner/repo のケースは保持）
+        assert_eq!(
+            RepoSource::from_str("owner/repo").unwrap().canonical(),
+            "github.com/owner/repo"
+        );
+        // HTTPS + 末尾 .git 削除
+        assert_eq!(
+            RepoSource::from_str("https://github.com/o/r.git")
+                .unwrap()
+                .canonical(),
+            "github.com/o/r"
+        );
+        // SSH + userinfo + .git → 同一 identity
+        assert_eq!(
+            RepoSource::from_str("ssh://git@github.com/o/r.git")
+                .unwrap()
+                .canonical(),
+            "github.com/o/r"
+        );
+        // host 小文字化
+        assert_eq!(
+            RepoSource::from_str("https://GitHub.COM/o/r")
+                .unwrap()
+                .canonical(),
+            "github.com/o/r"
+        );
+        // デフォルトポート削除
+        assert_eq!(
+            RepoSource::from_str("https://gitlab.com:443/o/r")
+                .unwrap()
+                .canonical(),
+            "gitlab.com/o/r"
+        );
+        // 非デフォルトポート保持
+        assert_eq!(
+            RepoSource::from_str("https://gitlab.com:2222/o/r")
+                .unwrap()
+                .canonical(),
+            "gitlab.com:2222/o/r"
+        );
+    }
+
+    #[test]
+    fn default_cachedir_matches_canonical_components() {
+        // canonical() の `/` 区切り == default_cachedir() のコンポーネント。
+        for s in [
+            "owner/repo",
+            "https://github.com/o/r.git",
+            "https://gitlab.com:2222/o/r",
+            "ssh://git@GitHub.COM/o/r.git",
+        ] {
+            let repo = RepoSource::from_str(s).unwrap();
+            let expected: PathBuf = repo
+                .canonical()
+                .split('/')
+                .filter(|seg| !seg.is_empty())
+                .collect();
+            assert_eq!(repo.default_cachedir(), expected, "mismatch for {:?}", s);
+        }
     }
 
     #[test]
