@@ -433,10 +433,10 @@ impl Add for LoadedPlugin {
         if self.lazy_type != rhs.lazy_type {
             return (self, Some(rhs));
         }
-        // `merge = false` is a user-plugin policy, independent of whether the
-        // plugin is start- or opt-loaded.  Generated PlugCtl artifacts retain
-        // their internal aggregation behavior, but must never merge with user
-        // plugins.
+        // `merge = false` は start/opt を問わずユーザプラグインのマージを阻止する。
+        // 生成された PlugCtl アーティファクトはユーザ設定によらず内部集約できるが、
+        // ユーザプラグインと混ざってはならない。なお `merge` のデフォルトは true
+        // （MergeConfig: Default + `#[serde(default)]`）なので、未指定ならマージする。
         if self.is_plugctl != rhs.is_plugctl
             || !(self.is_plugctl || self.merge_enabled && rhs.merge_enabled)
         {
@@ -2286,6 +2286,37 @@ mod tests {
         let (a, b, dir) = two_dir_plugins("disjoint", "a.lua", "b.lua");
         let (_merged, rest) = a + b;
         assert!(rest.is_none(), "disjoint directory children should merge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 2 回帰防止: manifest が存在しても filesystem と同じマージ結果（disjoint は成立）
+    /// になること。manifest 駆動プローブが filesystem とずれないか検証する。
+    #[tokio::test]
+    async fn manifest_driven_disjoint_directory_children_merge() {
+        let (a, b, dir) = two_dir_plugins("disjoint-mfst", "a.lua", "b.lua");
+        for root in ["a", "b"] {
+            SnapshotManifest::build_and_write(&dir.join(root), false, ".rsplug_build_success")
+                .await
+                .unwrap();
+        }
+        let (_merged, rest) = a + b;
+        assert!(
+            rest.is_none(),
+            "manifest present: disjoint directory children should still merge"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 1 回帰防止: opt プラグイン（merge_enabled=true, デフォルト）はマージすること。
+    /// main では opt の merge_enabled ガードをスキップしていたが、Phase 1 で両方に適用した
+    /// ことで merge=true の opt マージまで壊れていないか検証する。
+    #[test]
+    fn opt_plugins_with_default_merge_still_merge() {
+        let (mut a, mut b, dir) = two_dir_plugins("opt-merge", "a.lua", "b.lua");
+        a.lazy_type = LazyType::Opt(Default::default());
+        b.lazy_type = LazyType::Opt(Default::default());
+        let (_merged, rest) = a + b;
+        assert!(rest.is_none(), "opt plugins with merge=true should merge");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

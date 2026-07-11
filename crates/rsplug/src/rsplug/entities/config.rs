@@ -199,6 +199,7 @@ pub(super) struct PluginConfig {
     #[serde_as(as = "FromInto<SetupScriptOne>")]
     pub script: SetupScript,
     #[serde(flatten)]
+    #[serde(default)]
     pub merge: MergeConfig,
 }
 
@@ -305,6 +306,18 @@ pub struct MergeConfig {
     pub merge: bool,
 }
 
+impl Default for MergeConfig {
+    /// `merge` を設定ファイルで言及しない場合のデフォルト。**merge = true**（未指定なら
+    /// マージする）。`#[serde(flatten)]` で MergeConfig 全体が未指定のときもこの Default が
+    /// 使われるよう、PluginConfig 側に `#[serde(default)]` を併用する。
+    fn default() -> Self {
+        Self {
+            ignore: default_ignore(),
+            merge: true,
+        }
+    }
+}
+
 fn default_merge_true() -> bool {
     true
 }
@@ -326,6 +339,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_defaults_to_true_when_absent() {
+        // `merge` を設定ファイルで言及しない場合のデフォルトは true でなければならない
+        // （未指定ならマージする）。かつて flatten 周りで false に落ちていた回帰。
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "owner/plugin"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.plugins[0].merge.merge,
+            "merge must default to true when absent"
+        );
+    }
+
+    #[test]
+    fn merge_defaults_to_true_when_only_ignore_present() {
+        // flatten で MergeConfig が部分 populate（ignore のみ）される場合も、
+        // merge bool 未指定なら true にならなければならない。
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "owner/plugin"
+            ignore = "*.tmp"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.plugins[0].merge.merge,
+            "merge must default to true even when only ignore is set"
+        );
+    }
 
     #[test]
     fn plugin_config_deserializes_lua_start() {
