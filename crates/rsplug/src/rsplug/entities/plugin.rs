@@ -651,6 +651,11 @@ impl Plugin {
         // それ以外は sealed-dir のまま（install で copy_tree が clonefile/per-file copy で配置）。
         let mut file_entries: Vec<(PathBuf, FileItem)> = Vec::with_capacity(entries.len());
         for name in &entries {
+            // Phase 2 の manifest は cache 内部ファイル。pack に含めず、全プラグインで
+            // 同 path が衝突してマージを阻害する原因にもしないため、列挙から除外する。
+            if name == Path::new(MANIFEST_FILE) {
+                continue;
+            }
             // dotgit=true なら `.git` を ignore から救出して通常エントリに含める。
             if !(dotgit && name == Path::new(".git") || !merge.ignore.matched(name)) {
                 continue;
