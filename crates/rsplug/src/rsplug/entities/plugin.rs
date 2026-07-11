@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dag::{DagError, TryDag, iterator::DagIteratorMapFuncArgs};
+use dag::{TryDag, iterator::DagIteratorMapFuncArgs};
 use git2::Oid;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -228,8 +228,31 @@ impl FromStr for RepoSource {
 
 impl Plugin {
     /// 設定ファイルから Plugin のコレクションを構築する
-    pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, DagError> {
+    pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, Error> {
         let Config { plugins } = config;
+
+        // Phase 3A: 設定バリデーション。script-only（repo 無し）は安定 id が必須で、
+        // build/lua_build/lua_post_update/dotgit を持ってはならない。
+        for plug in &plugins {
+            if plug.cache.repo.is_none() {
+                if plug.stable_id().is_none() {
+                    return Err(Error::ConfigValidation {
+                        msg: "script-only plugin (no `repo`) requires an explicit `id` (or legacy `name`)"
+                            .into(),
+                    });
+                }
+                if !plug.cache.build.is_empty()
+                    || plug.cache.lua_build.is_some()
+                    || plug.cache.lua_post_update.is_some()
+                    || plug.cache.dotgit
+                {
+                    return Err(Error::ConfigValidation {
+                        msg: "script-only plugin (no `repo`) cannot have `build`/`lua_build`/`lua_post_update`/`dotgit`"
+                            .into(),
+                    });
+                }
+            }
+        }
 
         // order は (depth, config_index) の複合キー。depth と index は dag 側で
         // 計算して map 関数に渡される。tiebreak は config 出現順。
@@ -238,8 +261,8 @@ impl Plugin {
         // 重複チェック・UnknownDependency 検出は dag 側に委譲する。
         let mut id_to_index = hashbrown::HashMap::new();
         for (index, plug) in plugins.iter().enumerate() {
-            if let Some(dep_name) = plug.dep_name() {
-                id_to_index.insert(dep_name.to_string(), index);
+            if let Some(id) = plug.stable_id() {
+                id_to_index.insert(id.to_string(), index);
             }
         }
         let cachedirs = plugins
@@ -255,7 +278,7 @@ impl Plugin {
                       dependents_iter,
                   }| {
                 let order = depth * (total + 1) + index;
-                let source_name = inner.dep_name().map(str::to_string);
+                let source_name = inner.stable_id().map(str::to_string);
                 let PluginConfig {
                     cache,
                     lazy_type,
@@ -1343,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn unnamed_script_only_plugin_is_not_source_addressable() {
+    fn script_only_plugin_with_id_is_source_addressable_and_resolves_deps() {
         let config: Config = toml::from_str(
             r#"
             [[plugins]]
@@ -1351,6 +1374,7 @@ mod tests {
             repo = "owner/plugin"
 
             [[plugins]]
+            id = "scriptdep"
             depends = ["dep"]
             lua_start = "vim.g.script_only = true"
             "#,
@@ -1363,8 +1387,27 @@ mod tests {
             .iter()
             .find(|plugin| plugin.cache.repo.is_none())
             .unwrap();
-        assert_eq!(script_only.source_name, None);
+        // Phase 3A: script-only は id を持ち source addressable になる。
+        assert_eq!(script_only.source_name.as_deref(), Some("scriptdep"));
         assert_eq!(script_only.dependency_cachedirs.len(), 1);
+    }
+
+    #[test]
+    fn unnamed_script_only_plugin_is_rejected() {
+        // Phase 3A: script-only（repo 無し）は id（または非推奨 name）が必須。
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            depends = ["dep"]
+            lua_start = "vim.g.script_only = true"
+
+            [[plugins]]
+            name = "dep"
+            repo = "owner/plugin"
+            "#,
+        )
+        .unwrap();
+        assert!(Plugin::new(config).is_err());
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use file_specifier::FileSpecifier;
 use hashbrown::HashMap;
 use sailfish::runtime::Render;
 use serde::{Deserialize, Deserializer};
-use serde_with::{FromInto, OneOrMany, serde_as};
+use serde_with::{FromInto, OneOrMany, TryFromInto, serde_as};
 
 use super::*;
 
@@ -86,8 +86,10 @@ struct LazyTypeDeserializer {
     on_map: KeyPattern,
 }
 
-impl From<LazyTypeDeserializer> for LazyType {
-    fn from(val: LazyTypeDeserializer) -> Self {
+impl TryFrom<LazyTypeDeserializer> for LazyType {
+    type Error = &'static str;
+
+    fn try_from(val: LazyTypeDeserializer) -> Result<Self, Self::Error> {
         let LazyTypeDeserializer {
             start,
             on_event,
@@ -97,10 +99,21 @@ impl From<LazyTypeDeserializer> for LazyType {
             on_source,
             on_map,
         } = val;
+        // `start = true` を遅延トリガと併用できない（Phase 3A）。
+        let lazy = !on_event.is_empty()
+            || !on_cmd.is_empty()
+            || !on_ft.is_empty()
+            || !on_func.is_empty()
+            || !on_source.is_empty()
+            || on_map != KeyPattern::default();
+        if start && lazy {
+            return Err("`start = true` cannot be combined with a lazy trigger \
+                 (on_event/on_cmd/on_ft/on_func/on_source/on_map)");
+        }
         if start {
-            LazyType::Start
+            Ok(LazyType::Start)
         } else {
-            LazyType::Opt(
+            Ok(LazyType::Opt(
                 on_event
                     .into_iter()
                     .map(LoadEvent::Autocmd)
@@ -110,7 +123,7 @@ impl From<LazyTypeDeserializer> for LazyType {
                     .chain(on_source.into_iter().map(LoadEvent::OnSource))
                     .chain(once(LoadEvent::OnMap(on_map)))
                     .collect(),
-            )
+            ))
         }
     }
 }
@@ -166,10 +179,14 @@ impl From<LazyType> for LazyTypeDeserializer {
 #[serde_as]
 #[derive(Deserialize)]
 pub(super) struct PluginConfig {
+    /// 安定 id（Phase 3A）。`depends`/`on_source` はこの id を参照する。
+    /// 省略時は非推奨の `name`、さらに repo basename から推論する（互換リリース）。
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(flatten)]
     pub cache: CacheConfig,
     #[serde(flatten)]
-    #[serde_as(as = "FromInto<LazyTypeDeserializer>")]
+    #[serde_as(as = "TryFromInto<LazyTypeDeserializer>")]
     pub lazy_type: LazyType,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
@@ -184,9 +201,14 @@ pub(super) struct PluginConfig {
 }
 
 impl PluginConfig {
-    pub(super) fn dep_name(&self) -> Option<&str> {
-        if let Some(custom_name) = &self.custom_name {
-            return Some(custom_name);
+    /// depends/on_source/DAG で参照される安定 id（Phase 3A）。
+    /// 明示 `id` > 非推奨 `name` > repo basename。いずれも無ければ `None`。
+    pub(super) fn stable_id(&self) -> Option<&str> {
+        if let Some(id) = &self.id {
+            return Some(id.as_str());
+        }
+        if let Some(name) = &self.custom_name {
+            return Some(name.as_str());
         }
         match &self.cache.repo {
             Some(RepoSource::GitHub { repo, .. }) => Some(repo.as_ref()),
@@ -210,7 +232,7 @@ fn repo_basename(url: &str) -> &str {
 
 impl DagNode for PluginConfig {
     fn id(&self) -> Option<&str> {
-        self.dep_name()
+        self.stable_id()
     }
     fn depends(&self) -> impl IntoIterator<Item = &impl AsRef<str>> {
         &self.depends
@@ -345,7 +367,7 @@ mod tests {
         .unwrap();
 
         assert!(config.plugins[0].cache.repo.is_none());
-        assert_eq!(config.plugins[0].dep_name(), None);
+        assert_eq!(config.plugins[0].stable_id(), None);
         assert!(
             config.plugins[0]
                 .script
@@ -411,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn dep_name_uses_repo_basename_for_git_url() {
+    fn stable_id_uses_repo_basename_for_git_url() {
         let config: Config = toml::from_str(
             r#"
             [[plugins]]
@@ -419,11 +441,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.plugins[0].dep_name(), Some("plugin.nvim"));
+        assert_eq!(config.plugins[0].stable_id(), Some("plugin.nvim"));
     }
 
     #[test]
-    fn dep_name_custom_name_overrides_repo_basename() {
+    fn stable_id_custom_name_overrides_repo_basename() {
         let config: Config = toml::from_str(
             r#"
             [[plugins]]
@@ -432,7 +454,34 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.plugins[0].dep_name(), Some("my-plugin"));
+        assert_eq!(config.plugins[0].stable_id(), Some("my-plugin"));
+    }
+
+    #[test]
+    fn stable_id_prefers_explicit_id() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "https://gitlab.com/owner/plugin.nvim.git"
+            id = "explicit-id"
+            name = "legacy-name"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.plugins[0].stable_id(), Some("explicit-id"));
+    }
+
+    #[test]
+    fn start_with_lazy_trigger_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [[plugins]]
+            repo = "owner/plugin"
+            start = true
+            on_event = ["VimEnter"]
+            "#,
+        );
+        assert!(err.is_err(), "start + lazy trigger must be rejected");
     }
 }
 

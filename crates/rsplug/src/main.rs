@@ -302,8 +302,6 @@ enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
-    #[error(transparent)]
-    Dag(#[from] dag::DagError),
 }
 
 fn format_toml_parse_error(

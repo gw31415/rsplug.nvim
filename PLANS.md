@@ -136,6 +136,25 @@ retains scheme/host/non-default-port/path. Use it as the lock v2 key and in a
 cache path with a 128-bit hash suffix. Read lock v1 by normalizing configured
 keys in memory; reject conflicting revisions; write v2 on non-locked runs.
 
+### Status (2026-07-11) — partial (3A done)
+
+Implemented and validated (test/clippy/fmt green; e2e backward-compat
+confirmed: id-less configs still infer, explicit `id` works, generated
+init.lua loads in nvim headless).
+
+- **3A — `id` field (done):** `PluginConfig.id: Option<String>`;
+  `stable_id()` = explicit `id` > legacy `name` > repo basename. `depends`/
+  `on_source`/DAG/source_name all reference `stable_id` (so existing configs
+  keep working via inference). Validation in `Plugin::new` (routed via a new
+  `Error::ConfigValidation` + `Error::Dag(#[from])`): script-only (no repo)
+  requires a stable id and rejects `build`/`lua_build`/`lua_post_update`/
+  `dotgit`; duplicate ids via DAG (`DagError::DuplicateName`). `start=true` +
+  lazy trigger rejected at deserialize (`LazyType: TryFrom<LazyTypeDeserializer>`).
+- **Deferred from 3A:** the `name` deprecation *warning* (needs a log Message
+  variant + rendering; non-fatal, deferred).
+- **3B — `RemoteUrl`/`RepoIdentity` + canonical identity + lock v2:** not started.
+- **3C — explicit models (`PluginSpec`/`ResolvedGraph`/...) + `propagate_to_dependency`:** not started (largest piece).
+
 ## Phase 4 — atomic publish and runtime hot paths
 
 Build each pack generation under `pack/_gen/.staging-*`, then publish it only

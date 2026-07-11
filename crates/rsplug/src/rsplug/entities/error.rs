@@ -22,4 +22,10 @@ pub enum Error {
     },
     #[error("Build Lua script failed with exit code {code} in repo {repo:?}")]
     BuildLuaScriptFailed { code: i32, repo: Arc<str> },
+    /// Dependency-graph 構築エラー（重複 id・未知の依存・閉路）。
+    #[error(transparent)]
+    Dag(#[from] dag::DagError),
+    /// 設定バリデーションエラー（Phase 3A: script-only の id 必須・build/dotgit 拒否等）。
+    #[error("invalid plugin config: {msg}")]
+    ConfigValidation { msg: String },
 }
