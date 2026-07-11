@@ -11,7 +11,7 @@ use file_specifier::FileSpecifier;
 use hashbrown::HashMap;
 use sailfish::runtime::Render;
 use serde::{Deserialize, Deserializer};
-use serde_with::{FromInto, OneOrMany, TryFromInto, serde_as};
+use serde_with::{FromInto, OneOrMany, serde_as};
 
 use super::*;
 
@@ -86,10 +86,8 @@ struct LazyTypeDeserializer {
     on_map: KeyPattern,
 }
 
-impl TryFrom<LazyTypeDeserializer> for LazyType {
-    type Error = &'static str;
-
-    fn try_from(val: LazyTypeDeserializer) -> Result<Self, Self::Error> {
+impl From<LazyTypeDeserializer> for LazyType {
+    fn from(val: LazyTypeDeserializer) -> Self {
         let LazyTypeDeserializer {
             start,
             on_event,
@@ -99,21 +97,12 @@ impl TryFrom<LazyTypeDeserializer> for LazyType {
             on_source,
             on_map,
         } = val;
-        // `start = true` を遅延トリガと併用できない（Phase 3A）。
-        let lazy = !on_event.is_empty()
-            || !on_cmd.is_empty()
-            || !on_ft.is_empty()
-            || !on_func.is_empty()
-            || !on_source.is_empty()
-            || on_map != KeyPattern::default();
-        if start && lazy {
-            return Err("`start = true` cannot be combined with a lazy trigger \
-                 (on_event/on_cmd/on_ft/on_func/on_source/on_map)");
-        }
+        // `start = true` のとき遅延トリガは黙示無視して LazyType::Start になる。
+        // テスト/トグル目的で start=true を使うことがあるため、トリガとの併用を許す（main と同じ挙動）。
         if start {
-            Ok(LazyType::Start)
+            LazyType::Start
         } else {
-            Ok(LazyType::Opt(
+            LazyType::Opt(
                 on_event
                     .into_iter()
                     .map(LoadEvent::Autocmd)
@@ -123,7 +112,7 @@ impl TryFrom<LazyTypeDeserializer> for LazyType {
                     .chain(on_source.into_iter().map(LoadEvent::OnSource))
                     .chain(once(LoadEvent::OnMap(on_map)))
                     .collect(),
-            ))
+            )
         }
     }
 }
@@ -188,7 +177,7 @@ pub(super) struct PluginConfig {
     #[serde(flatten)]
     pub cache: CacheConfig,
     #[serde(flatten)]
-    #[serde_as(as = "TryFromInto<LazyTypeDeserializer>")]
+    #[serde_as(as = "FromInto<LazyTypeDeserializer>")]
     pub lazy_type: LazyType,
     #[serde_as(as = "OneOrMany<_>")]
     #[serde(default)]
@@ -548,16 +537,22 @@ mod tests {
     }
 
     #[test]
-    fn start_with_lazy_trigger_is_rejected() {
-        let err = toml::from_str::<Config>(
+    fn start_with_lazy_trigger_uses_start() {
+        // start=true のとき遅延トリガは黙示無視され LazyType::Start になる。
+        // テスト/トグル目的で start=true を使うことがあるため、トリガとの併用を許す（main と同じ）。
+        let config: Config = toml::from_str(
             r#"
             [[plugins]]
             repo = "owner/plugin"
             start = true
             on_event = ["VimEnter"]
             "#,
+        )
+        .unwrap();
+        assert!(
+            matches!(config.plugins[0].lazy_type, LazyType::Start),
+            "start=true must win and ignore lazy triggers"
         );
-        assert!(err.is_err(), "start + lazy trigger must be rejected");
     }
 }
 

@@ -120,11 +120,13 @@ Implemented and validated (`cargo test --workspace`, `cargo clippy --workspace
 
 ## Phase 3 — explicit public and internal models
 
-Add `id` to TOML. `depends` and `on_source` refer only to it. For one
-compatibility release, infer a missing ID from legacy `name`, then repository
-basename; reject duplicate inferred IDs and warn that `name` is deprecated.
-Script-only entries require `id` and reject build/dotgit fields. Reject
-`start=true` combined with a lazy trigger.
+Identity is **internal** (`id` = `name` ?? repository basename ?? script-content
+hash; not exposed in TOML). `depends` and `on_source` resolve against it. `name`
+is the user-facing optional override (default: basename) for disambiguating
+basename collisions; anonymous script-only entries are allowed and get a
+content-hash id. `start=true` wins over lazy triggers (triggers silently
+ignored), so users can toggle/test with `start=true` while leaving triggers in
+place.
 
 Replace flattened lifecycle handling with `PluginSpec`, `ResolvedGraph`,
 `MaterializationPlan`, `LazyRegistration`, `Artifact`, and `PackPlan`.
@@ -149,8 +151,9 @@ infer by basename, anonymous script-only generates successfully).
   collisions; anonymous script-only (e.g. start scripts that nothing references)
   is **allowed** and gets a content-hash internal id. `depends`/`on_source`/DAG
   resolve against the internal id; `source_name` = `dep_name` (name ?? basename,
-  `None` for anonymous script-only). `start=true` + lazy trigger rejected at
-  deserialize (`LazyType: TryFrom<LazyTypeDeserializer>`); duplicate ids via DAG.
+  `None` for anonymous script-only). `start=true` + lazy trigger is **allowed**
+  (start wins, triggers silently ignored) — the earlier 3A rejection was reverted
+  so users can toggle/test with `start=true`. Duplicate ids via DAG.
 - **Known separate bug (not 3A):** `LuaStartPluginTemplate` emits consecutive
   `(function()…end)()` with no separator, so 2+ `lua_start` scripts hit Lua
   "ambiguous syntax". Pre-existing; surfaced now that anonymous script-only is
