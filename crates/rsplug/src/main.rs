@@ -138,6 +138,9 @@ async fn app() -> Result<(), Error> {
 
     // プロセス全体で共有する HTTP クライアント（接続プール・HTTP/2 再利用）。
     let http_client = reqwest::Client::builder()
+        // GitHub API は User-Agent 無しを 403 で拒否する（administrative rules）。
+        // reqwest はデフォルトで User-Agent を送らないため明示的に設定する。
+        .user_agent(concat!("rsplug/", env!("CARGO_PKG_VERSION")))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(64)
         .tcp_keepalive(std::time::Duration::from_secs(60))

@@ -962,9 +962,7 @@ pub mod github {
             let resp = client
                 .post(GRAPHQL_URL)
                 .header("Authorization", format!("Bearer {token}"))
-                .header("X-GitHub-Api-Version", "2022-11-28")
                 .header("Content-Type", "application/json")
-                .header("Accept", "application/vnd.github+json")
                 .body(body_bytes)
                 .send()
                 .await
