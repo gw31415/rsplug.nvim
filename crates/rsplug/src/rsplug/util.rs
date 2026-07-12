@@ -791,6 +791,7 @@ pub mod github {
     }
 
     /// GraphQL バッチ rev 解決の入力（owner/repo + ref）。
+    #[derive(Clone)]
     pub(crate) struct GithubRev {
         pub owner: String,
         pub repo: String,
@@ -941,51 +942,43 @@ pub mod github {
         Ok(result)
     }
 
-    /// 全 GitHub リポジトリの最新 rev を1つの GraphQL リクエスト（chunk=50）で解決する。
-    /// 40-hex commit は呼出側で map に seed 済みを想定。`errors[]`/rate-limit は ApiError
-    /// （呼出側で per-repo フォールバック）。認証済み（token 有り）が前提。
-    pub(crate) async fn resolve_revs_via_graphql(
-        client: &reqwest::Client,
-        token: &str,
-        batch: &[GithubRev],
+    /// 1 chunk（複数リポジトリ）の GraphQL リクエストを送信し、結果をパースする。
+    pub(crate) async fn resolve_graphql_chunk(
+        client: reqwest::Client,
+        token: String,
+        chunk: Vec<GithubRev>,
     ) -> Result<std::collections::HashMap<(String, String), Option<String>>, ApiError> {
         const GRAPHQL_URL: &str = "https://api.github.com/graphql";
         const RATE_LIMIT_THRESHOLD: u64 = 50;
-        const CHUNK: usize = 50;
-        let mut result: std::collections::HashMap<(String, String), Option<String>> =
-            std::collections::HashMap::new();
-        for chunk in batch.chunks(CHUNK) {
-            let (query, mapping) = build_graphql_query(chunk);
-            let body = serde_json::json!({ "query": query });
-            let body_bytes = serde_json::to_vec(&body)
-                .map_err(|e| ApiError::Other(format!("serialize GraphQL query: {e}")))?;
-            let resp = client
-                .post(GRAPHQL_URL)
-                .header("Authorization", format!("Bearer {token}"))
-                .header("Content-Type", "application/json")
-                .body(body_bytes)
-                .send()
-                .await
-                .map_err(|e| ApiError::Other(e.to_string()))?;
-            if let Some(remaining) = resp
-                .headers()
-                .get("x-ratelimit-remaining")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                && remaining < RATE_LIMIT_THRESHOLD
-            {
-                return Err(ApiError::RateLimited);
-            }
-            if !resp.status().is_success() {
-                return Err(ApiError::Other(format!("GraphQL HTTP {}", resp.status())));
-            }
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| ApiError::Other(e.to_string()))?;
-            result.extend(parse_graphql_response(&text, &mapping)?);
+        let (query, mapping) = build_graphql_query(&chunk);
+        let body = serde_json::json!({ "query": query });
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| ApiError::Other(format!("serialize GraphQL query: {e}")))?;
+        let resp = client
+            .post(GRAPHQL_URL)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+        if let Some(remaining) = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            && remaining < RATE_LIMIT_THRESHOLD
+        {
+            return Err(ApiError::RateLimited);
         }
-        Ok(result)
+        if !resp.status().is_success() {
+            return Err(ApiError::Other(format!("GraphQL HTTP {}", resp.status())));
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Other(e.to_string()))?;
+        parse_graphql_response(&text, &mapping)
     }
 
     #[cfg(test)]

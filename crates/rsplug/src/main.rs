@@ -40,6 +40,90 @@ struct Args {
     config_files: Vec<String>,
 }
 
+/// per-plugin load のコンテキスト（Clone 可能）。各 load タスクに clone して渡す。
+#[derive(Clone)]
+struct LoadCtx {
+    locked: bool,
+    install: bool,
+    update: bool,
+    locked_map: Arc<BTreeMap<String, rsplug::LockedResource>>,
+    fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore,
+    http_client: reqwest::Client,
+    cache_dir: PathBuf,
+}
+
+/// load_one への locked_rev 指定。
+enum LoadRev {
+    /// --locked なら locked_map から（エラー含め既存通り）、それ以外は None（load 内 resolve）。
+    Auto,
+    /// 40-hex seeded または GraphQL 解決済み OID（None は per-repo fallback）。
+    Resolved(Option<Arc<str>>),
+}
+
+/// 1 plugin の load と後処理（LoadPluginDone・canon_to_remove 判定）。
+/// 既存 fan-out クロージャ本体を抽出。plugin.rs load はゼロ変更。
+async fn load_one(
+    plugin: rsplug::Plugin,
+    ctx: LoadCtx,
+    rev: LoadRev,
+) -> Result<
+    (
+        Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
+        Option<String>,
+    ),
+    Error,
+> {
+    let (locked_rev, repo_canon): (Option<Arc<str>>, Option<String>) = match rev {
+        LoadRev::Auto => {
+            if let Some(repo) = plugin.cache.repo.as_ref() {
+                let canonical = repo.canonical();
+                if ctx.locked
+                    && let Some(entry) = ctx.locked_map.get(&canonical)
+                {
+                    if entry.kind != rsplug::LockedResourceType::Git {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Unsupported lock type for {}: {:?}", canonical, entry.kind),
+                        )));
+                    }
+                    (Some(Arc::<str>::from(entry.rev.as_str())), Some(canonical))
+                } else if ctx.locked {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Missing locked revision for {}", canonical),
+                    )));
+                } else {
+                    (None, Some(canonical))
+                }
+            } else {
+                (None, None)
+            }
+        }
+        LoadRev::Resolved(oid) => {
+            let repo_canon = plugin.cache.repo.as_ref().map(|r| r.canonical());
+            (oid, repo_canon)
+        }
+    };
+    let result = plugin
+        .load(
+            ctx.install,
+            ctx.update,
+            ctx.cache_dir.as_path(),
+            locked_rev,
+            ctx.fetch_semaphore.clone(),
+            ctx.http_client.clone(),
+        )
+        .await;
+    msg(Message::LoadPluginDone);
+    let canon_to_remove =
+        if repo_canon.is_some() && result.is_ok() && result.as_ref().unwrap().is_none() {
+            repo_canon
+        } else {
+            None
+        };
+    Ok((result?, canon_to_remove))
+}
+
 async fn app() -> Result<(), Error> {
     let Args {
         install,
@@ -153,172 +237,189 @@ async fn app() -> Result<(), Error> {
         })?;
     // reqwest::Client は内部が Arc なので clone は安価。FnMut closure 内に move するため先に clone。
     let http_client = http_client.clone();
-    // --update/--install 時、fan-out 前に GitHub リポジトリ（Git バックエンドの GitHub HTTPS URL
-    // 含む）の最新 rev を GraphQL 1リクエスト/chunk で一括解決する。非 GitHub・wildcard・token なし・
-    // GraphQL 失敗時は preresolved に載せず、各 plugin の load 内で従来通り resolve_remote_oid で
-    // 解決する（パイプライン維持、ボトルネックを fetch から rev 解決に移動させない）。
-    // 解決済み OID は既存の locked_rev スロット経由で渡すため plugin.rs load はゼロ変更。
-    let preresolved_map: Arc<HashMap<String, Arc<str>>> = if !locked && (install || update) {
-        // 同一 canonical・異 rev の衝突を検出（該当 plugin は batch 対外＝個別 fallback）。
-        let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
-        let mut conflicts: HashSet<String> = HashSet::new();
-        for p in plugins.iter() {
-            if let Some(repo) = p.cache.repo.as_ref() {
-                let canonical = repo.canonical();
-                let rev = repo.rev();
-                match seen_rev.get(&canonical) {
-                    Some(existing) if *existing != rev => {
-                        conflicts.insert(canonical);
-                    }
-                    None => {
-                        seen_rev.insert(canonical, rev);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let token = rsplug::util::github::token();
-        let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
-        let mut seeded: HashMap<String, Arc<str>> = HashMap::new();
-        for p in plugins.iter() {
-            let Some(repo) = p.cache.repo.as_ref() else {
-                continue;
-            };
+    // --update/--install 時、GitHub リポジトリ（Git バックエンドの GitHub HTTPS URL 含む）の最新 rev を
+    // GraphQL で解決する。ただし **GraphQL chunk の完了ごとに該当 plugin の load を段階的に spawn** し、
+    // GraphQL のレイテンシを fetch と重ねる（パイプライン）。非 GitHub・wildcard・40-hex・token なし・
+    // 衝突・--locked・flagless は即 load（GraphQL と並行）。plugin.rs load はゼロ変更（locked_rev 経由）。
+
+    // 衝突検出（同一 canonical・異 rev は batch 対外＝個別 fallback）。
+    let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
+    let mut conflicts: HashSet<String> = HashSet::new();
+    for p in plugins.iter() {
+        if let Some(repo) = p.cache.repo.as_ref() {
             let canonical = repo.canonical();
-            if conflicts.contains(&canonical) {
+            let rev = repo.rev();
+            match seen_rev.get(&canonical) {
+                Some(existing) if *existing != rev => {
+                    conflicts.insert(canonical);
+                }
+                None => {
+                    seen_rev.insert(canonical, rev);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let token = rsplug::util::github::token();
+    let do_graphql = !locked && (install || update) && token.is_some();
+
+    // partition（by-value）。各 plugin は immediate（即 load）か graphql_pending（chunk 完了後に load）へ。
+    let mut immediate: Vec<(rsplug::Plugin, LoadRev)> = Vec::new();
+    let mut graphql_pending: Vec<Option<(rsplug::Plugin, String)>> = Vec::new();
+    let mut canonical_to_pending: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
+    for p in plugins {
+        let Some(repo) = p.cache.repo.as_ref() else {
+            // script-only: 即 load（Auto、rev は不要）。
+            immediate.push((p, LoadRev::Auto));
+            continue;
+        };
+        let canonical = repo.canonical();
+        if locked || !do_graphql || conflicts.contains(&canonical) {
+            // --locked / flagless / 衝突: 即 load（Auto、--locked なら locked_map lookup）。
+            immediate.push((p, LoadRev::Auto));
+            continue;
+        }
+        let rev = repo.rev();
+        if rev
+            .as_deref()
+            .is_some_and(rsplug::util::github::is_full_hex_hash)
+        {
+            // 40-hex commit: 即 load、OID seed 済み。
+            immediate.push((p, LoadRev::Resolved(rev)));
+        } else if repo.is_github_https()
+            && !rev.as_deref().is_some_and(|r| r.contains('*'))
+            && let Some((owner, rname)) = rsplug::util::github::parse_github_url(&repo.url())
+        {
+            // GitHub GraphQL 対象: chunk 完了後に load。
+            graphql_batch.push(rsplug::util::github::GithubRev {
+                owner,
+                repo: rname,
+                rev: rev.as_deref().map(ToString::to_string),
+            });
+            let idx = graphql_pending.len();
+            graphql_pending.push(Some((p, canonical.clone())));
+            canonical_to_pending.entry(canonical).or_default().push(idx);
+        } else {
+            // 非 GitHub・wildcard: 即 load（Resolved(None)、load 内 resolve_remote_oid）。
+            immediate.push((p, LoadRev::Resolved(None)));
+        }
+    }
+
+    let ctx = LoadCtx {
+        locked,
+        install,
+        update,
+        locked_map: Arc::clone(&locked_map),
+        fetch_semaphore: fetch_semaphore.clone(),
+        http_client: http_client.clone(),
+        cache_dir: DEFAULT_REPOCACHE_DIR.clone(),
+    };
+
+    let mut load_tasks = JoinSet::new();
+
+    // immediate plugin を即 spawn（GraphQL と並行）。
+    for (plugin, rev) in immediate {
+        let ctx = ctx.clone();
+        load_tasks.spawn(async move { load_one(plugin, ctx, rev).await });
+    }
+
+    // GraphQL chunk を並列送信し、完了ごとに該当 plugin の load を spawn（段階公開）。
+    let token_str = token.unwrap_or("");
+    let mut chunk_tasks = JoinSet::new();
+    for chunk in graphql_batch.chunks(25) {
+        let chunk_canonicals: Vec<String> = chunk
+            .iter()
+            .map(|g| format!("github.com/{}/{}", g.owner, g.repo))
+            .collect();
+        let client = http_client.clone();
+        let token_owned = token_str.to_string();
+        let chunk_owned = chunk.to_vec();
+        chunk_tasks.spawn(async move {
+            let result =
+                rsplug::util::github::resolve_graphql_chunk(client, token_owned, chunk_owned).await;
+            (result, chunk_canonicals)
+        });
+    }
+    while let Some(join_res) = chunk_tasks.join_next().await {
+        let (result, chunk_canonicals) = match join_res {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[rsplug] GraphQL chunk join error: {e}; affected plugins fall back to per-repo"
+                );
                 continue;
             }
-            let rev = repo.rev();
-            if rev
-                .as_deref()
-                .is_some_and(rsplug::util::github::is_full_hex_hash)
-            {
-                seeded.insert(canonical, rev.unwrap());
-            } else if repo.is_github_https()
-                && !rev.as_deref().is_some_and(|r| r.contains('*'))
-                && token.is_some()
-                && let Some((owner, rname)) = rsplug::util::github::parse_github_url(&repo.url())
-            {
-                graphql_batch.push(rsplug::util::github::GithubRev {
-                    owner,
-                    repo: rname,
-                    rev: rev.as_deref().map(ToString::to_string),
-                });
-            }
-            // 非 GitHub・wildcard・token なし はここでは解決せず load 内へ（preresolved に載せない）。
-        }
-        let mut map: HashMap<String, Arc<str>> = seeded;
-        if let Some(tok) = token {
-            match rsplug::util::github::resolve_revs_via_graphql(&http_client, tok, &graphql_batch)
-                .await
-            {
-                Ok(oids) => {
-                    for ((o, r), maybe_oid) in oids {
-                        if let Some(oid) = maybe_oid {
-                            map.insert(format!("github.com/{o}/{r}"), Arc::<str>::from(oid));
-                        }
+        };
+        let err_reason = match &result {
+            Ok(_) => None,
+            Err(rsplug::util::github::ApiError::RateLimited) => Some("rate-limited".to_string()),
+            Err(rsplug::util::github::ApiError::Other(s)) => Some(s.clone()),
+        };
+        let oid_map = result.unwrap_or_default();
+        for canon in chunk_canonicals {
+            let oid = if err_reason.is_some() {
+                None
+            } else {
+                // canonical = github.com/{owner}/{repo} → (owner, repo) で oid_map を引く。
+                let rest = canon.strip_prefix("github.com/").unwrap_or(&canon);
+                let mut parts = rest.split('/');
+                let owner = parts.next().unwrap_or("");
+                let repo = parts.next().unwrap_or("");
+                oid_map
+                    .get(&(owner.to_string(), repo.to_string()))
+                    .cloned()
+                    .flatten()
+                    .map(Arc::<str>::from)
+            };
+            if let Some(indices) = canonical_to_pending.remove(&canon) {
+                for idx in indices {
+                    if let Some((plugin, _)) = graphql_pending[idx].take() {
+                        let ctx = ctx.clone();
+                        let rev = LoadRev::Resolved(oid.clone());
+                        load_tasks.spawn(async move { load_one(plugin, ctx, rev).await });
                     }
-                }
-                Err(e) => {
-                    let reason = match e {
-                        rsplug::util::github::ApiError::RateLimited => "rate-limited".into(),
-                        rsplug::util::github::ApiError::Other(s) => s,
-                    };
-                    msg(Message::GraphQLBatchFailed { reason });
                 }
             }
         }
-        Arc::new(map)
-    } else {
-        Arc::new(HashMap::new())
-    };
-    let (plugins, lock_infos, remove_canons) = {
-        let res = plugins
-            .into_iter()
-            .map(|plugin| {
-                let locked_map = Arc::clone(&locked_map);
-                let fetch_semaphore = fetch_semaphore.clone();
-                let http_client = http_client.clone();
-                let preresolved_map = Arc::clone(&preresolved_map);
-                async move {
-                    let (locked_rev, repo_canon): (Option<Arc<str>>, Option<String>) =
-                        if let Some(repo) = plugin.cache.repo.as_ref() {
-                            let canonical = repo.canonical();
-                            if locked {
-                                if let Some(entry) = locked_map.get(&canonical) {
-                                    if entry.kind != rsplug::LockedResourceType::Git {
-                                        return Err(Error::Io(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            format!(
-                                                "Unsupported lock type for {}: {:?}",
-                                                canonical, entry.kind
-                                            ),
-                                        )));
-                                    }
-                                    (Some(Arc::<str>::from(entry.rev.as_str())), Some(canonical))
-                                } else {
-                                    return Err(Error::Io(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        format!("Missing locked revision for {}", canonical),
-                                    )));
-                                }
-                            } else {
-                                (preresolved_map.get(&canonical).cloned(), Some(canonical))
-                            }
-                        } else {
-                            (None, None)
-                        };
-                    let result = plugin
-                        .load(
-                            install,
-                            update,
-                            DEFAULT_REPOCACHE_DIR.as_path(),
-                            locked_rev,
-                            fetch_semaphore,
-                            http_client.clone(),
-                        )
-                        .await;
-                    msg(Message::LoadPluginDone);
-                    // Distinguish: repo present but load returned None means
-                    // not-installed (cache missing) → mark for lock removal.
-                    let canon_to_remove = if repo_canon.is_some()
-                        && result.is_ok()
-                        && result.as_ref().unwrap().is_none()
-                    {
-                        repo_canon
-                    } else {
-                        None
-                    };
-                    Ok((result?, canon_to_remove))
+        if let Some(reason) = err_reason {
+            msg(Message::GraphQLBatchFailed { reason });
+        }
+    }
+    // 残存（chunk panic/JoinError で canonical_to_pending に残った分）を救済: None で load。
+    for (_, indices) in canonical_to_pending.drain() {
+        for idx in indices {
+            if let Some((plugin, _)) = graphql_pending[idx].take() {
+                let ctx = ctx.clone();
+                load_tasks
+                    .spawn(async move { load_one(plugin, ctx, LoadRev::Resolved(None)).await });
+            }
+        }
+    }
+    let res = load_tasks.join_all().await;
+    // Wait until all loading is complete.
+    // NOTE: It does not abort if an error occurs (because of the build process).
+    msg(Message::LoadDone);
+    let (plugins, lock_infos, remove_canons) = res
+        .into_iter()
+        .try_fold(
+            (BinaryHeap::new(), Vec::new(), Vec::new()),
+            |(mut plugins, mut locks, mut remove_canons), res| {
+                let (result, canon_to_remove) = res?;
+                if let Some((loaded, lock_info)) = result {
+                    plugins.push(loaded);
+                    if let Some(lock_info) = lock_info {
+                        locks.push(lock_info);
+                    }
                 }
-            })
-            .collect::<JoinSet<_>>()
-            .join_all()
-            .await;
-        // Wait until all loading is complete.
-        // NOTE: It does not abort if an error occurs (because of the build process).
-        msg(Message::LoadDone);
-        let (plugins, locks, remove_canons) = res
-            .into_iter()
-            .try_fold(
-                (BinaryHeap::new(), Vec::new(), Vec::new()),
-                |(mut plugins, mut locks, mut remove_canons), res| {
-                    let (result, canon_to_remove) = res?;
-                    if let Some((loaded, lock_info)) = result {
-                        plugins.push(loaded);
-                        if let Some(lock_info) = lock_info {
-                            locks.push(lock_info);
-                        }
-                    }
-                    if let Some(canon) = canon_to_remove {
-                        remove_canons.push(canon);
-                    }
-                    Ok::<_, Box<Error>>((plugins, locks, remove_canons))
-                },
-            )
-            .map_err(|e| *e)?;
-        (plugins, locks, remove_canons)
-    };
+                if let Some(canon) = canon_to_remove {
+                    remove_canons.push(canon);
+                }
+                Ok::<_, Box<Error>>((plugins, locks, remove_canons))
+            },
+        )
+        .map_err(|e| *e)?;
     let total_count = plugins.len();
 
     // Create PackPathState and load packages into it.
