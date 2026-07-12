@@ -398,6 +398,9 @@ async fn app() -> Result<(), Error> {
         }
     }
     let res = load_tasks.join_all().await;
+    // LoadCtx が locked_map の Arc クローンを保持しているため、ここで捨てないと
+    // 後段の Arc::try_unwrap(locked_map) が失敗（panic）する。
+    drop(ctx);
     // Wait until all loading is complete.
     // NOTE: It does not abort if an error occurs (because of the build process).
     msg(Message::LoadDone);
