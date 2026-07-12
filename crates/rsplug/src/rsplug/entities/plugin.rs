@@ -399,11 +399,15 @@ impl Plugin {
                     url, locked_rev
                 )));
             }
-            (
-                Oid::from_str(locked_rev).map_err(Error::Git2)?,
-                false,
-                false,
-            )
+            let oid = Oid::from_str(locked_rev).map_err(Error::Git2)?;
+            // locked_rev は --lock 由来（lock 固定、更新概念なし）または preresolved（GraphQL、--update）。
+            // update=true なら preresolved: 既存 snapshot と比較して「実際に更新された」を立て、
+            // lua_post_update を実行させる（lua_post_update は新規 fetch 時のみ）。
+            let was_updated = update
+                && latest_snapshot_oid(&worktrees)
+                    .await?
+                    .is_some_and(|existing| existing != oid);
+            (oid, was_updated, false)
         } else {
             match latest_snapshot_oid(&worktrees).await? {
                 Some(existing) if update => {
