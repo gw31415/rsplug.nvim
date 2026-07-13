@@ -70,6 +70,11 @@ pub enum Message {
     GraphQLBatchFailed {
         reason: String,
     },
+    /// GraphQL rev 解決の進捗（resolved/total リポジトリ）。resolved>=total で完了。
+    GraphQLResolveProgress {
+        resolved: usize,
+        total: usize,
+    },
     InstallSkipped(Arc<str>),
     InstallYank {
         id: Arc<str>,
@@ -88,6 +93,7 @@ type Logger = (MessageSender, LoggerCloser);
 
 static LOGGER: Lazy<Logger> = Lazy::new(init);
 
+const GRAPHQL_PROGRESS_ID: &str = "graphql_resolve";
 const CACHE_FETCH_PROGRESS_ID: &str = "cache_fetch_progress";
 const CACHE_FETCH_STAGE_ID: &str = "cache_fetch_stage";
 const CACHE_FETCH_DONE_ID: &str = "cache_fetch_done";
@@ -302,6 +308,8 @@ enum ChildKey {
     FetchProgress,
     /// Updating 行（`self.updating_bar`）。
     Updating,
+    /// GraphQL rev 解決進捗行（`progress_bars[GRAPHQL_PROGRESS_ID]`）。
+    GraphQLResolve,
     /// ビルド行（`progress_bars[id]`）。
     Building(Arc<String>),
 }
@@ -613,6 +621,7 @@ impl ProgressManager {
             ChildKey::FetchDone => self.progress_bars.get(CACHE_FETCH_DONE_ID),
             ChildKey::FetchProgress => self.progress_bars.get(CACHE_FETCH_PROGRESS_ID),
             ChildKey::Updating => self.updating_bar.as_ref(),
+            ChildKey::GraphQLResolve => self.progress_bars.get(GRAPHQL_PROGRESS_ID),
             ChildKey::Building(id) => self.progress_bars.get(id.as_str()),
         }
     }
@@ -622,11 +631,12 @@ impl ProgressManager {
     /// 罫線（├─/└─）はこの優先順で決める。Building 同士は元の追加順を維持（sort は安定）。
     fn category_rank(key: &ChildKey) -> u8 {
         match key {
-            ChildKey::Updating => 0,
-            ChildKey::FetchStage => 1,
-            ChildKey::FetchDone => 2,
-            ChildKey::FetchProgress => 3,
-            ChildKey::Building(_) => 4,
+            ChildKey::GraphQLResolve => 0,
+            ChildKey::Updating => 1,
+            ChildKey::FetchStage => 2,
+            ChildKey::FetchDone => 3,
+            ChildKey::FetchProgress => 4,
+            ChildKey::Building(_) => 5,
         }
     }
 
@@ -670,6 +680,8 @@ impl ProgressManager {
                         self.pb_style_fetch_note_child_mid.clone()
                     }
                 }
+                ChildKey::GraphQLResolve if is_level1_last => self.pb_style_fetch_bar_last.clone(),
+                ChildKey::GraphQLResolve => self.pb_style_fetch_bar_mid.clone(),
                 ChildKey::FetchProgress if is_level1_last => self.pb_style_fetch_bar_last.clone(),
                 ChildKey::FetchProgress => self.pb_style_fetch_bar_mid.clone(),
                 _ if is_level1_last => self.pb_style_spinner_last.clone(),
@@ -706,6 +718,20 @@ impl ProgressManager {
             self.multipb.insert_after(&stage.bar, pb)
         } else if let Some(updating) = self.updating_bar.as_ref() {
             self.multipb.insert_after(&updating.bar, pb)
+        } else {
+            self.multipb.add(pb)
+        }
+    }
+
+    /// GraphQL rev 解決進捗行（GRAPHQL_PROGRESS_ID）を挿入する。
+    /// 順序上 Updating/Fetching/Objects の前（preresolved が最初）。
+    fn add_graphql_bar(&self, pb: ProgressBar) -> ProgressBar {
+        if let Some(updating) = self.updating_bar.as_ref() {
+            self.multipb.insert_before(&updating.bar, pb)
+        } else if let Some(stage) = self.progress_bars.get(CACHE_FETCH_STAGE_ID) {
+            self.multipb.insert_before(&stage.bar, pb)
+        } else if let Some(progress) = self.progress_bars.get(CACHE_FETCH_PROGRESS_ID) {
+            self.multipb.insert_before(&progress.bar, pb)
         } else {
             self.multipb.add(pb)
         }
@@ -1189,6 +1215,30 @@ impl ProgressManager {
                         reason
                     ))
                     .unwrap();
+            }
+            Message::GraphQLResolveProgress { resolved, total } => {
+                if total == 0 {
+                    return;
+                }
+                if !self.progress_bars.contains_key(GRAPHQL_PROGRESS_ID) {
+                    let pb = ProgressBar::new(total as u64)
+                        .with_style(self.pb_style_fetch_bar_last.clone())
+                        .with_prefix("Resolving");
+                    let pb = self.add_graphql_bar(pb);
+                    self.progress_bars
+                        .insert(GRAPHQL_PROGRESS_ID.to_string(), BarState::new(pb));
+                    self.register_child(ChildKey::GraphQLResolve);
+                }
+                let pb = self.progress_bars.get_mut(GRAPHQL_PROGRESS_ID).unwrap();
+                pb.bar.set_length(total as u64);
+                pb.bar.set_position(resolved as u64);
+                if resolved >= total {
+                    if let Some(bs) = self.progress_bars.remove(GRAPHQL_PROGRESS_ID) {
+                        bs.bar.finish_with_message("resolved");
+                    }
+                    self.child_order.retain(|k| k != &ChildKey::GraphQLResolve);
+                    self.refresh_connectors();
+                }
             }
             Message::InstallSkipped(id) => {
                 self.installskipped_count += 1;

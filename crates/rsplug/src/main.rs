@@ -327,6 +327,14 @@ async fn app() -> Result<(), Error> {
 
     // GraphQL chunk を並列送信し、完了ごとに該当 plugin の load を spawn（段階公開）。
     let token_str = token.unwrap_or("");
+    let graphql_total = graphql_batch.len();
+    let mut graphql_resolved = 0usize;
+    if graphql_total > 0 {
+        msg(Message::GraphQLResolveProgress {
+            resolved: 0,
+            total: graphql_total,
+        });
+    }
     let mut chunk_tasks = JoinSet::new();
     for chunk in graphql_batch.chunks(25) {
         let chunk_canonicals: Vec<String> = chunk
@@ -358,6 +366,7 @@ async fn app() -> Result<(), Error> {
             Err(rsplug::util::github::ApiError::Other(s)) => Some(s.clone()),
         };
         let oid_map = result.unwrap_or_default();
+        let chunk_size = chunk_canonicals.len();
         for canon in chunk_canonicals {
             let oid = if err_reason.is_some() {
                 None
@@ -386,9 +395,17 @@ async fn app() -> Result<(), Error> {
         if let Some(reason) = err_reason {
             msg(Message::GraphQLBatchFailed { reason });
         }
+        graphql_resolved += chunk_size;
+        if graphql_total > 0 {
+            msg(Message::GraphQLResolveProgress {
+                resolved: graphql_resolved,
+                total: graphql_total,
+            });
+        }
     }
     // 残存（chunk panic/JoinError で canonical_to_pending に残った分）を救済: None で load。
     for (_, indices) in canonical_to_pending.drain() {
+        graphql_resolved += indices.len();
         for idx in indices {
             if let Some((plugin, _)) = graphql_pending[idx].take() {
                 let ctx = ctx.clone();
@@ -396,6 +413,12 @@ async fn app() -> Result<(), Error> {
                     .spawn(async move { load_one(plugin, ctx, LoadRev::Resolved(None)).await });
             }
         }
+    }
+    if graphql_total > 0 {
+        msg(Message::GraphQLResolveProgress {
+            resolved: graphql_resolved,
+            total: graphql_total,
+        });
     }
     let res = load_tasks.join_all().await;
     // LoadCtx が locked_map の Arc クローンを保持しているため、ここで捨てないと
