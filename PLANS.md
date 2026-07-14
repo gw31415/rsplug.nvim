@@ -26,10 +26,10 @@ pack depend on the source cache.
       paths on one identity; read legacy raw-URL keys compatibly; reject
       conflicting revisions.
 - [~] Replace the remaining flattened lifecycle plumbing with explicit models
-      (`PluginSpec` ≈ `PluginConfig`, **`ResolvedGraph`** ✅ extracted from
-      `Plugin::new` (`plugin.rs`), `MaterializationPlan`, `LazyRegistration` ≈
-      `PlugCtl`, `PackPlan` ≈ `PackPathState`). Remaining: `MaterializationPlan`
-      (in `Plugin::load`); explicit `LazyRegistration`/`PackPlan` are rename-only.
+      (`PluginSpec` ≈ `PluginConfig`, **`ResolvedGraph`** ✅, **`MaterializationPlan`**
+      ✅ as `Plugin::load` stage-split: `resolve_target_commit` + `assemble_loaded_plugin`,
+      `LazyRegistration` ≈ `PlugCtl`, `PackPlan` ≈ `PackPathState`). Remaining: explicit
+      `LazyRegistration`/`PackPlan` are rename-only (low value).
 - [x] Parallelize TOML config parsing (`main.rs`) via `JoinSet` +
       `spawn_blocking`, reassembling `config_paths.sort()` order by task index so
       the discovery stage no longer serializes read+parse. Byte-identical
@@ -152,12 +152,21 @@ needs the rev. A new `Plugin::is_installed` helper drives the selection.
 `ResolvedGraph` is now extracted from `Plugin::new` (`plugin.rs`):
 `resolve(Config) -> ResolvedGraph` runs DAG resolution (`order`,
 `dependency_cachedirs`, dependent-aggregated `lazy_type`) identically to before,
-and `From<ResolvedNode> for Plugin` is a pure field move. Remaining:
-`MaterializationPlan` (extract from `Plugin::load`), and explicit
-`LazyRegistration`/`PackPlan` (≈ `PlugCtl`/`PackPathState`, rename-only and low
-value). `Plugin` struct fields, `Plugin::load`, and the `dag` crate are
-unchanged; pack/lock output is byte-identical. (Repository identity is already
-canonical — see above.)
+and `From<ResolvedNode> for Plugin` is a pure field move.
+
+`MaterializationPlan` is addressed by splitting `Plugin::load` (≈500 lines) into
+stage functions: `resolve_target_commit` (rev resolution) and
+`assemble_loaded_plugin` (`plugin_id` construction core: `read_dir` →
+`entries.sort()` → `lazy_type` synthesis → `FileItem` → `LoadedPlugin`, now
+unit-testable in isolation). The middle (fetch → materialize → identity → manifest)
+stays in `Plugin::load` — it is tightly coupled via `FetchCtx`/`materialize`/build/
+identity, and a full plan/execute split is structurally impossible because the plan
+phase itself is I/O-dependent (`resolve_remote_oid`, `materialize`,
+`build_repo_snapshot_identity`); forcing a 20+ field `LoadCtx` was judged worse for
+readability than the stage split. Remaining: explicit `LazyRegistration`/`PackPlan`
+(≈ `PlugCtl`/`PackPathState`, rename-only and low value). `Plugin` struct fields and
+the `dag` crate are unchanged; pack/lock output is byte-identical (verified across
+isolated-HOME runs). (Repository identity is already canonical — see above.)
 
 ### Runtime hot paths
 

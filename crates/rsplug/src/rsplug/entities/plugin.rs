@@ -386,9 +386,6 @@ impl Plugin {
         };
         use unicode_width::UnicodeWidthStr;
 
-        let invalid_data =
-            |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
-
         let Plugin {
             source_name,
             cache,
@@ -462,77 +459,28 @@ impl Plugin {
             }
         };
 
-        // --- target commit 解決 (PLANS §8 step 5) ---
-        // まずインストール状態（= 既存 snapshot worktree の有無）で分岐する。
-        //   - locked : lockfile の rev をそのまま使う（cache 不足は後段でエラー）。
-        //   - update : インストール済みならリモートの最新を fetch して更新する。
-        //              ※未インストールは対象外（スキップ）。`-u` 単独で新規 install はしない。
-        //   - install: 未インストールならリモートから新規 fetch する。
-        //   - それ以外(通常起動): 既存 snapshot の commit をそのまま使い、無ければスキップ。
-        let (oid, was_updated, was_installed) = if let Some(locked_rev) = locked_rev.as_deref() {
-            if !util::github::is_full_hex_hash(locked_rev) {
-                return Err(invalid_data(format!(
-                    "Locked revision must be full hash for {}: got {}",
-                    url, locked_rev
-                )));
-            }
-            let oid = Oid::from_str(locked_rev).map_err(Error::Git2)?;
-            // locked_rev は --lock 由来（lock 固定、更新概念なし）または preresolved（GraphQL、--install/--update）。
-            // インストール状態で分岐し、未インストール時は通常経路（後続の match）と同じセマンティクスを適用:
-            //   - install                  : 新規 fetch（was_installed=true で lua_post_update 実行）。
-            //   - update 単独(install=false): 新規 install しない（`-u` 単独はスキップ）。
-            //   - --lock 単独(install=update=false): lock はキャッシュ前提なのでキャッシュ不足はエラー
-            //     （Git 経路の ensure_source_git と整合。tarball 経路は source.git を使わないため、ここで
-            //      弾かないと未インストールでも新規 fetch してしまうのが本バグ）。
-            match latest_snapshot_oid(&worktrees).await? {
-                // インストール済み。update=true なら preresolved: 既存 snapshot と比較して「実際に更新された」を立て、
-                // lua_post_update を実行させる（lua_post_update は新規 fetch 時のみ）。
-                Some(existing) => (oid, update && existing != oid, false),
-                None if install => (oid, false, true),
-                None if update => {
-                    // 未インストール + --update 単独: 新規 install はしない
-                    // （防御。通常は main.rs で GraphQL 対象外になり、この経路には来ない）。
-                    msg(Message::PluginNotInstalled(display_name(
-                        &source_name,
-                        &logid,
-                    )));
-                    return Ok(None);
-                }
-                None => {
-                    // 未インストール + --lock 単独: キャッシュ前提なのでエラー。
-                    return Err(invalid_data(format!(
-                        "Missing cached repository for locked revision: {}",
-                        url
-                    )));
-                }
-            }
-        } else {
-            match latest_snapshot_oid(&worktrees).await? {
-                Some(existing) if update => {
-                    let _permit = semaphore.acquire().await;
-                    msg(Message::Cache("Updating", url.clone()));
-                    let oid = resolve_remote_oid(&http_client, &url, &rev, &token).await?;
-                    msg(Message::Cache("Updating:done", url.clone()));
-                    // リモートの最新 rev が既存 snapshot と異なれば「実際に更新された」。
-                    (oid, existing != oid, false)
-                }
-                Some(existing) => (existing, false, false),
-                None if install => {
-                    let _permit = semaphore.acquire().await;
-                    msg(Message::Cache("Updating", url.clone()));
-                    let oid = resolve_remote_oid(&http_client, &url, &rev, &token).await?;
-                    msg(Message::Cache("Updating:done", url.clone()));
-                    (oid, false, true)
-                }
-                None => {
-                    // 未インストール。install も update(既存更新) も対象外なのでスキップ。
-                    msg(Message::PluginNotInstalled(display_name(
-                        &source_name,
-                        &logid,
-                    )));
-                    return Ok(None);
-                }
-            }
+        // --- ステージ1: target commit 解決（install/update/locked の分岐とリモート解決） ---
+        let RevOutcome {
+            oid,
+            was_updated,
+            was_installed,
+        } = match resolve_target_commit(
+            &worktrees,
+            &url,
+            &rev,
+            &token,
+            &semaphore,
+            &http_client,
+            install,
+            update,
+            locked_rev.as_deref(),
+            &source_name,
+            &logid,
+        )
+        .await?
+        {
+            Some(o) => o,
+            None => return Ok(None),
         };
         let head_rev_str = oid.to_string();
 
@@ -716,87 +664,230 @@ impl Plugin {
             let _ = tokio::fs::write(repo_root.join("latest-snapshot"), key.as_bytes()).await;
         }
 
-        let filesource = Arc::new(FileSource::Directory {
-            path: snapshot_root_path.clone(),
-        });
-        // ls-files 列挙を廃止し、snapshot ルート直下を read_dir で1階層列挙する。
-        // ディレクトリ（lua/plugin 等）も1エントリにまとめ、install で copy_tree する
-        //（ファイル数分の syscall を削減）。`doc` だけは盗み集約のため個別ファイルに展開する（下記）。
-        // target/ 等の build 成果物は ignore 対象外なので pack に残る（旧 ls_files_with_untracked と同等）。
-        // .rsplug_build_success は ignore.gitignore で除外される。`.git` は通常 ignore 対象だが、
-        // dotgit=true のときは例外扱いせず通常ディレクトリと同じくエントリに含める
-        //（pack への copy・plugin_id への反映は他のディレクトリと同一経路。
-        // snapshot に `.git` が無い場合は install で検知し警告）。
-        let mut entries: Vec<PathBuf> = Vec::new();
-        {
-            let mut rd = tokio::fs::read_dir(snapshot_root_path.as_ref()).await?;
-            while let Some(entry) = rd.next_entry().await? {
-                entries.push(PathBuf::from(entry.file_name()));
-            }
-        }
-        entries.sort(); // 決定論的順序（plugin_id 安定化）
-        let mut lazy_type = lazy_type.clone();
-        for luam in extract_unique_lua_modules_from_snapshot(snapshot_root_path.as_ref()).await {
-            lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
-        }
-        // 各トップレベルエントリを配置対象に組み立てる。`doc` だけは例外:
-        // 「盗んで」`_rsplug:doc` start プラグインへ集約するため、sealed-dir 1エントリではなく
-        // 個別ファイル（`doc/<rel>`）に展開する（`PlugCtl::create` の `starts_with("doc/")` 盗みを効かせる）。
-        // それ以外は sealed-dir のまま（install で copy_tree が clonefile/per-file copy で配置）。
-        let mut file_entries: Vec<(PathBuf, FileItem)> = Vec::with_capacity(entries.len());
-        for name in &entries {
-            // Phase 2 の manifest は cache 内部ファイル。pack に含めず、全プラグインで
-            // 同 path が衝突してマージを阻害する原因にもしないため、列挙から除外する。
-            if name == Path::new(MANIFEST_FILE) {
-                continue;
-            }
-            // dotgit=true なら `.git` を ignore から救出して通常エントリに含める。
-            if !(dotgit && name == Path::new(".git") || !merge.ignore.matched(name)) {
-                continue;
-            }
-            if name == Path::new("doc") {
-                file_entries.extend(
-                    doc_file_entries(snapshot_root_path.as_ref(), &filesource, &identity).await,
-                );
-            } else {
-                file_entries.push((
-                    name.clone(),
-                    FileItem::new(
-                        filesource.clone(),
-                        FileIdentity::RepoFile(RepoFileIdentity::new(
-                            identity.clone(),
-                            name.clone(),
-                        )),
-                        MergeType::Conflict,
-                    ),
-                ));
-            }
-        }
-        let files: HowToPlaceFiles =
-            HowToPlaceFiles::CopyEachFile(file_entries.into_iter().collect());
-
-        // ロード成功が確定したので、実際に更新/新規インストールされたプラグインを
-        // サマリーへ通知する。早帰り(Ok(None))経路には到達しない＝スキップしたものは報告しない。
-        if was_updated {
-            msg(Message::PluginUpdated(display_name(&source_name, &logid)));
-        } else if was_installed {
-            msg(Message::PluginInstalled(display_name(&source_name, &logid)));
-        }
-
-        let loaded = LoadedPlugin {
-            source_names: source_name.into_iter().collect(),
-            files,
+        // --- ステージ6: LoadedPlugin 構築（plugin_id 決定の核心） ---
+        // filesource/entries/lazy_type 合成/FileItem 構築/通知は assemble_loaded_plugin 内へ
+        // 抽出した。計算式・順序は旧インライン実装と完全同一（plugin_id 安定性）。
+        let loaded = assemble_loaded_plugin(
+            &snapshot_root_path,
+            &identity,
+            dotgit,
+            &merge,
             lazy_type,
+            source_name,
             script,
             order,
             merge_enabled,
-            is_plugctl: false,
-            dotgit,
-        };
+            was_updated,
+            was_installed,
+            &logid,
+        )
+        .await?;
         let lock_info = Some((canonical, head_rev_str));
 
         Ok(Some((loaded, lock_info)))
     }
+}
+
+/// target commit 解決の結果（ステージ1）。`resolve_target_commit` の `Ok(None)` が
+/// `Plugin::load` のスキップ（`Ok(None)`）を表す。
+struct RevOutcome {
+    oid: Oid,
+    was_updated: bool,
+    was_installed: bool,
+}
+
+/// ステージ1: target commit 解決。install/update/locked の分岐とリモート解決。
+///
+/// まずインストール状態（= 既存 snapshot worktree の有無）で分岐する。locked は lockfile
+/// の rev をそのまま使い（cache 不足は後段でエラー）、update はインストール済みならリモートの
+/// 最新を fetch して更新する（未インストールは対象外＝スキップ。`-u` 単独で新規 install はしない）。
+/// install は未インストールならリモートから新規 fetch する。それ以外(通常起動) は既存 snapshot
+/// の commit をそのまま使い、無ければスキップ。
+///
+/// `Ok(None)` = スキップ（未インストール等）。
+// Plugin::load からの抽出。引数過多は LoadCtx 構造体化（巨大化）より局所的と判断し allow する。
+#[allow(clippy::too_many_arguments)]
+async fn resolve_target_commit(
+    worktrees: &Path,
+    url: &Arc<str>,
+    rev: &Option<Arc<str>>,
+    token: &Option<Arc<str>>,
+    semaphore: &adaptive_semaphore::AdaptiveSemaphore,
+    http_client: &reqwest::Client,
+    install: bool,
+    update: bool,
+    locked_rev: Option<&str>,
+    source_name: &Option<String>,
+    logid: &str,
+) -> Result<Option<RevOutcome>, Error> {
+    use crate::log::{Message, msg};
+
+    let invalid_data =
+        |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+
+    let (oid, was_updated, was_installed) = if let Some(locked_rev) = locked_rev {
+        if !util::github::is_full_hex_hash(locked_rev) {
+            return Err(invalid_data(format!(
+                "Locked revision must be full hash for {}: got {}",
+                url, locked_rev
+            )));
+        }
+        let oid = Oid::from_str(locked_rev).map_err(Error::Git2)?;
+        // locked_rev は --lock 由来（lock 固定）または preresolved（GraphQL、--install/--update）。
+        // 未インストール時は通常経路と同じセマンティクス:
+        //   - install     : 新規 fetch（was_installed=true で lua_post_update 実行）。
+        //   - update 単独 : 新規 install しない（スキップ）。
+        //   - --lock 単独 : キャッシュ前提なのでキャッシュ不足はエラー。
+        match latest_snapshot_oid(worktrees).await? {
+            // インストール済み。update=true なら preresolved: 既存 snapshot と比較して
+            // 「実際に更新された」を立て、lua_post_update を実行させる（新規 fetch 時のみ）。
+            Some(existing) => (oid, update && existing != oid, false),
+            None if install => (oid, false, true),
+            None if update => {
+                // 未インストール + --update 単独: 新規 install はしない
+                // （防御。通常は main.rs で GraphQL 対象外になり、この経路には来ない）。
+                msg(Message::PluginNotInstalled(display_name(
+                    source_name,
+                    logid,
+                )));
+                return Ok(None);
+            }
+            None => {
+                // 未インストール + --lock 単独: キャッシュ前提なのでエラー。
+                return Err(invalid_data(format!(
+                    "Missing cached repository for locked revision: {}",
+                    url
+                )));
+            }
+        }
+    } else {
+        match latest_snapshot_oid(worktrees).await? {
+            Some(existing) if update => {
+                let _permit = semaphore.acquire().await;
+                msg(Message::Cache("Updating", url.clone()));
+                let oid = resolve_remote_oid(http_client, url, rev, token).await?;
+                msg(Message::Cache("Updating:done", url.clone()));
+                // リモートの最新 rev が既存 snapshot と異なれば「実際に更新された」。
+                (oid, existing != oid, false)
+            }
+            Some(existing) => (existing, false, false),
+            None if install => {
+                let _permit = semaphore.acquire().await;
+                msg(Message::Cache("Updating", url.clone()));
+                let oid = resolve_remote_oid(http_client, url, rev, token).await?;
+                msg(Message::Cache("Updating:done", url.clone()));
+                (oid, false, true)
+            }
+            None => {
+                // 未インストール。install も update(既存更新) も対象外なのでスキップ。
+                msg(Message::PluginNotInstalled(display_name(
+                    source_name,
+                    logid,
+                )));
+                return Ok(None);
+            }
+        }
+    };
+    Ok(Some(RevOutcome {
+        oid,
+        was_updated,
+        was_installed,
+    }))
+}
+
+/// ステージ6: snapshot から `LoadedPlugin` を構築する（**plugin_id 決定の核心**）。
+///
+/// `read_dir` → `entries.sort()`（決定論的順序）→ `extract_unique_lua_modules_from_snapshot`
+/// による lazy_type 合成 → `FileItem` 構築 → `HowToPlaceFiles` → `LoadedPlugin` 生成。
+/// 計算式・フィールド値・順序は旧 `Plugin::load` インライン実装と完全同一（plugin_id 安定性）。
+/// 抽出により、この plugin_id 決定経路がダミー identity/snapshot_root で単体テスト可能になった。
+// Plugin::load からの抽出。引数過多は LoadCtx 構造体化（巨大化）より局所的と判断し allow する。
+#[allow(clippy::too_many_arguments)]
+async fn assemble_loaded_plugin(
+    snapshot_root_path: &Arc<Path>,
+    identity: &RepoSnapshotIdentity,
+    dotgit: bool,
+    merge: &MergeConfig,
+    mut lazy_type: LazyType,
+    source_name: Option<String>,
+    script: SetupScript,
+    order: usize,
+    merge_enabled: bool,
+    was_updated: bool,
+    was_installed: bool,
+    logid: &str,
+) -> Result<LoadedPlugin, Error> {
+    use crate::log::{Message, msg};
+
+    // ls-files 列挙を廃止し、snapshot ルート直下を read_dir で1階層列挙する。
+    // ディレクトリ（lua/plugin 等）も1エントリにまとめ、install で copy_tree する
+    //（ファイル数分の syscall を削減）。`doc` だけは盗み集約のため個別ファイルに展開する（下記）。
+    // target/ 等の build 成果物は ignore 対象外なので pack に残る。.rsplug_build_success は
+    // ignore.gitignore で除外される。`.git` は通常 ignore 対象だが、dotgit=true のときは
+    // 例外扱いせず通常ディレクトリと同じくエントリに含める。
+    let filesource = Arc::new(FileSource::Directory {
+        path: snapshot_root_path.clone(),
+    });
+    let mut entries: Vec<PathBuf> = Vec::new();
+    {
+        let mut rd = tokio::fs::read_dir(snapshot_root_path.as_ref()).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            entries.push(PathBuf::from(entry.file_name()));
+        }
+    }
+    entries.sort(); // 決定論的順序（plugin_id 安定化）
+    for luam in extract_unique_lua_modules_from_snapshot(snapshot_root_path.as_ref()).await {
+        lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
+    }
+    // 各トップレベルエントリを配置対象に組み立てる。`doc` だけは例外:
+    // 「盗んで」`_rsplug:doc` start プラグインへ集約するため、sealed-dir 1エントリではなく
+    // 個別ファイル（`doc/<rel>`）に展開する（`PlugCtl::create` の `starts_with("doc/")` 盗みを効かせる）。
+    // それ以外は sealed-dir のまま（install で copy_tree が clonefile/per-file copy で配置）。
+    let mut file_entries: Vec<(PathBuf, FileItem)> = Vec::with_capacity(entries.len());
+    for name in &entries {
+        // Phase 2 の manifest は cache 内部ファイル。pack に含めず、全プラグインで
+        // 同 path が衝突してマージを阻害する原因にもしないため、列挙から除外する。
+        if name == Path::new(MANIFEST_FILE) {
+            continue;
+        }
+        // dotgit=true なら `.git` を ignore から救出して通常エントリに含める。
+        if !(dotgit && name == Path::new(".git") || !merge.ignore.matched(name)) {
+            continue;
+        }
+        if name == Path::new("doc") {
+            file_entries
+                .extend(doc_file_entries(snapshot_root_path.as_ref(), &filesource, identity).await);
+        } else {
+            file_entries.push((
+                name.clone(),
+                FileItem::new(
+                    filesource.clone(),
+                    FileIdentity::RepoFile(RepoFileIdentity::new(identity.clone(), name.clone())),
+                    MergeType::Conflict,
+                ),
+            ));
+        }
+    }
+    let files: HowToPlaceFiles = HowToPlaceFiles::CopyEachFile(file_entries.into_iter().collect());
+
+    // ロード成功が確定したので、実際に更新/新規インストールされたプラグインを
+    // サマリーへ通知する。早帰り(Ok(None))経路には到達しない＝スキップしたものは報告しない。
+    if was_updated {
+        msg(Message::PluginUpdated(display_name(&source_name, logid)));
+    } else if was_installed {
+        msg(Message::PluginInstalled(display_name(&source_name, logid)));
+    }
+
+    Ok(LoadedPlugin {
+        source_names: source_name.into_iter().collect(),
+        files,
+        lazy_type,
+        script,
+        order,
+        merge_enabled,
+        is_plugctl: false,
+        dotgit,
+    })
 }
 
 /// フェッチに必要なコンテキスト（GitFetch / TarballFetch 共通）。
