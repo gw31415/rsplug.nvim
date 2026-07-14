@@ -6,14 +6,12 @@ use clap::Parser;
 use console::style;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
+use rsplug::config_walker::ConfigWalker;
 use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
 };
-use tokio::task::JoinSet;
-
-use rsplug::config_walker::ConfigWalker;
 
 #[derive(clap::Parser, Debug)]
 #[command(about)]
@@ -141,79 +139,88 @@ async fn app() -> Result<(), Error> {
     // packpath below.
     tokio::fs::create_dir_all(DEFAULT_APP_DIR.as_path()).await?;
 
-    // Parse config files in deterministic path order.
-    // `order` uses config_index, so walker receive order must not affect config order.
-    let config = {
-        let mut config_paths = Vec::new();
-        let mut walker = ConfigWalker::new(config_files).await?;
-        while let Some(item) = walker.recv().await {
-            match item {
-                Ok(path) => {
-                    msg(Message::ConfigFound(path.clone()));
-                    config_paths.push(path);
+    // パース生産者: walker → sort → 並列パース（spawn_blocking）→ SchedEvent 送信。
+    // 完了順に関わらず index を添えて送り、最後に ParsePhaseDone{total} で確定通知する。
+    // スケジューラ（run_load_scheduler）がこれを消費して load fan-out を統括する。
+    let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<SchedEvent>();
+    let parse_prod = tokio::spawn({
+        let parse_tx = parse_tx.clone();
+        async move {
+            let mut config_paths = Vec::new();
+            let mut walker = match ConfigWalker::new(config_files).await {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = parse_tx.send(SchedEvent::ParseError(Error::Io(e)));
+                    return;
                 }
-                Err(e) => return Err(Error::Io(e)),
+            };
+            while let Some(item) = walker.recv().await {
+                match item {
+                    Ok(path) => {
+                        msg(Message::ConfigFound(path.clone()));
+                        config_paths.push(path);
+                    }
+                    Err(e) => {
+                        let _ = parse_tx.send(SchedEvent::ParseError(Error::Io(e)));
+                        return;
+                    }
+                }
             }
-        }
-        config_paths.sort();
-        log::msg(Message::ConfigWalkFinish);
-
-        // TOML の読み込みとパースを並列化する。設定ファイル数が増えるとシリアルな
-        // read+parse がディスカバリのクリティカルパスになるため、各ファイルを独立
-        // タスクで処理する。ただし `order = depth * (total + 1) + index`（plugin.rs）
-        // の `index` が `config_paths.sort()` 後の出現順の tiebreak なので、タスクの
-        // 完了順に関わらず index で元の順序に復元して集約しないと determinism が壊れる。
-        // `toml::from_str` はブロッキング CPU work なので `spawn_blocking` に逃がし、
-        // tokio ワーカースレッド（GraphQL chunk 解決等と共有）を占有しないようにする。
-        let total = config_paths.len();
-        let mut parse_tasks = tokio::task::JoinSet::new();
-        for (index, path) in config_paths.into_iter().enumerate() {
-            parse_tasks.spawn(async move {
-                let input =
-                    tokio::fs::read_to_string(&path)
-                        .await
-                        .map_err(|source| Error::ConfigRead {
+            config_paths.sort();
+            msg(Message::ConfigWalkFinish);
+            let total = config_paths.len();
+            let mut parse_tasks = tokio::task::JoinSet::new();
+            for (index, path) in config_paths.into_iter().enumerate() {
+                let parse_tx = parse_tx.clone();
+                parse_tasks.spawn(async move {
+                    let input = tokio::fs::read_to_string(&path).await.map_err(|source| {
+                        Error::ConfigRead {
                             path: path.clone(),
                             source,
-                        })?;
-                // path/input は parse エラー時のキャレット描画（format_toml_parse_error）
-                // に必要なので、spawn_blocking の中で消費して Result に所有させる。
-                // Error::Parse は大きい（source+path+input）ので Box に詰めてクロージャ
-                // 戻り値のスタックサイズを抑える（clippy::result_large_err 回避）。
-                let parsed = tokio::task::spawn_blocking(move || {
-                    toml::from_str::<rsplug::Config>(&input).map_err(|source| {
-                        Box::new(Error::Parse {
-                            source,
-                            path,
-                            input,
+                        }
+                    })?;
+                    // Error::Parse が大きいので Box に詰める（clippy::result_large_err 回避）。
+                    let parsed = tokio::task::spawn_blocking(move || {
+                        toml::from_str::<rsplug::Config>(&input).map_err(|source| {
+                            Box::new(Error::Parse {
+                                source,
+                                path,
+                                input,
+                            })
                         })
                     })
-                })
-                .await
-                .map_err(|e| {
-                    Error::Io(std::io::Error::other(format!(
-                        "config parse task failed: {e}"
-                    )))
-                })?
-                .map_err(|boxed| *boxed)?;
-                Ok::<_, Error>((index, parsed))
-            });
+                    .await
+                    .map_err(|e| {
+                        Error::Io(std::io::Error::other(format!(
+                            "config parse task failed: {e}"
+                        )))
+                    })?
+                    .map_err(|boxed| *boxed)?;
+                    let _ = parse_tx.send(SchedEvent::Parsed {
+                        index,
+                        config: parsed,
+                    });
+                    Ok::<_, Error>(())
+                });
+            }
+            while let Some(res) = parse_tasks.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let _ = parse_tx.send(SchedEvent::ParseError(e));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = parse_tx.send(SchedEvent::ParseError(Error::Io(
+                            std::io::Error::other(format!("config parse task panicked: {e}")),
+                        )));
+                        return;
+                    }
+                }
+            }
+            let _ = parse_tx.send(SchedEvent::ParsePhaseDone { total });
         }
-        // 並列に完了した結果を index で元の順序に復元する。
-        let mut indexed: Vec<Option<rsplug::Config>> = (0..total).map(|_| None).collect();
-        while let Some(res) = parse_tasks.join_next().await {
-            let (index, parsed) = res.map_err(|e| {
-                Error::Io(std::io::Error::other(format!(
-                    "config parse task panicked: {e}"
-                )))
-            })??;
-            indexed[index] = Some(parsed);
-        }
-        indexed
-            .into_iter()
-            .map(|c| c.expect("全 config のパース結果が格納済み"))
-            .sum::<rsplug::Config>()
-    };
+    });
 
     // Always read the lock file as the baseline. `--locked` uses it to pin
     // revisions; non-`--locked` runs use it as the starting point for the
@@ -233,21 +240,9 @@ async fn app() -> Result<(), Error> {
         Err(e) => return Err(e.into()),
     };
 
-    let plugins = rsplug::Plugin::new(config)?;
-    let plugins: Vec<_> = plugins.collect();
-    msg(Message::LoadBegin {
-        total: plugins.len(),
-    });
-
-    // Load plugins through Cache based on the Units.
-    // 全 plugin を並列に load/build する（DAG は runtime 読み込み順であり build 依存順ではない）。
-    // 依存先 snapshot は各依存先 repo の worktrees/ から best-effort で解決する (PLANS §10.3)。
     let locked_map = Arc::new(locked_map);
-    // 全 plugin のネットワークフェッチ並列度を制限する。
-    // 初期値は CPU 数に応じて抑え、最大 64 に制限する。tarball は CDN 経由でも
-    // download 後に展開・materialize が続くため、数百本の同時接続は総スループットを
-    // 下げ、FD/RSS を不必要に消費する。
-    // エラー率上昇時に自動的に並列度を半減させる。
+
+    // 全 plugin のネットワークフェッチ並列度を制限する（初期 CPU*2・最大 64・エラー時半減）。
     let cpu_count = rsplug::util::resources::available_cpus();
     let fetch_initial_limit = (cpu_count * 2).min(16);
     let fetch_semaphore = adaptive_semaphore::AdaptiveSemaphore::with_limits(
@@ -259,8 +254,6 @@ async fn app() -> Result<(), Error> {
 
     // プロセス全体で共有する HTTP クライアント（接続プール・HTTP/2 再利用）。
     let http_client = reqwest::Client::builder()
-        // GitHub API は User-Agent 無しを 403 で拒否する（administrative rules）。
-        // reqwest はデフォルトで User-Agent を送らないため明示的に設定する。
         .user_agent(concat!("rsplug/", env!("CARGO_PKG_VERSION")))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(64)
@@ -272,84 +265,6 @@ async fn app() -> Result<(), Error> {
                 "failed to build HTTP client: {e}"
             )))
         })?;
-    // reqwest::Client は内部が Arc なので clone は安価。FnMut closure 内に move するため先に clone。
-    let http_client = http_client.clone();
-    // --update/--install 時、GitHub リポジトリ（Git バックエンドの GitHub HTTPS URL 含む）の最新 rev を
-    // GraphQL で解決する。ただし **GraphQL chunk の完了ごとに該当 plugin の load を段階的に spawn** し、
-    // GraphQL のレイテンシを fetch と重ねる（パイプライン）。非 GitHub・wildcard・40-hex・token なし・
-    // 衝突・--locked・flagless は即 load（GraphQL と並行）。plugin.rs load はゼロ変更（locked_rev 経由）。
-
-    // 衝突検出（同一 canonical・異 rev は batch 対外＝個別 fallback）。
-    let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
-    let mut conflicts: HashSet<String> = HashSet::new();
-    for p in plugins.iter() {
-        if let Some(repo) = p.cache.repo.as_ref() {
-            let canonical = repo.canonical();
-            let rev = repo.rev();
-            match seen_rev.get(&canonical) {
-                Some(existing) if *existing != rev => {
-                    conflicts.insert(canonical);
-                }
-                None => {
-                    seen_rev.insert(canonical, rev);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let token = rsplug::util::github::token();
-    let do_graphql = !locked && (install || update) && token.is_some();
-
-    // partition（by-value）。各 plugin は immediate（即 load）か graphql_pending（chunk 完了後に load）へ。
-    let mut immediate: Vec<(rsplug::Plugin, LoadRev)> = Vec::new();
-    let mut graphql_pending: Vec<Option<(rsplug::Plugin, String)>> = Vec::new();
-    let mut canonical_to_pending: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
-    for p in plugins {
-        let Some(repo) = p.cache.repo.as_ref() else {
-            // script-only: 即 load（Auto、rev は不要）。
-            immediate.push((p, LoadRev::Auto));
-            continue;
-        };
-        let canonical = repo.canonical();
-        if locked || !do_graphql || conflicts.contains(&canonical) {
-            // --locked / flagless / 衝突: 即 load（Auto、--locked なら locked_map lookup）。
-            immediate.push((p, LoadRev::Auto));
-            continue;
-        }
-        let rev = repo.rev();
-        if rev
-            .as_deref()
-            .is_some_and(rsplug::util::github::is_full_hex_hash)
-        {
-            // 40-hex commit: 即 load、OID seed 済み。
-            immediate.push((p, LoadRev::Resolved(rev)));
-        } else if repo.is_github_https()
-            && !rev.as_deref().is_some_and(|r| r.contains('*'))
-            && let Some((owner, rname)) = rsplug::util::github::parse_github_url(&repo.url())
-        {
-            // 未インストール + --update は GraphQL せず即 load（load 内で未インストール判定 →
-            // スキップ。rev を解決する必要がない）。--install の未インストールは新規 install に
-            // rev が必要なので GraphQL 対象のまま（バッチ高速化を維持）。
-            if update && !p.is_installed(DEFAULT_REPOCACHE_DIR.as_path()).await {
-                immediate.push((p, LoadRev::Resolved(None)));
-                continue;
-            }
-            // インストール済み、または --install: GitHub GraphQL 対象。chunk 完了後に load。
-            graphql_batch.push(rsplug::util::github::GithubRev {
-                owner,
-                repo: rname,
-                rev: rev.as_deref().map(ToString::to_string),
-            });
-            let idx = graphql_pending.len();
-            graphql_pending.push(Some((p, canonical.clone())));
-            canonical_to_pending.entry(canonical).or_default().push(idx);
-        } else {
-            // 非 GitHub・wildcard: 即 load（Resolved(None)、load 内 resolve_remote_oid）。
-            immediate.push((p, LoadRev::Resolved(None)));
-        }
-    }
 
     let ctx = LoadCtx {
         locked,
@@ -361,135 +276,15 @@ async fn app() -> Result<(), Error> {
         cache_dir: DEFAULT_REPOCACHE_DIR.clone(),
     };
 
-    let mut load_tasks = JoinSet::new();
+    let token = rsplug::util::github::token();
+    let do_graphql = !locked && (install || update) && token.is_some();
 
-    // immediate plugin を即 spawn（GraphQL と並行）。
-    for (plugin, rev) in immediate {
-        let ctx = ctx.clone();
-        load_tasks.spawn(async move { load_one(plugin, ctx, rev).await });
-    }
-
-    // GraphQL chunk を並列送信し、完了ごとに該当 plugin の load を spawn（段階公開）。
-    let token_str = token.unwrap_or("");
-    let graphql_total = graphql_batch.len();
-    let mut graphql_resolved = 0usize;
-    if graphql_total > 0 {
-        msg(Message::GraphQLResolveProgress {
-            resolved: 0,
-            total: graphql_total,
-        });
-    }
-    let mut chunk_tasks = JoinSet::new();
-    for chunk in graphql_batch.chunks(25) {
-        let chunk_canonicals: Vec<String> = chunk
-            .iter()
-            .map(|g| format!("github.com/{}/{}", g.owner, g.repo))
-            .collect();
-        let client = http_client.clone();
-        let token_owned = token_str.to_string();
-        let chunk_owned = chunk.to_vec();
-        chunk_tasks.spawn(async move {
-            let result =
-                rsplug::util::github::resolve_graphql_chunk(client, token_owned, chunk_owned).await;
-            (result, chunk_canonicals)
-        });
-    }
-    while let Some(join_res) = chunk_tasks.join_next().await {
-        let (result, chunk_canonicals) = match join_res {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "[rsplug] GraphQL chunk join error: {e}; affected plugins fall back to per-repo"
-                );
-                continue;
-            }
-        };
-        let err_reason = match &result {
-            Ok(_) => None,
-            Err(rsplug::util::github::ApiError::RateLimited) => Some("rate-limited".to_string()),
-            Err(rsplug::util::github::ApiError::Other(s)) => Some(s.clone()),
-        };
-        let oid_map = result.unwrap_or_default();
-        let chunk_size = chunk_canonicals.len();
-        for canon in chunk_canonicals {
-            let oid = if err_reason.is_some() {
-                None
-            } else {
-                // canonical = github.com/{owner}/{repo} → (owner, repo) で oid_map を引く。
-                let rest = canon.strip_prefix("github.com/").unwrap_or(&canon);
-                let mut parts = rest.split('/');
-                let owner = parts.next().unwrap_or("");
-                let repo = parts.next().unwrap_or("");
-                oid_map
-                    .get(&(owner.to_string(), repo.to_string()))
-                    .cloned()
-                    .flatten()
-                    .map(Arc::<str>::from)
-            };
-            if let Some(indices) = canonical_to_pending.remove(&canon) {
-                for idx in indices {
-                    if let Some((plugin, _)) = graphql_pending[idx].take() {
-                        let ctx = ctx.clone();
-                        let rev = LoadRev::Resolved(oid.clone());
-                        load_tasks.spawn(async move { load_one(plugin, ctx, rev).await });
-                    }
-                }
-            }
-        }
-        if let Some(reason) = err_reason {
-            msg(Message::GraphQLBatchFailed { reason });
-        }
-        graphql_resolved += chunk_size;
-        if graphql_total > 0 {
-            msg(Message::GraphQLResolveProgress {
-                resolved: graphql_resolved,
-                total: graphql_total,
-            });
-        }
-    }
-    // 残存（chunk panic/JoinError で canonical_to_pending に残った分）を救済: None で load。
-    for (_, indices) in canonical_to_pending.drain() {
-        graphql_resolved += indices.len();
-        for idx in indices {
-            if let Some((plugin, _)) = graphql_pending[idx].take() {
-                let ctx = ctx.clone();
-                load_tasks
-                    .spawn(async move { load_one(plugin, ctx, LoadRev::Resolved(None)).await });
-            }
-        }
-    }
-    if graphql_total > 0 {
-        msg(Message::GraphQLResolveProgress {
-            resolved: graphql_resolved,
-            total: graphql_total,
-        });
-    }
-    let res = load_tasks.join_all().await;
-    // LoadCtx が locked_map の Arc クローンを保持しているため、ここで捨てないと
-    // 後段の Arc::try_unwrap(locked_map) が失敗（panic）する。
-    drop(ctx);
-    // Wait until all loading is complete.
-    // NOTE: It does not abort if an error occurs (because of the build process).
-    msg(Message::LoadDone);
-    let (plugins, lock_infos, remove_canons) = res
-        .into_iter()
-        .try_fold(
-            (BinaryHeap::new(), Vec::new(), Vec::new()),
-            |(mut plugins, mut locks, mut remove_canons), res| {
-                let (result, canon_to_remove) = res?;
-                if let Some((loaded, lock_info)) = result {
-                    plugins.push(loaded);
-                    if let Some(lock_info) = lock_info {
-                        locks.push(lock_info);
-                    }
-                }
-                if let Some(canon) = canon_to_remove {
-                    remove_canons.push(canon);
-                }
-                Ok::<_, Box<Error>>((plugins, locks, remove_canons))
-            },
-        )
-        .map_err(|e| *e)?;
+    // スケジューラがパースイベントを消費しつつ load fan-out を統括する。
+    // ctx を消費して返るので、ここ以降 locked_map の Arc はスケジューラ内でのみ保持される。
+    let (plugins, lock_infos, remove_canons) =
+        run_load_scheduler(parse_rx, ctx, token.map(Arc::<str>::from), do_graphql).await?;
+    // パース生産者タスクは ParsePhaseDone 送信後に終了しているはず。join して panic を拾う。
+    let _ = parse_prod.await;
     let total_count = plugins.len();
 
     // Create PackPathState and load packages into it.
@@ -535,6 +330,289 @@ async fn app() -> Result<(), Error> {
         .await?;
     }
     Ok(())
+}
+
+/// per-TOML パース結果をスケジューラへ流すイベント。
+enum SchedEvent {
+    /// TOML 1 ファイルのパース完了。`index` は `config_paths.sort()` 後の位置。
+    Parsed {
+        index: usize,
+        config: rsplug::Config,
+    },
+    /// パースフェーズ全体の完了（全TOML揃い = `total`/order 確定）。
+    ParsePhaseDone { total: usize },
+    /// パース中のエラー（ConfigRead/Parse）。即時終了する。
+    ParseError(Error),
+}
+
+/// 1 プラグインの load 結果（`load_one` の戻り値）。
+type LoadOutcome = Result<
+    (
+        Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
+        Option<String>,
+    ),
+    Error,
+>;
+
+/// GraphQL chunk 解決タスクの結果（oid_map と chunk の canonical リスト）。
+type GraphqlChunkResult = (
+    Result<HashMap<(String, String), Option<String>>, rsplug::util::github::ApiError>,
+    Vec<String>,
+);
+
+/// load fan-out を統括するスケジューラ（Step 1: 骨格）。
+///
+/// `Plugin::new`（バッチ resolve）をそのまま使い、`ParsePhaseDone` 後に全プラグインを
+/// conflict 検出 → partition → fan-out する（現状の `app()` と同一振る舞い）。
+/// parse は呼び出し元が並列化し `Parsed`/`ParsePhaseDone` を流す。BFS 依存スケジューリング
+/// （Step 2）と GraphQL chunk 統合（Step 3）は後続で導入する。
+async fn run_load_scheduler(
+    mut parse_rx: tokio::sync::mpsc::UnboundedReceiver<SchedEvent>,
+    ctx: LoadCtx,
+    token: Option<Arc<str>>,
+    do_graphql: bool,
+) -> Result<
+    (
+        BinaryHeap<rsplug::LoadedPlugin>,
+        Vec<(String, String)>,
+        Vec<String>,
+    ),
+    Error,
+> {
+    use tokio::task::JoinSet;
+
+    let mut configs: HashMap<usize, rsplug::Config> = HashMap::new();
+    let mut _total: Option<usize> = None; // Step 2 で order 計算に使用
+    let mut parse_done = false;
+    let mut load_tasks: JoinSet<LoadOutcome> = JoinSet::new();
+    let mut chunk_tasks: JoinSet<GraphqlChunkResult> = JoinSet::new();
+    let mut finished: Vec<LoadOutcome> = Vec::new();
+    let mut graphql_pending: Vec<Option<(rsplug::Plugin, String)>> = Vec::new();
+    let mut canonical_to_pending: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut graphql_total = 0usize;
+    let mut graphql_resolved = 0usize;
+
+    loop {
+        tokio::select! {
+            ev = parse_rx.recv() => match ev {
+                Some(SchedEvent::Parsed { index, config }) => {
+                    configs.insert(index, config);
+                }
+                Some(SchedEvent::ParsePhaseDone { total: t }) => {
+                    _total = Some(t);
+                    parse_done = true;
+                    let merged: rsplug::Config = (0..t)
+                        .map(|i| configs.remove(&i).expect("parsed config"))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .sum();
+                    let plugins: Vec<_> = rsplug::Plugin::new(merged)?.collect();
+                    msg(Message::LoadBegin {
+                        total: plugins.len(),
+                    });
+                    // 衝突検出（同一 canonical・異 rev）。
+                    let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
+                    let mut conflicts: HashSet<String> = HashSet::new();
+                    for p in plugins.iter() {
+                        if let Some(repo) = p.cache.repo.as_ref() {
+                            let canonical = repo.canonical();
+                            let rev = repo.rev();
+                            match seen_rev.get(&canonical) {
+                                Some(existing) if *existing != rev => {
+                                    conflicts.insert(canonical);
+                                }
+                                None => {
+                                    seen_rev.insert(canonical, rev);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    let token_str = token.as_deref().unwrap_or("").to_string();
+                    let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
+                    for p in plugins {
+                        let rev = match p.cache.repo.as_ref() {
+                            None => LoadRev::Auto,
+                            Some(repo) => {
+                                let canonical = repo.canonical();
+                                let rev = repo.rev();
+                                if ctx.locked || !do_graphql || conflicts.contains(&canonical) {
+                                    LoadRev::Auto
+                                } else if rev
+                                    .as_deref()
+                                    .is_some_and(rsplug::util::github::is_full_hex_hash)
+                                {
+                                    LoadRev::Resolved(rev)
+                                } else if repo.is_github_https()
+                                    && !rev.as_deref().is_some_and(|r| r.contains('*'))
+                                    && let Some((owner, rname)) =
+                                        rsplug::util::github::parse_github_url(&repo.url())
+                                {
+                                    if ctx.update
+                                        && !p.is_installed(ctx.cache_dir.as_path()).await
+                                    {
+                                        LoadRev::Resolved(None)
+                                    } else {
+                                        graphql_batch.push(rsplug::util::github::GithubRev {
+                                            owner,
+                                            repo: rname,
+                                            rev: rev.as_deref().map(ToString::to_string),
+                                        });
+                                        let idx = graphql_pending.len();
+                                        graphql_pending.push(Some((p, canonical.clone())));
+                                        canonical_to_pending
+                                            .entry(canonical)
+                                            .or_default()
+                                            .push(idx);
+                                        continue;
+                                    }
+                                } else {
+                                    LoadRev::Resolved(None)
+                                }
+                            }
+                        };
+                        let ctx2 = ctx.clone();
+                        load_tasks.spawn(async move { load_one(p, ctx2, rev).await });
+                    }
+                    // GraphQL chunk を並列送信（完了ごとに段階的に load spawn）。
+                    graphql_total = graphql_batch.len();
+                    if graphql_total > 0 {
+                        msg(Message::GraphQLResolveProgress {
+                            resolved: 0,
+                            total: graphql_total,
+                        });
+                    }
+                    for chunk in graphql_batch.chunks(25) {
+                        let chunk_canonicals: Vec<String> = chunk
+                            .iter()
+                            .map(|g| format!("github.com/{}/{}", g.owner, g.repo))
+                            .collect();
+                        let client = ctx.http_client.clone();
+                        let token_owned = token_str.clone();
+                        let chunk_owned = chunk.to_vec();
+                        chunk_tasks.spawn(async move {
+                            let result = rsplug::util::github::resolve_graphql_chunk(
+                                client,
+                                token_owned,
+                                chunk_owned,
+                            )
+                            .await;
+                            (result, chunk_canonicals)
+                        });
+                    }
+                }
+                Some(SchedEvent::ParseError(e)) => return Err(e),
+                None => break,
+            },
+            Some(jr) = load_tasks.join_next() => {
+                let res = jr.map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("load task panicked: {e}")))
+                })?;
+                finished.push(res);
+            }
+            Some(jr) = chunk_tasks.join_next() => {
+                let (result, chunk_canonicals) = match jr {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "[rsplug] GraphQL chunk join error: {e}; affected plugins fall back to per-repo"
+                        );
+                        continue;
+                    }
+                };
+                let err_reason = match &result {
+                    Ok(_) => None,
+                    Err(rsplug::util::github::ApiError::RateLimited) => {
+                        Some("rate-limited".to_string())
+                    }
+                    Err(rsplug::util::github::ApiError::Other(s)) => Some(s.clone()),
+                };
+                let oid_map = result.unwrap_or_default();
+                let chunk_size = chunk_canonicals.len();
+                for canon in &chunk_canonicals {
+                    let oid = if err_reason.is_some() {
+                        None
+                    } else {
+                        let rest = canon.strip_prefix("github.com/").unwrap_or(canon);
+                        let mut parts = rest.split('/');
+                        let owner = parts.next().unwrap_or("");
+                        let repo = parts.next().unwrap_or("");
+                        oid_map
+                            .get(&(owner.to_string(), repo.to_string()))
+                            .cloned()
+                            .flatten()
+                            .map(Arc::<str>::from)
+                    };
+                    if let Some(indices) = canonical_to_pending.remove(canon) {
+                        for idx in indices {
+                            if let Some((plugin, _)) = graphql_pending[idx].take() {
+                                let ctx2 = ctx.clone();
+                                let rev = LoadRev::Resolved(oid.clone());
+                                load_tasks.spawn(async move { load_one(plugin, ctx2, rev).await });
+                            }
+                        }
+                    }
+                }
+                if let Some(reason) = err_reason {
+                    msg(Message::GraphQLBatchFailed { reason });
+                }
+                graphql_resolved += chunk_size;
+                if graphql_total > 0 {
+                    msg(Message::GraphQLResolveProgress {
+                        resolved: graphql_resolved,
+                        total: graphql_total,
+                    });
+                }
+            }
+        }
+        if parse_done && parse_rx.is_empty() && load_tasks.is_empty() && chunk_tasks.is_empty() {
+            break;
+        }
+    }
+    // 残存（chunk panic で canonical_to_pending に残った分）を救済: None で load。
+    for (_, indices) in canonical_to_pending.drain() {
+        graphql_resolved += indices.len();
+        for idx in indices {
+            if let Some((plugin, _)) = graphql_pending[idx].take() {
+                let ctx2 = ctx.clone();
+                load_tasks
+                    .spawn(async move { load_one(plugin, ctx2, LoadRev::Resolved(None)).await });
+            }
+        }
+    }
+    if graphql_total > 0 {
+        msg(Message::GraphQLResolveProgress {
+            resolved: graphql_resolved,
+            total: graphql_total,
+        });
+    }
+    // 残りの load を待つ。
+    while let Some(jr) = load_tasks.join_next().await {
+        let res =
+            jr.map_err(|e| Error::Io(std::io::Error::other(format!("load task panicked: {e}"))))?;
+        finished.push(res);
+    }
+    msg(Message::LoadDone);
+    let (plugins, lock_infos, remove_canons) = finished
+        .into_iter()
+        .try_fold(
+            (BinaryHeap::new(), Vec::new(), Vec::new()),
+            |(mut plugins, mut locks, mut remove_canons), res| {
+                let (result, canon_to_remove) = res?;
+                if let Some((loaded, lock_info)) = result {
+                    plugins.push(loaded);
+                    if let Some(lock_info) = lock_info {
+                        locks.push(lock_info);
+                    }
+                }
+                if let Some(canon) = canon_to_remove {
+                    remove_canons.push(canon);
+                }
+                Ok::<_, Box<Error>>((plugins, locks, remove_canons))
+            },
+        )
+        .map_err(|e| *e)?;
+    Ok((plugins, lock_infos, remove_canons))
 }
 
 static DEFAULT_APP_DIR: Lazy<PathBuf> = Lazy::new(|| {
