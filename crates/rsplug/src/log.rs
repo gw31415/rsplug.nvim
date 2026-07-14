@@ -944,6 +944,18 @@ impl ProgressManager {
                     // 責務としてバーを消去し、サマリー行を println で1行出す。
                     pb.bar.finish_and_clear();
                 }
+                // loading バー消去後（アクティブバーが無い状態）で印字する。LoadDone では
+                // "loading" バーを残したまま println するため indicatif の再描画で上書きされて
+                // 出力に残らない。ここで Loaded と同タイミングに出すことで永続化する。
+                if !self.not_installed.is_empty() {
+                    self.warn_not_installed();
+                }
+                if !self.updated_plugins.is_empty() {
+                    self.print_plugin_list_block("Updated", &self.updated_plugins);
+                }
+                if !self.installed_plugins.is_empty() {
+                    self.print_plugin_list_block("Installed", &self.installed_plugins);
+                }
                 self.multipb
                     .println(format!("{} {message}", summary_prefix("Loaded", true)))
                     .unwrap();
@@ -1176,15 +1188,10 @@ impl ProgressManager {
                 }
                 // 全レベル1子バー(Fetching/Updating/Building)を破棄したので追加順も空にする。
                 self.child_order.clear();
-                if !self.not_installed.is_empty() {
-                    self.warn_not_installed();
-                }
-                if !self.updated_plugins.is_empty() {
-                    self.print_plugin_list_block("Updated", &self.updated_plugins);
-                }
-                if !self.installed_plugins.is_empty() {
-                    self.print_plugin_list_block("Installed", &self.installed_plugins);
-                }
+                // not_installed/Updated/Installed ブロックの印字は MergeFinished に移動。
+                // ここでは "loading" バーを表示領域に残すため、バー生存中の println となり
+                // indicatif の再描画で上書きされて出力に残らない（Loaded と同じく loading
+                // バー消去後に印字する必要がある）。
             }
             Message::PluginNotInstalled(id) => {
                 self.not_installed.push(id);
@@ -1618,6 +1625,10 @@ mod tests {
         m.process(Message::PluginNotInstalled(Arc::from("short")));
 
         m.process(Message::LoadDone);
+        m.process(Message::MergeFinished {
+            total: 2,
+            merged: 2,
+        });
 
         let rendered = {
             let s = screen.lock().unwrap();
@@ -1656,6 +1667,10 @@ mod tests {
             m.process(Message::PluginNotInstalled(Arc::from(s)));
         }
         m.process(Message::LoadDone);
+        m.process(Message::MergeFinished {
+            total: 4,
+            merged: 4,
+        });
 
         let rendered = {
             let s = screen.lock().unwrap();
@@ -1708,8 +1723,10 @@ mod tests {
         );
     }
 
-    /// `-u` で実際に更新されたプラグインが、LoadDone で `✓ Updated N plugins`
+    /// `-u` で実際に更新されたプラグインが、MergeFinished で `✓ Updated N plugins`
     /// ブロック（先頭3件・個別 truncate・超過 ` …`）として印字されることを検証する。
+    /// LoadDone ではなく MergeFinished（loading バー消去後）で出すことで、 indicatif の
+    /// バー再描画で上書きされず出力に永続化される。
     #[test]
     fn updated_block_lists_names_with_ellipsis() {
         let (term, screen) = ScreenTermLike::new(120);
@@ -1720,6 +1737,10 @@ mod tests {
             m.process(Message::PluginUpdated(Arc::from(s)));
         }
         m.process(Message::LoadDone);
+        m.process(Message::MergeFinished {
+            total: 4,
+            merged: 4,
+        });
 
         let rendered = screen_rendered(&screen);
         assert!(
