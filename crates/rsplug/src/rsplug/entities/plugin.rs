@@ -216,9 +216,69 @@ impl FromStr for RepoSource {
     }
 }
 
+/// DAG 解決の結果（PLANS.md "ResolvedGraph" モデル）。`Config`（PluginSpec 集合）
+/// を `try_dag` にかけ、各ノードの `order`・`dependency_cachedirs`・依存元集約
+/// `lazy_type` を確定した中間表現。この段階では fetch/ビルド（Materialization）
+/// も runtime registration（LazyRegistration）も行わない。`Plugin::new` は
+/// `Config → ResolvedGraph → Plugin` の2段階に分かれ、ResolvedGraph が
+/// 「DAG 解決結果」を、Plugin が「マテリアライズ入力 + ライセンス登録材料」を
+/// それぞれ明示的に担う。将来的に order/depends を load fan-out 後に組み立て直す
+/// （per-TOML ストリーミング化）際の明示的な足場でもある。
+struct ResolvedGraph {
+    /// トポロジカル順 + (depth, original_index) tiebreak で並んだ解決済みノード。
+    nodes: Vec<ResolvedNode>,
+}
+
+/// 1つの解決済みプラグインノード。DAG 解決由来のフィールド（`order`,
+/// `dependency_cachedirs`, 集約 `lazy_type`）と、PluginConfig（PluginSpec）由来の
+/// マテリアライズ材料を保持する。`From<ResolvedNode> for Plugin` で純粋に
+/// フィールド移動される（計算は一切行わない）。
+struct ResolvedNode {
+    /// DAGトポロジカル順。`order = depth * (total + 1) + index`（旧 Plugin::new と同一式）。
+    order: usize,
+    /// `depends` で指定された依存先プラグインのキャッシュ相対パス。
+    /// 依存先が script-only（リポジトリなし）なら除外済み（同一セマンティクス）。
+    dependency_cachedirs: Vec<PathBuf>,
+    /// 依存元の lazy_type を集約した結果（同一 fold）。
+    lazy_type: LazyType,
+    /// マテリアライズ材料（PluginSpec = PluginConfig 由来）。
+    source_name: Option<String>,
+    cache: CacheConfig,
+    script: SetupScript,
+    merge: MergeConfig,
+    merge_enabled: bool,
+}
+
+/// 段階2: `ResolvedNode` → `Plugin`。純粋なフィールド移動（計算なし）。
+/// これにより「DAG 解決」と「マテリアライズ材料の詰め替え」が型レベルで分離される。
+impl From<ResolvedNode> for Plugin {
+    fn from(n: ResolvedNode) -> Self {
+        Plugin {
+            source_name: n.source_name,
+            cache: n.cache,
+            lazy_type: n.lazy_type,
+            script: n.script,
+            merge: n.merge,
+            dependency_cachedirs: n.dependency_cachedirs,
+            merge_enabled: n.merge_enabled,
+            order: n.order,
+        }
+    }
+}
+
 impl Plugin {
-    /// 設定ファイルから Plugin のコレクションを構築する
+    /// 設定ファイルから Plugin のコレクションを構築する。
+    /// `Config → ResolvedGraph`（DAG 解決）→ `Plugin`（フィールド移動）の2段階。
     pub fn new(config: Config) -> Result<impl Iterator<Item = Plugin>, Error> {
+        let resolved = Self::resolve(config)?;
+        Ok(resolved.nodes.into_iter().map(Plugin::from))
+    }
+
+    /// 段階1: DAG 解決。`Config`（PluginSpec 集合）を `ResolvedGraph` に変換する。
+    /// `order`/`dependency_cachedirs`/依存元集約 `lazy_type` をここで確定する。
+    /// 重複チェック・UnknownDependency・閉路検出は dag クレートの `try_dag`
+    /// （Kahn法 O(V+E)）に委譲する。計算式は旧 `Plugin::new` と完全同一。
+    fn resolve(config: Config) -> Result<ResolvedGraph, Error> {
         let Config { mut plugins } = config;
 
         // Phase 3A: 内部的同一性 id を各プラグインに算出して格納する。
@@ -244,51 +304,56 @@ impl Plugin {
             .map(|plug| plug.cache.repo.as_ref().map(RepoSource::default_cachedir))
             .collect::<Vec<_>>();
 
-        Ok(plugins.try_dag()?.into_map_iter(
-            move |DagIteratorMapFuncArgs {
-                      inner,
-                      index,
-                      depth,
-                      dependents_iter,
-                  }| {
-                let order = depth * (total + 1) + index;
-                let source_name = inner.dep_name().map(str::to_string);
-                let PluginConfig {
-                    cache,
-                    lazy_type,
-                    depends,
-                    custom_name: _,
-                    script,
-                    merge,
-                    ..
-                } = inner;
-                // 依存元の lazy_type を集約
-                let lazy_type = dependents_iter
-                    .flatten()
-                    .fold(lazy_type, |dep, plug| dep & &plug.lazy_type);
-                // 依存先が script-only（リポジトリなし）の場合はキャッシュディレクトリが
-                // 存在しないため除外する（runtimepath に追加すべきパスがない）。
-                let dependency_cachedirs = depends
-                    .into_iter()
-                    .filter_map(|dep_id| {
-                        id_to_index
-                            .get(&dep_id)
-                            .and_then(|&dep_index| cachedirs[dep_index].clone())
-                    })
-                    .collect();
-                let merge_enabled = merge.merge;
-                Plugin {
-                    source_name,
-                    cache,
-                    lazy_type,
-                    script,
-                    merge,
-                    dependency_cachedirs,
-                    merge_enabled,
-                    order,
-                }
-            },
-        ))
+        let nodes = plugins
+            .try_dag()?
+            .into_map_iter(
+                move |DagIteratorMapFuncArgs {
+                          inner,
+                          index,
+                          depth,
+                          dependents_iter,
+                      }| {
+                    let order = depth * (total + 1) + index;
+                    let source_name = inner.dep_name().map(str::to_string);
+                    let PluginConfig {
+                        cache,
+                        lazy_type,
+                        depends,
+                        custom_name: _,
+                        script,
+                        merge,
+                        ..
+                    } = inner;
+                    // 依存元の lazy_type を集約
+                    let lazy_type = dependents_iter
+                        .flatten()
+                        .fold(lazy_type, |dep, plug| dep & &plug.lazy_type);
+                    // 依存先が script-only（リポジトリなし）の場合はキャッシュディレクトリが
+                    // 存在しないため除外する（runtimepath に追加すべきパスがない）。
+                    let dependency_cachedirs = depends
+                        .into_iter()
+                        .filter_map(|dep_id| {
+                            id_to_index
+                                .get(&dep_id)
+                                .and_then(|&dep_index| cachedirs[dep_index].clone())
+                        })
+                        .collect();
+                    let merge_enabled = merge.merge;
+                    ResolvedNode {
+                        order,
+                        dependency_cachedirs,
+                        lazy_type,
+                        source_name,
+                        cache,
+                        script,
+                        merge,
+                        merge_enabled,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(ResolvedGraph { nodes })
     }
 
     /// キャッシュに既存 snapshot があるか（= インストール済み）。
