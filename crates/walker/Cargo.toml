@@ -21,7 +21,7 @@ hashbrown.workspace = true
 tokio.workspace = true
 wildmatch.workspace = true
 
-path-dedot = { version = "3.1.1", features = ["once_cell_cache"] }
+path-dedot = { version = "4.0.1", features = ["fixed_workdir"] }
 
 [target.'cfg(all(unix, not(windows)))'.dependencies]
 fts.workspace = true

@@ -31,15 +31,15 @@ serde_with = { version = "3.21", features = [
 ], default-features = false }
 tempfile = "3"
 toml = "1.1"
-toml_edit = "0.23"
+toml_edit = "0.25"
 unicode-width = "0.2"
 wildmatch = "2.6"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # reflink (clonefile/FICLONE)・errno 定数のプラットフォーム FFI。git2/tokio の既存推移依存。
 libc = "0.2"
 # Phase 2: HTTP tarball download
-reqwest = { version = "0.12", default-features = false, features = [
-	"rustls-tls",
+reqwest = { version = "0.13", default-features = false, features = [
+	"rustls",
 	"http2",
 ] }
 flate2 = { version = "1", features = ["zlib-ng"] }
