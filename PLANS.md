@@ -25,9 +25,15 @@ pack depend on the source cache.
       ports and trailing `.git`, exclude userinfo; unify lock keys and cache
       paths on one identity; read legacy raw-URL keys compatibly; reject
       conflicting revisions.
-- [ ] Replace the remaining flattened lifecycle plumbing with explicit models
-      (`PluginSpec`, `ResolvedGraph`, `MaterializationPlan`, `LazyRegistration`,
-      `PackPlan`).
+- [~] Replace the remaining flattened lifecycle plumbing with explicit models
+      (`PluginSpec` ≈ `PluginConfig`, **`ResolvedGraph`** ✅ extracted from
+      `Plugin::new` (`plugin.rs`), `MaterializationPlan`, `LazyRegistration` ≈
+      `PlugCtl`, `PackPlan` ≈ `PackPathState`). Remaining: `MaterializationPlan`
+      (in `Plugin::load`); explicit `LazyRegistration`/`PackPlan` are rename-only.
+- [x] Parallelize TOML config parsing (`main.rs`) via `JoinSet` +
+      `spawn_blocking`, reassembling `config_paths.sort()` order by task index so
+      the discovery stage no longer serializes read+parse. Byte-identical
+      pack/lock verified across isolated-HOME runs.
 - [x] Publish pack generations atomically via a staging directory and tie
       lockfile-write timing to successful publication.
 - [x] Resolve GitHub revs for `--update`/`--install` in a single batched
@@ -143,10 +149,15 @@ needs the rev. A new `Plugin::is_installed` helper drives the selection.
 
 ### Explicit models
 
-Replace the remaining flattened lifecycle plumbing with `PluginSpec`,
-`ResolvedGraph`, `MaterializationPlan`, `LazyRegistration`, and `PackPlan`,
-keeping public TOML behavior stable. (Repository identity is already canonical
-— see above.)
+`ResolvedGraph` is now extracted from `Plugin::new` (`plugin.rs`):
+`resolve(Config) -> ResolvedGraph` runs DAG resolution (`order`,
+`dependency_cachedirs`, dependent-aggregated `lazy_type`) identically to before,
+and `From<ResolvedNode> for Plugin` is a pure field move. Remaining:
+`MaterializationPlan` (extract from `Plugin::load`), and explicit
+`LazyRegistration`/`PackPlan` (≈ `PlugCtl`/`PackPathState`, rename-only and low
+value). `Plugin` struct fields, `Plugin::load`, and the `dag` crate are
+unchanged; pack/lock output is byte-identical. (Repository identity is already
+canonical — see above.)
 
 ### Runtime hot paths
 
@@ -171,9 +182,11 @@ is order-independent and runs in parallel, so a pipeline is feasible but needs
 the order/dependency/conflict stages reworked to finalize after the fan-out
 (best-effort dependency resolution semantics must be preserved).
 
-Low-risk incremental win available without that rework: parallelize TOML
-parsing (`main.rs:161-178` serial `read_to_string`+`from_str`); collection
-completion still gates the fan-out. Defer the full pipeline as a separate effort.
+Low-risk incremental win **done**: TOML parsing is now parallelized in `main.rs`
+via `JoinSet` + `spawn_blocking` (async `read_to_string` + `from_str` on the
+blocking pool), with results reassembled in `config_paths.sort()` order by task
+index so determinism is preserved. Collection completion still gates the
+fan-out; the full streaming per-TOML pipeline remains a separate effort.
 
 ## Validation
 

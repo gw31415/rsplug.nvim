@@ -158,24 +158,61 @@ async fn app() -> Result<(), Error> {
         config_paths.sort();
         log::msg(Message::ConfigWalkFinish);
 
-        let mut configs = Vec::with_capacity(config_paths.len());
-        for path in config_paths {
-            let input =
-                tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|source| Error::ConfigRead {
-                        path: path.clone(),
-                        source,
-                    })?;
-            configs.push(toml::from_str::<rsplug::Config>(&input).map_err(|source| {
-                Error::Parse {
-                    source,
-                    path,
-                    input,
-                }
-            })?);
+        // TOML の読み込みとパースを並列化する。設定ファイル数が増えるとシリアルな
+        // read+parse がディスカバリのクリティカルパスになるため、各ファイルを独立
+        // タスクで処理する。ただし `order = depth * (total + 1) + index`（plugin.rs）
+        // の `index` が `config_paths.sort()` 後の出現順の tiebreak なので、タスクの
+        // 完了順に関わらず index で元の順序に復元して集約しないと determinism が壊れる。
+        // `toml::from_str` はブロッキング CPU work なので `spawn_blocking` に逃がし、
+        // tokio ワーカースレッド（GraphQL chunk 解決等と共有）を占有しないようにする。
+        let total = config_paths.len();
+        let mut parse_tasks = tokio::task::JoinSet::new();
+        for (index, path) in config_paths.into_iter().enumerate() {
+            parse_tasks.spawn(async move {
+                let input =
+                    tokio::fs::read_to_string(&path)
+                        .await
+                        .map_err(|source| Error::ConfigRead {
+                            path: path.clone(),
+                            source,
+                        })?;
+                // path/input は parse エラー時のキャレット描画（format_toml_parse_error）
+                // に必要なので、spawn_blocking の中で消費して Result に所有させる。
+                // Error::Parse は大きい（source+path+input）ので Box に詰めてクロージャ
+                // 戻り値のスタックサイズを抑える（clippy::result_large_err 回避）。
+                let parsed = tokio::task::spawn_blocking(move || {
+                    toml::from_str::<rsplug::Config>(&input).map_err(|source| {
+                        Box::new(Error::Parse {
+                            source,
+                            path,
+                            input,
+                        })
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    Error::Io(std::io::Error::other(format!(
+                        "config parse task failed: {e}"
+                    )))
+                })?
+                .map_err(|boxed| *boxed)?;
+                Ok::<_, Error>((index, parsed))
+            });
         }
-        configs.into_iter().sum::<rsplug::Config>()
+        // 並列に完了した結果を index で元の順序に復元する。
+        let mut indexed: Vec<Option<rsplug::Config>> = (0..total).map(|_| None).collect();
+        while let Some(res) = parse_tasks.join_next().await {
+            let (index, parsed) = res.map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "config parse task panicked: {e}"
+                )))
+            })??;
+            indexed[index] = Some(parsed);
+        }
+        indexed
+            .into_iter()
+            .map(|c| c.expect("全 config のパース結果が格納済み"))
+            .sum::<rsplug::Config>()
     };
 
     // Always read the lock file as the baseline. `--locked` uses it to pin
