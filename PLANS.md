@@ -33,6 +33,8 @@ pack depend on the source cache.
 - [x] Resolve GitHub revs for `--update`/`--install` in a single batched
       GraphQL query (Git backend GitHub HTTPS URLs included; wildcards and
       non-GitHub repos resolve per-repo inside load as before).
+- [x] Exclude uninstalled repos from `--update` (no GraphQL resolve, no fetch);
+      `--install` still resolves/installs them.
 
 ## Decisions already implemented
 
@@ -118,6 +120,25 @@ runs, and any GraphQL error/null keep the existing per-repo path inside `load`
 as GitHub revs are resolved and the bottleneck stays on fetch (download/extract),
 not on rev resolution.
 
+### Uninstalled repos are not updated or GraphQL-resolved
+
+`-u` alone must only refresh already-installed repos; it must not newly install,
+nor even resolve a rev for, an uninstalled one. Previously, GitHub HTTPS + token
+repos entered `Plugin::load` with a GraphQL-preresolved `locked_rev=Some(oid)`
+even when uninstalled. The `locked_rev` branch (`plugin.rs:395`) lacked the
+install-state check that the normal branch has, so an uninstalled repo slipped
+past the `ensure_source_git` skip guard (which `use_tarball` bypasses for
+GitHub) and fetched anyway — a GitHub-backend-only bug.
+
+Now the GraphQL preresolve selection (`main.rs`) drops uninstalled repos under
+`--update` to the immediate-load path (no GraphQL, `locked_rev=None`), where the
+normal `load` branch skips them. The `locked_rev` branch is also made
+self-sufficient: uninstalled + `--install` newly installs (`was_installed=true`),
+uninstalled + `--update` skips, and uninstalled + `--lock` (cache is assumed
+present) errors with "Missing cached repository", matching the Git-backend path.
+`--install` keeps resolving uninstalled repos via GraphQL since a new install
+needs the rev. A new `Plugin::is_installed` helper drives the selection.
+
 ## Remaining phases
 
 ### Explicit models
@@ -133,6 +154,26 @@ Have generated event handlers track rsplug-owned groups/callbacks, use manifest
 paths for filetype loading, and maintain a module-root index for `require`
 loading. Remove one-shot loaders after use and avoid scanning every mapping on
 each mode change.
+
+### TOML collection / load pipeline
+
+`main.rs` collects all TOML config paths, sorts, parses serially, then merges
+into one `Config` before generating plugins and fanning out GraphQL/load
+(`main.rs:146-178`, `199-203`). Until that merge completes, neither rev
+resolution nor fetch starts, so large config sets make discovery the critical
+path instead of the network.
+
+Fully streaming "per-TOML GraphQL/load" is blocked by ordering today:
+`order = depth * (total + 1) + index` (`plugin.rs:254`), DAG dependency
+resolution (`depends` id lookup, `plugin.rs:271-278`), and conflict detection
+(`main.rs:246-262`) all require every plugin to be merged first. `load` itself
+is order-independent and runs in parallel, so a pipeline is feasible but needs
+the order/dependency/conflict stages reworked to finalize after the fan-out
+(best-effort dependency resolution semantics must be preserved).
+
+Low-risk incremental win available without that rework: parallelize TOML
+parsing (`main.rs:161-178` serial `read_to_string`+`from_str`); collection
+completion still gates the fan-out. Defer the full pipeline as a separate effort.
 
 ## Validation
 

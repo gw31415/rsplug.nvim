@@ -292,7 +292,14 @@ async fn app() -> Result<(), Error> {
             && !rev.as_deref().is_some_and(|r| r.contains('*'))
             && let Some((owner, rname)) = rsplug::util::github::parse_github_url(&repo.url())
         {
-            // GitHub GraphQL 対象: chunk 完了後に load。
+            // 未インストール + --update は GraphQL せず即 load（load 内で未インストール判定 →
+            // スキップ。rev を解決する必要がない）。--install の未インストールは新規 install に
+            // rev が必要なので GraphQL 対象のまま（バッチ高速化を維持）。
+            if update && !p.is_installed(DEFAULT_REPOCACHE_DIR.as_path()).await {
+                immediate.push((p, LoadRev::Resolved(None)));
+                continue;
+            }
+            // インストール済み、または --install: GitHub GraphQL 対象。chunk 完了後に load。
             graphql_batch.push(rsplug::util::github::GithubRev {
                 owner,
                 repo: rname,

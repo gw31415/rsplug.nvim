@@ -291,6 +291,18 @@ impl Plugin {
         ))
     }
 
+    /// キャッシュに既存 snapshot があるか（= インストール済み）。
+    /// GraphQL preresolve の対象選別（main.rs）で未インストール + --update を除外するために使う。
+    /// `repo` 無し（script-only）はインストール概念がないので false。
+    pub(crate) async fn is_installed(&self, cache_dir: &Path) -> bool {
+        let Some(repo) = self.cache.repo.as_ref() else {
+            return false;
+        };
+        let r_root = repo_root(cache_dir, repo);
+        let worktrees = worktrees_dir(&r_root);
+        latest_snapshot_dir(&worktrees).await.is_some()
+    }
+
     /// キャッシュからPluginを読み込む。オプションでインストールやアップデートも行う。
     /// インストールされていない場合は `Ok(None)` を返す。
     pub async fn load(
@@ -400,14 +412,35 @@ impl Plugin {
                 )));
             }
             let oid = Oid::from_str(locked_rev).map_err(Error::Git2)?;
-            // locked_rev は --lock 由来（lock 固定、更新概念なし）または preresolved（GraphQL、--update）。
-            // update=true なら preresolved: 既存 snapshot と比較して「実際に更新された」を立て、
-            // lua_post_update を実行させる（lua_post_update は新規 fetch 時のみ）。
-            let was_updated = update
-                && latest_snapshot_oid(&worktrees)
-                    .await?
-                    .is_some_and(|existing| existing != oid);
-            (oid, was_updated, false)
+            // locked_rev は --lock 由来（lock 固定、更新概念なし）または preresolved（GraphQL、--install/--update）。
+            // インストール状態で分岐し、未インストール時は通常経路（後続の match）と同じセマンティクスを適用:
+            //   - install                  : 新規 fetch（was_installed=true で lua_post_update 実行）。
+            //   - update 単独(install=false): 新規 install しない（`-u` 単独はスキップ）。
+            //   - --lock 単独(install=update=false): lock はキャッシュ前提なのでキャッシュ不足はエラー
+            //     （Git 経路の ensure_source_git と整合。tarball 経路は source.git を使わないため、ここで
+            //      弾かないと未インストールでも新規 fetch してしまうのが本バグ）。
+            match latest_snapshot_oid(&worktrees).await? {
+                // インストール済み。update=true なら preresolved: 既存 snapshot と比較して「実際に更新された」を立て、
+                // lua_post_update を実行させる（lua_post_update は新規 fetch 時のみ）。
+                Some(existing) => (oid, update && existing != oid, false),
+                None if install => (oid, false, true),
+                None if update => {
+                    // 未インストール + --update 単独: 新規 install はしない
+                    // （防御。通常は main.rs で GraphQL 対象外になり、この経路には来ない）。
+                    msg(Message::PluginNotInstalled(display_name(
+                        &source_name,
+                        &logid,
+                    )));
+                    return Ok(None);
+                }
+                None => {
+                    // 未インストール + --lock 単独: キャッシュ前提なのでエラー。
+                    return Err(invalid_data(format!(
+                        "Missing cached repository for locked revision: {}",
+                        url
+                    )));
+                }
+            }
         } else {
             match latest_snapshot_oid(&worktrees).await? {
                 Some(existing) if update => {
@@ -1853,6 +1886,230 @@ mod tests {
             "install+update should produce a snapshot"
         );
         assert!(repo_root.join("source.git").is_dir());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn is_installed_reflects_snapshot_existence() {
+        // is_installed: install 前 false、install 後 true。file:// Git リポジトリで検証。
+        // これは main.rs の GraphQL preresolve 対象選別（未インストール + --update の除外）の判定根拠。
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("rsplug-is-installed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let remote = dir.join("remote");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(remote.join("plugin")).unwrap();
+        std::fs::write(remote.join("plugin/init.vim"), "\"x\n").unwrap();
+        let git = |args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(&remote)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let c = Command::new("git")
+            .current_dir(&remote)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(c.success());
+        let url = format!("file://{}", remote.display());
+
+        let mk_cfg = || {
+            toml::from_str::<Config>(&format!(
+                r#"
+            [[plugins]]
+            repo = "{url}"
+            sym = true
+            "#
+            ))
+            .unwrap()
+        };
+
+        // (1) install 前: 未インストール。
+        let p0 = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        assert!(
+            !p0.is_installed(&cache).await,
+            "must report not-installed before load"
+        );
+
+        // (2) install 実行。
+        let p1 = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let _ = p1
+            .load(
+                true,
+                false,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+
+        // (3) install 後: インストール済み。Config は Clone できないので新プラグインで再判定。
+        let p2 = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        assert!(
+            p2.is_installed(&cache).await,
+            "must report installed after load"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn locked_rev_path_skips_installs_or_errors_for_uninstalled() {
+        // locked_rev=Some（GraphQL preresolved / --lock 由来）+ 未インストールの分岐。
+        //   - update 単独 → Ok(None) スキップ（本バグの核心: -u 単独は新規 install しない）
+        //   - install    → 新規 install（preresolved rev で）
+        //   - lock 単独(install=update=false) → キャッシュ不足エラー（Git 経路と整合）
+        use std::{process::Command, sync::Arc};
+        let dir = std::env::temp_dir().join(format!(
+            "rsplug-lockedrev-uninstalled-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let remote = dir.join("remote");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(remote.join("plugin")).unwrap();
+        std::fs::write(remote.join("plugin/init.vim"), "\"x\n").unwrap();
+        let git = |args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(&remote)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let c = Command::new("git")
+            .current_dir(&remote)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(c.success());
+        let oid = String::from_utf8(
+            Command::new("git")
+                .current_dir(&remote)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let oid: Arc<str> = Arc::from(oid.trim());
+        let url = format!("file://{}", remote.display());
+
+        let mk_cfg = || {
+            toml::from_str::<Config>(&format!(
+                r#"
+            [[plugins]]
+            repo = "{url}"
+            sym = true
+            "#
+            ))
+            .unwrap()
+        };
+
+        // repo_root は load ごとに不変（キャッシュ未作成の確認用）。
+        let repo_root = {
+            let p = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+            cache.join(p.cache.repo.as_ref().unwrap().default_cachedir())
+        };
+
+        // (1) 未インストール + update 単独 (locked_rev=Some) → スキップ。何も作らない。
+        let p = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let r = p
+            .load(
+                false,
+                true,
+                &cache,
+                Some(oid.clone()),
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.is_none(),
+            "update alone must skip an uninstalled repo even with preresolved rev"
+        );
+        assert!(
+            !repo_root.join("source.git").exists(),
+            "update alone must not create source.git"
+        );
+        assert!(
+            !repo_root.join("worktrees").exists(),
+            "update alone must not create any snapshot"
+        );
+
+        // (2) 未インストール + install (locked_rev=Some) → 新規 install。
+        let p = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let (loaded, _) = p
+            .load(
+                true,
+                false,
+                &cache,
+                Some(oid.clone()),
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
+            )
+            .await
+            .unwrap()
+            .expect("install with preresolved rev must install an uninstalled repo");
+        assert!(
+            loaded.snapshot_root().is_some(),
+            "install must produce a snapshot"
+        );
+
+        // (3) のためキャッシュを削除して未インストールに戻す。
+        let _ = std::fs::remove_dir_all(&repo_root);
+
+        // (3) 未インストール + lock 単独 (install=false, update=false) → キャッシュ不足エラー。
+        let p = Plugin::new(mk_cfg()).unwrap().next().unwrap();
+        let err = p
+            .load(
+                false,
+                false,
+                &cache,
+                Some(oid.clone()),
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Missing cached repository"),
+            "lock alone must fail with cache-missing, got: {msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
