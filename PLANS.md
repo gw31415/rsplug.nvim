@@ -194,8 +194,27 @@ the order/dependency/conflict stages reworked to finalize after the fan-out
 Low-risk incremental win **done**: TOML parsing is now parallelized in `main.rs`
 via `JoinSet` + `spawn_blocking` (async `read_to_string` + `from_str` on the
 blocking pool), with results reassembled in `config_paths.sort()` order by task
-index so determinism is preserved. Collection completion still gates the
-fan-out; the full streaming per-TOML pipeline remains a separate effort.
+index so determinism is preserved.
+
+**Scheduler foundation done** (`run_load_scheduler`, commit `5568884`): a
+single-consumer scheduler consumes `SchedEvent` (Parsed/ParsePhaseDone/ParseError)
+from the parallel parse producer and drives load fan-out via `tokio::select!` +
+`JoinSet`. Step 1 = `Plugin::new` (batch) used as-is, GraphQL chunk integration
+done; behavior byte-identical (pack/lock/generation id match across isolated
+HOMEs). This is the event-driven pipeline base.
+
+**BFS load ordering (in progress)**: `Plugin`/`ResolvedNode` carry internal
+`id`/`depends` (commit `0bf1ee4`, WIP; NOT in `plugin_id` Hash). Design
+decision: keep `Plugin::new` (batch DAG resolve incl. lazy_type aggregation,
+which is infeasible to reproduce in a streaming way without changing
+`plugin_id`), and add BFS only to load fan-out ordering (fan-out a plugin after
+its dependencies' load completes) — this removes the build-runtimepath race
+while keeping `plugin_id` byte-identical. Remaining: `run_load_scheduler` BFS
+rewrite (`NodeState`/`pending_deps`/`try_schedule_ready`/LoadDone/chunk
+coordination). Deferred to a follow-up session for careful implementation and
+verification. A full plan/execute split remains structurally impossible (the
+plan phase is itself I/O-dependent); the streaming win is dependency-chained
+parallelism + race elimination, gated by `ParsePhaseDone`.
 
 ## Validation
 
