@@ -36,6 +36,13 @@ pub struct Plugin {
     pub merge_enabled: bool,
     /// DAGトポロジカル順。controlled startup の順序維持に使う。
     pub order: usize,
+    /// 内部 id（BFS 依存スケジューリング用）。`plugin_id`（`LoadedPlugin` の Hash）には
+    /// 含まれない。`Plugin::new` で `PluginConfig.id` から移行する。
+    #[allow(dead_code)] // Step 2d で run_load_scheduler が使用
+    pub id: String,
+    /// 依存先 id リスト（BFS 用）。`plugin_id` には含まれない。
+    #[allow(dead_code)]
+    pub depends: Vec<String>,
 }
 
 /// プラグインの取得元
@@ -247,6 +254,10 @@ struct ResolvedNode {
     script: SetupScript,
     merge: MergeConfig,
     merge_enabled: bool,
+    /// 内部 id（BFS 用）。Plugin への移行のみ。
+    id: String,
+    /// 依存先 id リスト（BFS 用）。
+    depends: Vec<String>,
 }
 
 /// 段階2: `ResolvedNode` → `Plugin`。純粋なフィールド移動（計算なし）。
@@ -262,6 +273,8 @@ impl From<ResolvedNode> for Plugin {
             dependency_cachedirs: n.dependency_cachedirs,
             merge_enabled: n.merge_enabled,
             order: n.order,
+            id: n.id,
+            depends: n.depends,
         }
     }
 }
@@ -315,6 +328,7 @@ impl Plugin {
                       }| {
                     let order = depth * (total + 1) + index;
                     let source_name = inner.dep_name().map(str::to_string);
+                    let id = inner.id.clone().unwrap_or_default();
                     let PluginConfig {
                         cache,
                         lazy_type,
@@ -331,10 +345,10 @@ impl Plugin {
                     // 依存先が script-only（リポジトリなし）の場合はキャッシュディレクトリが
                     // 存在しないため除外する（runtimepath に追加すべきパスがない）。
                     let dependency_cachedirs = depends
-                        .into_iter()
+                        .iter()
                         .filter_map(|dep_id| {
                             id_to_index
-                                .get(&dep_id)
+                                .get(dep_id)
                                 .and_then(|&dep_index| cachedirs[dep_index].clone())
                         })
                         .collect();
@@ -348,6 +362,8 @@ impl Plugin {
                         script,
                         merge,
                         merge_enabled,
+                        id,
+                        depends,
                     }
                 },
             )
@@ -395,6 +411,8 @@ impl Plugin {
             dependency_cachedirs,
             merge_enabled,
             order,
+            id: _,
+            depends: _,
         } = self;
 
         let CacheConfig {
