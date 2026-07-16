@@ -203,18 +203,22 @@ from the parallel parse producer and drives load fan-out via `tokio::select!` +
 done; behavior byte-identical (pack/lock/generation id match across isolated
 HOMEs). This is the event-driven pipeline base.
 
-**BFS load ordering (in progress)**: `Plugin`/`ResolvedNode` carry internal
-`id`/`depends` (commit `0bf1ee4`, WIP; NOT in `plugin_id` Hash). Design
-decision: keep `Plugin::new` (batch DAG resolve incl. lazy_type aggregation,
-which is infeasible to reproduce in a streaming way without changing
-`plugin_id`), and add BFS only to load fan-out ordering (fan-out a plugin after
-its dependencies' load completes) — this removes the build-runtimepath race
-while keeping `plugin_id` byte-identical. Remaining: `run_load_scheduler` BFS
-rewrite (`NodeState`/`pending_deps`/`try_schedule_ready`/LoadDone/chunk
-coordination). Deferred to a follow-up session for careful implementation and
-verification. A full plan/execute split remains structurally impossible (the
-plan phase is itself I/O-dependent); the streaming win is dependency-chained
-parallelism + race elimination, gated by `ParsePhaseDone`.
+**BFS load ordering (done)**: `Plugin`/`ResolvedNode` carry internal
+`id`/`depends` (commit `0bf1ee4`; NOT in `plugin_id` Hash).
+`run_load_scheduler` now drives a 2-gate fan-out: each plugin is spawned only
+after (a) its rev is resolved (non-GitHub immediately, GitHub via chunk
+completion) and (b) all its dependencies' load completes (`NodeState` /
+`pending_deps` / `dependents` / `try_schedule`). This removes the
+build-runtimepath race while keeping `plugin_id` byte-identical
+(`LoadedPlugin::Ord` + `merge()` + `PackPathState::load`'s `drain()` + `merge()`
+are fan-out-order independent). The `select!` branches are `if`-guarded so the
+post-`ParsePhaseDone` `parse_rx` terminal doesn't busy-loop and GraphQL chunk
+completions are reliably consumed (the old `None => break` could drop in-flight
+chunks to per-repo fallback). Rev-undetermined nodes (chunk panic) are rescued
+with per-repo fallback at shutdown; a leftover never-ready node is treated as a
+deadlock (theoretical only — `try_dag` rejects cycles). Byte-identical verified
+via `cargo test` / `clippy` / `fmt`; isolated-HOME end-to-end remains optional
+follow-up.
 
 ## Validation
 

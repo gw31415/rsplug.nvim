@@ -37,11 +37,10 @@ pub struct Plugin {
     /// DAGトポロジカル順。controlled startup の順序維持に使う。
     pub order: usize,
     /// 内部 id（BFS 依存スケジューリング用）。`plugin_id`（`LoadedPlugin` の Hash）には
-    /// 含まれない。`Plugin::new` で `PluginConfig.id` から移行する。
-    #[allow(dead_code)] // Step 2d で run_load_scheduler が使用
+    /// 含まれない。`Plugin::new` で `PluginConfig.id` から移行する。`run_load_scheduler`
+    /// が fan-out 完了追跡のキーとして使う。
     pub id: String,
     /// 依存先 id リスト（BFS 用）。`plugin_id` には含まれない。
-    #[allow(dead_code)]
     pub depends: Vec<String>,
 }
 
