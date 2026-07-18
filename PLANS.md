@@ -41,6 +41,17 @@ pack depend on the source cache.
       non-GitHub repos resolve per-repo inside load as before).
 - [x] Exclude uninstalled repos from `--update` (no GraphQL resolve, no fetch);
       `--install` still resolves/installs them.
+- [x] Stream parse → load through an event-driven scheduler
+      (`run_load_scheduler`, Step 1), then BFS fan-out so each plugin loads only
+      after its rev is resolved and all dependencies' loads complete (Step 2);
+      `plugin_id` stays byte-identical across fan-out order.
+- [x] Split `Plugin::load` into `load_early` (rev resolve → fetch/materialize →
+      identity) and `load_late` (BUILD → assemble with final `order`/`lazy_type`),
+      so EARLY can fan out before the full merge; `finalized` + dependency LATE
+      completion gate the BUILD phase (Step 3).
+- [ ] Full per-TOML streaming (Step 4): incremental conflict detection and
+      per-arriving-plugin GraphQL / EARLY kick instead of waiting for
+      ParsePhaseDone, so fetch stops being serialized behind config discovery.
 
 ## Decisions already implemented
 
@@ -131,10 +142,11 @@ not on rev resolution.
 `-u` alone must only refresh already-installed repos; it must not newly install,
 nor even resolve a rev for, an uninstalled one. Previously, GitHub HTTPS + token
 repos entered `Plugin::load` with a GraphQL-preresolved `locked_rev=Some(oid)`
-even when uninstalled. The `locked_rev` branch (`plugin.rs:395`) lacked the
-install-state check that the normal branch has, so an uninstalled repo slipped
-past the `ensure_source_git` skip guard (which `use_tarball` bypasses for
-GitHub) and fetched anyway — a GitHub-backend-only bug.
+even when uninstalled. The `locked_rev` branch (`resolve_target_commit` in
+`plugin.rs`) lacked the install-state check that the normal branch has, so an
+uninstalled repo slipped past the `ensure_source_git` skip guard (which
+`use_tarball` bypasses for GitHub) and fetched anyway — a GitHub-backend-only
+bug.
 
 Now the GraphQL preresolve selection (`main.rs`) drops uninstalled repos under
 `--update` to the immediate-load path (no GraphQL, `locked_rev=None`), where the
@@ -177,33 +189,34 @@ each mode change.
 
 ### TOML collection / load pipeline
 
-`main.rs` collects all TOML config paths, sorts, parses serially, then merges
-into one `Config` before generating plugins and fanning out GraphQL/load
-(`main.rs:146-178`, `199-203`). Until that merge completes, neither rev
-resolution nor fetch starts, so large config sets make discovery the critical
-path instead of the network.
+`main.rs` collects all TOML config paths, sorts, and parses them in parallel
+(Step 1), but still waits for the full merge into one `Config` before
+generating plugins and fanning out GraphQL/load. Until that merge completes
+(ParsePhaseDone), neither rev resolution nor fetch starts, so large config
+sets make discovery the critical path instead of the network.
 
 Fully streaming "per-TOML GraphQL/load" is blocked by ordering today:
-`order = depth * (total + 1) + index` (`plugin.rs:254`), DAG dependency
-resolution (`depends` id lookup, `plugin.rs:271-278`), and conflict detection
-(`main.rs:246-262`) all require every plugin to be merged first. `load` itself
-is order-independent and runs in parallel, so a pipeline is feasible but needs
-the order/dependency/conflict stages reworked to finalize after the fan-out
-(best-effort dependency resolution semantics must be preserved).
+`order = depth * (total + 1) + index` (computed in `Plugin::resolve`), DAG
+dependency resolution (`depends` id lookup, also in `Plugin::resolve`), and
+conflict detection (`run_load_scheduler`'s ParsePhaseDone handler) all require
+every plugin to be merged first. `load` itself is order-independent and runs in
+parallel, so a pipeline is feasible but needs the order/dependency/conflict
+stages reworked to finalize after the fan-out (best-effort dependency
+resolution semantics must be preserved).
 
 Low-risk incremental win **done**: TOML parsing is now parallelized in `main.rs`
 via `JoinSet` + `spawn_blocking` (async `read_to_string` + `from_str` on the
 blocking pool), with results reassembled in `config_paths.sort()` order by task
 index so determinism is preserved.
 
-**Scheduler foundation done** (`run_load_scheduler`, commit `5568884`): a
-single-consumer scheduler consumes `SchedEvent` (Parsed/ParsePhaseDone/ParseError)
+**Scheduler foundation done — Step 1** (`run_load_scheduler`, commit `5568884`):
+a single-consumer scheduler consumes `SchedEvent` (Parsed/ParsePhaseDone/ParseError)
 from the parallel parse producer and drives load fan-out via `tokio::select!` +
-`JoinSet`. Step 1 = `Plugin::new` (batch) used as-is, GraphQL chunk integration
+`JoinSet`. `Plugin::new` (batch) is used as-is, with GraphQL chunk integration
 done; behavior byte-identical (pack/lock/generation id match across isolated
 HOMEs). This is the event-driven pipeline base.
 
-**BFS load ordering (done)**: `Plugin`/`ResolvedNode` carry internal
+**BFS load ordering (done — Step 2)**: `Plugin`/`ResolvedNode` carry internal
 `id`/`depends` (commit `0bf1ee4`; NOT in `plugin_id` Hash).
 `run_load_scheduler` now drives a 2-gate fan-out: each plugin is spawned only
 after (a) its rev is resolved (non-GitHub immediately, GitHub via chunk
@@ -219,6 +232,42 @@ with per-repo fallback at shutdown; a leftover never-ready node is treated as a
 deadlock (theoretical only — `try_dag` rejects cycles). Byte-identical verified
 via `cargo test` / `clippy` / `fmt`; isolated-HOME end-to-end remains optional
 follow-up.
+
+**EARLY/LATE load split (done — Step 3)**: The split rests on two facts about
+`Plugin::load`. **FACT 1**: everything before BUILD is dependency-free — only
+the BUILD step reads `dependency_cachedirs`, so rev resolve → fetch/materialize
+→ identity-core can run as soon as the rev is known, before `order`/`lazy_type`/
+dependencies are final. **FACT 2**: `order` and `lazy_type` are baked into
+`LoadedPlugin`'s `Hash` derive (hence into `plugin_id`) and cannot be
+overwritten after BUILD, so assembly with the final values must wait until the
+full resolve (DAG order + aggregated `lazy_type`) completes. Accordingly
+`Plugin::load` is split into `load_early` (FACT 1: rev resolve → fetch/
+materialize → identity-core) and `load_late` (FACT 2: BUILD via
+`dependency_cachedirs` → assemble with the final `order`/`lazy_type`). New
+intermediate types `MaterializeOutcome`/`EarlyOutcome` carry the EARLY result;
+`EarlyOutcome`/`MaterializeOutcome`/`RunningGuard`/`load_early`/`load_late` are
+`pub(crate)` and `EarlyOutcome` is re-exported from `rsplug::`. `run_load_scheduler`
+is now a 2-phase scheduler with `EarlySlot`/`finalized`/`pending_deps` on
+`NodeState`: EARLY tasks (`load_early`) fan out on rev resolution; LATE tasks
+(`load_late`) run only after `finalized` (resolve done at ParsePhaseDone) +
+EARLY done + dependency LATE completion. The `finalized` gate enforces FACT 2
+(`order`/`lazy_type` reach `load_late` only after resolve). `Plugin::load` is
+kept as a `#[cfg(test)]` serial wrapper for existing tests. EARLY still starts
+after ParsePhaseDone (GraphQL/conflict remain batched there), so the fetch
+bottleneck is not yet addressed — that is the remaining work below. Byte-identical
+verified via `cargo test` / `clippy` / `fmt`.
+
+**Remaining: full per-TOML streaming (Step 4, deferred to a later session)**:
+move conflict detection into the `Parsed` handler (incremental), kick GraphQL
+per-arriving-plugin (rolling batch of 25), and start EARLY (`load_early`) on each
+`Parsed` instead of after ParsePhaseDone. Requires: a staging table (id-keyed)
+for plugins arriving before the full merge; `PluginConfig -> Plugin` (order/
+lazy_type dummy) generation so pre-resolve EARLY is possible (EARLY ignores
+those fields per FACT 1); promotion at ParsePhaseDone that merges staged EARLY
+state into the resolved `nodes`; design points are same-name id overwrite and
+EARLY (dummy Plugin) / LATE (resolved Plugin) id-binding. `Config`/`PluginConfig`
+must become `pub(crate)` so `main.rs` can reach plugins per-TOML. isolated-HOME
+E2E (byte-identical pack/lock/generation vs HEAD) to follow once implemented.
 
 ## Validation
 

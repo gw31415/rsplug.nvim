@@ -58,20 +58,15 @@ enum LoadRev {
     Resolved(Option<Arc<str>>),
 }
 
-/// 1 plugin の load と後処理（LoadPluginDone・canon_to_remove 判定）。
-/// 既存 fan-out クロージャ本体を抽出。plugin.rs load はゼロ変更。
-async fn load_one(
-    plugin: rsplug::Plugin,
-    ctx: LoadCtx,
+#[allow(clippy::result_large_err)]
+/// (locked_rev, repo_canon) を LoadRev と Plugin から展開。旧 load_one 前半。
+/// EARLY 相で rev を確定し、Skipped の canon_to_remove 用に repo_canon を返す。
+fn expand_rev(
+    plugin: &rsplug::Plugin,
+    ctx: &LoadCtx,
     rev: LoadRev,
-) -> Result<
-    (
-        Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
-        Option<String>,
-    ),
-    Error,
-> {
-    let (locked_rev, repo_canon): (Option<Arc<str>>, Option<String>) = match rev {
+) -> Result<(Option<Arc<str>>, Option<String>), Error> {
+    Ok(match rev {
         LoadRev::Auto => {
             if let Some(repo) = plugin.cache.repo.as_ref() {
                 let canonical = repo.canonical();
@@ -101,17 +96,44 @@ async fn load_one(
             let repo_canon = plugin.cache.repo.as_ref().map(|r| r.canonical());
             (oid, repo_canon)
         }
-    };
-    let result = plugin
-        .load(
+    })
+}
+
+/// EARLY 相（rev 解決 → fetch/materialize）。`&plugin` で呼び plugin を消費しない。
+/// 戻りは `(EarlyOutcome, repo_canon)`。repo_canon は Skipped の canon_to_remove 用。
+async fn run_load_early(
+    plugin: &rsplug::Plugin,
+    ctx: &LoadCtx,
+    rev: LoadRev,
+) -> Result<(rsplug::EarlyOutcome, Option<String>), Error> {
+    let (locked_rev, repo_canon) = expand_rev(plugin, ctx, rev)?;
+    let early = plugin
+        .load_early(
             ctx.install,
             ctx.update,
-            ctx.cache_dir.as_path(),
-            locked_rev,
-            ctx.fetch_semaphore.clone(),
-            ctx.http_client.clone(),
+            &ctx.cache_dir,
+            locked_rev.as_deref(),
+            &ctx.fetch_semaphore,
+            &ctx.http_client,
         )
-        .await;
+        .await?;
+    Ok((early, repo_canon))
+}
+
+/// LATE 相（BUILD + assemble）。plugin を消費。canon_to_remove 用に repo_canon を再計算。
+async fn run_load_late(
+    plugin: rsplug::Plugin,
+    early: rsplug::EarlyOutcome,
+    ctx: &LoadCtx,
+) -> Result<
+    (
+        Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
+        Option<String>,
+    ),
+    Error,
+> {
+    let repo_canon = plugin.cache.repo.as_ref().map(|r| r.canonical());
+    let result = plugin.load_late(early, &ctx.cache_dir, ctx.update).await;
     msg(Message::LoadPluginDone);
     let canon_to_remove =
         if repo_canon.is_some() && result.is_ok() && result.as_ref().unwrap().is_none() {
@@ -120,6 +142,19 @@ async fn load_one(
             None
         };
     Ok((result?, canon_to_remove))
+}
+
+/// EARLY 相の進行状態。EARLY 完了結果（`EarlyOutcome`）を保持する。
+enum EarlySlot {
+    InFlight,
+    Done(rsplug::EarlyOutcome),
+}
+
+/// EARLY 相タスクの完了結果。EARLY 完了後も plugin を戻し、LATE 相へ渡す。
+struct EarlyDone {
+    idx: usize,
+    plugin: rsplug::Plugin,
+    outcome: Result<(rsplug::EarlyOutcome, Option<String>), Error>,
 }
 
 async fn app() -> Result<(), Error> {
@@ -332,6 +367,115 @@ async fn app() -> Result<(), Error> {
     Ok(())
 }
 
+/// 1 プラグインの LATE 相成功ペイロード（`run_load_late` の成功値）。
+struct LoadPayload {
+    loaded: Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
+    canon_to_remove: Option<String>,
+}
+
+/// 集約用の LATE 相結果（`run_load_late` の戻り値そのもの）。`finished` に蓄積する。
+type LoadOutcome = Result<
+    (
+        Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
+        Option<String>,
+    ),
+    Error,
+>;
+
+/// 1 プラグインの LATE 相完了結果。BFS の依存完了追跡用にノード index を添える。
+/// エラーでも index は分かるので、依存元の `pending_deps` を進められる。
+struct LoadDone {
+    idx: usize,
+    outcome: Result<LoadPayload, Error>,
+}
+
+/// GraphQL chunk 解決タスクの結果（oid_map と chunk の canonical リスト）。
+type GraphqlChunkResult = (
+    Result<HashMap<(String, String), Option<String>>, rsplug::util::github::ApiError>,
+    Vec<String>,
+);
+
+/// 2相 load スケジューリング用の各プラグインノード状態。
+///
+/// 各プラグインは EARLY 相（rev 解決 → fetch/materialize、依存不要）と LATE 相
+/// （BUILD + assemble、全DAG確定後）に分かれ、それぞれ独立したゲートを通過する:
+/// (1) EARLY ゲート: `rev` 確定 + `early` 未開始。rev 解決直後に fetch/materialize を開始
+///     （FACT 1: 依存情報不要）。
+/// (2) LATE ゲート: `finalized`(resolve 完了) + `early` Done + `pending_deps == 0`
+///     （依存先の LATE 完了）。order/lazy_type が resolve で確定後にしか load_late は呼ばれない
+///     （FACT 2: plugin_id 安定性）。build-runtimepath race も依存 LATE 完了待ちで排除。
+struct NodeState {
+    /// EARLY 前・EARLY 完了後に保持。EARLY/LATE タスクが take する。
+    plugin: Option<rsplug::Plugin>,
+    /// EARLY ゲート用の rev。`None` = GraphQL chunk 解決待ち。
+    rev: Option<LoadRev>,
+    /// EARLY 相の進行状態。`None` = 未開始、`InFlight` = 進行中、`Done` = 完了。
+    early: Option<EarlySlot>,
+    /// resolve() 完了（ParsePhaseDone で order/lazy_type/dependency_cachedirs 確定）。
+    finalized: bool,
+    /// 未完了の依存先 LATE 数。依存先 LATE 完了ごとに減る。
+    pending_deps: usize,
+    /// このプラグインの LATE 完了を待つ（依存している）ノード index。
+    dependents: Vec<usize>,
+}
+
+/// ノードが EARLY fan-out 可能（rev 確定 + EARLY 未開始 + plugin 有り）なら load_early タスクを spawn。
+fn try_schedule_early(
+    nodes: &mut [NodeState],
+    early_tasks: &mut tokio::task::JoinSet<EarlyDone>,
+    ctx: &LoadCtx,
+    idx: usize,
+) {
+    let Some(state) = nodes.get_mut(idx) else {
+        return;
+    };
+    if state.rev.is_none() || state.early.is_some() || state.plugin.is_none() {
+        return;
+    }
+    let plugin = state.plugin.take().expect("checked above");
+    let rev = state.rev.take().expect("rev is Some (checked above)");
+    state.early = Some(EarlySlot::InFlight);
+    let ctx2 = ctx.clone();
+    early_tasks.spawn(async move {
+        let outcome = run_load_early(&plugin, &ctx2, rev).await;
+        EarlyDone {
+            idx,
+            plugin,
+            outcome,
+        }
+    });
+}
+
+/// ノードが LATE fan-out 可能（finalized + EARLY 完了 + 依存 LATE 完了）なら load_late タスクを spawn。
+fn try_schedule_late(
+    nodes: &mut [NodeState],
+    load_tasks: &mut tokio::task::JoinSet<LoadDone>,
+    ctx: &LoadCtx,
+    idx: usize,
+) {
+    let Some(state) = nodes.get_mut(idx) else {
+        return;
+    };
+    // FACT 2 の核心: finalized（resolve 確定）でなければ LATE しない。
+    if !state.finalized || state.pending_deps != 0 || state.plugin.is_none() {
+        return;
+    }
+    let Some(EarlySlot::Done(early)) = state.early.take() else {
+        return;
+    };
+    let plugin = state.plugin.take().expect("checked above");
+    let ctx2 = ctx.clone();
+    load_tasks.spawn(async move {
+        let outcome = run_load_late(plugin, early, &ctx2)
+            .await
+            .map(|(loaded, canon_to_remove)| LoadPayload {
+                loaded,
+                canon_to_remove,
+            });
+        LoadDone { idx, outcome }
+    });
+}
+
 /// per-TOML パース結果をスケジューラへ流すイベント。
 enum SchedEvent {
     /// TOML 1 ファイルのパース完了。`index` は `config_paths.sort()` 後の位置。
@@ -345,100 +489,17 @@ enum SchedEvent {
     ParseError(Error),
 }
 
-/// 1 プラグインの load 成功ペイロード（`load_one` の成功値）。
-struct LoadPayload {
-    loaded: Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
-    canon_to_remove: Option<String>,
-}
-
-/// 集約用の load 結果（`load_one` の戻り値そのもの）。`finished` に蓄積する。
-type LoadOutcome = Result<
-    (
-        Option<(rsplug::LoadedPlugin, Option<(String, String)>)>,
-        Option<String>,
-    ),
-    Error,
->;
-
-/// 1 プラグインの load 完了結果。BFS の依存完了追跡用にノード index を添える。
-/// エラーでも index は分かるので、依存元の `pending_deps` を進められる。
-struct LoadDone {
-    idx: usize,
-    outcome: Result<LoadPayload, Error>,
-}
-
-/// GraphQL chunk 解決タスクの結果（oid_map と chunk の canonical リスト）。
-type GraphqlChunkResult = (
-    Result<HashMap<(String, String), Option<String>>, rsplug::util::github::ApiError>,
-    Vec<String>,
-);
-
-/// BFS 依存スケジューリング用の各プラグインノード状態。
+/// load fan-out を統括するスケジューラ（2相 EARLY/LATE + BFS 依存スケジューリング）。
 ///
-/// 各プラグインは2段階のゲートを通過してから load fan-out される:
-/// (1) `rev` が確定していること（非GraphQL は最初から確定、GraphQL は chunk 完了後）
-/// (2) `pending_deps == 0`（依存先の load が全て完了していること）
+/// EARLY 相（fetch/materialize）は rev 解決直後に開始し、LATE 相（BUILD/assemble）は
+/// resolve() 完了（`finalized`）+ 依存 LATE 完了後に実行する。これにより:
+/// - FACT 1: fetch/materialize は依存情報不要なので EARLY で並列実行。
+/// - FACT 2: order/lazy_type は resolve() で確定後にしか load_late に渡らない（plugin_id 安定性）。
+/// - build-runtimepath race: LATE(build) は依存先の LATE 完了を待つ（`pending_deps`）。
 ///
-/// これにより build-runtimepath race（依存元が依存先より先に load 完了し、
-/// 依存先 cachedir が未確定のまま runtimepath に組まれる）を排除する。
-struct NodeState {
-    /// 未 fan-out のプラグイン本体。fan-out 後は `None`（完了待ちへ移行）。
-    plugin: Option<rsplug::Plugin>,
-    /// 未完了の依存先数。依存先が load 完了するごとに減る。0 になれば（rev 確定後）ready。
-    pending_deps: usize,
-    /// load に渡す rev。`None` = GraphQL chunk 解決待ち。
-    rev: Option<LoadRev>,
-    /// このプラグインの load 完了を待っている（依存している）ノード index。
-    dependents: Vec<usize>,
-}
-
-/// ノードが fan-out 可能（rev 確定 + 依存完了）なら load タスクを spawn する。
-///
-/// 二重 spawn 防止: `plugin`/`rev` を take して消費するので、2回目以降の呼び出しは
-/// `plugin` が `None` になり何もしない。rev 未確定・依存待ちの場合も保留して何もしない。
-fn try_schedule(
-    nodes: &mut [NodeState],
-    load_tasks: &mut tokio::task::JoinSet<LoadDone>,
-    ctx: &LoadCtx,
-    idx: usize,
-) {
-    let Some(state) = nodes.get_mut(idx) else {
-        return;
-    };
-    // rev 未確定、または依存待ちなら保留。
-    if state.rev.is_none() || state.pending_deps != 0 {
-        return;
-    }
-    let Some(plugin) = state.plugin.take() else {
-        return; // 既に fan-out 済み
-    };
-    let rev = state.rev.take().expect("rev is Some (checked above)");
-    let ctx2 = ctx.clone();
-    load_tasks.spawn(async move {
-        let outcome = load_one(plugin, ctx2, rev)
-            .await
-            .map(|(loaded, canon_to_remove)| LoadPayload {
-                loaded,
-                canon_to_remove,
-            });
-        LoadDone { idx, outcome }
-    });
-}
-
-/// load fan-out を統括するスケジューラ（BFS 依存スケジューリング）。
-///
-/// `Plugin::new`（バッチ resolve）で `id`/`depends` を載せたプラグイン群を作り、
-/// `ParsePhaseDone` 後に BFS ノード表を構築する。各プラグインは2段階のゲート
-/// （rev 確定 + 依存先 load 完了）を通過してから fan-out されるため、依存先が
-/// 先に load 完了し build-runtimepath race が排除される。最終出力（pack/lock）は
-/// `LoadedPlugin` の `Ord` と `merge()` の決定的ソートが fan-out 順序に依存しないため
-/// byte-identical。
-///
-/// `select!` の各分岐は `if` ガードで「まだやるべきことがある」時だけ有効化する。
-/// これにより (a) `ParsePhaseDone` 後の `parse_rx` 終端でビジーループせず、
-/// (b) GraphQL chunk 完了を確実に処理できる（旧実装は `None => break` で chunk を
-/// 捨て per-repo fallback に落ちる可能性があった）。全分岐ガード false で `else` に
-/// 至り、rev 未確定ノードの救済とデッドロック検出を行って終了する。
+/// 本段階では GraphQL 衝突解決・conflict 検出は ParsePhaseDone に留める（per-TOML ストリーミングは
+/// 次段階）。最終出力（pack/lock）は LoadedPlugin の Ord と merge() の決定的ソートが
+/// fan-out 順序に依存しないため byte-identical。
 async fn run_load_scheduler(
     mut parse_rx: tokio::sync::mpsc::UnboundedReceiver<SchedEvent>,
     ctx: LoadCtx,
@@ -456,6 +517,7 @@ async fn run_load_scheduler(
 
     let mut configs: HashMap<usize, rsplug::Config> = HashMap::new();
     let mut parse_done = false;
+    let mut early_tasks: JoinSet<EarlyDone> = JoinSet::new();
     let mut load_tasks: JoinSet<LoadDone> = JoinSet::new();
     let mut chunk_tasks: JoinSet<GraphqlChunkResult> = JoinSet::new();
     let mut finished: Vec<LoadOutcome> = Vec::new();
@@ -501,14 +563,14 @@ async fn run_load_scheduler(
                         }
                     }
 
-                    // BFS ノード表を構築。
-                    // 1st pass: id → index（同名 id は最後勝ち。Plugin::resolve の
-                    // dependency_cachedirs 解決と同一セマンティクス）。本体はまだ預けない。
+                    // BFS ノード表を構築。finalized=true（resolve 完了済み = order/lazy_type 確定）。
                     nodes = (0..plugins.len())
                         .map(|_| NodeState {
                             plugin: None,
-                            pending_deps: 0,
                             rev: None,
+                            early: None,
+                            finalized: true,
+                            pending_deps: 0,
                             dependents: Vec::new(),
                         })
                         .collect();
@@ -516,9 +578,6 @@ async fn run_load_scheduler(
                     for (idx, p) in plugins.iter().enumerate() {
                         id_to_index.insert(p.id.clone(), idx);
                     }
-                    // 2nd pass: pending_deps と dependents（リバースインデックス）。
-                    // depends 内の未知 id・重複・自己参照は除外（安全のため。依存グラフは
-                    // try_dag で循環/未知依存は検出済みだが、重複 id は dag 側で弾かれない）。
                     for (idx, p) in plugins.iter().enumerate() {
                         let mut dep_indices: Vec<usize> = p
                             .depends
@@ -534,7 +593,7 @@ async fn run_load_scheduler(
                         }
                     }
 
-                    // 3rd pass: rev 初期値 + GraphQL batch 構築。本体を nodes へ預ける。
+                    // rev 初期値 + GraphQL batch 構築。本体を nodes へ預ける。
                     let token_str = token.as_deref().unwrap_or("").to_string();
                     let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
                     for (idx, p) in plugins.into_iter().enumerate() {
@@ -582,7 +641,7 @@ async fn run_load_scheduler(
                         nodes[idx].rev = Some(rev);
                     }
 
-                    // GraphQL chunk を並列送信（完了ごとに段階的に load spawn）。
+                    // GraphQL chunk を並列送信（完了ごとに段階的に EARLY spawn）。
                     graphql_total = graphql_batch.len();
                     if graphql_total > 0 {
                         msg(Message::GraphQLResolveProgress {
@@ -609,15 +668,14 @@ async fn run_load_scheduler(
                         });
                     }
 
-                    // rev 確定済みで依存無し（ルート）のノードを fan-out。
+                    // rev 確定済みノードを EARLY fan-out（fetch/materialize を即時開始）。
                     for idx in 0..nodes.len() {
-                        try_schedule(&mut nodes, &mut load_tasks, &ctx, idx);
+                        try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
                     }
                 }
                 Some(SchedEvent::ParseError(e)) => return Err(e),
                 None => {
                     // parse 生産者が ParsePhaseDone を送る前にチャネルを閉じた（異常）。
-                    // 通常は ParseError で return するのでここには来ない。
                     if !parse_done {
                         return Err(Error::Io(std::io::Error::other(
                             "parse producer closed before ParsePhaseDone",
@@ -625,20 +683,57 @@ async fn run_load_scheduler(
                     }
                 }
             },
+            Some(jr) = early_tasks.join_next(), if !early_tasks.is_empty() => {
+                let EarlyDone {
+                    idx,
+                    plugin,
+                    outcome,
+                } = jr.map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("early load task panicked: {e}")))
+                })?;
+                match outcome {
+                    // EARLY エラー: finished へ。依存の pending_deps を進める。
+                    Err(e) => {
+                        finished.push(Err(e));
+                        let dependents = std::mem::take(&mut nodes[idx].dependents);
+                        for dep_idx in dependents {
+                            if nodes[dep_idx].pending_deps > 0 {
+                                nodes[dep_idx].pending_deps -= 1;
+                            }
+                            try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                        }
+                    }
+                    // Skipped（未インストール等）: finished へ Ok(None) + canon_to_remove。
+                    Ok((rsplug::EarlyOutcome::Skipped, repo_canon)) => {
+                        finished.push(Ok((None, repo_canon)));
+                        let dependents = std::mem::take(&mut nodes[idx].dependents);
+                        for dep_idx in dependents {
+                            if nodes[dep_idx].pending_deps > 0 {
+                                nodes[dep_idx].pending_deps -= 1;
+                            }
+                            try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                        }
+                    }
+                    // ScriptOnly / Materialized: LATE 相へ。plugin と early を nodes へ戻す。
+                    Ok((early, _repo_canon)) => {
+                        nodes[idx].plugin = Some(plugin);
+                        nodes[idx].early = Some(EarlySlot::Done(early));
+                        try_schedule_late(&mut nodes, &mut load_tasks, &ctx, idx);
+                    }
+                }
+            }
             Some(jr) = load_tasks.join_next(), if !load_tasks.is_empty() => {
                 let LoadDone { idx, outcome } = jr.map_err(|e| {
                     Error::Io(std::io::Error::other(format!("load task panicked: {e}")))
                 })?;
-                // 結果（成功/エラー問わず）を格納し、依存元の pending_deps を進める。
-                // 依存先が skip（Ok(None)）でもエラーでも、依存元は独立して load を試みる
-                // （旧実装の全 fan-out セマンティクスを維持）。
+                // LATE 完了（成功/エラー問わず）を格納し、依存元の pending_deps を進める。
                 finished.push(outcome.map(|p| (p.loaded, p.canon_to_remove)));
                 let dependents = std::mem::take(&mut nodes[idx].dependents);
                 for dep_idx in dependents {
                     if nodes[dep_idx].pending_deps > 0 {
                         nodes[dep_idx].pending_deps -= 1;
                     }
-                    try_schedule(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                    try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
                 }
             }
             Some(jr) = chunk_tasks.join_next(), if !chunk_tasks.is_empty() => {
@@ -674,11 +769,11 @@ async fn run_load_scheduler(
                             .flatten()
                             .map(Arc::<str>::from)
                     };
-                    // 該当ノードの rev を確定し、依存完了していれば fan-out。
+                    // 該当ノードの rev を確定し、EARLY fan-out。
                     if let Some(indices) = canonical_to_node_indices.remove(canon) {
                         for idx in indices {
                             nodes[idx].rev = Some(LoadRev::Resolved(oid.clone()));
-                            try_schedule(&mut nodes, &mut load_tasks, &ctx, idx);
+                            try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
                         }
                     }
                 }
@@ -694,21 +789,24 @@ async fn run_load_scheduler(
                 }
             }
             else => {
-                // parse 完了 + 全 chunk 完了 + 全 load 完了。
-                // rev 未確定（chunk panic 等）のノードを救済: per-repo fallback で load。
+                // parse 完了 + 全 chunk/EARLY/LATE 完了。
+                // rev 未確定（chunk panic 等）のノードを救済: per-repo fallback で EARLY。
                 let mut rescued = false;
                 for idx in 0..nodes.len() {
-                    if nodes[idx].rev.is_none() && nodes[idx].plugin.is_some() {
+                    if nodes[idx].rev.is_none()
+                        && nodes[idx].plugin.is_some()
+                        && nodes[idx].early.is_none()
+                    {
                         nodes[idx].rev = Some(LoadRev::Resolved(None));
-                        try_schedule(&mut nodes, &mut load_tasks, &ctx, idx);
+                        try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
                         rescued = true;
                     }
                 }
                 if !rescued {
-                    // 依存グラフは DAG（try_dag で循環検出済み）なので、全 chunk/load
-                    // 完了後に未 fan-out が残ることは理論上ない。残っていればデッドロック。
+                    // 依存グラフは DAG（try_dag で循環検出済み）なので、全 chunk/EARLY/LATE
+                    // 完了後に未処理が残ることは理論上ない。残っていればデッドロック。
                     for state in &nodes {
-                        if state.plugin.is_some() {
+                        if state.plugin.is_some() || state.early.is_some() {
                             return Err(Error::Io(std::io::Error::other(
                                 "scheduler deadlock: plugin never became ready",
                             )));

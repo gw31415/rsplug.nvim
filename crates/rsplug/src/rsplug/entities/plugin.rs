@@ -383,8 +383,14 @@ impl Plugin {
         latest_snapshot_dir(&worktrees).await.is_some()
     }
 
+    #[cfg(test)]
     /// キャッシュからPluginを読み込む。オプションでインストールやアップデートも行う。
     /// インストールされていない場合は `Ok(None)` を返す。
+    ///
+    /// 内部は EARLY 相（rev 解決 + fetch/materialize、依存情報不要）と LATE 相
+    /// （BUILD + assemble、全DAG確定後）に分割。ストリーミング（run_load_scheduler）では
+    /// EARLY/LATE を別タスクで管理するが、ここでは同一タスクで直列に呼び出すため振る舞いは
+    /// 従来の `Plugin::load` と同一（pack/lock/generation byte-identical）。
     pub async fn load(
         self,
         install: bool,
@@ -394,53 +400,45 @@ impl Plugin {
         semaphore: adaptive_semaphore::AdaptiveSemaphore,
         http_client: reqwest::Client,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
+        let cache_dir = cache_dir.as_ref().to_path_buf();
+        let early = self
+            .load_early(
+                install,
+                update,
+                &cache_dir,
+                locked_rev.as_deref(),
+                &semaphore,
+                &http_client,
+            )
+            .await?;
+        self.load_late(early, &cache_dir, update).await
+    }
+
+    /// EARLY 相: rev 解決 → fetch/materialize まで。`dependency_cachedirs`・`order`・集約
+    /// `lazy_type` を一切使わない（FACT 1）。ストリーミングでは per-TOML 到着時・rev 解決直後
+    /// から実行可能。`&self` で repo/source 情報を読み、materialize 成果物を [`EarlyOutcome`]
+    /// で返す（戻りは `self` に依存しない owned データのみ）。
+    pub(crate) async fn load_early(
+        &self,
+        install: bool,
+        update: bool,
+        cache_dir: &Path,
+        locked_rev: Option<&str>,
+        semaphore: &adaptive_semaphore::AdaptiveSemaphore,
+        http_client: &reqwest::Client,
+    ) -> Result<EarlyOutcome, Error> {
         use super::util::git;
-        use crate::{
-            log::{Message, msg},
-            rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE, truncate},
-        };
+        use crate::rsplug::util::truncate;
         use unicode_width::UnicodeWidthStr;
 
-        let Plugin {
-            source_name,
-            cache,
-            lazy_type,
-            script,
-            merge,
-            dependency_cachedirs,
-            merge_enabled,
-            order,
-            id: _,
-            depends: _,
-        } = self;
-
-        let CacheConfig {
-            repo,
-            dotgit,
-            build,
-            lua_build,
-            lua_post_update,
-        } = cache;
-
-        let Some(repo) = repo else {
-            let loaded = LoadedPlugin {
-                source_names: source_name.into_iter().collect(),
-                files: HowToPlaceFiles::CopyEachFile(Default::default()),
-                lazy_type,
-                script,
-                order,
-                merge_enabled,
-                is_plugctl: false,
-                dotgit: false,
-            };
-            return Ok(Some((loaded, None)));
+        // script-only（repo 無し）は EARLY では何もしない。LATE で LoadedPlugin を構築。
+        let Some(repo) = self.cache.repo.as_ref() else {
+            return Ok(EarlyOutcome::ScriptOnly);
         };
 
-        // `repo` は直後の match で move されるため、論理 identity に使う相対 cachedir を先に捕捉する。
-        // 絶対パス (`proj_root`) は配置用であり identity には含めない。
+        // `repo` は借りるので、論理 identity に使う相対 cachedir を先に捕捉する。
         let cachedir = repo.default_cachedir();
-        let cache_dir = cache_dir.as_ref().to_path_buf();
-        let r_root = repo_root(&cache_dir, &repo);
+        let r_root = repo_root(cache_dir, repo);
         let source_git = source_git_dir(&r_root);
         let worktrees = worktrees_dir(&r_root);
         let url: Arc<str> = Arc::from(repo.url());
@@ -454,27 +452,33 @@ impl Plugin {
             None
         };
 
-        // バリアント固有のフィールドを抽出（ログ・エラー表示用）
+        // バリアント固有のフィールドを抽出（ログ・エラー表示用）。repo は借りるので clone。
         let (rev, logid, repo_name): (Option<Arc<str>>, String, Arc<str>) = match repo {
             RepoSource::GitHub { owner, repo, rev } => {
                 const MAX_LOGID_LEN: usize = 20;
-                let repo_t = truncate(&repo, MAX_LOGID_LEN);
+                let repo_t = truncate(repo, MAX_LOGID_LEN);
                 let len = MAX_LOGID_LEN.saturating_sub(repo_t.width_cjk() + 1);
                 let logid = if len < 2 {
                     repo_t
                 } else {
-                    let mut o = truncate(&owner, len);
+                    let mut o = truncate(owner, len);
                     o.push('/');
                     o.push_str(&repo_t);
                     o
                 };
-                (rev, logid, repo)
+                (rev.clone(), logid, repo.clone())
             }
             RepoSource::Git { url, rev } => {
                 const MAX_LOGID_LEN: usize = 20;
-                (rev, truncate(&url, MAX_LOGID_LEN), url)
+                (rev.clone(), truncate(url, MAX_LOGID_LEN), url.clone())
             }
         };
+
+        // build/lua_build/dotgit は EARLY で materialize 戦略・has_build 判定に読む。
+        // 所有権は LATE 相で self.cache を消費して取り出すので、ここでは参照。
+        let build = &self.cache.build;
+        let lua_build = self.cache.lua_build.as_deref();
+        let dotgit = self.cache.dotgit;
 
         // --- ステージ1: target commit 解決（install/update/locked の分岐とリモート解決） ---
         let RevOutcome {
@@ -486,22 +490,21 @@ impl Plugin {
             &url,
             &rev,
             &token,
-            &semaphore,
-            &http_client,
+            semaphore,
+            http_client,
             install,
             update,
-            locked_rev.as_deref(),
-            &source_name,
+            locked_rev,
+            &self.source_name,
             &logid,
         )
         .await?
         {
             Some(o) => o,
-            None => return Ok(None),
+            None => return Ok(EarlyOutcome::Skipped),
         };
         let head_rev_str = oid.to_string();
-
-        let _running_guard = RunningGuard::new();
+        let guard = RunningGuard::new();
 
         // --- フェッチ戦略の選択 (Phase 2) ---
         // token があって GitHub HTTPS URL なら TarballFetch（source.git 不要）。
@@ -516,9 +519,9 @@ impl Plugin {
             oid,
             source_git: &source_git,
             token: &token,
-            source_name: &source_name,
-            semaphore: &semaphore,
-            http_client: &http_client,
+            source_name: &self.source_name,
+            semaphore,
+            http_client,
             install,
             update,
             locked,
@@ -532,7 +535,7 @@ impl Plugin {
             && !snapshot_exists_for_oid(&worktrees, &head_rev_str).await
             && !ensure_source_git(&ctx).await?
         {
-            return Ok(None);
+            return Ok(EarlyOutcome::Skipped);
         }
 
         // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
@@ -543,12 +546,18 @@ impl Plugin {
             head_rev_str.as_bytes().to_vec(),
             None,
             Arc::from(build.as_slice()),
-            lua_build.as_deref().map(Into::into),
+            lua_build.map(Into::into),
         );
         let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &pre_identity.snapshot_key()));
 
-        let (snapshot_root_path, repository): (Arc<Path>, MaterializedRepo) = if final_root.exists()
-        {
+        // EARLY 相の materialize。BUILD（lua_post_update/run_repo_build）と rename は LATE 相へ
+        // 回す。has_build の場合、一時 building worktree に materialize して止める。
+        let (worktree_path, repository, is_plain, needs_build): (
+            Arc<Path>,
+            MaterializedRepo,
+            bool,
+            bool,
+        ) = if final_root.exists() {
             // 同一 key の snapshot が既存 → 再利用（build/lua_post_update をスキップ）。
             // Phase 7 以降の tarball snapshot は `.git` 無し → Plain、旧 snapshot は Git。
             let repo = if final_root.join(".git").exists() {
@@ -556,152 +565,262 @@ impl Plugin {
             } else {
                 MaterializedRepo::Plain
             };
-            (final_root.clone(), repo)
+            (final_root.clone(), repo, false, false)
         } else if has_build {
-            // build がある: 一時 worktree で build → dirty 計算 → final key → rename/reuse。
+            // build がある: 一時 worktree で materialize まで。build/dirty/rename は LATE。
             // dirty_diff を snapshot_key に含めるため、build 後でないと最終 key が確定しない。
             let building = building_worktree_dir(&worktrees);
             let _ = tokio::fs::remove_dir_all(&building).await;
             let building: Arc<Path> = Arc::from(building);
             let repo = match materialize(&ctx, building.as_ref(), use_tarball).await? {
                 Some(r) => r,
-                None => return Ok(None),
+                None => return Ok(EarlyOutcome::Skipped),
             };
-            // tarball（Plain）かを記憶: rename 後 Git は開き直すが Plain は git::open 不要。
+            // tarball（Plain）かを記憶: LATE の rename 後 Git は開き直すが Plain は git::open 不要。
             let is_plain = matches!(repo, MaterializedRepo::Plain);
-
-            // lua_post_update は update 検知時のみ building worktree で実行。
-            if update && let Some(lua_post_update) = lua_post_update.as_deref() {
-                let rtp = build_runtimepaths(&building, &cache_dir, &dependency_cachedirs).await;
-                let id = Arc::new(format!("{logid} (lua_post_update)"));
-                let result: Result<(), Error> = {
-                    let id = id.clone();
-                    async {
-                        let path = create_lua_build_script(lua_post_update, &rtp).await?;
-                        let _build = super::util::resources::build().await?;
-                        let code = execute(
-                            lua_build_nvim_command(path.as_os_str()),
-                            building.clone(),
-                            move |(stdtype, line)| {
-                                msg(Message::CacheBuildProgress {
-                                    id: id.clone(),
-                                    stdtype,
-                                    line,
-                                });
-                            },
-                        )
-                        .await;
-                        let _ = tokio::fs::remove_file(&path).await;
-                        let code = code?;
-                        if code != 0 {
-                            return Err(Error::BuildLuaScriptFailed {
-                                code,
-                                repo: repo_name.clone(),
-                            });
-                        }
-                        Ok(())
-                    }
-                }
-                .await;
-                msg(Message::CacheBuildFinished {
-                    id,
-                    success: result.is_ok(),
-                });
-                result?;
-            }
-
-            let rtp = build_runtimepaths(&building, &cache_dir, &dependency_cachedirs).await;
-            run_repo_build(
-                &build,
-                lua_build.as_deref(),
-                building.clone(),
-                rtp,
-                &logid,
-                &repo_name,
-            )
-            .await?;
-
-            // build 後 dirty を反映した最終 identity → key
-            // final_root（= pre_identity の key）へ原子リネーム。失敗しても final_root は作られない。
-            drop(repo);
-            tokio::fs::rename(building.as_ref(), final_root.as_ref()).await?;
-            // Plain は `.git` 無しで開き直せない。Git のみ git::open する。
-            let repo = if is_plain {
-                MaterializedRepo::Plain
-            } else {
-                MaterializedRepo::Git(git::open(final_root.clone()).await?)
-            };
-            (final_root, repo)
+            (building, repo, is_plain, true)
         } else {
-            // build 無し: key は確定（dirty=None）。final があれば再利用、なければ作成。
+            // build 無し: key は確定（dirty=None）。final に materialize。
             let repo = match materialize(&ctx, final_root.as_ref(), use_tarball).await? {
                 Some(r) => r,
-                None => return Ok(None),
+                None => return Ok(EarlyOutcome::Skipped),
             };
-            (final_root.clone(), repo)
+            (final_root.clone(), repo, false, false)
         };
 
-        // --- 最終 identity と build 成功 marker (snapshot_root 単位, PLANS §11) ---
-        let identity = build_repo_snapshot_identity(
-            &repository,
-            snapshot_root_path.as_ref(),
-            cachedir.clone(),
-            head_rev_str.as_bytes().to_vec(),
-            &build,
-            lua_build.as_deref(),
-        )
-        .await?;
-        if has_build {
-            tokio::fs::write(
-                snapshot_root_path.join(RSPLUG_BUILD_SUCCESS_FILE),
-                identity.plugin_id().as_str().as_bytes(),
-            )
-            .await?;
-        }
+        Ok(EarlyOutcome::Materialized {
+            guard,
+            outcome: MaterializeOutcome {
+                worktree_path,
+                repository,
+                has_build,
+                needs_build,
+                is_plain,
+                final_root,
+                cachedir,
+                head_rev_str,
+                was_updated,
+                was_installed,
+                logid,
+                repo_name,
+                canonical,
+            },
+        })
+    }
 
-        // Phase 2: snapshot が ready になったので manifest を記録する（best-effort cache）。
-        // 以降の merge/copy 計画は manifest からパス集合を引ける（Part B）。欠損時は filesystem
-        // fallback。既存 snapshot の再利用時は書き込みを省き、重複 walk を避ける。
-        let manifest_path = snapshot_root_path.join(MANIFEST_FILE);
-        if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
-            let _ = SnapshotManifest::build_and_write(
-                snapshot_root_path.as_ref(),
-                dotgit,
-                RSPLUG_BUILD_SUCCESS_FILE,
-            )
-            .await;
-        }
-        // per-repo latest-snapshot index: `<repo>/latest-snapshot` に snapshot_key を記録する。
-        // worktrees/ を scan せずに最新 snapshot を特定できる（best-effort）。
-        if let (Some(worktrees), Some(key)) =
-            (snapshot_root_path.parent(), snapshot_root_path.file_name())
-            && let Some(repo_root) = worktrees.parent()
-        {
-            let key = key.to_string_lossy();
-            let _ = tokio::fs::write(repo_root.join("latest-snapshot"), key.as_bytes()).await;
-        }
+    /// LATE 相: BUILD（`dependency_cachedirs` 使用）→ identity → manifest → assemble。
+    /// 全DAG確定後（`order`/集約 `lazy_type`/`dependency_cachedirs` が resolve で確定済み）
+    /// に呼ばれることが前提。`self` を消費して Plugin 由来フィールドを取り出し、`order`/集約
+    /// `lazy_type` を `LoadedPlugin` の plugin_id に焼き込む（FACT 2: 構築後の上書きは不可）。
+    pub(crate) async fn load_late(
+        self,
+        early: EarlyOutcome,
+        cache_dir: &Path,
+        update: bool,
+    ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
+        use super::util::git;
+        use crate::{
+            log::{Message, msg},
+            rsplug::util::{execute, git::RSPLUG_BUILD_SUCCESS_FILE},
+        };
 
-        // --- ステージ6: LoadedPlugin 構築（plugin_id 決定の核心） ---
-        // filesource/entries/lazy_type 合成/FileItem 構築/通知は assemble_loaded_plugin 内へ
-        // 抽出した。計算式・順序は旧インライン実装と完全同一（plugin_id 安定性）。
-        let loaded = assemble_loaded_plugin(
-            &snapshot_root_path,
-            &identity,
-            dotgit,
-            &merge,
-            lazy_type,
-            source_name,
-            script,
-            order,
-            merge_enabled,
-            was_updated,
-            was_installed,
-            &logid,
-        )
-        .await?;
-        let lock_info = Some((canonical, head_rev_str));
+        match early {
+            EarlyOutcome::ScriptOnly => {
+                // script-only（repo 無し）: order/lazy_type は resolve 確定済みなので plugin_id 安定。
+                let Plugin {
+                    source_name,
+                    lazy_type,
+                    script,
+                    merge_enabled,
+                    order,
+                    ..
+                } = self;
+                let loaded = LoadedPlugin {
+                    source_names: source_name.into_iter().collect(),
+                    files: HowToPlaceFiles::CopyEachFile(Default::default()),
+                    lazy_type,
+                    script,
+                    order,
+                    merge_enabled,
+                    is_plugctl: false,
+                    dotgit: false,
+                };
+                Ok(Some((loaded, None)))
+            }
+            EarlyOutcome::Skipped => Ok(None),
+            EarlyOutcome::Materialized { guard, outcome } => {
+                // RunningGuard は LATE 相の終了まで保持（従来 Plugin::load スコープと同一ライフサイクル）。
+                let _guard = guard;
+                let MaterializeOutcome {
+                    worktree_path,
+                    mut repository,
+                    has_build,
+                    needs_build,
+                    is_plain,
+                    final_root,
+                    cachedir,
+                    head_rev_str,
+                    was_updated,
+                    was_installed,
+                    logid,
+                    repo_name,
+                    canonical,
+                } = outcome;
 
-        Ok(Some((loaded, lock_info)))
+                let Plugin {
+                    source_name,
+                    cache,
+                    lazy_type,
+                    script,
+                    merge,
+                    dependency_cachedirs,
+                    merge_enabled,
+                    order,
+                    ..
+                } = self;
+                let CacheConfig {
+                    repo: _,
+                    dotgit,
+                    build,
+                    lua_build,
+                    lua_post_update,
+                } = cache;
+
+                // --- BUILD（has_build なら building worktree で実行 → rename → reopen） ---
+                let snapshot_root_path: Arc<Path> = if needs_build {
+                    // lua_post_update は update 検知時のみ building worktree で実行。
+                    if update && let Some(lua_post_update) = lua_post_update.as_deref() {
+                        let rtp =
+                            build_runtimepaths(&worktree_path, cache_dir, &dependency_cachedirs)
+                                .await;
+                        let id = Arc::new(format!("{logid} (lua_post_update)"));
+                        let result: Result<(), Error> = {
+                            let id = id.clone();
+                            async {
+                                let path = create_lua_build_script(lua_post_update, &rtp).await?;
+                                let _build = super::util::resources::build().await?;
+                                let code = execute(
+                                    lua_build_nvim_command(path.as_os_str()),
+                                    worktree_path.clone(),
+                                    move |(stdtype, line)| {
+                                        msg(Message::CacheBuildProgress {
+                                            id: id.clone(),
+                                            stdtype,
+                                            line,
+                                        });
+                                    },
+                                )
+                                .await;
+                                let _ = tokio::fs::remove_file(&path).await;
+                                let code = code?;
+                                if code != 0 {
+                                    return Err(Error::BuildLuaScriptFailed {
+                                        code,
+                                        repo: repo_name.clone(),
+                                    });
+                                }
+                                Ok(())
+                            }
+                        }
+                        .await;
+                        msg(Message::CacheBuildFinished {
+                            id,
+                            success: result.is_ok(),
+                        });
+                        result?;
+                    }
+
+                    let rtp =
+                        build_runtimepaths(&worktree_path, cache_dir, &dependency_cachedirs).await;
+                    run_repo_build(
+                        &build,
+                        lua_build.as_deref(),
+                        worktree_path.clone(),
+                        rtp,
+                        &logid,
+                        &repo_name,
+                    )
+                    .await?;
+
+                    // build 後 dirty を反映した最終 identity → key へ原子リネーム。
+                    // 失敗しても final_root は作られない。
+                    drop(repository);
+                    tokio::fs::rename(worktree_path.as_ref(), final_root.as_ref()).await?;
+                    // Plain は `.git` 無しで開き直せない。Git のみ git::open する。
+                    repository = if is_plain {
+                        MaterializedRepo::Plain
+                    } else {
+                        MaterializedRepo::Git(git::open(final_root.clone()).await?)
+                    };
+                    final_root.clone()
+                } else {
+                    worktree_path.clone()
+                };
+
+                // --- 最終 identity と build 成功 marker (snapshot_root 単位, PLANS §11) ---
+                let identity = build_repo_snapshot_identity(
+                    &repository,
+                    snapshot_root_path.as_ref(),
+                    cachedir.clone(),
+                    head_rev_str.as_bytes().to_vec(),
+                    &build,
+                    lua_build.as_deref(),
+                )
+                .await?;
+                if has_build {
+                    tokio::fs::write(
+                        snapshot_root_path.join(RSPLUG_BUILD_SUCCESS_FILE),
+                        identity.plugin_id().as_str().as_bytes(),
+                    )
+                    .await?;
+                }
+
+                // Phase 2: snapshot が ready になったので manifest を記録する（best-effort cache）。
+                // 以降の merge/copy 計画は manifest からパス集合を引ける（Part B）。欠損時は filesystem
+                // fallback。既存 snapshot の再利用時は書き込みを省き、重複 walk を避ける。
+                let manifest_path = snapshot_root_path.join(MANIFEST_FILE);
+                if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
+                    let _ = SnapshotManifest::build_and_write(
+                        snapshot_root_path.as_ref(),
+                        dotgit,
+                        RSPLUG_BUILD_SUCCESS_FILE,
+                    )
+                    .await;
+                }
+                // per-repo latest-snapshot index: `<repo>/latest-snapshot` に snapshot_key を記録する。
+                // worktrees/ を scan せずに最新 snapshot を特定できる（best-effort）。
+                if let (Some(worktrees), Some(key)) =
+                    (snapshot_root_path.parent(), snapshot_root_path.file_name())
+                    && let Some(repo_root) = worktrees.parent()
+                {
+                    let key = key.to_string_lossy();
+                    let _ =
+                        tokio::fs::write(repo_root.join("latest-snapshot"), key.as_bytes()).await;
+                }
+
+                // --- ステージ6: LoadedPlugin 構築（plugin_id 決定の核心） ---
+                // filesource/entries/lazy_type 合成/FileItem 構築/通知は assemble_loaded_plugin 内へ
+                // 抽出した。計算式・順序は旧インライン実装と完全同一（plugin_id 安定性）。
+                let loaded = assemble_loaded_plugin(
+                    &snapshot_root_path,
+                    &identity,
+                    dotgit,
+                    &merge,
+                    lazy_type,
+                    source_name,
+                    script,
+                    order,
+                    merge_enabled,
+                    was_updated,
+                    was_installed,
+                    &logid,
+                )
+                .await?;
+                let lock_info = Some((canonical, head_rev_str));
+
+                Ok(Some((loaded, lock_info)))
+            }
+        }
     }
 }
 
@@ -711,6 +830,56 @@ struct RevOutcome {
     oid: Oid,
     was_updated: bool,
     was_installed: bool,
+}
+
+/// EARLY 相（rev 解決 → fetch/materialize）の成果物。BUILD・identity 計算・assemble は
+/// 未実行で LATE 相へ回す。**依存情報（`dependency_cachedirs`）・`order`・集約 `lazy_type`
+/// は一切含まない**（FACT 1: fetch/materialize/identity-core は依存不要）。LATE 相がこれと
+/// 確定済み `Plugin` フィールドで build/assemble を行う。
+pub(crate) struct MaterializeOutcome {
+    /// materialize 済み worktree。`has_build` なら一時 `building` worktree、
+    /// それ以外（reuse/no-build）は `final_root` と同一。
+    worktree_path: Arc<Path>,
+    /// 実体化された snapshot バックエンド。BUILD 後に reopen される。
+    repository: MaterializedRepo,
+    /// build/lua_build があるか（build 成功 marker 書き込みの判定）。
+    has_build: bool,
+    /// LATE 相で実際に BUILD（lua_post_update/run_repo_build/rename）を実行するか。
+    /// 新規 has-build materialize のみ true（reuse は既存 snapshot を使い build をスキップ）。
+    needs_build: bool,
+    /// tarball（Plain）由來か。`has_build` 時の rename 後 reopen 判定に使う。
+    is_plain: bool,
+    /// 最終配置先。`has_build` なら rename 先、それ以外は `worktree_path` と同一。
+    final_root: Arc<Path>,
+    /// repo のキャッシュ相対パス（identity 計算用）。
+    cachedir: PathBuf,
+    /// HEAD commit ハッシュ文字列（identity・lock_info 用）。
+    head_rev_str: String,
+    /// 更新検知（lua_post_update 実行・通知用）。
+    was_updated: bool,
+    was_installed: bool,
+    /// ログ/エラー表示用。
+    logid: String,
+    repo_name: Arc<str>,
+    /// lock key 用 canonical identity。
+    canonical: String,
+}
+
+/// EARLY 相の結果。LATE 相への引き継ぎを3ケースで表現する。
+pub(crate) enum EarlyOutcome {
+    /// repo 無し（script-only）。LATE で `LoadedPlugin` を構築
+    /// （`order`/`lazy_type` は resolve 確定済みなので plugin_id は安定）。
+    ScriptOnly,
+    /// `resolve_target_commit`/`materialize` で未インストール等によりスキップ（`Ok(None)`）。
+    /// canon_to_remove 判定は main.rs の load_one が既存ロジック（repo_canon）で行うため、
+    /// ここでは canonical を持たない。
+    Skipped,
+    /// materialize 完了。LATE で BUILD + assemble。`guard` は Loading 進捗バーの稼働区間
+    /// （EARLY で確保し LATE 終了まで保持して、従来 `Plugin::load` の RunningGuard ライフサイクルを維持）。
+    Materialized {
+        guard: RunningGuard,
+        outcome: MaterializeOutcome,
+    },
 }
 
 /// ステージ1: target commit 解決。install/update/locked の分岐とリモート解決。
@@ -1069,7 +1238,7 @@ fn display_name(source_name: &Option<String>, logid: &str) -> Arc<str> {
 /// fetch 許可を取得してネットワーク実作業に入った時点で `new()` が +1 し
 /// （`LoadPluginRunning`）、`load()` の戻りとともに `Drop` が -1 する
 /// （`LoadPluginRunningDone`）。成功・エラー全経路で対になる。
-struct RunningGuard;
+pub(crate) struct RunningGuard;
 
 impl RunningGuard {
     fn new() -> Self {
