@@ -8,7 +8,7 @@ use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use rsplug::config_walker::ConfigWalker;
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashMap},
     path::PathBuf,
     sync::Arc,
 };
@@ -544,16 +544,21 @@ async fn run_load_scheduler(
                         total: plugins.len(),
                     });
 
-                    // 衝突検出（同一 canonical・異 rev）。
+                    // 衝突検出（同一 canonical・異 rev）→ 即エラー。
+                    // conflict は存在し得ないことが、到着順ストリーミングで rev を
+                    // 確定できる根拠（Step 4）。
                     let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
-                    let mut conflicts: HashSet<String> = HashSet::new();
                     for p in plugins.iter() {
                         if let Some(repo) = p.cache.repo.as_ref() {
                             let canonical = repo.canonical();
                             let rev = repo.rev();
                             match seen_rev.get(&canonical) {
                                 Some(existing) if *existing != rev => {
-                                    conflicts.insert(canonical);
+                                    return Err(Error::ConflictingRevisions {
+                                        canonical,
+                                        rev_a: existing.clone(),
+                                        rev_b: rev,
+                                    });
                                 }
                                 None => {
                                     seen_rev.insert(canonical, rev);
@@ -602,7 +607,7 @@ async fn run_load_scheduler(
                             Some(repo) => {
                                 let canonical = repo.canonical();
                                 let rev = repo.rev();
-                                if ctx.locked || !do_graphql || conflicts.contains(&canonical) {
+                                if ctx.locked || !do_graphql {
                                     LoadRev::Auto
                                 } else if rev
                                     .as_deref()
@@ -865,6 +870,14 @@ enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
+    /// 同一 canonical リポジトリに複数の異なる rev が指定された（設定ミス）。
+    /// conflict は存在し得ないことが、到着順ストリーミングで rev を確定できる根拠（Step 4）。
+    #[error("Conflicting revisions for {canonical}: {rev_a:?} vs {rev_b:?}")]
+    ConflictingRevisions {
+        canonical: String,
+        rev_a: Option<Arc<str>>,
+        rev_b: Option<Arc<str>>,
+    },
 }
 
 fn format_toml_parse_error(
