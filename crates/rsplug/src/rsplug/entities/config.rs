@@ -26,7 +26,7 @@ impl<T: IntoIterator<Item = Config>> From<T> for Config {
 #[derive(Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub(super) plugins: Vec<PluginConfig>,
+    pub(crate) plugins: Vec<PluginConfig>,
 }
 
 impl AddAssign for Config {
@@ -167,13 +167,13 @@ impl From<LazyType> for LazyTypeDeserializer {
 
 #[serde_as]
 #[derive(Deserialize)]
-pub(super) struct PluginConfig {
+pub(crate) struct PluginConfig {
     /// 内部的同一性 id（Phase 3A）。**ユーザーには公開しない**（TOML には現れない）。
     /// `name` ?? repo basename ?? script 内容ハッシュ。`Plugin::new` で計算して格納する。
     /// Vim 文化では basename でプラグインを識別するのが基本だが、basename 衝突時は
     /// `name` で、無名 script-only は内容ハッシュで一意にする。
     #[serde(skip)]
-    pub(super) id: Option<String>,
+    pub(crate) id: Option<String>,
     #[serde(flatten)]
     pub cache: CacheConfig,
     #[serde(flatten)]
@@ -195,7 +195,7 @@ pub(super) struct PluginConfig {
 impl PluginConfig {
     /// ユーザー公開の名前（on_source の表示/対象名）。`name` ?? repo basename。
     /// script-only で `name` が無ければ `None`（参照されない start スクリプト等も許す）。
-    pub(super) fn dep_name(&self) -> Option<&str> {
+    pub(crate) fn dep_name(&self) -> Option<&str> {
         if let Some(name) = &self.custom_name {
             return Some(name.as_str());
         }
@@ -209,7 +209,7 @@ impl PluginConfig {
     /// 内部的同一性 id（Phase 3A）。`dep_name()` ?? script 内容ハッシュ。
     /// 常に確定し、無名 script-only は内容ハッシュで一意に識別される。
     /// **ユーザーには触らせない**内部表現（TOML の `id` は存在しない）。
-    pub(super) fn compute_internal_id(&self) -> String {
+    pub(crate) fn compute_internal_id(&self) -> String {
         if let Some(name) = self.dep_name() {
             return name.to_string();
         }
