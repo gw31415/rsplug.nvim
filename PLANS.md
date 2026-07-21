@@ -312,10 +312,36 @@ ids, `dag/lib.rs:155-163`) — not a positional index. New main.rs types
 handler (unused-import until then). Verification: per-step
 `cargo test`/`clippy`/`fmt`; new scheduler test (inject `SchedEvent`s with a mock
 `http_client`, assert EARLY-per-Parsed + LATE-post-ParsePhaseDone + output ==
-batch mode); isolated-HOME E2E byte-identical vs HEAD (per
-[[rsplug-generate-verification]]). Highest-risk: the ParsePhaseDone promotion
-loop (today's `main.rs:599-642`) — staged EARLY state must merge into `nodes`
-correctly, including the in-flight-at-promotion race.
+batch mode). Highest-risk was the ParsePhaseDone promotion loop — staged EARLY
+state merging into `nodes`, including the in-flight-at-promotion race.
+
+**isolated-HOME E2E byte-identical — done.** Built both `main` (= `d416de8`,
+batch baseline: has `run_load_scheduler`/BFS but no EARLY/LATE split or
+per-Parsed streaming) and `HEAD` binaries, then ran `example.toml` (covers
+GitHub shorthand + wildcard `v*` GraphQL, gitlab/codeberg per-repo Git,
+`depends`, `on_map`/`on_ft`/`on_event`, `start`) in isolated `HOME`s with the
+`-i` fast-path (GITHUB_TOKEN tarball) and `--locked` (cache+lock, no network)
+modes. Results, all byte-identical across the compared trees
+(`rsplug.lock.json`, `pack/_gen/opt/**`, `generations/*.lua`, `init.lua`):
+
+- **Determinism** — `HEAD --locked` in two fresh `HOME`s: pack/lock/generation
+  identical ⇒ the streaming fan-out is order-independent (no scheduler
+  nondeterminism).
+- **Refactor preserves output (`--locked`)** — `HEAD --locked` == `main
+  --locked`: identical.
+- **Refactor preserves output (`-i`)** — `HEAD -i` == `main -i`: locks identical
+  (no rev drift in the window) and pack/generation identical. This exercises the
+  full Step 4 path (rolling GraphQL batch + tarball fast-path + per-Parsed
+  EARLY + EARLY/LATE split).
+
+Pre-existing (not a Step 4 regression; reproduced identically on `main`): the
+package id (`plugin_id`) for 2–3 plugins differs between an `-i` run and a
+`--locked`/regenerate run even though the placed file content is byte-identical
+(e.g. rainbow-delimiters.nvim). `plugin_id` hashes `LoadedPlugin` fields
+(`source_names`/`lazy_type`/`files`/`script`/`order`/`merge_enabled`/`is_plugctl`/
+`dotgit`), so some non-file field must differ by mode; the pack stays internally
+consistent each run (init.lua always points at the current generation), so this
+is benign but worth a separate look later.
 
 ## Validation
 
@@ -329,5 +355,7 @@ Do not run `cargo check -q`. Focused coverage now includes lock compatibility
 (legacy URL-key read, dedup, conflicting-revision rejection), canonical
 identity forms (host case, default vs non-default ports, userinfo, `.git`),
 anonymous scripts, all lazy triggers, generation publication failure, and merge
-behavior. Network-dependent end-to-end and large synthetic benchmarks remain
-optional follow-up work.
+behavior. Isolated-HOME end-to-end byte-identical (streaming vs batch, `-i` and
+`--locked`) is done for Step 4 (see above); large synthetic benchmarks and the
+pre-existing `-i`-vs-regenerate package-id divergence remain optional
+follow-up work.
