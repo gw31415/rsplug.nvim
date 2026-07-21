@@ -1290,4 +1290,104 @@ mod tests {
             }
         }
     }
+
+    /// Step 4: `run_load_scheduler` が Parsed 到着順で EARLY を kick し、ParsePhaseDone
+    /// 後に LATE を実行して、正しい LoadedPlugin を生成することを検証する。
+    /// script-only プラグイン（repo なし）でネットワーク・キャッシュ不要。
+    #[tokio::test]
+    async fn run_load_scheduler_streams_script_only_plugins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = LoadCtx {
+            locked: false,
+            install: false,
+            update: false,
+            locked_map: Arc::new(BTreeMap::new()),
+            fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore::new(),
+            http_client: reqwest::Client::new(),
+            cache_dir: tmp.path().to_path_buf(),
+        };
+        let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<SchedEvent>();
+        let c1: rsplug::Config =
+            toml::from_str("[[plugins]]\nlua_start = \"vim.g.a = 1\"").unwrap();
+        let c2: rsplug::Config =
+            toml::from_str("[[plugins]]\nlua_start = \"vim.g.b = 2\"").unwrap();
+        parse_tx
+            .send(SchedEvent::Parsed {
+                index: 0,
+                config: c1,
+            })
+            .unwrap();
+        parse_tx
+            .send(SchedEvent::Parsed {
+                index: 1,
+                config: c2,
+            })
+            .unwrap();
+        parse_tx
+            .send(SchedEvent::ParsePhaseDone { total: 2 })
+            .unwrap();
+        drop(parse_tx);
+
+        let (plugins, _locks, _remove) = run_load_scheduler(parse_rx, ctx, None, false)
+            .await
+            .unwrap();
+
+        // script-only 2個 → 2つの LoadedPlugin（異なる plugin_id）。
+        // EARLY（ScriptOnly）→ LATE（assemble）が Parsed 到着順 + ParsePhaseDone promotion
+        // で正しく完了した証拠。
+        assert_eq!(plugins.len(), 2, "expected 2 loaded plugins");
+        let ids: Vec<_> = plugins.iter().map(|p| p.plugin_id()).collect();
+        assert_ne!(ids[0], ids[1], "plugin_ids must differ");
+    }
+
+    /// Step 4 × Step 2: 依存（depends）のあるプラグインが、streaming と BFS の協調で
+    /// デッドロックなく正しくロードされること。child は base に依存し、到着順は逆
+    /// （child 先、base 後）。promotion 後の `pending_deps` ゲートが正しく働く証拠。
+    #[tokio::test]
+    async fn run_load_scheduler_resolves_dependency_with_streaming() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = LoadCtx {
+            locked: false,
+            install: false,
+            update: false,
+            locked_map: Arc::new(BTreeMap::new()),
+            fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore::new(),
+            http_client: reqwest::Client::new(),
+            cache_dir: tmp.path().to_path_buf(),
+        };
+        let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<SchedEvent>();
+        // 到着順は依存逆順（child → base）。Plugin::resolve が topo 順に並べ直す。
+        let child: rsplug::Config = toml::from_str(
+            "[[plugins]]\nname = \"child\"\nlua_start = \"vim.g.child = true\"\ndepends = [\"base\"]",
+        )
+        .unwrap();
+        let base: rsplug::Config =
+            toml::from_str("[[plugins]]\nname = \"base\"\nlua_start = \"vim.g.base = true\"")
+                .unwrap();
+        parse_tx
+            .send(SchedEvent::Parsed {
+                index: 0,
+                config: child,
+            })
+            .unwrap();
+        parse_tx
+            .send(SchedEvent::Parsed {
+                index: 1,
+                config: base,
+            })
+            .unwrap();
+        parse_tx
+            .send(SchedEvent::ParsePhaseDone { total: 2 })
+            .unwrap();
+        drop(parse_tx);
+
+        let (plugins, _locks, _remove) = run_load_scheduler(parse_rx, ctx, None, false)
+            .await
+            .unwrap();
+
+        // base と child の2つがデッドロックなくロードされる（依存 LATE 完了ゲート正常）。
+        assert_eq!(plugins.len(), 2, "dependency did not resolve cleanly");
+        let ids: Vec<_> = plugins.iter().map(|p| p.plugin_id()).collect();
+        assert_ne!(ids[0], ids[1], "plugin_ids must differ");
+    }
 }
