@@ -49,7 +49,7 @@ pack depend on the source cache.
       identity) and `load_late` (BUILD → assemble with final `order`/`lazy_type`),
       so EARLY can fan out before the full merge; `finalized` + dependency LATE
       completion gate the BUILD phase (Step 3).
-- [ ] Full per-TOML streaming (Step 4): incremental conflict detection and
+- [x] Full per-TOML streaming (Step 4): incremental conflict detection and
       per-arriving-plugin GraphQL / EARLY kick instead of waiting for
       ParsePhaseDone, so fetch stops being serialized behind config discovery.
 
@@ -257,7 +257,7 @@ after ParsePhaseDone (GraphQL/conflict remain batched there), so the fetch
 bottleneck is not yet addressed — that is the remaining work below. Byte-identical
 verified via `cargo test` / `clippy` / `fmt`.
 
-**Step 4: full per-TOML streaming — design fixed, scaffolding committed, handler rewrite pending**:
+**Step 4: full per-TOML streaming — done** (`55f79b1`; scaffolding `befb442`..`a19a284`):
 
 Goal: kick EARLY (`load_early`) per-arriving-`Parsed`-TOML with rolling-batch(25)
 GraphQL, so fetch overlaps with config discovery. LATE still waits for
@@ -279,7 +279,7 @@ ParsePhaseDone (`finalized`). pack/lock/generation stay byte-identical.
    `Plugin::new(merged)` (resolved LATE). This was a plan oversight surfaced
    during implementation.
 
-**Remaining: `run_load_scheduler` handler rewrite** (the core Step 4 work).
+**Handler rewrite — done** (`55f79b1`). Implemented exactly as designed below.
 `Plugin::resolve` emits **topological** order (`dag/lib.rs:240-246`), so the
 EARLY↔LATE binding key is the string **`id`** (unique: `try_dag` rejects duplicate
 ids, `dag/lib.rs:155-163`) — not a positional index. New main.rs types
