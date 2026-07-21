@@ -47,7 +47,7 @@ impl Sum for Config {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct CacheConfig {
     #[serde(default, rename = "repo")]
     pub repo: Option<RepoSource>,
@@ -166,7 +166,7 @@ impl From<LazyType> for LazyTypeDeserializer {
 }
 
 #[serde_as]
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct PluginConfig {
     /// 内部的同一性 id（Phase 3A）。**ユーザーには公開しない**（TOML には現れない）。
     /// `name` ?? repo basename ?? script 内容ハッシュ。`Plugin::new` で計算して格納する。
@@ -286,7 +286,7 @@ impl AddAssign for SetupScript {
 }
 
 /// プラグインのセットアップに用いるスクリプト群
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct MergeConfig {
     #[serde(deserialize_with = "deserialize_file_specifier")]
     #[serde(default = "default_ignore")]

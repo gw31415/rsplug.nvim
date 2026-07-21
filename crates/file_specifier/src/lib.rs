@@ -3,9 +3,10 @@ use std::{borrow::Cow, convert::Infallible, path::Path, str::FromStr};
 use wildmatch::WildMatch;
 
 /// Gitignore形式のファイル指定子
+#[derive(Clone)]
 pub struct FileSpecifier(Vec<FileSpecifierPattern>, String);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FileSpecifierPattern {
     matcher: WildMatch,
     matcher_for_any_depth: Option<WildMatch>,
