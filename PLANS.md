@@ -257,17 +257,65 @@ after ParsePhaseDone (GraphQL/conflict remain batched there), so the fetch
 bottleneck is not yet addressed — that is the remaining work below. Byte-identical
 verified via `cargo test` / `clippy` / `fmt`.
 
-**Remaining: full per-TOML streaming (Step 4, deferred to a later session)**:
-move conflict detection into the `Parsed` handler (incremental), kick GraphQL
-per-arriving-plugin (rolling batch of 25), and start EARLY (`load_early`) on each
-`Parsed` instead of after ParsePhaseDone. Requires: a staging table (id-keyed)
-for plugins arriving before the full merge; `PluginConfig -> Plugin` (order/
-lazy_type dummy) generation so pre-resolve EARLY is possible (EARLY ignores
-those fields per FACT 1); promotion at ParsePhaseDone that merges staged EARLY
-state into the resolved `nodes`; design points are same-name id overwrite and
-EARLY (dummy Plugin) / LATE (resolved Plugin) id-binding. `Config`/`PluginConfig`
-must become `pub(crate)` so `main.rs` can reach plugins per-TOML. isolated-HOME
-E2E (byte-identical pack/lock/generation vs HEAD) to follow once implemented.
+**Step 4: full per-TOML streaming — design fixed, scaffolding committed, handler rewrite pending**:
+
+Goal: kick EARLY (`load_early`) per-arriving-`Parsed`-TOML with rolling-batch(25)
+GraphQL, so fetch overlaps with config discovery. LATE still waits for
+ParsePhaseDone (`finalized`). pack/lock/generation stay byte-identical.
+
+**Committed scaffolding** (`befb442`..`a19a284` on `early-late-load-split`):
+1. **Conflict → hard error** (`befb442`): same canonical repo + different rev is
+   now `Error::ConflictingRevisions` instead of silent `LoadRev::Auto`. Conflict
+   is impossible by construction ⇒ every plugin can decide its rev at arrival time
+   (the key enabler; byte-identical except the invalid case).
+2. **Visibility** (`d93bcac`): `PluginConfig`/`Config.plugins`/
+   `PluginConfig::{id,dep_name,compute_internal_id}` `pub(super)`→`pub(crate)`.
+3. **`Plugin::from_config`** (`944f50c`): dummy Plugin for pre-resolve EARLY
+   (`id`=compute_internal_id, `order=0`/`lazy_type`=user/`dependency_cachedirs`=[]
+   dummies per FACT 1; LATE uses the resolved Plugin). Unit-tested id equality.
+4. **Clone** (`a19a284`): `Clone` on `PluginConfig` + dependencies
+   (`CacheConfig`/`RepoSource`/`MergeConfig`/`FileSpecifier`/`FileSpecifierPattern`).
+   Required: `PluginConfig` is consumed twice — `from_config` (EARLY dummy) and
+   `Plugin::new(merged)` (resolved LATE). This was a plan oversight surfaced
+   during implementation.
+
+**Remaining: `run_load_scheduler` handler rewrite** (the core Step 4 work).
+`Plugin::resolve` emits **topological** order (`dag/lib.rs:240-246`), so the
+EARLY↔LATE binding key is the string **`id`** (unique: `try_dag` rejects duplicate
+ids, `dag/lib.rs:155-163`) — not a positional index. New main.rs types
+`EarlyKey{Node(usize),Staged(String)}` / `StagedState{Pending,InFlight,Done}` /
+`StagedEarly{plugin,state,rev}` (id-keyed `staging`); `EarlyDone.idx`→`key`;
+`try_schedule_staged_early`; `flush_graphql_chunks(all)`. Loop-scope state:
+`staging`/`seen_rev`/`canonical_to_keys`/`graphql_batch`/`staged_id_to_node_idx`/
+`token_str`. The five handlers:
+- **Parsed**: per `pc` in `config.plugins` — conflict check (loop-scope `seen_rev`,
+  errors), `dummy=from_config(pc.clone())`, decide rev (same tree as today minus
+  the deleted `conflicts.contains` branch), push to rolling `graphql_batch` +
+  `canonical_to_keys[canon].push(Staged(id))` + flush at 25, insert `staging[id]`,
+  `try_schedule_staged_early` if rev known. Keep `config` in `configs` for the merge.
+- **ParsePhaseDone**: merge + `Plugin::new(merged)` (topo, unchanged) + build
+  `nodes`/`id_to_index`/`pending_deps`/`dependents` (unchanged), then **promote**:
+  for each resolved Plugin at `idx`, `staging.remove(id)` → set `nodes[idx].rev`/
+  `plugin`; `Done(Ok(..))`→`early` (Skipped→`finished`), `InFlight`→record
+  `staged_id_to_node_idx[id]=idx`, `Pending`→ rev stays None (GraphQL). Flush
+  remaining batch; `try_schedule_early`+`try_schedule_late` for all.
+- **EARLY-done**: `EarlyKey::Node(idx)`→existing (plugin=resolved back to node);
+  `EarlyKey::Staged(id)`→ if `staged_id_to_node_idx` has `id`, route outcome to
+  `nodes[idx].early`+`try_schedule_late` (discard dummy plugin; node has resolved
+  plugin), else `staging[id].state=Done(outcome)`.
+- **chunk completion**: `canonical_to_keys.remove(canon)` → for each key,
+  `Node(idx)`→set `nodes[idx].rev`+`try_schedule_early`; `Staged(id)`→
+  `staging[id].rev`+`try_schedule_staged_early` (or via `staged_id_to_node_idx`).
+- **shutdown `else`**: assert `staging.is_empty()`; keep node-rescue.
+
+`mod.rs` `pub(crate) use entities::config::PluginConfig;` lands with the Parsed
+handler (unused-import until then). Verification: per-step
+`cargo test`/`clippy`/`fmt`; new scheduler test (inject `SchedEvent`s with a mock
+`http_client`, assert EARLY-per-Parsed + LATE-post-ParsePhaseDone + output ==
+batch mode); isolated-HOME E2E byte-identical vs HEAD (per
+[[rsplug-generate-verification]]). Highest-risk: the ParsePhaseDone promotion
+loop (today's `main.rs:599-642`) — staged EARLY state must merge into `nodes`
+correctly, including the in-flight-at-promotion race.
 
 ## Validation
 
