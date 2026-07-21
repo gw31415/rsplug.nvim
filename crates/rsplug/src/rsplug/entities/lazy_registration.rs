@@ -54,7 +54,7 @@ impl Render for AfterOrBefore {
 
 /// プラグインの読み込み制御・ロード後の設定 (after_lua等)を行う構造体
 #[derive(Default)]
-pub struct PlugCtl {
+pub struct LazyRegistration {
     pkgid2scripts: Vec<PkgId2ScriptsItem>,
     event2pkgid: BTreeMap<Autocmd, Vec<PluginIDStr>>,
     cmd2pkgid: BTreeMap<UserCmd, Vec<PluginIDStr>>,
@@ -94,17 +94,17 @@ fn instant_startup_pkg(path: &str, data: impl Into<Cow<'static, [u8]>>) -> Loade
         script: Default::default(),
         order: usize::MAX,
         merge_enabled: true,
-        is_plugctl: true,
+        is_lazy_registration: true,
         dotgit: false,
     }
 }
 
-impl From<PlugCtl> for Vec<LoadedPlugin> {
-    fn from(value: PlugCtl) -> Vec<LoadedPlugin> {
+impl From<LazyRegistration> for Vec<LoadedPlugin> {
+    fn from(value: LazyRegistration) -> Vec<LoadedPlugin> {
         if value.is_empty() {
             return Vec::with_capacity(0);
         }
-        let PlugCtl {
+        let LazyRegistration {
             pkgid2scripts,
             event2pkgid,
             cmd2pkgid,
@@ -215,7 +215,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 script: Default::default(),
                 order: usize::MAX,
                 merge_enabled: true,
-                is_plugctl: true,
+                is_lazy_registration: true,
                 dotgit: false,
             });
         }
@@ -270,7 +270,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     script: Default::default(),
                     order: usize::MAX,
                     merge_enabled: true,
-                    is_plugctl: true,
+                    is_lazy_registration: true,
                     dotgit: false,
                 }
             });
@@ -304,7 +304,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 script: Default::default(),
                 order: usize::MAX,
                 merge_enabled: true,
-                is_plugctl: true,
+                is_lazy_registration: true,
                 dotgit: false,
             });
         }
@@ -339,7 +339,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                     script: Default::default(),
                     order: usize::MAX,
                     merge_enabled: true,
-                    is_plugctl: true,
+                    is_lazy_registration: true,
                     dotgit: false,
                 }
             });
@@ -368,7 +368,7 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
                 script: Default::default(),
                 order: usize::MAX,
                 merge_enabled: true,
-                is_plugctl: true,
+                is_lazy_registration: true,
                 dotgit: false,
             });
         }
@@ -397,15 +397,15 @@ impl From<PlugCtl> for Vec<LoadedPlugin> {
             }
         }
 
-        // NOTE: doc 盗みは `LoadedPlugin::split_doc`（`PackPathState::load`）で LoadedPlugin として
+        // NOTE: doc 盗みは `LoadedPlugin::split_doc`（`PackPlan::load`）で LoadedPlugin として
         // 扱い、ここ（control マージ）で rsplug-doc・lazy loader と統一マージされる。
-        // PlugCtl 自体は lazy 実行制御のみを担う。
+        // LazyRegistration 自体は lazy 実行制御のみを担う。
 
         plugs
     }
 }
 
-impl AddAssign for PlugCtl {
+impl AddAssign for LazyRegistration {
     fn add_assign(&mut self, other: Self) {
         let Self {
             pkgid2scripts,
@@ -450,9 +450,9 @@ impl AddAssign for PlugCtl {
     }
 }
 
-impl Sum for PlugCtl {
+impl Sum for LazyRegistration {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        let mut res = PlugCtl::new();
+        let mut res = LazyRegistration::new();
         for l in iter {
             res += l
         }
@@ -460,12 +460,12 @@ impl Sum for PlugCtl {
     }
 }
 
-impl PlugCtl {
+impl LazyRegistration {
     /// Create empty
     pub fn new() -> Self {
         Default::default()
     }
-    /// PlugCtlが空かどうか
+    /// LazyRegistrationが空かどうか
     pub fn is_empty(&self) -> bool {
         let Self {
             pkgid2scripts: scripts,
@@ -489,7 +489,7 @@ impl PlugCtl {
             && keypattern2pkgid.values().all(|v| v.is_empty())
     }
 
-    /// パッケージ情報を読み込み、 PlugCtl を作成する。
+    /// パッケージ情報を読み込み、 LazyRegistration を作成する。
     /// 読み込む情報が要らない場合は `None` を返す。
     /// NOTE: Package はインストールされる必要があるため、変更を抑制する意図で PackageID の所有権を奪う。
     /// その他必要な情報のみ引数に取る。

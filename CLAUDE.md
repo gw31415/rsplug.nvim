@@ -30,7 +30,7 @@ This repository is rsplug.nvim, an external Rust binary that generates a Neovim 
 
 ## Lazy-loading model reminders
 
-- `PlugCtl` generates runtime control files and maps plugin IDs to lazy triggers.
+- `LazyRegistration` generates runtime control files and maps plugin IDs to lazy triggers.
 - Supported triggers: `on_event`, `on_ft`, `require`, `on_cmd`, `on_map`, `lua_after`, `lua_before`, `lua_start`, `build`.
 - Lazy plugin IDs are derived from `LoadedPlugin::plugin_id()`; changes to hashing/merge behavior can affect generated package names and trigger maps.
 - When investigating lazy-loading changes, compare generated pack output and then exercise the behavior in a real Neovim session with Neowright.

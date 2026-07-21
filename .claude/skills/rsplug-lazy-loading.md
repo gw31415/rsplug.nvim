@@ -1,19 +1,19 @@
 ---
 name: rsplug-lazy-loading
-description: Use this skill when changing, reviewing, or debugging rsplug.nvim lazy-loading behavior, generated pack output, PlugCtl, plugin IDs, merge behavior, or Neovim runtime integration.
+description: Use this skill when changing, reviewing, or debugging rsplug.nvim lazy-loading behavior, generated pack output, LazyRegistration, plugin IDs, merge behavior, or Neovim runtime integration.
 ---
 
 # rsplug.nvim lazy-loading investigation
 
-Use this skill when the task involves `on_event`, `on_ft`, `on_cmd`, `on_map`, Lua `require`, `lua_before`, `lua_after`, `lua_start`, `PlugCtl`, `LoadedPlugin::plugin_id()`, package merging, or generated pack output.
+Use this skill when the task involves `on_event`, `on_ft`, `on_cmd`, `on_map`, Lua `require`, `lua_before`, `lua_after`, `lua_start`, `LazyRegistration`, `LoadedPlugin::plugin_id()`, package merging, or generated pack output.
 
 ## Repository context
 
 - Read `AGENTS.md` first.
 - `rsplug` is an external Rust binary, not a Neovim plugin.
 - Lua runtime files are generated from Sailfish templates in `crates/rsplug/templates/`.
-- `PlugCtl` in `crates/rsplug/src/rsplug/entities/plugctl.rs` wires lazy triggers.
-- `LoadedPlugin` and merge/ID behavior live in `crates/rsplug/src/rsplug/entities/packpathstate.rs`.
+- `LazyRegistration` in `crates/rsplug/src/rsplug/entities/lazy_registration.rs` wires lazy triggers.
+- `LoadedPlugin` and merge/ID behavior live in `crates/rsplug/src/rsplug/entities/pack_plan.rs`.
 - Config parsing and plugin construction live under `crates/rsplug/src/rsplug/entities/`.
 
 ## Investigation workflow

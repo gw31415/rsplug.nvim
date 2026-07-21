@@ -671,7 +671,7 @@ impl Plugin {
                     script,
                     order,
                     merge_enabled,
-                    is_plugctl: false,
+                    is_lazy_registration: false,
                     dotgit: false,
                 };
                 Ok(Some((loaded, None)))
@@ -1056,7 +1056,7 @@ async fn assemble_loaded_plugin(
     }
     // 各トップレベルエントリを配置対象に組み立てる。`doc` だけは例外:
     // 「盗んで」`_rsplug:doc` start プラグインへ集約するため、sealed-dir 1エントリではなく
-    // 個別ファイル（`doc/<rel>`）に展開する（`PlugCtl::create` の `starts_with("doc/")` 盗みを効かせる）。
+    // 個別ファイル（`doc/<rel>`）に展開する（`LazyRegistration::create` の `starts_with("doc/")` 盗みを効かせる）。
     // それ以外は sealed-dir のまま（install で copy_tree が clonefile/per-file copy で配置）。
     let mut file_entries: Vec<(PathBuf, FileItem)> = Vec::with_capacity(entries.len());
     for name in &entries {
@@ -1100,7 +1100,7 @@ async fn assemble_loaded_plugin(
         script,
         order,
         merge_enabled,
-        is_plugctl: false,
+        is_lazy_registration: false,
         dotgit,
     })
 }
@@ -1456,7 +1456,7 @@ async fn latest_snapshot_oid(worktrees: &Path) -> Result<Option<Oid>, Error> {
 /// `lua/<name>`（ディレクトリ）or `lua/<name>.lua`（ファイル）の stem を取る。
 /// ls-files 廃止に伴い read_dir で取得する（`lua/` が無ければ空）。
 /// `doc/` を再帰走査し、個別ファイルエントリ（key = `doc/<rel>`）を返す。
-/// `PlugCtl::create` が `doc/**` を盗んで `_rsplug:doc` start プラグインへ集約できるよう、
+/// `LazyRegistration::create` が `doc/**` を盗んで `_rsplug:doc` start プラグインへ集約できるよう、
 /// `doc` を sealed-dir 1エントリではなく個別ファイルとして列挙する
 ///（origin/main `collect_doc_files_from_root` 相当。同期 IO を避けるため async で走査）。
 /// doc_root が無い/ディレクトリでなければ空。エラーは寛容に skip し得た分だけ返す。

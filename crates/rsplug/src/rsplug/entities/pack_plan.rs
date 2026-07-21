@@ -158,7 +158,7 @@ impl Default for HowToPlaceFiles {
 }
 
 /// インストール単位となるプラグイン。
-/// NOTE: 遅延実行されるプラグイン等は、インストール後に PlugCtl が生成される。PlugCtlはまとめて
+/// NOTE: 遅延実行されるプラグイン等は、インストール後に LazyRegistration が生成される。LazyRegistrationはまとめて
 /// PluginLoadedに変換する。
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct LoadedPlugin {
@@ -175,8 +175,8 @@ pub struct LoadedPlugin {
     pub(super) order: usize,
     /// マージを許可するか（TOMLの `merge` フィールド）
     pub(super) merge_enabled: bool,
-    /// PlugCtlを元に作成されたかどうか
-    pub(super) is_plugctl: bool,
+    /// LazyRegistrationを元に作成されたかどうか
+    pub(super) is_lazy_registration: bool,
     /// pack に `.git` を含めるか（git 利用プラグイン用）。`dotgit=true` なら `Plugin::load` が
     /// `.git` を通常 sealed-dir エントリとして列挙に含め（他ディレクトリと同一経路で copy される）、
     /// install で `.git` エントリが無ければ `PluginDotgitMissing` で skip する。
@@ -206,7 +206,7 @@ impl LoadedPlugin {
     /// self を `(rest, doc)` に分割する。`rest` は `doc/**` を除外した元プラグイン。
     /// `doc` は抜き出した `doc/**` を持つ `_rsplug:doc` プラグイン（doc が無ければ `None`）。
     /// doc を「LoadedPlugin のまま」扱い、control マージで rsplug-doc・lazy loader と統一的に
-    /// 1つの `_rsplug:doc` に集約する（Phase 8: `PlugCtl.overwrite_files` 中間表現を廃止）。
+    /// 1つの `_rsplug:doc` に集約する（Phase 8: `LazyRegistration.overwrite_files` 中間表現を廃止）。
     pub(super) fn split_doc(self) -> (LoadedPlugin, Option<LoadedPlugin>) {
         let LoadedPlugin {
             source_names,
@@ -215,7 +215,7 @@ impl LoadedPlugin {
             script,
             order,
             merge_enabled,
-            is_plugctl,
+            is_lazy_registration,
             dotgit,
         } = self;
         let HowToPlaceFiles::CopyEachFile(mut map) = files;
@@ -238,20 +238,22 @@ impl LoadedPlugin {
             script,
             order,
             merge_enabled,
-            is_plugctl,
+            is_lazy_registration,
             dotgit,
         };
         let doc = if doc_map.is_empty() {
             None
         } else {
             Some(LoadedPlugin {
-                source_names: BTreeSet::from([super::plugctl::DOC_PLUGIN_NAME.to_string()]),
+                source_names: BTreeSet::from([
+                    super::lazy_registration::DOC_PLUGIN_NAME.to_string()
+                ]),
                 lazy_type: LazyType::Start,
                 files: HowToPlaceFiles::CopyEachFile(doc_map),
                 script: SetupScript::default(),
                 order: usize::MAX,
                 merge_enabled: true,
-                is_plugctl: true,
+                is_lazy_registration: true,
                 dotgit: false,
             })
         };
@@ -374,7 +376,7 @@ impl LoadedPlugin {
         self.lazy_type
             .cmp(&other.lazy_type)
             .then_with(|| self.order.cmp(&other.order))
-            .then_with(|| self.is_plugctl.cmp(&other.is_plugctl))
+            .then_with(|| self.is_lazy_registration.cmp(&other.is_lazy_registration))
             .then_with(|| self.plugin_id().cmp(&other.plugin_id()))
     }
 
@@ -434,11 +436,11 @@ impl Add for LoadedPlugin {
             return (self, Some(rhs));
         }
         // `merge = false` は start/opt を問わずユーザプラグインのマージを阻止する。
-        // 生成された PlugCtl アーティファクトはユーザ設定によらず内部集約できるが、
+        // 生成された LazyRegistration アーティファクトはユーザ設定によらず内部集約できるが、
         // ユーザプラグインと混ざってはならない。なお `merge` のデフォルトは true
         // （MergeConfig: Default + `#[serde(default)]`）なので、未指定ならマージする。
-        if self.is_plugctl != rhs.is_plugctl
-            || !(self.is_plugctl || self.merge_enabled && rhs.merge_enabled)
+        if self.is_lazy_registration != rhs.is_lazy_registration
+            || !(self.is_lazy_registration || self.merge_enabled && rhs.merge_enabled)
         {
             return (self, Some(rhs));
         }
@@ -453,7 +455,7 @@ impl Add for LoadedPlugin {
                         mut script,
                         order,
                         merge_enabled,
-                        is_plugctl,
+                        is_lazy_registration,
                         dotgit,
                     } = self;
                     let Self {
@@ -463,7 +465,7 @@ impl Add for LoadedPlugin {
                         script: rscript,
                         order: r_order,
                         merge_enabled: _,
-                        is_plugctl: r_is_plugctl,
+                        is_lazy_registration: r_is_lazy_registration,
                         dotgit: r_dotgit,
                     } = rhs;
                     files = union_files(files, rfiles);
@@ -480,7 +482,7 @@ impl Add for LoadedPlugin {
                             script,
                             order,
                             merge_enabled,
-                            is_plugctl: is_plugctl || r_is_plugctl,
+                            is_lazy_registration: is_lazy_registration || r_is_lazy_registration,
                             dotgit: dotgit || r_dotgit,
                         },
                         None,
@@ -814,7 +816,7 @@ impl FileSource {
 }
 
 struct Files {
-    is_plugctl: bool,
+    is_lazy_registration: bool,
     /// 配置エントリ（ファイル・sealed-dir 不分別）。install で各 `source.yank` に任せる。
     entries: Vec<(PathBuf, Arc<FileSource>)>,
     /// dotgit=true かつ repo 由来なら install 時に snapshot の .git を pack に copy する。
@@ -1262,20 +1264,20 @@ async fn retained_manifest_entries(
 
 /// PackPath の象徴となる状態。この構造体に PluginLoaded をインサートしていき、最後に実際のパスを指定して install を行う。
 #[derive(Default)]
-pub struct PackPathState {
+pub struct PackPlan {
     installing: HashSet<Box<[u8]>>,
     files: HashMap<PluginIDStr, Files>,
-    ctl: PlugCtl,
+    ctl: LazyRegistration,
     /// `split_doc` で分割された doc プラグイン群（LoadedPlugin のまま）。install の control
     /// マージで rsplug-doc・lazy loader と統一マージされ、1つの `_rsplug:doc` に集約される（Phase 8）。
     doc_plugins: Vec<LoadedPlugin>,
 }
 
-impl PackPathState {
+impl PackPlan {
     pub fn len(&self) -> usize {
         self.installing.len()
     }
-    /// 空の PackPathState を生成する。
+    /// 空の PackPlan を生成する。
     pub fn new() -> Self {
         Default::default()
     }
@@ -1297,7 +1299,7 @@ impl PackPathState {
             self.insert(plugin);
         }
     }
-    /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な PlugCtl を返す。
+    /// PluginLoaded をインサートする。その PluginLoaded の実行制御や設定に必要な LazyRegistration を返す。
     pub fn insert(&mut self, loaded_plugin: LoadedPlugin) {
         let id = loaded_plugin.plugin_id();
         let id_str = id.as_str();
@@ -1313,27 +1315,27 @@ impl PackPathState {
             script,
             order,
             merge_enabled: _,
-            is_plugctl,
+            is_lazy_registration,
             dotgit,
         } = loaded_plugin;
 
-        if !is_plugctl {
-            // doc 盗みはマージ前に `PackPathState::load` → `LoadedPlugin::steal_doc` で済ませているため、
-            // ここでは lazy 実行制御（PlugCtl）の生成のみ。files は変更しない。
-            self.ctl += PlugCtl::create(id, source_names, lazy_type, script, order);
+        if !is_lazy_registration {
+            // doc 盗みはマージ前に `PackPlan::load` → `LoadedPlugin::steal_doc` で済ませているため、
+            // ここでは lazy 実行制御（LazyRegistration）の生成のみ。files は変更しない。
+            self.ctl += LazyRegistration::create(id, source_names, lazy_type, script, order);
         }
         match files {
             HowToPlaceFiles::CopyEachFile(files) => {
                 for (path, item) in files {
                     let entry = self.files.entry(id_str.clone()).or_insert(Files {
-                        is_plugctl,
+                        is_lazy_registration,
                         entries: Vec::new(),
                         dotgit,
                     });
                     // 同 id に複数 LoadedPlugin が統合される場合、最初にエントリを作った
-                    // LoadedPlugin の is_plugctl/dotgit が or_insert で固定されるのを防ぐため、
+                    // LoadedPlugin の is_lazy_registration/dotgit が or_insert で固定されるのを防ぐため、
                     // 既存エントリのフラグを update する（どれか1つでも true なら true）。
-                    entry.is_plugctl = entry.is_plugctl || is_plugctl;
+                    entry.is_lazy_registration = entry.is_lazy_registration || is_lazy_registration;
                     entry.dotgit = entry.dotgit || dotgit;
                     // ファイル・sealed-dir を事前分類せずそのまま保持。
                     // install で `source.yank` が種別（file/dir/symlink）を判定して配置する。
@@ -1343,12 +1345,12 @@ impl PackPathState {
         }
     }
 
-    /// PackPathState を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
+    /// PackPlan を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
     /// NOTE: インストール後のディレクトリ構成は以下のようになる。
     /// {packpath}/pack/_gen/opt/{id}/
     pub async fn install(mut self, packpath: &Path) -> io::Result<()> {
         {
-            // PlugCtl（lazy 実行制御）と分割された doc プラグイン群を control マージで統一する。
+            // LazyRegistration（lazy 実行制御）と分割された doc プラグイン群を control マージで統一する。
             // rsplug-doc・lazy loader・doc 分割群が1つの `_rsplug:doc`（+ 制御パック）に集約される。
             let plugins = {
                 let plugins: Vec<LoadedPlugin> = std::mem::take(&mut self.ctl).into();
@@ -1393,7 +1395,7 @@ impl PackPathState {
         let manifest_content = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
         let mut control_ids: Vec<PluginIDStr> = files
             .iter()
-            .filter(|(_, files)| files.is_plugctl)
+            .filter(|(_, files)| files.is_lazy_registration)
             .map(|(id, _)| id.clone())
             .collect();
         control_ids.sort();
@@ -1421,7 +1423,7 @@ impl PackPathState {
         for (
             id,
             Files {
-                is_plugctl: _,
+                is_lazy_registration: _,
                 entries,
                 dotgit,
             },
@@ -1778,7 +1780,7 @@ mod tests {
             script: SetupScript::default(),
             order: 0,
             merge_enabled: true,
-            is_plugctl: false,
+            is_lazy_registration: false,
             dotgit: false,
         }
     }
@@ -2149,12 +2151,12 @@ mod tests {
             script: SetupScript::default(),
             order: 0,
             merge_enabled: true,
-            is_plugctl: false,
+            is_lazy_registration: false,
             dotgit: true,
         };
         let plugin_id = loaded.plugin_id();
 
-        let mut state = PackPathState::new();
+        let mut state = PackPlan::new();
         state.insert(loaded);
         state.install(&packpath).await.unwrap();
 
@@ -2295,12 +2297,12 @@ mod tests {
             script: SetupScript::default(),
             order: 0,
             merge_enabled: true,
-            is_plugctl: false,
+            is_lazy_registration: false,
             dotgit: true,
         };
         let plugin_id = loaded.plugin_id();
 
-        let mut state = PackPathState::new();
+        let mut state = PackPlan::new();
         state.insert(loaded);
         state.install(&packpath).await.unwrap();
 
@@ -2349,7 +2351,7 @@ mod tests {
         let loaded = synth(HowToPlaceFiles::CopyEachFile(files));
         let plugin_id = loaded.plugin_id();
 
-        let mut state = PackPathState::new();
+        let mut state = PackPlan::new();
         state.insert(loaded);
         state.install(&packpath).await.unwrap();
 
@@ -2451,7 +2453,7 @@ mod tests {
 
         let packpath = dir.join("packpath");
         let plugin_id = merged.plugin_id();
-        let mut state = PackPathState::new();
+        let mut state = PackPlan::new();
         state.insert(merged);
         state.install(&packpath).await.unwrap();
 
@@ -2551,13 +2553,16 @@ mod tests {
         assert_eq!(rest_files.len(), 1, "only lua/x.lua remains in rest");
         assert!(rest_files.contains_key(Path::new("lua/x.lua")));
 
-        // doc は `_rsplug:doc` プラグイン（is_plugctl, Start 相当）で doc/** を Overwrite 保持。
+        // doc は `_rsplug:doc` プラグイン（is_lazy_registration, Start 相当）で doc/** を Overwrite 保持。
         let doc = doc.expect("doc plugin must be Some when doc/** present");
         assert_eq!(
             doc.source_names,
             BTreeSet::from(["_rsplug:doc".to_string()])
         );
-        assert!(doc.is_plugctl, "doc plugin must be a control package");
+        assert!(
+            doc.is_lazy_registration,
+            "doc plugin must be a control package"
+        );
         let HowToPlaceFiles::CopyEachFile(doc_files) = &doc.files;
         assert_eq!(doc_files.len(), 2, "doc/foo.txt and doc/sub/bar.txt");
         assert!(doc_files.contains_key(Path::new("doc/foo.txt")));
@@ -2708,7 +2713,7 @@ mod tests {
         let id = plugin.plugin_id().as_str().to_string();
 
         // 1回目: publish。
-        let mut state = PackPathState::new();
+        let mut state = PackPlan::new();
         state.insert(plugin);
         state.install(&packpath).await.unwrap();
         let opt_a = packpath
@@ -2721,7 +2726,7 @@ mod tests {
         // 公開内容は不変。staging にも残骸が残らない。
         std::fs::write(snap_root.join("plugin/a.lua"), b"-- CHANGED\n").unwrap();
         let plugin2 = one_file_plugin("github.com/owner/a", b"rev-a", "plugin/a.lua", &snap_root);
-        let mut state2 = PackPathState::new();
+        let mut state2 = PackPlan::new();
         state2.insert(plugin2);
         state2.install(&packpath).await.unwrap();
 
@@ -2743,7 +2748,7 @@ mod tests {
         std::fs::write(genpath.join(".staging-leftover/opt/junk"), b"x").unwrap();
 
         // プラグインが空でも install 入口の staging 掃除は走る。
-        let state = PackPathState::new();
+        let state = PackPlan::new();
         state.install(&packpath).await.unwrap();
 
         assert!(
@@ -2765,7 +2770,7 @@ mod tests {
         // 1回目: A を publish しておく。
         let plugin_a = one_file_plugin("github.com/owner/a", b"rev-a", "plugin/a.lua", &snap_a);
         let id_a = plugin_a.plugin_id().as_str().to_string();
-        let mut state = PackPathState::new();
+        let mut state = PackPlan::new();
         state.insert(plugin_a);
         state.install(&packpath).await.unwrap();
         let opt_a = packpath.join("pack/_gen/opt").join(&id_a);
@@ -2778,7 +2783,7 @@ mod tests {
         let plugin_b = one_file_plugin("github.com/owner/b", b"rev-b", "plugin/b.lua", &snap_b);
         std::fs::remove_file(snap_b.join("plugin/b.lua")).unwrap();
 
-        let mut state2 = PackPathState::new();
+        let mut state2 = PackPlan::new();
         state2.insert(plugin_b);
         let result = state2.install(&packpath).await;
         assert!(result.is_err(), "copy failure must fail install");

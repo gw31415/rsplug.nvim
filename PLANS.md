@@ -25,11 +25,10 @@ pack depend on the source cache.
       ports and trailing `.git`, exclude userinfo; unify lock keys and cache
       paths on one identity; read legacy raw-URL keys compatibly; reject
       conflicting revisions.
-- [~] Replace the remaining flattened lifecycle plumbing with explicit models
+- [x] Replace the remaining flattened lifecycle plumbing with explicit models
       (`PluginSpec` ≈ `PluginConfig`, **`ResolvedGraph`** ✅, **`MaterializationPlan`**
       ✅ as `Plugin::load` stage-split: `resolve_target_commit` + `assemble_loaded_plugin`,
-      `LazyRegistration` ≈ `PlugCtl`, `PackPlan` ≈ `PackPathState`). Remaining: explicit
-      `LazyRegistration`/`PackPlan` are rename-only (low value).
+      **`LazyRegistration`** ✅ (was `PlugCtl`), **`PackPlan`** ✅ (was `PackPathState`)).
 - [x] Parallelize TOML config parsing (`main.rs`) via `JoinSet` +
       `spawn_blocking`, reassembling `config_paths.sort()` order by task index so
       the discovery stage no longer serializes read+parse. Byte-identical
@@ -175,8 +174,9 @@ stays in `Plugin::load` — it is tightly coupled via `FetchCtx`/`materialize`/b
 identity, and a full plan/execute split is structurally impossible because the plan
 phase itself is I/O-dependent (`resolve_remote_oid`, `materialize`,
 `build_repo_snapshot_identity`); forcing a 20+ field `LoadCtx` was judged worse for
-readability than the stage split. Remaining: explicit `LazyRegistration`/`PackPlan`
-(≈ `PlugCtl`/`PackPathState`, rename-only and low value). `Plugin` struct fields and
+readability than the stage split. `LazyRegistration` (was `PlugCtl`) and `PackPlan`
+      (was `PackPathState`) are renamed to the design-intended model names (now done;
+      byte-identical output). `Plugin` struct fields and
 the `dag` crate are unchanged; pack/lock output is byte-identical (verified across
 isolated-HOME runs). (Repository identity is already canonical — see above.)
 
@@ -223,7 +223,7 @@ after (a) its rev is resolved (non-GitHub immediately, GitHub via chunk
 completion) and (b) all its dependencies' load completes (`NodeState` /
 `pending_deps` / `dependents` / `try_schedule`). This removes the
 build-runtimepath race while keeping `plugin_id` byte-identical
-(`LoadedPlugin::Ord` + `merge()` + `PackPathState::load`'s `drain()` + `merge()`
+(`LoadedPlugin::Ord` + `merge()` + `PackPlan::load`'s `drain()` + `merge()`
 are fan-out-order independent). The `select!` branches are `if`-guarded so the
 post-`ParsePhaseDone` `parse_rx` terminal doesn't busy-loop and GraphQL chunk
 completions are reliably consumed (the old `None => break` could drop in-flight
@@ -338,7 +338,7 @@ Pre-existing (not a Step 4 regression; reproduced identically on `main`): the
 package id (`plugin_id`) for 2–3 plugins differs between an `-i` run and a
 `--locked`/regenerate run even though the placed file content is byte-identical
 (e.g. rainbow-delimiters.nvim). `plugin_id` hashes `LoadedPlugin` fields
-(`source_names`/`lazy_type`/`files`/`script`/`order`/`merge_enabled`/`is_plugctl`/
+(`source_names`/`lazy_type`/`files`/`script`/`order`/`merge_enabled`/`is_lazy_registration`/
 `dotgit`), so some non-file field must differ by mode; the pack stays internally
 consistent each run (init.lua always points at the current generation), so this
 is benign but worth a separate look later.

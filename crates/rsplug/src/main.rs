@@ -349,9 +349,9 @@ async fn app() -> Result<(), Error> {
     let _ = parse_prod.await;
     let total_count = plugins.len();
 
-    // Create PackPathState and load packages into it.
+    // Create PackPlan and load packages into it.
     // doc 盗みはマージ前に行う（doc が source 間マージの対象にならないよう）。
-    let mut state = rsplug::PackPathState::new();
+    let mut state = rsplug::PackPlan::new();
     state.load(plugins);
     msg(Message::MergeFinished {
         total: total_count,

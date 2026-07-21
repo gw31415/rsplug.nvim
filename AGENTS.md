@@ -68,7 +68,7 @@ Cache directory for URL sources: scheme, auth, port, and `.git` suffix are strip
 
 ## Lazy-loading model
 
-A `PlugCtl` structure aggregates all plugin settings and generates a single
+A `LazyRegistration` structure aggregates all plugin settings and generates a single
 plugin that:
 
 - Adds runtime paths and loads scripts (e.g. `plugin/`, `ftdetect/`) on events.
