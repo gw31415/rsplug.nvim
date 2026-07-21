@@ -286,6 +286,35 @@ impl Plugin {
         Ok(resolved.nodes.into_iter().map(Plugin::from))
     }
 
+    /// Pre-resolve Plugin for EARLY-only execution（Step 4 到着順ストリーミング）。
+    ///
+    /// FACT 1 により `load_early` は `order`/`lazy_type`/`dependency_cachedirs`/
+    /// `merge_enabled`/`depends`/`id` を一切読まないので、これらは dummy でよい。
+    /// LATE（`load_late`）は `Plugin::resolve` で確定した resolved Plugin で実行され、
+    /// 最終的な `order`/`lazy_type` が `plugin_id` に焼き込まれる。
+    ///
+    /// `id = compute_internal_id()` は resolve 後の Plugin の id と完全一致する
+    /// （`try_dag` が重複 id を拒否するため、id は一意）。これが EARLY↔LATE 紐付けキー。
+    /// EARLY はこの dummy Plugin、LATE は resolved Plugin だが、id で橋渡しする。
+    #[allow(dead_code)] // Step 4 で run_load_scheduler が使用開始
+    pub(crate) fn from_config(pc: PluginConfig) -> Plugin {
+        // dep_name/compute_internal_id は &self 呼び出し。フィールド move の前に済ませる。
+        let id = pc.compute_internal_id();
+        let source_name = pc.dep_name().map(str::to_string);
+        Plugin {
+            source_name,
+            cache: pc.cache,
+            lazy_type: pc.lazy_type, // ユーザー指定値（aggregate 前）。load_early は無視。
+            script: pc.script,
+            merge: pc.merge,
+            dependency_cachedirs: Vec::new(), // dummy。LATE は resolved Plugin の値を使う。
+            merge_enabled: false,             // dummy。load_early は読まない。
+            order: 0,                         // dummy。load_early は読まない。
+            id,
+            depends: pc.depends,
+        }
+    }
+
     /// 段階1: DAG 解決。`Config`（PluginSpec 集合）を `ResolvedGraph` に変換する。
     /// `order`/`dependency_cachedirs`/依存元集約 `lazy_type` をここで確定する。
     /// 重複チェック・UnknownDependency・閉路検出は dag クレートの `try_dag`
@@ -2631,6 +2660,40 @@ mod tests {
             doc_file_entries(nodoc.path(), &filesource, &identity)
                 .await
                 .is_empty()
+        );
+    }
+
+    /// Step 4: `Plugin::from_config`（EARLY 用 dummy Plugin）の id が、`Plugin::new` 経由の
+    /// resolved Plugin の id と一致すること。EARLY（dummy）↔ LATE（resolved）を id で
+    /// 橋渡しする根拠。`compute_internal_id` は単独 PluginConfig から計算可能で、resolve
+    /// 前後で不変（`try_dag` が重複 id を拒否するため id は一意）。
+    #[test]
+    fn from_config_id_matches_resolved() {
+        fn check(toml_src: &str) {
+            let early: PluginConfig = toml::from_str(toml_src).unwrap();
+            let resolved: PluginConfig = toml::from_str(toml_src).unwrap();
+            let early_id = Plugin::from_config(early).id;
+            let resolved_id = Plugin::new(Config {
+                plugins: vec![resolved],
+            })
+            .unwrap()
+            .next()
+            .unwrap()
+            .id;
+            assert_eq!(early_id, resolved_id, "id mismatch for TOML:\n{toml_src}");
+        }
+        // GitHub 省略形（basename "plugin" が id）。
+        check(r#"repo = "owner/plugin""#);
+        // Git URL（basename "plugin.nvim" が id）。
+        check(r#"repo = "https://gitlab.com/owner/plugin.nvim.git""#);
+        // 無名 script-only（script 内容ハッシュが id）。
+        check(r#"lua_start = "vim.g.x = true""#);
+        // custom name が basename に勝つ。
+        check(
+            r#"
+            repo = "owner/plugin"
+            name = "my-plugin"
+            "#,
         );
     }
 }
