@@ -150,9 +150,36 @@ enum EarlySlot {
     Done(rsplug::EarlyOutcome),
 }
 
+/// EARLY タスクの識別子。staging 段階（pre-ParsePhaseDone）は id（文字列）、
+/// promotion 後（`nodes` 構築後）はノード index。EARLY 完了の routing に使う。
+enum EarlyKey {
+    Node(usize),
+    Staged(String),
+}
+
+/// staging 段階（pre-ParsePhaseDone）の EARLY 進行状態。
+enum StagedState {
+    /// rev 待ち等、EARLY 未開始。
+    Pending,
+    /// EARLY タスク進行中。
+    InFlight,
+    /// EARLY 完了（成功/エラー）。promotion で `nodes` へ持ち込む。
+    Done(Result<(rsplug::EarlyOutcome, Option<String>), Error>),
+}
+
+/// pre-ParsePhaseDone のプラグイン staging エントリ（id-keyed）。EARLY を到着順で
+/// kick するため、`Plugin::resolve` 前の dummy Plugin を保持する。
+struct StagedEarly {
+    /// dummy Plugin（`Plugin::from_config`）。EARLY kick 時に take。
+    plugin: Option<rsplug::Plugin>,
+    state: StagedState,
+    /// EARLY ゲート用の rev。`None` = GraphQL chunk 解決待ち。
+    rev: Option<LoadRev>,
+}
+
 /// EARLY 相タスクの完了結果。EARLY 完了後も plugin を戻し、LATE 相へ渡す。
 struct EarlyDone {
-    idx: usize,
+    key: EarlyKey,
     plugin: rsplug::Plugin,
     outcome: Result<(rsplug::EarlyOutcome, Option<String>), Error>,
 }
@@ -439,11 +466,70 @@ fn try_schedule_early(
     early_tasks.spawn(async move {
         let outcome = run_load_early(&plugin, &ctx2, rev).await;
         EarlyDone {
-            idx,
+            key: EarlyKey::Node(idx),
             plugin,
             outcome,
         }
     });
+}
+
+/// staging エントリが EARLY fan-out 可能（rev 確定 + `Pending` + plugin 有り）なら
+/// load_early タスクを spawn。EARLY 完了は `EarlyKey::Staged(id)` で識別し、
+/// promotion 済みか否かで `nodes` か `staging` へ routing する。
+fn try_schedule_staged_early(
+    staging: &mut HashMap<String, StagedEarly>,
+    early_tasks: &mut tokio::task::JoinSet<EarlyDone>,
+    ctx: &LoadCtx,
+    id: &str,
+) {
+    let Some(staged) = staging.get_mut(id) else {
+        return;
+    };
+    if staged.rev.is_none()
+        || !matches!(staged.state, StagedState::Pending)
+        || staged.plugin.is_none()
+    {
+        return;
+    }
+    let plugin = staged.plugin.take().expect("checked above");
+    let rev = staged.rev.take().expect("rev is Some (checked above)");
+    staged.state = StagedState::InFlight;
+    let id_owned = id.to_string();
+    let ctx2 = ctx.clone();
+    early_tasks.spawn(async move {
+        let outcome = run_load_early(&plugin, &ctx2, rev).await;
+        EarlyDone {
+            key: EarlyKey::Staged(id_owned),
+            plugin,
+            outcome,
+        }
+    });
+}
+
+/// graphql_batch を chunk（25）に分けて chunk task を spawn する。
+/// `all=false` は rolling flush（25 到達分のみ）、`all=true` は残り全て（ParsePhaseDone 用）。
+fn flush_graphql_chunks(
+    batch: &mut Vec<rsplug::util::github::GithubRev>,
+    chunk_tasks: &mut tokio::task::JoinSet<GraphqlChunkResult>,
+    http_client: &reqwest::Client,
+    token_str: &str,
+    all: bool,
+) {
+    while batch.len() >= 25 || (all && !batch.is_empty()) {
+        let take = batch.len().min(25);
+        let chunk: Vec<_> = batch.drain(..take).collect();
+        let chunk_canonicals: Vec<String> = chunk
+            .iter()
+            .map(|g| format!("github.com/{}/{}", g.owner, g.repo))
+            .collect();
+        let client = http_client.clone();
+        let token_owned = token_str.to_string();
+        chunk_tasks.spawn(async move {
+            let result =
+                rsplug::util::github::resolve_graphql_chunk(client, token_owned, chunk).await;
+            (result, chunk_canonicals)
+        });
+    }
 }
 
 /// ノードが LATE fan-out 可能（finalized + EARLY 完了 + 依存 LATE 完了）なら load_late タスクを spawn。
@@ -515,6 +601,7 @@ async fn run_load_scheduler(
 > {
     use tokio::task::JoinSet;
 
+    let token_str = token.as_deref().unwrap_or("").to_string();
     let mut configs: HashMap<usize, rsplug::Config> = HashMap::new();
     let mut parse_done = false;
     let mut early_tasks: JoinSet<EarlyDone> = JoinSet::new();
@@ -522,34 +609,29 @@ async fn run_load_scheduler(
     let mut chunk_tasks: JoinSet<GraphqlChunkResult> = JoinSet::new();
     let mut finished: Vec<LoadOutcome> = Vec::new();
     let mut nodes: Vec<NodeState> = Vec::new();
-    let mut canonical_to_node_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    // pre-ParsePhaseDone の staging（id-keyed）と conflict 検出表。両方 loop scope。
+    let mut staging: HashMap<String, StagedEarly> = HashMap::new();
+    let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
+    // canonical → EARLY キー群（GraphQL chunk 完了で routing）。pre/post promotion 両対応。
+    let mut canonical_to_keys: HashMap<String, Vec<EarlyKey>> = HashMap::new();
+    // rolling GraphQL batch（25 到達ごとに flush、残りは ParsePhaseDone で）。
+    let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
+    // promotion（ParsePhaseDone）で id → node index を記録。in-flight EARLY の再 routing 用。
+    let mut staged_id_to_node_idx: HashMap<String, usize> = HashMap::new();
     let mut graphql_total = 0usize;
     let mut graphql_resolved = 0usize;
+    let mut graphql_progress_sent = false;
 
     loop {
         tokio::select! {
             ev = parse_rx.recv(), if !parse_done => match ev {
                 Some(SchedEvent::Parsed { index, config }) => {
-                    configs.insert(index, config);
-                }
-                Some(SchedEvent::ParsePhaseDone { total: t }) => {
-                    parse_done = true;
-                    let merged: rsplug::Config = (0..t)
-                        .map(|i| configs.remove(&i).expect("parsed config"))
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .sum();
-                    let plugins: Vec<rsplug::Plugin> = rsplug::Plugin::new(merged)?.collect();
-                    msg(Message::LoadBegin {
-                        total: plugins.len(),
-                    });
-
-                    // 衝突検出（同一 canonical・異 rev）→ 即エラー。
-                    // conflict は存在し得ないことが、到着順ストリーミングで rev を
-                    // 確定できる根拠（Step 4）。
-                    let mut seen_rev: HashMap<String, Option<Arc<str>>> = HashMap::new();
-                    for p in plugins.iter() {
-                        if let Some(repo) = p.cache.repo.as_ref() {
+                    // config.plugins を到着順で staging に積み、EARLY を即時 kick する。
+                    // config 自体は merge 用に保持（Plugin::new(merged) のため）。
+                    for pc in &config.plugins {
+                        let id = pc.compute_internal_id();
+                        // conflict 検出（同一 canonical・異 rev）→ 即エラー。
+                        if let Some(repo) = pc.cache.repo.as_ref() {
                             let canonical = repo.canonical();
                             let rev = repo.rev();
                             match seen_rev.get(&canonical) {
@@ -566,7 +648,80 @@ async fn run_load_scheduler(
                                 _ => {}
                             }
                         }
+                        let dummy = rsplug::Plugin::from_config(pc.clone());
+                        // rev 決定（conflict は存在し得ない）。決定木は旧 ParsePhaseDone と同一。
+                        let rev = match pc.cache.repo.as_ref() {
+                            None => Some(LoadRev::Auto),
+                            Some(repo) => {
+                                let canonical = repo.canonical();
+                                let repo_rev = repo.rev();
+                                if ctx.locked || !do_graphql {
+                                    Some(LoadRev::Auto)
+                                } else if repo_rev
+                                    .as_deref()
+                                    .is_some_and(rsplug::util::github::is_full_hex_hash)
+                                {
+                                    Some(LoadRev::Resolved(repo_rev))
+                                } else if repo.is_github_https()
+                                    && !repo_rev.as_deref().is_some_and(|r| r.contains('*'))
+                                    && let Some((owner, rname)) =
+                                        rsplug::util::github::parse_github_url(&repo.url())
+                                {
+                                    if ctx.update
+                                        && !dummy.is_installed(ctx.cache_dir.as_path()).await
+                                    {
+                                        Some(LoadRev::Resolved(None))
+                                    } else {
+                                        graphql_batch.push(rsplug::util::github::GithubRev {
+                                            owner,
+                                            repo: rname,
+                                            rev: repo_rev.as_deref().map(ToString::to_string),
+                                        });
+                                        graphql_total += 1;
+                                        canonical_to_keys
+                                            .entry(canonical)
+                                            .or_default()
+                                            .push(EarlyKey::Staged(id.clone()));
+                                        flush_graphql_chunks(
+                                            &mut graphql_batch,
+                                            &mut chunk_tasks,
+                                            &ctx.http_client,
+                                            &token_str,
+                                            false,
+                                        );
+                                        None
+                                    }
+                                } else {
+                                    Some(LoadRev::Resolved(None))
+                                }
+                            }
+                        };
+                        let should_schedule = rev.is_some();
+                        staging.insert(
+                            id.clone(),
+                            StagedEarly {
+                                plugin: Some(dummy),
+                                state: StagedState::Pending,
+                                rev,
+                            },
+                        );
+                        if should_schedule {
+                            try_schedule_staged_early(&mut staging, &mut early_tasks, &ctx, &id);
+                        }
                     }
+                    configs.insert(index, config);
+                }
+                Some(SchedEvent::ParsePhaseDone { total: t }) => {
+                    parse_done = true;
+                    let merged: rsplug::Config = (0..t)
+                        .map(|i| configs.remove(&i).expect("parsed config"))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .sum();
+                    let plugins: Vec<rsplug::Plugin> = rsplug::Plugin::new(merged)?.collect();
+                    msg(Message::LoadBegin {
+                        total: plugins.len(),
+                    });
 
                     // BFS ノード表を構築。finalized=true（resolve 完了済み = order/lazy_type 確定）。
                     nodes = (0..plugins.len())
@@ -598,84 +753,59 @@ async fn run_load_scheduler(
                         }
                     }
 
-                    // rev 初期値 + GraphQL batch 構築。本体を nodes へ預ける。
-                    let token_str = token.as_deref().unwrap_or("").to_string();
-                    let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
+                    // promotion: staging（dummy Plugin + EARLY 状態）を resolved Plugin の
+                    // ノードへ持ち込む。EARLY が Done なら nodes[idx].early へ、InFlight なら
+                    // staged_id_to_node_idx に記録（EARLY-done で routing）、Pending（rev 待ち）
+                    // は rev=None のまま（GraphQL chunk 完了で try_schedule_early）。
                     for (idx, p) in plugins.into_iter().enumerate() {
-                        let rev = match p.cache.repo.as_ref() {
-                            None => LoadRev::Auto,
-                            Some(repo) => {
-                                let canonical = repo.canonical();
-                                let rev = repo.rev();
-                                if ctx.locked || !do_graphql {
-                                    LoadRev::Auto
-                                } else if rev
-                                    .as_deref()
-                                    .is_some_and(rsplug::util::github::is_full_hex_hash)
-                                {
-                                    LoadRev::Resolved(rev)
-                                } else if repo.is_github_https()
-                                    && !rev.as_deref().is_some_and(|r| r.contains('*'))
-                                    && let Some((owner, rname)) =
-                                        rsplug::util::github::parse_github_url(&repo.url())
-                                {
-                                    if ctx.update
-                                        && !p.is_installed(ctx.cache_dir.as_path()).await
-                                    {
-                                        LoadRev::Resolved(None)
-                                    } else {
-                                        graphql_batch.push(rsplug::util::github::GithubRev {
-                                            owner,
-                                            repo: rname,
-                                            rev: rev.as_deref().map(ToString::to_string),
-                                        });
-                                        canonical_to_node_indices
-                                            .entry(canonical)
-                                            .or_default()
-                                            .push(idx);
-                                        nodes[idx].plugin = Some(p);
-                                        nodes[idx].rev = None;
-                                        continue;
+                        let id = p.id.clone();
+                        nodes[idx].plugin = Some(p);
+                        if let Some(mut staged) = staging.remove(&id) {
+                            staged_id_to_node_idx.insert(id, idx);
+                            nodes[idx].rev = staged.rev.take();
+                            match staged.state {
+                                StagedState::Done(Ok((early, repo_canon))) => match early {
+                                    rsplug::EarlyOutcome::Skipped => {
+                                        finished.push(Ok((None, repo_canon)));
                                     }
-                                } else {
-                                    LoadRev::Resolved(None)
+                                    early => {
+                                        nodes[idx].early = Some(EarlySlot::Done(early));
+                                    }
+                                },
+                                StagedState::Done(Err(e)) => {
+                                    finished.push(Err(e));
+                                }
+                                StagedState::InFlight => {
+                                    // EARLY-done で nodes[idx] へ routing（staged_id_to_node_idx 経由）。
+                                }
+                                StagedState::Pending => {
+                                    // rev 待ち（GraphQL pending）。try_schedule_early で処理（rev 設定後）。
                                 }
                             }
-                        };
-                        nodes[idx].plugin = Some(p);
-                        nodes[idx].rev = Some(rev);
+                            // staged.plugin（dummy）が残れば破棄（LATE は resolved Plugin を使う）。
+                        }
                     }
 
-                    // GraphQL chunk を並列送信（完了ごとに段階的に EARLY spawn）。
-                    graphql_total = graphql_batch.len();
-                    if graphql_total > 0 {
+                    // 残り GraphQL batch を flush（25 未満の端数）。
+                    flush_graphql_chunks(
+                        &mut graphql_batch,
+                        &mut chunk_tasks,
+                        &ctx.http_client,
+                        &token_str,
+                        true,
+                    );
+                    if graphql_total > 0 && !graphql_progress_sent {
                         msg(Message::GraphQLResolveProgress {
-                            resolved: 0,
+                            resolved: graphql_resolved,
                             total: graphql_total,
                         });
-                    }
-                    for chunk in graphql_batch.chunks(25) {
-                        let chunk_canonicals: Vec<String> = chunk
-                            .iter()
-                            .map(|g| format!("github.com/{}/{}", g.owner, g.repo))
-                            .collect();
-                        let client = ctx.http_client.clone();
-                        let token_owned = token_str.clone();
-                        let chunk_owned = chunk.to_vec();
-                        chunk_tasks.spawn(async move {
-                            let result = rsplug::util::github::resolve_graphql_chunk(
-                                client,
-                                token_owned,
-                                chunk_owned,
-                            )
-                            .await;
-                            (result, chunk_canonicals)
-                        });
+                        graphql_progress_sent = true;
                     }
 
-                    // rev 確定済みノードを EARLY fan-out（fetch/materialize を即時開始）。
+                    // rev 確定済みノードを EARLY fan-out し、LATE gate を評価。
                     for idx in 0..nodes.len() {
                         try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
+                        try_schedule_late(&mut nodes, &mut load_tasks, &ctx, idx);
                     }
                 }
                 Some(SchedEvent::ParseError(e)) => return Err(e),
@@ -690,40 +820,84 @@ async fn run_load_scheduler(
             },
             Some(jr) = early_tasks.join_next(), if !early_tasks.is_empty() => {
                 let EarlyDone {
-                    idx,
+                    key,
                     plugin,
                     outcome,
                 } = jr.map_err(|e| {
                     Error::Io(std::io::Error::other(format!("early load task panicked: {e}")))
                 })?;
-                match outcome {
-                    // EARLY エラー: finished へ。依存の pending_deps を進める。
-                    Err(e) => {
-                        finished.push(Err(e));
-                        let dependents = std::mem::take(&mut nodes[idx].dependents);
-                        for dep_idx in dependents {
-                            if nodes[dep_idx].pending_deps > 0 {
-                                nodes[dep_idx].pending_deps -= 1;
+                match key {
+                    EarlyKey::Node(idx) => {
+                        // 既存ロジック。plugin（resolved）を nodes[idx] に戻す。
+                        match outcome {
+                            // EARLY エラー: finished へ。依存の pending_deps を進める。
+                            Err(e) => {
+                                finished.push(Err(e));
+                                let dependents = std::mem::take(&mut nodes[idx].dependents);
+                                for dep_idx in dependents {
+                                    if nodes[dep_idx].pending_deps > 0 {
+                                        nodes[dep_idx].pending_deps -= 1;
+                                    }
+                                    try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                                }
                             }
-                            try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                            // Skipped（未インストール等）: finished へ Ok(None) + canon_to_remove。
+                            Ok((rsplug::EarlyOutcome::Skipped, repo_canon)) => {
+                                finished.push(Ok((None, repo_canon)));
+                                let dependents = std::mem::take(&mut nodes[idx].dependents);
+                                for dep_idx in dependents {
+                                    if nodes[dep_idx].pending_deps > 0 {
+                                        nodes[dep_idx].pending_deps -= 1;
+                                    }
+                                    try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                                }
+                            }
+                            // ScriptOnly / Materialized: LATE 相へ。plugin と early を nodes へ戻す。
+                            Ok((early, _repo_canon)) => {
+                                nodes[idx].plugin = Some(plugin);
+                                nodes[idx].early = Some(EarlySlot::Done(early));
+                                try_schedule_late(&mut nodes, &mut load_tasks, &ctx, idx);
+                            }
                         }
                     }
-                    // Skipped（未インストール等）: finished へ Ok(None) + canon_to_remove。
-                    Ok((rsplug::EarlyOutcome::Skipped, repo_canon)) => {
-                        finished.push(Ok((None, repo_canon)));
-                        let dependents = std::mem::take(&mut nodes[idx].dependents);
-                        for dep_idx in dependents {
-                            if nodes[dep_idx].pending_deps > 0 {
-                                nodes[dep_idx].pending_deps -= 1;
+                    EarlyKey::Staged(id) => {
+                        // promotion 済み（in-flight だった）なら nodes[idx] へ routing。
+                        // まだ promotion 前なら staging に Done を格納（promotion で nodes へ）。
+                        if let Some(&idx) = staged_id_to_node_idx.get(&id) {
+                            match outcome {
+                                Err(e) => {
+                                    finished.push(Err(e));
+                                    let dependents = std::mem::take(&mut nodes[idx].dependents);
+                                    for dep_idx in dependents {
+                                        if nodes[dep_idx].pending_deps > 0 {
+                                            nodes[dep_idx].pending_deps -= 1;
+                                        }
+                                        try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                                    }
+                                }
+                                Ok((rsplug::EarlyOutcome::Skipped, repo_canon)) => {
+                                    finished.push(Ok((None, repo_canon)));
+                                    let dependents = std::mem::take(&mut nodes[idx].dependents);
+                                    for dep_idx in dependents {
+                                        if nodes[dep_idx].pending_deps > 0 {
+                                            nodes[dep_idx].pending_deps -= 1;
+                                        }
+                                        try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                                    }
+                                }
+                                Ok((early, _)) => {
+                                    // nodes[idx].plugin は resolved（promotion 済み）。dummy は破棄。
+                                    nodes[idx].early = Some(EarlySlot::Done(early));
+                                    try_schedule_late(&mut nodes, &mut load_tasks, &ctx, idx);
+                                }
                             }
-                            try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
+                            drop(plugin);
+                        } else if let Some(staged) = staging.get_mut(&id) {
+                            staged.state = StagedState::Done(outcome);
+                            drop(plugin);
+                        } else {
+                            drop(plugin);
                         }
-                    }
-                    // ScriptOnly / Materialized: LATE 相へ。plugin と early を nodes へ戻す。
-                    Ok((early, _repo_canon)) => {
-                        nodes[idx].plugin = Some(plugin);
-                        nodes[idx].early = Some(EarlySlot::Done(early));
-                        try_schedule_late(&mut nodes, &mut load_tasks, &ctx, idx);
                     }
                 }
             }
@@ -774,11 +948,36 @@ async fn run_load_scheduler(
                             .flatten()
                             .map(Arc::<str>::from)
                     };
-                    // 該当ノードの rev を確定し、EARLY fan-out。
-                    if let Some(indices) = canonical_to_node_indices.remove(canon) {
-                        for idx in indices {
-                            nodes[idx].rev = Some(LoadRev::Resolved(oid.clone()));
-                            try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
+                    // 該当キー（Node/Staged）の rev を確定し、EARLY fan-out。
+                    if let Some(keys) = canonical_to_keys.remove(canon) {
+                        for key in keys {
+                            match key {
+                                EarlyKey::Node(idx) => {
+                                    nodes[idx].rev = Some(LoadRev::Resolved(oid.clone()));
+                                    try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
+                                }
+                                EarlyKey::Staged(id) => {
+                                    if let Some(&idx) = staged_id_to_node_idx.get(&id) {
+                                        // promotion 済み。nodes へ。
+                                        nodes[idx].rev = Some(LoadRev::Resolved(oid.clone()));
+                                        try_schedule_early(
+                                            &mut nodes,
+                                            &mut early_tasks,
+                                            &ctx,
+                                            idx,
+                                        );
+                                    } else if let Some(staged) = staging.get_mut(&id) {
+                                        // promotion 前。staging へ。
+                                        staged.rev = Some(LoadRev::Resolved(oid.clone()));
+                                        try_schedule_staged_early(
+                                            &mut staging,
+                                            &mut early_tasks,
+                                            &ctx,
+                                            &id,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -786,7 +985,7 @@ async fn run_load_scheduler(
                     msg(Message::GraphQLBatchFailed { reason });
                 }
                 graphql_resolved += chunk_size;
-                if graphql_total > 0 {
+                if graphql_total > 0 && graphql_progress_sent {
                     msg(Message::GraphQLResolveProgress {
                         resolved: graphql_resolved,
                         total: graphql_total,
@@ -795,6 +994,12 @@ async fn run_load_scheduler(
             }
             else => {
                 // parse 完了 + 全 chunk/EARLY/LATE 完了。
+                // staging が残っていれば promotion 忘れ（論理バグ）。
+                if !staging.is_empty() {
+                    return Err(Error::Io(std::io::Error::other(
+                        "scheduler shutdown with unpromoted staging entries",
+                    )));
+                }
                 // rev 未確定（chunk panic 等）のノードを救済: per-repo fallback で EARLY。
                 let mut rescued = false;
                 for idx in 0..nodes.len() {
