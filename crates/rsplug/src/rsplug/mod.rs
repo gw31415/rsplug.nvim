@@ -1,4 +1,5 @@
 mod entities;
+pub(crate) mod perf;
 pub(crate) mod util;
 
 pub use entities::config_walker;

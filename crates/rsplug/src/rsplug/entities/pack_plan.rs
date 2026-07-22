@@ -402,6 +402,7 @@ impl LoadedPlugin {
                 let mut merged = false;
 
                 for i in 0..groups.len() {
+                    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::MergeAttempt);
                     let candidate = groups.remove(i);
                     match candidate + pending {
                         (merged_group, None) => {
@@ -502,6 +503,7 @@ static MANIFEST_CACHE: Lazy<Mutex<HashMap<PathBuf, Option<Arc<SnapshotManifest>>
 
 /// `root` の manifest を（あれば）キャッシュ付きで読み込む。
 fn manifest_for(root: &Path) -> Option<Arc<SnapshotManifest>> {
+    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::ManifestFsRead);
     let mut cache = MANIFEST_CACHE.lock().unwrap();
     if let Some(m) = cache.get(root) {
         return m.clone();
@@ -797,6 +799,7 @@ impl FileSource {
         whichfile: impl AsRef<Path>,
         install_dir: impl AsRef<Path>,
     ) -> io::Result<()> {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::PackageCopy);
         match self {
             FileSource::Directory { path } => {
                 let src = path.join(&whichfile);
@@ -1027,33 +1030,48 @@ async fn copy_file_with_strategy(src: &Path, dst: &Path) -> io::Result<()> {
     loop {
         match copy_strategy() {
             s if s == STRATEGY_REFLINK => match reflink_file(src, dst).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::ReflinkCopy);
+                    return Ok(());
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     // dst 既存在（マージで同名ファイルが複数 plugin 由来等）。copy で上書き。
                     // 戦略は変更しない（AlreadyExists は環境起因ではない）。
-                    tokio::fs::copy(src, dst).await?;
+                    let bytes = tokio::fs::copy(src, dst).await?;
+                    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::FileCopied);
+                    crate::rsplug::perf::incr_bytes(bytes);
                     return Ok(());
                 }
                 Err(e) if reflink_should_fallback(&e) => {
+                    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::FallbackFanout);
                     advance_strategy(&e);
                     continue;
                 }
                 Err(e) => return Err(e),
             },
             STRATEGY_HARDLINK => match tokio::fs::hard_link(src, dst).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::HardlinkCopy);
+                    return Ok(());
+                }
                 Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::FallbackFanout);
                     advance_strategy(&e);
                     continue;
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    tokio::fs::copy(src, dst).await?;
+                    let bytes = tokio::fs::copy(src, dst).await?;
+                    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::FileCopied);
+                    crate::rsplug::perf::incr_bytes(bytes);
                     return Ok(());
                 }
                 Err(e) => return Err(e),
             },
             _ => {
-                tokio::fs::copy(src, dst).await?;
+                crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::PlainCopy);
+                let bytes = tokio::fs::copy(src, dst).await?;
+                crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::FileCopied);
+                crate::rsplug::perf::incr_bytes(bytes);
                 return Ok(());
             }
         }
@@ -1267,6 +1285,7 @@ async fn retained_manifest_entries(
         if let Ok(content) = tokio::fs::read(&path).await
             && let Ok(manifest) = serde_json::from_slice::<GenerationManifest>(&content)
         {
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::RetentionManifestRead);
             retained_entries.extend(manifest_entries(&manifest));
             retained_count += 1;
         }
@@ -1281,6 +1300,7 @@ async fn build_ft_index(
     gen_root: &Path,
     ft_pairs: &BTreeMap<String, Vec<String>>,
 ) -> io::Result<BTreeMap<String, BTreeMap<String, Vec<String>>>> {
+    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::FtIndexScan);
     let opt_root = gen_root.join("opt");
     let mut out: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     for (ft, ids) in ft_pairs {
@@ -1590,6 +1610,7 @@ impl PackPlan {
                     if help_dir.is_dir() {
                         let cmd = format!("helptags {}", help_dir.to_string_lossy());
                         msg(Message::InstallHelp { help_dir });
+                        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::HelptagsProcess);
                         nvim.arg("--headless")
                             .arg("-u")
                             .arg("NONE")
@@ -1674,7 +1695,9 @@ impl PackPlan {
         if let Ok(mut rd) = tokio::fs::read_dir(staging.join("opt")).await {
             while let Some(entry) = rd.next_entry().await? {
                 let name = entry.file_name();
+                crate::rsplug::perf::failpoint("package_rename_before")?;
                 tokio::fs::rename(entry.path(), gen_root.join("opt").join(name)).await?;
+                crate::rsplug::perf::failpoint("package_rename_after")?;
             }
         }
 
@@ -1699,7 +1722,10 @@ impl PackPlan {
                 .join(<PluginIDStr as AsRef<Path>>::as_ref(id))
                 .join("manifest.json");
             tokio::fs::create_dir_all(manifest_path.parent().unwrap()).await?;
+            crate::rsplug::perf::failpoint("generation_metadata_before")?;
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::GenerationManifestWrite);
             tokio::fs::write(manifest_path, &manifest_content).await?;
+            crate::rsplug::perf::failpoint("generation_metadata_after")?;
         }
         let generations_dir = packpath.join("generations");
         tokio::fs::create_dir_all(&generations_dir).await?;
@@ -1707,8 +1733,11 @@ impl PackPlan {
             // ponytail: no control package to anchor a generation file; fall back to a plain init.lua.
             // temp 経由の rename で原子置換する。
             let tmp = packpath.join(".init.lua.swap");
+            crate::rsplug::perf::failpoint("pointer_swap_before")?;
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::InitLuaSwap);
             tokio::fs::write(&tmp, &init_content).await?;
             tokio::fs::rename(&tmp, packpath.join("init.lua")).await?;
+            crate::rsplug::perf::failpoint("pointer_swap_after")?;
         } else {
             // Each generation's loader lives at generations/<control_id>.lua; init.lua is a
             // pure symlink to it, so older retained generations stay addressable by name.
@@ -1721,12 +1750,15 @@ impl PackPlan {
             // ブータビリティ公開点で、これより前の失敗は init.lua → 旧世代のまま（公開ツリー intact）。
             let init_path = packpath.join("init.lua");
             let tmp = packpath.join(".init.lua.swap");
+            crate::rsplug::perf::failpoint("pointer_swap_before")?;
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::InitLuaSwap);
             symlink_file(&gen_path, &tmp).await?;
             if tokio::fs::rename(&tmp, &init_path).await.is_err() {
                 // Windows 等で既存ファイルへの rename が失敗する場合は remove+rename に fallback。
                 let _ = tokio::fs::remove_file(&init_path).await;
                 tokio::fs::rename(&tmp, &init_path).await?;
             }
+            crate::rsplug::perf::failpoint("pointer_swap_after")?;
         }
 
         let retained_entries =
@@ -1753,8 +1785,10 @@ impl PackPlan {
                         let not_retained_entry = !retained_entries.contains(entry_key.as_slice());
                         let path = entry.path();
                         if not_retained_entry && path.is_dir() {
+                            crate::rsplug::perf::failpoint("gc_before")?;
                             let permit = cleanup_semaphore.acquire().await;
                             let result = tokio::fs::remove_dir_all(path).await;
+                            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::GcDelete);
                             let is_error = result.is_err();
                             permit.finish(is_error);
                             result?;

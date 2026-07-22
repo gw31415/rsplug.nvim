@@ -55,6 +55,7 @@ impl SnapshotManifest {
         dotgit: bool,
         build_success_file: &str,
     ) -> std::io::Result<Self> {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::InventoryBuild);
         let mut entries = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -128,6 +129,7 @@ impl SnapshotManifest {
 
     /// `rel` の種別。manifest に無ければ `None`（呼出元は filesystem に fallback）。
     pub(super) fn kind_of(&self, rel: &Path) -> Option<ManifestKind> {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::ManifestLinearScan);
         self.entries
             .iter()
             .find(|e| e.path.as_os_str() == rel.as_os_str())
@@ -139,6 +141,7 @@ impl SnapshotManifest {
     /// symlink は manifest が follow しないため子が不明であり、`is_dir()`/`read_dir`（共に
     /// follow する）と一致させるには filesystem に問うしかない。
     pub(super) fn child_names(&self, parent: &Path) -> Option<HashSet<OsString>> {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::ManifestLinearScan);
         match self.kind_of(parent) {
             Some(ManifestKind::Dir) => {}
             Some(ManifestKind::File) => return Some(HashSet::new()),
