@@ -638,6 +638,31 @@ fn try_schedule_late(
     });
 }
 
+/// ノードを EARLY で終了させ、依存元の LATE ゲートを進める。
+///
+/// `Skipped` と EARLY エラーはどちらもこのノードに LATE が無い終端状態である。resolved
+/// Plugin や EARLY slot を残すと、タスクが全て終わった後に scheduler が未処理ノードとして
+/// 誤認する。promotion 前に EARLY が完了した場合にも同じ処理を使う。
+fn finish_node_early(
+    nodes: &mut [NodeState],
+    load_tasks: &mut tokio::task::JoinSet<LoadDone>,
+    ctx: &LoadCtx,
+    finished: &mut Vec<LoadOutcome>,
+    idx: usize,
+    outcome: LoadOutcome,
+) {
+    finished.push(outcome);
+    nodes[idx].plugin = None;
+    nodes[idx].early = None;
+    let dependents = std::mem::take(&mut nodes[idx].dependents);
+    for dep_idx in dependents {
+        if nodes[dep_idx].pending_deps > 0 {
+            nodes[dep_idx].pending_deps -= 1;
+        }
+        try_schedule_late(nodes, load_tasks, ctx, dep_idx);
+    }
+}
+
 /// per-TOML パース結果をスケジューラへ流すイベント。
 enum SchedEvent {
     /// TOML 1 ファイルのパース完了。`index` は `config_paths.sort()` 後の位置。
@@ -875,14 +900,28 @@ async fn run_load_scheduler(
                             match staged.state {
                                 StagedState::Done(Ok((early, repo_canon))) => match early {
                                     rsplug::EarlyOutcome::Skipped => {
-                                        finished.push(Ok((None, repo_canon)));
+                                        finish_node_early(
+                                            &mut nodes,
+                                            &mut load_tasks,
+                                            &ctx,
+                                            &mut finished,
+                                            idx,
+                                            Ok((None, repo_canon)),
+                                        );
                                     }
                                     early => {
                                         nodes[idx].early = Some(EarlySlot::Done(early));
                                     }
                                 },
                                 StagedState::Done(Err(e)) => {
-                                    finished.push(Err(e));
+                                    finish_node_early(
+                                        &mut nodes,
+                                        &mut load_tasks,
+                                        &ctx,
+                                        &mut finished,
+                                        idx,
+                                        Err(e),
+                                    );
                                 }
                                 StagedState::InFlight => {
                                     // EARLY-done で nodes[idx] へ routing（staged_id_to_node_idx 経由）。
@@ -943,25 +982,25 @@ async fn run_load_scheduler(
                         match outcome {
                             // EARLY エラー: finished へ。依存の pending_deps を進める。
                             Err(e) => {
-                                finished.push(Err(e));
-                                let dependents = std::mem::take(&mut nodes[idx].dependents);
-                                for dep_idx in dependents {
-                                    if nodes[dep_idx].pending_deps > 0 {
-                                        nodes[dep_idx].pending_deps -= 1;
-                                    }
-                                    try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
-                                }
+                                finish_node_early(
+                                    &mut nodes,
+                                    &mut load_tasks,
+                                    &ctx,
+                                    &mut finished,
+                                    idx,
+                                    Err(e),
+                                );
                             }
                             // Skipped（未インストール等）: finished へ Ok(None) + canon_to_remove。
                             Ok((rsplug::EarlyOutcome::Skipped, repo_canon)) => {
-                                finished.push(Ok((None, repo_canon)));
-                                let dependents = std::mem::take(&mut nodes[idx].dependents);
-                                for dep_idx in dependents {
-                                    if nodes[dep_idx].pending_deps > 0 {
-                                        nodes[dep_idx].pending_deps -= 1;
-                                    }
-                                    try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
-                                }
+                                finish_node_early(
+                                    &mut nodes,
+                                    &mut load_tasks,
+                                    &ctx,
+                                    &mut finished,
+                                    idx,
+                                    Ok((None, repo_canon)),
+                                );
                             }
                             // ScriptOnly / Materialized: LATE 相へ。plugin と early を nodes へ戻す。
                             Ok((early, _repo_canon)) => {
@@ -977,24 +1016,24 @@ async fn run_load_scheduler(
                         if let Some(&idx) = staged_id_to_node_idx.get(&id) {
                             match outcome {
                                 Err(e) => {
-                                    finished.push(Err(e));
-                                    let dependents = std::mem::take(&mut nodes[idx].dependents);
-                                    for dep_idx in dependents {
-                                        if nodes[dep_idx].pending_deps > 0 {
-                                            nodes[dep_idx].pending_deps -= 1;
-                                        }
-                                        try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
-                                    }
+                                    finish_node_early(
+                                        &mut nodes,
+                                        &mut load_tasks,
+                                        &ctx,
+                                        &mut finished,
+                                        idx,
+                                        Err(e),
+                                    );
                                 }
                                 Ok((rsplug::EarlyOutcome::Skipped, repo_canon)) => {
-                                    finished.push(Ok((None, repo_canon)));
-                                    let dependents = std::mem::take(&mut nodes[idx].dependents);
-                                    for dep_idx in dependents {
-                                        if nodes[dep_idx].pending_deps > 0 {
-                                            nodes[dep_idx].pending_deps -= 1;
-                                        }
-                                        try_schedule_late(&mut nodes, &mut load_tasks, &ctx, dep_idx);
-                                    }
+                                    finish_node_early(
+                                        &mut nodes,
+                                        &mut load_tasks,
+                                        &ctx,
+                                        &mut finished,
+                                        idx,
+                                        Ok((None, repo_canon)),
+                                    );
                                 }
                                 Ok((early, _)) => {
                                     // nodes[idx].plugin は resolved（promotion 済み）。dummy は破棄。
@@ -1559,5 +1598,59 @@ mod tests {
         assert_eq!(plugins.len(), 2, "dependency did not resolve cleanly");
         let ids: Vec<_> = plugins.iter().map(|p| p.plugin_id()).collect();
         assert_ne!(ids[0], ids[1], "plugin_ids must differ");
+    }
+
+    #[tokio::test]
+    async fn run_load_scheduler_skips_all_missing_cached_plugins_without_deadlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = LoadCtx {
+            locked: false,
+            install: false,
+            update: false,
+            locked_map: Arc::new(BTreeMap::new()),
+            network: adaptive_semaphore::NetworkLimits::new(
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                16,
+            ),
+            breaker: Arc::new(rsplug::util::github::CircuitBreaker::new()),
+            http_client: reqwest::Client::new(),
+            cache_dir: tmp.path().to_path_buf(),
+            catalogs: Arc::new(rsplug::SnapshotCatalogCache::new()),
+        };
+        let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<SchedEvent>();
+        let config: rsplug::Config = toml::from_str(
+            r#"
+            [[plugins]]
+            repo = "owner/missing-one"
+
+            [[plugins]]
+            repo = "owner/missing-two"
+
+            [[plugins]]
+            repo = "owner/missing-three"
+            "#,
+        )
+        .unwrap();
+        parse_tx
+            .send(SchedEvent::Parsed { index: 0, config })
+            .unwrap();
+        parse_tx
+            .send(SchedEvent::ParsePhaseDone { total: 1 })
+            .unwrap();
+        drop(parse_tx);
+
+        let (plugins, _locks, remove_canons) = run_load_scheduler(parse_rx, ctx, None, false)
+            .await
+            .unwrap();
+
+        assert!(plugins.is_empty());
+        assert_eq!(
+            remove_canons,
+            vec![
+                "github.com/owner/missing-one",
+                "github.com/owner/missing-two",
+                "github.com/owner/missing-three",
+            ]
+        );
     }
 }
