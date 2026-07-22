@@ -343,7 +343,9 @@ its arguments.  Command completion also causes loading.
 Each filetype contains only ASCII letters, digits, `_`, `-`, or `.`.  On a
 filetype trigger, rsplug loads the entries, sources newly available matching
 `ftplugin/<ft>` files, and re-executes newly registered `Syntax`, `BufEnter`,
-and `BufWinEnter` autocmds where applicable.
+and `BufWinEnter` autocmds where applicable. Valid generated manifests provide
+the paths directly, in stable manifest order, and each matching path is sourced
+at most once. A missing or invalid manifest uses the runtime fallback.
 
 `on_func`:
 

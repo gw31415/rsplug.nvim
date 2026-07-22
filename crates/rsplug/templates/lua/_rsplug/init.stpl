@@ -52,11 +52,12 @@ return setmetatable({
 		if not fttbl then return {} end
 		local gen_root = rsplug.gen_root
 		local entries = rsplug.entries or {}
-		local result = {}
+		local result, result_set = {}, {}
 		for _, id in ipairs(ids) do
 			local paths = fttbl[id]
-			if paths then
-				local prefix = 'opt/' .. id .. '/'
+			local entry = 'opt/' .. id
+			if paths and entries[entry] then
+				local prefix = entry .. '/'
 				for _, rel in ipairs(paths) do
 					-- 絶対パス・`..` 成分・entries に無い opt/<id> は拒否する。
 					if rel:sub(1, 1) ~= '/' and rel:sub(1, #prefix) == prefix then
@@ -64,10 +65,11 @@ return setmetatable({
 						for comp in rel:gmatch('[^/]+') do
 							if comp == '..' then danger = true; break end
 						end
-						if not danger and entries['opt/' .. id] then
+						if not danger then
 							local full = gen_root .. '/' .. rel
-							if not vim.list_contains(result, full) then
-								table.insert(result, full)
+							if not result_set[full] then
+								result_set[full] = true
+								result[#result + 1] = full
 							end
 						end
 					end

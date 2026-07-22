@@ -233,8 +233,10 @@ trigger runs `lua_before`, loads the plugin, then runs `lua_after`.
 
 Compatible entries with non-conflicting files can share one pack entry. Help
 files are collected for a single helptags pass. Snapshot manifests make the
-merge and copy decisions without repeatedly walking repository trees; they are
-only a cache and filesystem fallback preserves correctness.
+merge and copy decisions without repeatedly walking repository trees; their
+indexed filetype paths are validated while resolving and de-duplicated in
+stable manifest order. Manifests are only a cache and filesystem fallback
+preserves correctness.
 
 To boot a retained generation, list `~/.cache/rsplug/generations/` and pass its
 32-character ID:

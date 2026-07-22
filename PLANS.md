@@ -1036,7 +1036,10 @@ and compares the active rsplug require searcher with an otherwise identical
 temporarily removed-searcher control. The ignored benchmark produced
 `target/runtime_hot_paths_bench.json` on 2026-07-22. The update, install, and
 snapshot-refresh reports and structural counter infrastructure remain to be
-implemented; U1 and later production milestones have not started.
+implemented. A first scoped L2 filetype hot-path change is now implemented:
+the valid v2 manifest resolver uses a reverse path set for stable de-duplication
+and hoists package-entry checks outside its path loop. The broader L2 milestone
+and U1/U2/I1/S1/S2/S3/S4/L1/C1/D1 remain incomplete.
 
 ## Discoveries and decision log
 
@@ -1053,3 +1056,6 @@ implemented; U1 and later production milestones have not started.
 - 2026-07-22: A content/generation identity mismatch across install, flagless,
   and locked modes is treated as a performance bug because it defeats warm
   package reuse, even if the resulting file bytes happen to match.
+- 2026-07-22: The first bounded implementation slice after M0 targets the
+  valid-manifest filetype resolver: a set replaces linear result membership
+  checks while preserving manifest order and path validation.
