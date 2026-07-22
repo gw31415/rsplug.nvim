@@ -739,6 +739,28 @@ impl ProgressManager {
         }
     }
 
+    /// Loading は全体進捗なので、先に始まった Resolving/Updating 等の子バーより常に上へ置く。
+    fn add_loading_bar(&self, pb: ProgressBar) -> ProgressBar {
+        if let Some(graphql) = self.progress_bars.get(GRAPHQL_PROGRESS_ID) {
+            self.multipb.insert_before(&graphql.bar, pb)
+        } else if let Some(updating) = self.updating_bar.as_ref() {
+            self.multipb.insert_before(&updating.bar, pb)
+        } else if let Some(stage) = self.progress_bars.get(CACHE_FETCH_STAGE_ID) {
+            self.multipb.insert_before(&stage.bar, pb)
+        } else if let Some(done) = self.progress_bars.get(CACHE_FETCH_DONE_ID) {
+            self.multipb.insert_before(&done.bar, pb)
+        } else if let Some(progress) = self.progress_bars.get(CACHE_FETCH_PROGRESS_ID) {
+            self.multipb.insert_before(&progress.bar, pb)
+        } else if let Some(building) = self.child_order.iter().find_map(|key| match key {
+            ChildKey::Building(id) => self.progress_bars.get(id.as_str()),
+            _ => None,
+        }) {
+            self.multipb.insert_before(&building.bar, pb)
+        } else {
+            self.multipb.add(pb)
+        }
+    }
+
     /// Fetching 行（CACHE_FETCH_STAGE_ID）を挿入する。
     /// 順序上 Updating の直後、fetched/Objects の前。
     fn add_fetch_stage_bar(&self, pb: ProgressBar) -> ProgressBar {
@@ -1129,7 +1151,7 @@ impl ProgressManager {
                     .with_style(loading_style(running.clone()))
                     .with_prefix("Loading");
                 pb.enable_steady_tick(Duration::from_millis(120));
-                let bar = BarState::new(self.multipb.add(pb));
+                let bar = BarState::new(self.add_loading_bar(pb));
                 self.progress_bars.insert("loading".to_string(), bar);
                 self.loading_running = Some(running);
                 // Loading フェーズは OSC 9;4 を不定(割合なし)にする。
@@ -1693,6 +1715,28 @@ mod tests {
         assert!(
             !rendered.contains("Resolving"),
             "completed Resolving bar must not remain; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn loading_bar_is_above_updating_started_during_streaming_parse() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        m.process(Message::Cache(
+            "Updating",
+            Arc::from("https://example.test/plugin"),
+        ));
+        m.process(Message::LoadBegin { total: 1 });
+        std::thread::sleep(Duration::from_millis(160));
+
+        let rendered = screen_rendered(&screen);
+        let loading = rendered.find("Loading").expect("loading bar");
+        let updating = rendered.find("Updating").expect("updating bar");
+        assert!(
+            loading < updating,
+            "Loading must remain above its Updating child: {rendered}"
         );
     }
 
