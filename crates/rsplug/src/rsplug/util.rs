@@ -571,6 +571,16 @@ pub mod repo {
         )
     }
 
+    /// 正規化済み identity `host[:port]/path` からホスト部（`host[:port]`）を取り出す。
+    /// per-host リソース上限のキーに使う (PLANS U2 step 6)。ポートは非デフォルトのみ残る。
+    pub fn host_of(url: &str) -> String {
+        let canon = canonicalize_url(url);
+        match canon.find('/') {
+            Some(i) => canon[..i].to_string(),
+            None => canon,
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -618,6 +628,18 @@ pub mod repo {
             );
             // GitHub shorthand（第1セグメントに `.` を含まない）
             assert_eq!(canonicalize_lock_key("owner/repo"), "github.com/owner/repo");
+        }
+
+        #[test]
+        fn host_of_extracts_host_port_for_per_host_limit() {
+            // per-host リソース上限のキー (PLANS U2 step 6)。
+            assert_eq!(host_of("https://github.com/owner/repo"), "github.com");
+            assert_eq!(host_of("https://api.github.com/graphql"), "api.github.com");
+            assert_eq!(host_of("https://gitlab.com/o/r"), "gitlab.com");
+            // 非デフォルトポートは保持（別エンドポイント = 別ホスト）。
+            assert_eq!(host_of("https://gitlab.com:2222/o/r"), "gitlab.com:2222");
+            // デフォルトポート・userinfo・.git は除去済み。
+            assert_eq!(host_of("ssh://git@github.com/o/r.git"), "github.com");
         }
     }
 }
@@ -673,13 +695,101 @@ pub mod github {
     }
 
     /// REST API で rev 解決を試みた結果のエラー種別。
-    /// 呼出元は `RateLimited` と `Other` のどちらでも git protocol へフォールバックする。
-    #[derive(Debug)]
+    ///
+    /// 呼出元はどのバリアントでも最終的に git protocol へフォールバックするが、
+    /// その前に取る行動（サーキットブレーカー始動・一時エラー再試行・即フォールバック）
+    /// をこの分類で決定する (PLANS U2 step 5)。
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum ApiError {
-        /// API rate limit 残量が少ない（閾値以下）。
+        /// API rate limit 残量が少ない（閾値以下）または 429。
+        /// 実行スコープのサーキットブレーカーを開き、以降は Git フォールバックへ直行する。
         RateLimited,
-        /// その他のエラー（ネットワーク・HTTP 4xx/5xx・パース失敗等）。
+        /// 認証エラー（401/403）。再試行せず Git フォールバック。
+        Auth,
+        /// リポジトリ/ref 未検出（404）。再試行せず Git フォールバック。
+        NotFound,
+        /// 一時的エラー（5xx・ネットワーク・タイムアウト）。少額の再試行予算を消費してからフォールバック。
+        Transient,
+        /// その他（パース失敗・想定外ステータス等）。再試行せず Git フォールバック。
         Other(String),
+    }
+
+    /// HTTP ステータスから [`ApiError`] を分類する。
+    fn classify_http_status(status: reqwest::StatusCode) -> ApiError {
+        match status.as_u16() {
+            401 | 403 => ApiError::Auth,
+            404 => ApiError::NotFound,
+            429 => ApiError::RateLimited,
+            500..=599 => ApiError::Transient,
+            _ => ApiError::Other(format!("GitHub API HTTP {status}")),
+        }
+    }
+
+    /// API エラー後の行動 (PLANS U2 step 5)。純粋関数（テスト可能）。
+    pub(crate) enum ApiFallbackPolicy {
+        /// 一時エラーで予算が残っている: 再試行する。
+        Retry,
+        /// レートリミット: ブレーカーを開き Git フォールバックへ。
+        RateLimited,
+        /// 認証/未検出/その他、または予算切れ: Git フォールバックへ。
+        GiveUp,
+    }
+
+    /// `err` と現在の試行回数から次の行動を決定する。
+    /// - RateLimited → ブレーカー始動 + Git フォールバック
+    /// - Transient かつ `attempt < max_retries` → 再試行
+    /// - それ以外（Auth/NotFound/Other、または予算切れ）→ Git フォールバック
+    pub(crate) fn api_error_policy(
+        err: &ApiError,
+        attempt: usize,
+        max_retries: usize,
+    ) -> ApiFallbackPolicy {
+        match err {
+            ApiError::RateLimited => ApiFallbackPolicy::RateLimited,
+            ApiError::Transient if attempt < max_retries => ApiFallbackPolicy::Retry,
+            _ => ApiFallbackPolicy::GiveUp,
+        }
+    }
+
+    /// 一時エラー再試行のバックオフ (PLANS U2 step 5)。決定的: ジッタは出力の決定性を
+    /// 壊さないよう試行番号由来の固定ステップのみ（本番のタイミングはこれに依存しない）。
+    pub(crate) fn transient_backoff(attempt: usize) -> std::time::Duration {
+        let shift = attempt.min(10) as u32;
+        std::time::Duration::from_millis(2u64 << shift)
+    }
+
+    /// 実行スコープの GitHub API サーキットブレーカー (PLANS U2 step 5)。
+    ///
+    /// レートリミット応答で一度でも開くと、実行の残り全体で API を信頼不可とみなす。
+    /// 以降の解決は REST API を飛ばして bounded Git フォールバックへ直行する。
+    /// 実行内で自動復旧せず、新しい実行は閉じた状態で開始する。
+    #[derive(Debug)]
+    pub struct CircuitBreaker {
+        open: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for CircuitBreaker {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl CircuitBreaker {
+        pub fn new() -> Self {
+            Self {
+                open: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// ブレーカーが開いている（= API をスキップして Git フォールバックへ直行すべき）か。
+        pub fn is_open(&self) -> bool {
+            self.open.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// レートリミット等でブレーカーを開く。以降の `is_open` は true。
+        pub fn trip(&self) {
+            self.open.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// GitHub REST API でコミットハッシュを解決する。
@@ -710,10 +820,7 @@ pub mod github {
         // GitHub REST API は JSON を返す。`reqwest` に `json` feature が必要だが、
         // default-features = false なので手動でヘッダを付ける。
         req = req.header("Accept", "application/vnd.github+json");
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+        let resp = req.send().await.map_err(|_| ApiError::Transient)?;
 
         // rate limit チェック
         if let Some(remaining) = resp
@@ -727,18 +834,12 @@ pub mod github {
         }
 
         if !resp.status().is_success() {
-            return Err(ApiError::Other(format!(
-                "GitHub API HTTP {} for {url}",
-                resp.status()
-            )));
+            return Err(classify_http_status(resp.status()));
         }
 
         // JSON を手動パースして sha を取り出す（serde_json 依存を避けるため最小限の抽出）。
         // `/repos/{o}/{r}` は default_branch を返し、それを解決するために2段階になる。
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+        let body = resp.text().await.map_err(|_| ApiError::Transient)?;
         let default_branch = super::json_extract_string(&body, "default_branch")
             .ok_or_else(|| ApiError::Other("missing default_branch in API response".into()))?;
 
@@ -754,10 +855,7 @@ pub mod github {
                 .header("X-GitHub-Api-Version", "2022-11-28");
         }
         req2 = req2.header("Accept", "application/vnd.github+json");
-        let resp2 = req2
-            .send()
-            .await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+        let resp2 = req2.send().await.map_err(|_| ApiError::Transient)?;
 
         // 2回目のリクエストでも rate limit をチェック
         if let Some(remaining) = resp2
@@ -771,16 +869,10 @@ pub mod github {
         }
 
         if !resp2.status().is_success() {
-            return Err(ApiError::Other(format!(
-                "GitHub API HTTP {} for commits/{target_ref}",
-                resp2.status()
-            )));
+            return Err(classify_http_status(resp2.status()));
         }
 
-        let body2 = resp2
-            .text()
-            .await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+        let body2 = resp2.text().await.map_err(|_| ApiError::Transient)?;
         super::json_extract_string(&body2, "sha")
             .ok_or_else(|| ApiError::Other("missing sha in API response".into()))
     }
@@ -961,7 +1053,7 @@ pub mod github {
             .body(body_bytes)
             .send()
             .await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+            .map_err(|_| ApiError::Transient)?;
         if let Some(remaining) = resp
             .headers()
             .get("x-ratelimit-remaining")
@@ -972,12 +1064,9 @@ pub mod github {
             return Err(ApiError::RateLimited);
         }
         if !resp.status().is_success() {
-            return Err(ApiError::Other(format!("GraphQL HTTP {}", resp.status())));
+            return Err(classify_http_status(resp.status()));
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+        let text = resp.text().await.map_err(|_| ApiError::Transient)?;
         parse_graphql_response(&text, &mapping)
     }
 
@@ -1071,6 +1160,95 @@ pub mod github {
                 res.get(&("o".to_string(), "r".to_string())),
                 Some(&Some("headoid".to_string()))
             );
+        }
+
+        // --- U2 step 5: error classification, retry policy, circuit breaker ---
+
+        #[test]
+        fn classify_http_status_maps_known_codes() {
+            use reqwest::StatusCode;
+            assert_eq!(
+                classify_http_status(StatusCode::UNAUTHORIZED),
+                ApiError::Auth
+            );
+            assert_eq!(classify_http_status(StatusCode::FORBIDDEN), ApiError::Auth);
+            assert_eq!(
+                classify_http_status(StatusCode::NOT_FOUND),
+                ApiError::NotFound
+            );
+            assert_eq!(
+                classify_http_status(StatusCode::TOO_MANY_REQUESTS),
+                ApiError::RateLimited
+            );
+            assert_eq!(
+                classify_http_status(StatusCode::INTERNAL_SERVER_ERROR),
+                ApiError::Transient
+            );
+            assert_eq!(
+                classify_http_status(StatusCode::BAD_GATEWAY),
+                ApiError::Transient
+            );
+            assert!(matches!(
+                classify_http_status(StatusCode::BAD_REQUEST),
+                ApiError::Other(_)
+            ));
+        }
+
+        #[test]
+        fn api_error_policy_retry_transient_until_budget_exhausted() {
+            // Transient within budget -> retry; at budget -> give up.
+            assert!(matches!(
+                api_error_policy(&ApiError::Transient, 0, 2),
+                ApiFallbackPolicy::Retry
+            ));
+            assert!(matches!(
+                api_error_policy(&ApiError::Transient, 1, 2),
+                ApiFallbackPolicy::Retry
+            ));
+            assert!(matches!(
+                api_error_policy(&ApiError::Transient, 2, 2),
+                ApiFallbackPolicy::GiveUp
+            ));
+        }
+
+        #[test]
+        fn api_error_policy_no_retry_for_auth_notfound_other() {
+            for err in [
+                ApiError::Auth,
+                ApiError::NotFound,
+                ApiError::Other("parse".into()),
+            ] {
+                assert!(
+                    matches!(api_error_policy(&err, 0, 2), ApiFallbackPolicy::GiveUp),
+                    "auth/notfound/other must not retry"
+                );
+            }
+        }
+
+        #[test]
+        fn api_error_policy_rate_limited_trips_breaker() {
+            assert!(matches!(
+                api_error_policy(&ApiError::RateLimited, 0, 2),
+                ApiFallbackPolicy::RateLimited
+            ));
+        }
+
+        #[test]
+        fn transient_backoff_is_deterministic_and_growing() {
+            assert_eq!(transient_backoff(0), std::time::Duration::from_millis(2));
+            assert_eq!(transient_backoff(1), std::time::Duration::from_millis(4));
+            assert_eq!(transient_backoff(2), std::time::Duration::from_millis(8));
+        }
+
+        #[test]
+        fn circuit_breaker_starts_closed_and_trips() {
+            let breaker = CircuitBreaker::new();
+            assert!(!breaker.is_open());
+            breaker.trip();
+            assert!(breaker.is_open());
+            // Trip is sticky for the run.
+            breaker.trip();
+            assert!(breaker.is_open());
         }
     }
 }

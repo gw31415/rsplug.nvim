@@ -8,7 +8,7 @@ use log::{Message, close, msg};
 use once_cell::sync::Lazy;
 use rsplug::config_walker::ConfigWalker;
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
 };
@@ -45,7 +45,8 @@ struct LoadCtx {
     install: bool,
     update: bool,
     locked_map: Arc<BTreeMap<String, rsplug::LockedResource>>,
-    fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore,
+    network: adaptive_semaphore::NetworkLimits,
+    breaker: Arc<rsplug::util::github::CircuitBreaker>,
     http_client: reqwest::Client,
     cache_dir: PathBuf,
     catalogs: Arc<rsplug::SnapshotCatalogCache>,
@@ -114,7 +115,8 @@ async fn run_load_early(
             ctx.update,
             &ctx.cache_dir,
             locked_rev.as_deref(),
-            &ctx.fetch_semaphore,
+            &ctx.network,
+            &ctx.breaker,
             &ctx.http_client,
             &ctx.catalogs,
         )
@@ -149,6 +151,7 @@ async fn run_load_late(
 }
 
 /// EARLY 相の進行状態。EARLY 完了結果（`EarlyOutcome`）を保持する。
+#[allow(clippy::large_enum_variant)]
 enum EarlySlot {
     InFlight,
     Done(rsplug::EarlyOutcome),
@@ -162,6 +165,7 @@ enum EarlyKey {
 }
 
 /// staging 段階（pre-ParsePhaseDone）の EARLY 進行状態。
+#[allow(clippy::large_enum_variant)]
 enum StagedState {
     /// rev 待ち等、EARLY 未開始。
     Pending,
@@ -341,12 +345,14 @@ async fn app() -> Result<(), Error> {
             )))
         })?;
 
+    let network = adaptive_semaphore::NetworkLimits::new(fetch_semaphore, 16);
     let ctx = LoadCtx {
         locked,
         install,
         update,
         locked_map: Arc::clone(&locked_map),
-        fetch_semaphore: fetch_semaphore.clone(),
+        network,
+        breaker: Arc::new(rsplug::util::github::CircuitBreaker::new()),
         http_client: http_client.clone(),
         cache_dir: DEFAULT_REPOCACHE_DIR.clone(),
         catalogs: Arc::new(rsplug::SnapshotCatalogCache::new()),
@@ -525,12 +531,33 @@ fn try_schedule_staged_early(
 fn flush_graphql_chunks(
     batch: &mut Vec<rsplug::util::github::GithubRev>,
     chunk_tasks: &mut tokio::task::JoinSet<GraphqlChunkResult>,
+    network: &adaptive_semaphore::NetworkLimits,
+    breaker: &Arc<rsplug::util::github::CircuitBreaker>,
     http_client: &reqwest::Client,
     token_str: &str,
     all: bool,
 ) {
-    while batch.len() >= 25 || (all && !batch.is_empty()) {
-        let take = batch.len().min(25);
+    const FIELD_BUDGET: usize = 50;
+    const MAX_IN_FLIGHT: usize = 4;
+    while chunk_tasks.len() < MAX_IN_FLIGHT
+        && (batch
+            .iter()
+            .map(|g| if g.rev.is_some() { 2 } else { 1 })
+            .sum::<usize>()
+            >= FIELD_BUDGET
+            || (all && !batch.is_empty()))
+    {
+        let mut cost = 0;
+        let mut take = 0;
+        for item in batch.iter() {
+            let item_cost = if item.rev.is_some() { 2 } else { 1 };
+            if take > 0 && cost + item_cost > FIELD_BUDGET {
+                break;
+            }
+            cost += item_cost;
+            take += 1;
+        }
+        let take = take.max(1).min(batch.len());
         let chunk: Vec<_> = batch.drain(..take).collect();
         let chunk_canonicals: Vec<String> = chunk
             .iter()
@@ -538,10 +565,44 @@ fn flush_graphql_chunks(
             .collect();
         let client = http_client.clone();
         let token_owned = token_str.to_string();
+        let network = network.clone();
+        let breaker = Arc::clone(breaker);
         chunk_tasks.spawn(async move {
             rsplug::perf::incr(rsplug::perf::PerfOp::GraphqlRequest);
-            let result =
-                rsplug::util::github::resolve_graphql_chunk(client, token_owned, chunk).await;
+            let mut attempt = 0;
+            let result = loop {
+                let result = network
+                    .run(
+                        "api.github.com",
+                        rsplug::util::github::resolve_graphql_chunk(
+                            client.clone(),
+                            token_owned.clone(),
+                            chunk.clone(),
+                        ),
+                    )
+                    .await;
+                match result {
+                    Err(err) => match rsplug::util::github::api_error_policy(&err, attempt, 2) {
+                        rsplug::util::github::ApiFallbackPolicy::Retry => {
+                            tokio::time::sleep(rsplug::util::github::transient_backoff(attempt))
+                                .await;
+                            attempt += 1;
+                        }
+                        rsplug::util::github::ApiFallbackPolicy::RateLimited => {
+                            breaker.trip();
+                            break Err(err);
+                        }
+                        rsplug::util::github::ApiFallbackPolicy::GiveUp => break Err(err),
+                    },
+                    Ok(value) => break Ok(value),
+                }
+            };
+            // A terminal GraphQL failure is a shared API decision: bounded Git
+            // fallback handles all affected repositories instead of each one
+            // reopening REST independently. Rate limits take this path too.
+            if result.is_err() {
+                breaker.trip();
+            }
             (result, chunk_canonicals)
         });
     }
@@ -635,6 +696,7 @@ async fn run_load_scheduler(
     let mut canonical_to_keys: HashMap<String, Vec<EarlyKey>> = HashMap::new();
     // rolling GraphQL batch（25 到達ごとに flush、残りは ParsePhaseDone で）。
     let mut graphql_batch: Vec<rsplug::util::github::GithubRev> = Vec::new();
+    let mut graphql_seen: HashSet<(String, Option<String>)> = HashSet::new();
     // promotion（ParsePhaseDone）で id → node index を記録。in-flight EARLY の再 routing 用。
     let mut staged_id_to_node_idx: HashMap<String, usize> = HashMap::new();
     let mut graphql_total = 0usize;
@@ -711,11 +773,17 @@ async fn run_load_scheduler(
                                         });
                                         None
                                     } else {
-                                        graphql_batch.push(rsplug::util::github::GithubRev {
-                                            owner,
-                                            repo: rname,
-                                            rev: repo_rev.as_deref().map(ToString::to_string),
-                                        });
+                                        let request_key = (
+                                            canonical.clone(),
+                                            repo_rev.as_deref().map(ToString::to_string),
+                                        );
+                                        if graphql_seen.insert(request_key) {
+                                            graphql_batch.push(rsplug::util::github::GithubRev {
+                                                owner,
+                                                repo: rname,
+                                                rev: repo_rev.as_deref().map(ToString::to_string),
+                                            });
+                                        }
                                         graphql_total += 1;
                                         canonical_to_keys
                                             .entry(canonical)
@@ -724,6 +792,8 @@ async fn run_load_scheduler(
                                         flush_graphql_chunks(
                                             &mut graphql_batch,
                                             &mut chunk_tasks,
+                                            &ctx.network,
+                                            &ctx.breaker,
                                             &ctx.http_client,
                                             &token_str,
                                             false,
@@ -829,6 +899,8 @@ async fn run_load_scheduler(
                     flush_graphql_chunks(
                         &mut graphql_batch,
                         &mut chunk_tasks,
+                        &ctx.network,
+                        &ctx.breaker,
                         &ctx.http_client,
                         &token_str,
                         true,
@@ -961,7 +1033,10 @@ async fn run_load_scheduler(
                         eprintln!(
                             "[rsplug] GraphQL chunk join error: {e}; affected plugins fall back to per-repo"
                         );
-                        continue;
+                        // A task panic must not strand the staged keys forever.  The
+                        // normal task cannot panic, but route this defensively as a
+                        // transient shared failure if JoinSet reports one.
+                        (Err(rsplug::util::github::ApiError::Transient), Vec::new())
                     }
                 };
                 let err_reason = match &result {
@@ -969,7 +1044,7 @@ async fn run_load_scheduler(
                     Err(rsplug::util::github::ApiError::RateLimited) => {
                         Some("rate-limited".to_string())
                     }
-                    Err(rsplug::util::github::ApiError::Other(s)) => Some(s.clone()),
+                    Err(err) => Some(format!("{err:?}")),
                 };
                 let oid_map = result.unwrap_or_default();
                 let chunk_size = chunk_canonicals.len();
@@ -1020,6 +1095,20 @@ async fn run_load_scheduler(
                         }
                     }
                 }
+                // ParsePhaseDone may have filled a final chunk while the bounded
+                // task window was full.  Refill the window whenever one task
+                // completes, otherwise those queued requests would never run.
+                if parse_done {
+                    flush_graphql_chunks(
+                        &mut graphql_batch,
+                        &mut chunk_tasks,
+                        &ctx.network,
+                        &ctx.breaker,
+                        &ctx.http_client,
+                        &token_str,
+                        true,
+                    );
+                }
                 if let Some(reason) = err_reason {
                     msg(Message::GraphQLBatchFailed { reason });
                 }
@@ -1049,6 +1138,8 @@ async fn run_load_scheduler(
                     flush_graphql_chunks(
                         &mut graphql_batch,
                         &mut chunk_tasks,
+                        &ctx.network,
+                        &ctx.breaker,
                         &ctx.http_client,
                         &token_str,
                         false,
@@ -1371,7 +1462,11 @@ mod tests {
             install: false,
             update: false,
             locked_map: Arc::new(BTreeMap::new()),
-            fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore::new(),
+            network: adaptive_semaphore::NetworkLimits::new(
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                16,
+            ),
+            breaker: Arc::new(rsplug::util::github::CircuitBreaker::new()),
             http_client: reqwest::Client::new(),
             cache_dir: tmp.path().to_path_buf(),
             catalogs: Arc::new(rsplug::SnapshotCatalogCache::new()),
@@ -1421,7 +1516,11 @@ mod tests {
             install: false,
             update: false,
             locked_map: Arc::new(BTreeMap::new()),
-            fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore::new(),
+            network: adaptive_semaphore::NetworkLimits::new(
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                16,
+            ),
+            breaker: Arc::new(rsplug::util::github::CircuitBreaker::new()),
             http_client: reqwest::Client::new(),
             cache_dir: tmp.path().to_path_buf(),
             catalogs: Arc::new(rsplug::SnapshotCatalogCache::new()),

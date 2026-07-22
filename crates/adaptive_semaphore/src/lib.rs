@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 const DEFAULT_INITIAL_LIMIT: usize = 16;
 const DEFAULT_MIN_LIMIT: usize = 1;
@@ -47,6 +48,10 @@ pub struct AdaptiveSemaphorePermit {
 struct WindowStats {
     completed: usize,
     errors: usize,
+    /// Permits released by cancellation/drop without `finish`. Tracked separately
+    /// so a cancelled in-flight operation never reads as a successful sample
+    /// (PLANS U2 step 1) and never skews throughput/latency adaptation.
+    cancelled: usize,
     total_latency: Duration,
 }
 
@@ -110,6 +115,30 @@ impl AdaptiveSemaphore {
         self.state.inner.lock().unwrap().adjust_interval
     }
 
+    /// Current-window completed samples (success + error), excluding cancellations.
+    #[cfg(test)]
+    fn completed(&self) -> usize {
+        self.state.inner.lock().unwrap().current.completed
+    }
+
+    /// Current-window error samples.
+    #[cfg(test)]
+    fn errors(&self) -> usize {
+        self.state.inner.lock().unwrap().current.errors
+    }
+
+    /// Current-window cancelled (dropped-without-finish) samples.
+    #[cfg(test)]
+    fn cancelled(&self) -> usize {
+        self.state.inner.lock().unwrap().current.cancelled
+    }
+
+    /// Permits currently held by in-flight operations.
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.state.inner.lock().unwrap().in_flight
+    }
+
     pub async fn acquire(&self) -> AdaptiveSemaphorePermit {
         loop {
             let notified = {
@@ -147,9 +176,17 @@ impl AdaptiveSemaphore {
         let should_notify = {
             let mut inner = self.state.inner.lock().unwrap();
             inner.in_flight = inner.in_flight.saturating_sub(1);
-            if let Some((latency, is_error)) = outcome {
-                inner.record(latency, is_error);
-                inner.adjust_if_needed();
+            match outcome {
+                // Completed operation: contribute exactly one success/error sample
+                // and let the limit adapt.
+                Some((latency, is_error)) => {
+                    inner.record(latency, is_error);
+                    inner.adjust_if_needed();
+                }
+                // Dropped without `finish`: the in-flight operation was cancelled
+                // (task aborted, future dropped, etc.). Count it as cancelled
+                // rather than leaving no trace and rather than as a success.
+                None => inner.current.cancelled += 1,
             }
             inner.in_flight < inner.limit
         };
@@ -157,6 +194,24 @@ impl AdaptiveSemaphore {
             self.state.notify.notify_one();
             self.state.blocking_notify.notify_one();
         }
+    }
+
+    /// Run `future` under one adaptive permit and record exactly one outcome
+    /// sample (success/error). This is the single path network call sites must
+    /// use so the advertised limit actually adapts on the main network path
+    /// (PLANS U2 step 1).
+    ///
+    /// If the returned future is dropped after a permit was acquired but before
+    /// completion, the permit is dropped without `finish` and is counted as
+    /// cancelled instead of as a successful sample.
+    pub async fn run<F, T, E>(&self, future: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let permit = self.acquire().await;
+        let result = future.await;
+        permit.finish(result.is_err());
+        result
     }
 
     #[cfg(test)]
@@ -188,6 +243,131 @@ impl Drop for AdaptiveSemaphorePermit {
         if !self.finished {
             self.semaphore.release(None);
         }
+    }
+}
+
+/// Per-host concurrency cap layered on top of the global [`AdaptiveSemaphore`]
+/// (PLANS U2 step 6).
+///
+/// Each distinct host string gets its own bounded [`Semaphore`] of `cap`
+/// permits, so one host (e.g. `api.github.com`) cannot exhaust the global
+/// budget and starve requests to another host (e.g. `codeload` or an arbitrary
+/// Git host). The global [`AdaptiveSemaphore`] remains the upper bound.
+#[derive(Clone, Debug)]
+pub struct HostLimits {
+    cap: usize,
+    slots: Arc<Mutex<HashMap<Arc<str>, Arc<Semaphore>>>>,
+}
+
+impl HostLimits {
+    /// Create a per-host limiter allowing at most `cap` concurrent operations
+    /// per host. `cap` is clamped to at least 1.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            slots: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Acquire one permit for `host`, creating the host's semaphore on first use.
+    pub async fn acquire(&self, host: Arc<str>) -> HostPermit {
+        let slot = {
+            let mut slots = self.slots.lock().unwrap();
+            slots
+                .entry(host)
+                .or_insert_with(|| Arc::new(Semaphore::new(self.cap)))
+                .clone()
+        };
+        let permit = slot
+            .acquire_owned()
+            .await
+            .expect("host semaphore is never closed");
+        HostPermit { _permit: permit }
+    }
+
+    /// Number of distinct hosts that currently own a semaphore.
+    #[cfg(test)]
+    fn host_count(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
+}
+
+/// A held per-host slot. Releases on drop.
+pub struct HostPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Combined network concurrency budget: a global adaptive upper bound plus a
+/// per-host cap (PLANS U2 steps 1 and 6).
+///
+/// Every network operation must go through [`NetworkLimits::run`] (or
+/// [`NetworkLimits::acquire`] + [`NetworkPermit::finish`]) so that it consumes
+/// one global permit, one host permit, and contributes exactly one adaptive
+/// success/error sample.
+#[derive(Clone, Debug)]
+pub struct NetworkLimits {
+    global: AdaptiveSemaphore,
+    hosts: HostLimits,
+}
+
+impl NetworkLimits {
+    pub fn new(global: AdaptiveSemaphore, per_host_cap: usize) -> Self {
+        Self {
+            global,
+            hosts: HostLimits::new(per_host_cap),
+        }
+    }
+
+    pub fn global(&self) -> &AdaptiveSemaphore {
+        &self.global
+    }
+
+    pub fn hosts(&self) -> &HostLimits {
+        &self.hosts
+    }
+
+    /// Acquire a global adaptive permit plus a per-host permit. Call
+    /// [`NetworkPermit::finish`] to record the outcome sample; dropping the
+    /// guard without finishing counts as cancelled.
+    pub async fn acquire(&self, host: &str) -> NetworkPermit {
+        let host = Arc::<str>::from(host);
+        let host_permit = self.hosts.acquire(host).await;
+        let adaptive = self.global.acquire().await;
+        NetworkPermit {
+            adaptive,
+            _host: host_permit,
+        }
+    }
+
+    /// Run `future` under a global + per-host permit and record exactly one
+    /// outcome sample. Cancellation of the returned future counts as cancelled.
+    ///
+    /// The host slot is acquired first and held across the global permit + the
+    /// operation, so the per-host cap bounds concurrent in-flight requests to a
+    /// single host regardless of how the global limit adapts.
+    pub async fn run<F, T, E>(&self, host: &str, future: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let host = Arc::<str>::from(host);
+        let _host = self.hosts.acquire(host).await;
+        self.global.run(future).await
+    }
+}
+
+/// Combined global adaptive permit + per-host slot.
+pub struct NetworkPermit {
+    adaptive: AdaptiveSemaphorePermit,
+    _host: HostPermit,
+}
+
+impl NetworkPermit {
+    /// Record the outcome sample (success/error) and release both permits.
+    pub fn finish(self, is_error: bool) {
+        let NetworkPermit { adaptive, _host } = self;
+        // Release the host slot first, then record the adaptive sample.
+        drop(_host);
+        adaptive.finish(is_error);
     }
 }
 
@@ -496,5 +676,147 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(1))
             .expect("blocking waiter should be notified");
         handle.join().expect("waiter should not panic");
+    }
+
+    // --- U2: adaptive permit outcome recording (real call-site path) ---
+
+    #[tokio::test]
+    async fn run_records_one_success_sample_per_completion() {
+        // `run` is the path network call sites use. A successful completion must
+        // contribute exactly one (success) sample and release the permit.
+        let sem = semaphore(8);
+        for _ in 0..5 {
+            sem.run(async { Ok::<_, ()>(()) }).await.unwrap();
+        }
+        assert_eq!(sem.completed(), 5);
+        assert_eq!(sem.errors(), 0);
+        assert_eq!(sem.cancelled(), 0);
+        assert_eq!(sem.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_records_one_error_sample_per_completion() {
+        let sem = semaphore(8);
+        for _ in 0..5 {
+            let _ = sem.run(async { Err::<(), _>(()) }).await;
+        }
+        assert_eq!(sem.completed(), 5);
+        assert_eq!(sem.errors(), 5);
+        assert_eq!(sem.cancelled(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_halves_limit_after_synthetic_error_window() {
+        // Proves the production acquire -> await -> finish path (not direct
+        // record()/force_adjust_for unit calls) drives adaptation: a sustained
+        // error window halves the limit.
+        let sem = semaphore(8);
+        // Baseline success window.
+        for _ in 0..10 {
+            sem.run(async { Ok::<_, ()>(()) }).await.unwrap();
+        }
+        sem.force_adjust_for(Duration::from_secs(1));
+        // Error window: error_rate = 1.0 > 0.01 -> halve.
+        for _ in 0..10 {
+            let _ = sem.run(async { Err::<(), _>(()) }).await;
+        }
+        sem.force_adjust_for(Duration::from_secs(1));
+        assert_eq!(sem.limit(), 4, "sustained errors must halve the limit");
+    }
+
+    #[tokio::test]
+    async fn dropped_permit_without_finish_counts_as_cancelled() {
+        // A permit dropped without finish is a cancellation, not a silent release
+        // and not a successful sample.
+        let sem = semaphore(8);
+        {
+            let _permit = sem.acquire().await;
+        }
+        assert_eq!(sem.cancelled(), 1);
+        assert_eq!(sem.completed(), 0);
+        assert_eq!(sem.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_run_future_counts_as_cancelled() {
+        // Aborting a task that is inside `run` (permit acquired, op pending)
+        // drops the permit mid-flight and counts it as cancelled.
+        let sem = AdaptiveSemaphore::with_limits(1, 1, 1, MIN_ADJUST_INTERVAL);
+        let sem2 = sem.clone();
+        let handle =
+            tokio::spawn(async move { sem2.run(std::future::pending::<Result<(), ()>>()).await });
+        // Wait for the spawned task to acquire its permit.
+        let mut acquired = false;
+        for _ in 0..200 {
+            if sem.in_flight() == 1 {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(acquired, "task should have acquired the permit");
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(sem.cancelled(), 1);
+        assert_eq!(sem.in_flight(), 0);
+    }
+
+    // --- U2: per-host + global resource limits ---
+
+    #[tokio::test]
+    async fn host_limits_caps_concurrent_per_host() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hosts = HostLimits::new(2);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let hosts = hosts.clone();
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = hosts.acquire(Arc::<str>::from("api.github.com")).await;
+                let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let max = max_seen.load(Ordering::SeqCst);
+        assert!(max <= 2, "per-host cap exceeded: {max}");
+        assert!(max >= 2, "expected to reach the cap, got {max}");
+        assert_eq!(hosts.host_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_limits_isolate_hosts() {
+        // A saturated host must not block a different host.
+        let hosts = HostLimits::new(1);
+        let _a = hosts.acquire(Arc::<str>::from("a.example")).await;
+        let b = tokio::time::timeout(
+            Duration::from_millis(100),
+            hosts.acquire(Arc::<str>::from("b.example")),
+        )
+        .await;
+        assert!(b.is_ok(), "different host must not be blocked");
+        assert_eq!(hosts.host_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn network_limits_run_records_sample_and_uses_host_slot() {
+        let net = NetworkLimits::new(
+            AdaptiveSemaphore::with_limits(8, 1, 64, MIN_ADJUST_INTERVAL),
+            2,
+        );
+        for _ in 0..3 {
+            net.run("api.github.com", async { Ok::<_, ()>(()) })
+                .await
+                .unwrap();
+        }
+        assert_eq!(net.global().completed(), 3);
+        assert_eq!(net.hosts().host_count(), 1);
     }
 }
