@@ -3,30 +3,60 @@ local pkgid2scripts = {<% for (id, script_set) in pkgid2scripts {%>['<%=id%>']={
 local startup_plugins = {<% for id in startup_plugins {%>'<%=id%>',<%}%>}
 local source2pkgid = {<% for (source, ids) in source2pkgid {%>['<%=source%>']={<% for id in ids { %>'<%=id%>',<%}%>},<%}%>}
 local loaded = {}
+-- L1: パッケージ状態は unloaded(nil) | loading | loaded の3状態。
+-- `loaded` は「完全に読み込み完了」した id のみ。`loading` は packadd 実行中の再帰ガード。
+local loading = {}
+-- L1: central TriggerRegistry。各 trigger モジュールが setup 時に cleanup callback を登録し、
+-- パッケージが読み込み完了したときに一回ずつ呼ばれる（hot-path の per-call table 参照ではない）。
+local load_handlers = {}
+
+---パッケージ読み込み完了時に登録済み cleanup callback を全て呼ぶ。
+---各 callback は自身の trigger 登録から id を retire する。
+local function retire_all(id)
+	for i = 1, #load_handlers do
+		load_handlers[i](id)
+	end
+end
+
 return setmetatable({
 	loaded = loaded,
+	---trigger モジュールが cleanup callback を登録する。
+	---@param fn function  `fn(id)` — id が読み込み完了したとき呼ばれる
+	on_loaded = function(fn)
+		load_handlers[#load_handlers + 1] = fn
+	end,
 	---@param id string
 	---@param startup boolean|nil
 	packadd = function(id, startup)
+		-- loaded なら即復帰。loading 中の自己再入も即復帰（再帰ガード）。
 		if loaded[id] then return end
+		if loading[id] then return end
+		loading[id] = true
+		local setup_scripts = pkgid2scripts[id] or {}
+		-- L1: before/packadd/after/on-source を1トランザクションとして実行する。
+		-- 成功の境界（reference test で定義された順序）を通過したときだけ loaded にする。
+		-- エラー時は retryable な unloaded 状態に戻し、元の traceback を保存して再送する。
+		local ok, err = xpcall(function()
+			for _, before in ipairs(setup_scripts.lua_before or {}) do
+				require(before)
+			end
+			vim.cmd((startup and 'packadd! ' or 'packadd ') .. vim.fn.fnameescape(id))
+			for _, after in ipairs(setup_scripts.lua_after or {}) do
+				require(after)
+			end
+			for _, on_source_id in ipairs(source2pkgid[id] or {}) do
+				require '_rsplug'.packadd(on_source_id)
+			end
+		end, debug.traceback)
+		if not ok then
+			loading[id] = nil
+			error(err, 0)
+		end
+		loading[id] = nil
 		loaded[id] = true
-		local setup_scripts = pkgid2scripts[id] or {};
-		for _, before in ipairs(setup_scripts.lua_before or {}) do
-			require(before)
-		end
-		vim.cmd((startup and 'packadd! ' or 'packadd ') .. vim.fn.fnameescape(id))
-		for _, after in ipairs(setup_scripts.lua_after or {}) do
-			require(after)
-		end
-		for _, on_source_id in ipairs(source2pkgid[id] or {}) do
-			require '_rsplug'.packadd(on_source_id)
-		end
-		-- R4: on_lua モジュールが既に読み込まれていれば、root reconcile のために通知する。
-		-- 通知のためにモジュールを require し直さない（package.loaded を見る）。
-		local on_lua = package.loaded['_rsplug/on_lua']
-		if on_lua and on_lua.on_packadd then
-			on_lua.on_packadd(id)
-		end
+		-- L1: central on_loaded。on_lua の root reconcile を含め、全 trigger の
+		-- reverse registration をここから退役させる（module を require し直さない）。
+		retire_all(id)
 	end,
 	startup = function()
 		for _, id in ipairs(startup_plugins) do
