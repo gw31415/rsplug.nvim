@@ -1703,11 +1703,13 @@ async fn materialize(
             msg(Message::Cache("Fetching", ctx.url.clone()));
             let head_rev = ctx.oid.to_string();
             crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::TarballFetch);
-            let result = ctx
+            // Network permit covers only HTTP download.  Archive extraction is CPU/disk bound
+            // and runs afterwards under TarballFetch's separate bounded semaphore.
+            let download = ctx
                 .network
                 .run(
                     "codeload.github.com",
-                    TarballFetch.fetch_to_snapshot(
+                    TarballFetch.download(
                         ctx.http_client,
                         ctx.url.as_ref(),
                         &head_rev,
@@ -1716,11 +1718,14 @@ async fn materialize(
                     ),
                 )
                 .await;
-            let tarball_ok = match result {
-                Ok(()) => {
-                    msg(Message::Cache("Fetching:done", ctx.url.clone()));
-                    true
-                }
+            let tarball_ok = match download {
+                Ok(tarball) => match tarball.extract_to_snapshot(dest).await {
+                    Ok(()) => {
+                        msg(Message::Cache("Fetching:done", ctx.url.clone()));
+                        true
+                    }
+                    Err(_) => false,
+                },
                 Err(_) => false,
             };
             crate::rsplug::perf::incr(if tarball_ok {

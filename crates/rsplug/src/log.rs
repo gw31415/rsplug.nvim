@@ -359,9 +359,10 @@ struct ProgressManager {
     child_order: Vec<ChildKey>,
     config_files: Vec<Arc<Path>>,
     osc94: Option<OSC94>,
-    /// Loading バーの「稼働中」計数。LoadBegin でバー生成時に作り、
-    /// `dualbar`/`active` トラッカーと共有する。LoadDone で破棄。
+    /// Loading バーの「稼働中」計数。LoadBegin より前に EARLY が始まるストリーミング経路でも
+    /// 正しく引き継ぐため、バーの有無にかかわらず `loading_running_count` を正とする。
     loading_running: Option<Arc<AtomicUsize>>,
+    loading_running_count: usize,
     /// fetched 行の300ms空欄化タイマー用の sender。
     /// 本番は `init` が注入、テストは None（タイマー不起動、`FetchDoneIdle` を直接
     /// `process` に送って検証）。グローバル LOGGER に依存しないことで単体テストを可能にする。
@@ -609,6 +610,7 @@ impl ProgressManager {
             config_files: Vec::new(),
             osc94: None,
             loading_running: None,
+            loading_running_count: 0,
             idle_tx,
         }
     }
@@ -1122,7 +1124,7 @@ impl ProgressManager {
                 // 従来は完了数(pos)のみで進んだため、パイプライン充填中や
                 // 並列度立ち上がり時にバーが長く 0% で止まり、最後に一気に進んで見えた。
                 // 稼働中セルと注釈の「N active」で、作業中の実体を逐次反映する。
-                let running = Arc::new(AtomicUsize::new(0));
+                let running = Arc::new(AtomicUsize::new(self.loading_running_count));
                 let pb = ProgressBar::new(total as u64)
                     .with_style(loading_style(running.clone()))
                     .with_prefix("Loading");
@@ -1136,13 +1138,15 @@ impl ProgressManager {
                     .progress::<u8>(None);
             }
             Message::LoadPluginRunning => {
+                self.loading_running_count = self.loading_running_count.saturating_add(1);
                 if let Some(running) = self.loading_running.as_ref() {
-                    running.fetch_add(1, Ordering::Relaxed);
+                    running.store(self.loading_running_count, Ordering::Relaxed);
                 }
             }
             Message::LoadPluginRunningDone => {
+                self.loading_running_count = self.loading_running_count.saturating_sub(1);
                 if let Some(running) = self.loading_running.as_ref() {
-                    running.fetch_sub(1, Ordering::Relaxed);
+                    running.store(self.loading_running_count, Ordering::Relaxed);
                 }
             }
             Message::LoadPluginDone => {
@@ -1167,6 +1171,7 @@ impl ProgressManager {
                 drop(self.osc94.take());
                 // これ以降稼働中計数は更新されない（バーは MergeFinished まで残留表示）。
                 self.loading_running = None;
+                self.loading_running_count = 0;
                 let mut pbs = std::mem::take(&mut self.progress_bars);
                 if let Some(pb) = pbs.remove(CACHE_FETCH_PROGRESS_ID) {
                     pb.bar.set_style(self.pb_style.clone());
@@ -2290,6 +2295,28 @@ mod tests {
         assert!(
             !rendered.contains("Loading"),
             "loading bar must be cleared after merge; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn loading_running_events_before_load_begin_do_not_underflow() {
+        let (term, _screen) = ScreenTermLike::new(100);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        // EARLY は config parse のストリーミング中に始まり、LoadBegin より先に届き得る。
+        m.process(Message::LoadPluginRunning);
+        m.process(Message::LoadBegin { total: 1 });
+        assert_eq!(
+            m.loading_running.as_ref().unwrap().load(Ordering::Relaxed),
+            1
+        );
+
+        m.process(Message::LoadPluginRunningDone);
+        assert_eq!(
+            m.loading_running.as_ref().unwrap().load(Ordering::Relaxed),
+            0,
+            "a pre-LoadBegin start must be paired without usize underflow"
         );
     }
 }

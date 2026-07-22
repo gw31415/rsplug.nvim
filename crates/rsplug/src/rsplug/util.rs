@@ -1293,22 +1293,30 @@ pub mod fetch {
     use super::super::error::Error;
     use super::github;
 
-    /// Phase 2: HTTP tarball download + 展開によるフェッチ。
+    /// ダウンロード済み tarball と、その所有する一時 staging directory。
+    ///
+    /// HTTP 完了後に network permit を解放しても archive を安全に展開できるよう、TempDir の
+    /// 所有権をこの値へ移す。成功・失敗・fallback のいずれでも Drop で archive を掃除する。
+    pub struct DownloadedTarball {
+        staging: tempfile::TempDir,
+        archive_path: std::path::PathBuf,
+    }
+
+    /// Phase 2: HTTP tarball fetch。
     pub struct TarballFetch;
 
     impl TarballFetch {
-        /// `url`（GitHub HTTPS）のコミット `oid` の tarball をダウンロードし、`snapshot_root`
-        /// に展開する（**`.git` は作らない**）。Phase 7 で git2 互換化作業ツリーの生成を廃止し、
-        /// identity/dirty はファイル内容ハッシュ（`dirty_diff_from_content`）で計算する。
-        /// head_rev（lockfile / SnapshotKey 用）は元リポジトリの OID を使う。
-        pub async fn fetch_to_snapshot(
+        /// `url`（GitHub HTTPS）のコミット `oid` の tarball を staging file へ保存する。
+        /// 呼出側は network permit の内側でこの段階だけを実行し、その後
+        /// [`DownloadedTarball::extract_to_snapshot`] を別の展開予算で呼ぶ。
+        pub async fn download(
             &self,
             client: &reqwest::Client,
             url: &str,
             oid: &str,
             snapshot_root: &Path,
             token: Option<&str>,
-        ) -> Result<(), Error> {
+        ) -> Result<DownloadedTarball, Error> {
             let (owner, repo) = github::parse_github_url(url).ok_or_else(|| {
                 Error::Io(std::io::Error::other(format!(
                     "not a GitHub HTTPS URL for tarball: {url}"
@@ -1331,23 +1339,21 @@ pub mod fetch {
                 .prefix(".rsplug-tarball-")
                 .tempdir_in(parent)
                 .map_err(Error::Io)?;
-            let extract_dir = staging.path().join("extract");
-            tokio::fs::create_dir(&extract_dir).await?;
-            Self::download_and_extract(client, &tarball_url, &extract_dir, token).await?;
-
-            let extracted_root = Self::single_archive_root(&extract_dir)?;
-            tokio::fs::rename(extracted_root, snapshot_root).await?;
-
-            Ok(())
+            let archive_path = staging.path().join("archive.tar.gz");
+            Self::download_to_archive(client, &tarball_url, &archive_path, token).await?;
+            Ok(DownloadedTarball {
+                staging,
+                archive_path,
+            })
         }
 
-        /// tarball を共有 `Client` で staging file にストリーミング保存してから展開する。
+        /// tarball を共有 `Client` で staging file にストリーミング保存する。
         /// レスポンス全体をメモリに保持しないため、大きな repository を多数同時に取得しても
         /// RSS が archive size の合計に比例しない。
-        async fn download_and_extract(
+        async fn download_to_archive(
             client: &reqwest::Client,
             url: &str,
-            staging: &Path,
+            archive_path: &Path,
             token: Option<&str>,
         ) -> Result<(), Error> {
             let mut req = client.get(url);
@@ -1366,14 +1372,7 @@ pub mod fetch {
                 ))));
             }
 
-            // Store the compressed body beside (not inside) the extraction root:
-            // a malformed archive must never be able to overwrite the source file
-            // that is still being read by the decoder.
-            let archive_path = staging
-                .parent()
-                .ok_or_else(|| Error::Io(std::io::Error::other("extraction root has no parent")))?
-                .join("archive.tar.gz");
-            let mut archive_file = tokio::fs::File::create(&archive_path).await?;
+            let mut archive_file = tokio::fs::File::create(archive_path).await?;
             let mut response = response;
             while let Some(chunk) = response.chunk().await.map_err(|e| {
                 Error::Io(std::io::Error::other(format!(
@@ -1384,15 +1383,20 @@ pub mod fetch {
             }
             archive_file.flush().await?;
             archive_file.sync_all().await?;
-            drop(archive_file);
+            Ok(())
+        }
+    }
 
-            // gzip 展開 + tar 展開を1回の spawn_blocking で実行。
-            // flate2 (zlib-ng) は純 Rust の async-compression より高速。
+    impl DownloadedTarball {
+        /// gzip 展開 + tar 展開を、HTTP とは別の展開予算で実行して snapshot を原子的に公開する。
+        pub async fn extract_to_snapshot(self, snapshot_root: &Path) -> Result<(), Error> {
+            let extract_dir = self.staging.path().join("extract");
+            tokio::fs::create_dir(&extract_dir).await?;
             let _permit = EXTRACTION_SEMAPHORE.acquire().await.map_err(|_| {
                 Error::Io(std::io::Error::other("tarball extraction semaphore closed"))
             })?;
-            let archive_path = archive_path.clone();
-            let staging = staging.to_path_buf();
+            let archive_path = self.archive_path.clone();
+            let extract_dir_for_unpack = extract_dir.clone();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 let archive_file = std::fs::File::open(&archive_path)?;
                 let decoder = flate2::read::GzDecoder::new(archive_file);
@@ -1403,7 +1407,7 @@ pub mod fetch {
                     // containment checks.  We retain GitHub's one top-level
                     // directory and strip it only by atomically moving that
                     // verified directory after extraction.
-                    if !entry.unpack_in(&staging)? {
+                    if !entry.unpack_in(&extract_dir_for_unpack)? {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "tarball entry escapes staging directory",
@@ -1415,9 +1419,22 @@ pub mod fetch {
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("join error: {e}"))))??;
 
+            let extracted_root = TarballFetch::single_archive_root(&extract_dir)?;
+            tokio::fs::rename(extracted_root, snapshot_root).await?;
             Ok(())
         }
 
+        #[cfg(test)]
+        pub(crate) fn from_test_staging(staging: tempfile::TempDir) -> Self {
+            let archive_path = staging.path().join("archive.tar.gz");
+            Self {
+                staging,
+                archive_path,
+            }
+        }
+    }
+
+    impl TarballFetch {
         /// GitHub archives contain exactly one top-level directory.  Requiring
         /// that shape makes the final rename atomic and rejects archives which
         /// would otherwise place files beside the expected repository root.
@@ -1615,6 +1632,42 @@ mod tests {
 
         std::fs::write(extract.join("unexpected"), b"not an archive root").unwrap();
         assert!(fetch::TarballFetch::single_archive_root(&extract).is_err());
+    }
+
+    #[tokio::test]
+    async fn downloaded_tarball_extracts_after_download_stage() {
+        use std::io::Write;
+
+        let staging = tempfile::tempdir().unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let archive_path = staging_path.join("archive.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let data = b"return 'ok'\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "owner-repo-rev/lua/plugin.lua", &data[..])
+            .unwrap();
+        let mut encoder = archive.into_inner().unwrap();
+        encoder.flush().unwrap();
+        encoder.finish().unwrap();
+
+        let target_parent = tempfile::tempdir().unwrap();
+        let snapshot = target_parent.path().join("snapshot");
+        fetch::DownloadedTarball::from_test_staging(staging)
+            .extract_to_snapshot(&snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(snapshot.join("lua/plugin.lua")).unwrap(),
+            data
+        );
+        assert!(!staging_path.exists(), "staging archive must be cleaned up");
     }
 
     #[tokio::test]

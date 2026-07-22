@@ -1067,3 +1067,7 @@ zero-scan generation plan remain future S3 work.
 - 2026-07-22: Warm `--install` favors a catalog probe over unconditional
   GraphQL. A generation is a no-op only after validating package directories,
   manifest, loader, and init symlink; any inconsistency falls back to repair.
+- 2026-07-22: Split tarball acquisition at the HTTP/archive boundary. Network
+  permits now cover download plus its durable staging write only; bounded
+  extraction runs after permit release while the owned staging directory keeps
+  failure cleanup and Git fallback atomic.
