@@ -1,12 +1,14 @@
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use dag::{TryDag, iterator::DagIteratorMapFuncArgs};
 use git2::Oid;
@@ -165,23 +167,321 @@ pub(super) fn snapshot_root(repo_root: &Path, snapshot_key: &str) -> PathBuf {
     worktrees_dir(repo_root).join(snapshot_key)
 }
 
-/// `worktrees/` に `<oid>` または `<oid>__...` の snapshot が既にあるか。
-/// GitFetch（source.git 不要）で既存 snapshot を再利用する判定に使う。
-async fn snapshot_exists_for_oid(worktrees: &Path, oid: &str) -> bool {
-    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::WorktreesScan);
-    let Ok(mut rd) = tokio::fs::read_dir(worktrees).await else {
-        return false;
-    };
-    let prefix_exact = oid.to_string();
-    let prefix_under = format!("{oid}__");
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        if let Some(name) = entry.file_name().to_str()
-            && (name == prefix_exact || name.starts_with(&prefix_under))
+/// per-repo latest-snapshot index のファイル名: `<repo>/latest-snapshot`。
+pub(super) const LATEST_SNAPSHOT_FILE: &str = "latest-snapshot";
+static LATEST_INDEX_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// === SnapshotCatalog (PLANS U1) ============================================
+// 1 canonical repository の snapshot 一覧を O(1) fast path で引く catalog。
+// `<repo>/latest-snapshot` index が有効なら worktrees/ を scan せずに最新 snapshot を特定
+// できる。index が不在/不正/陳腐化なら worktrees/ を1回だけ scan して fallback し、原子的に
+// index を修復する。1 run (scheduler scope) で canonical repo ごとに高々1回の fallback scan
+// に制限する（OnceCell で解決結果を全 specs で共有）。
+
+/// catalog の解決状態。index が有効だったか、fallback 修復したか、snapshot が無いか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexStatus {
+    /// `<repo>/latest-snapshot` が有効で read_dir せずに使えた。
+    ValidIndex,
+    /// index が不在/不正/陳腐化で fallback scan し原子修復した。
+    Repaired,
+    /// worktrees/ が無い等で snapshot が1つも無い。
+    Unavailable,
+}
+
+/// 最新 snapshot（catalog 解決済み）。key = worktrees 直下の相対 filename。
+#[derive(Debug, Clone)]
+struct LatestSnapshot {
+    key: String,
+    oid: Oid,
+}
+
+/// catalog の解決結果。valid fast path では `by_oid` を構築しない（read_dir しないため）。
+struct CatalogResolution {
+    latest: Option<LatestSnapshot>,
+    /// fallback scan 時のみ構築される oid -> snapshot keys map。exact-key 判定・build
+    /// variant 検査に使う。valid fast path では `None`。
+    by_oid: Option<HashMap<Oid, Vec<String>>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    status: IndexStatus,
+}
+
+/// 1 canonical repository の snapshot catalog (PLANS U1)。
+pub struct SnapshotCatalog {
+    repo_root: PathBuf,
+    worktrees: PathBuf,
+    latest_index_path: PathBuf,
+    resolved: tokio::sync::OnceCell<CatalogResolution>,
+}
+
+impl SnapshotCatalog {
+    fn new(repo_root: PathBuf) -> Self {
+        let worktrees = worktrees_dir(&repo_root);
+        let latest_index_path = repo_root.join(LATEST_SNAPSHOT_FILE);
+        Self {
+            repo_root,
+            worktrees,
+            latest_index_path,
+            resolved: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// 解決結果を取得（初回のみ解決、以降はキャッシュ）。複数 task が並行しても1回だけ解決する。
+    async fn ensure(&self) -> &CatalogResolution {
+        let repo_root = self.repo_root.clone();
+        let worktrees = self.worktrees.clone();
+        let index_path = self.latest_index_path.clone();
+        self.resolved
+            .get_or_init(
+                || async move { Self::resolve_inner(repo_root, worktrees, index_path).await },
+            )
+            .await
+    }
+
+    /// index 読み取り → fallback scan の2段階解決。
+    async fn resolve_inner(
+        repo_root: PathBuf,
+        worktrees: PathBuf,
+        index_path: PathBuf,
+    ) -> CatalogResolution {
+        // 1. valid fast path: latest-snapshot を読んで検証。read_dir(worktrees) しない。
+        if let Some(res) = try_read_valid_index(&worktrees, &index_path).await {
+            return res;
+        }
+        // 2. fallback: worktrees を1回 scan し、最新を決定して by_oid を構築、原子修復。
+        let scanned = fallback_scan(&worktrees).await;
+        if let Some(latest) = &scanned.latest {
+            // best-effort 原子修復（cache なので失敗は無視）。次回 run は fast path になる。
+            let _ = publish_latest_snapshot(&repo_root, &latest.key).await;
+        }
+        let status = if scanned.latest.is_some() {
+            IndexStatus::Repaired
+        } else {
+            IndexStatus::Unavailable
+        };
+        CatalogResolution {
+            latest: scanned.latest,
+            by_oid: Some(scanned.by_oid),
+            status,
+        }
+    }
+
+    /// インストール済みか（最新 snapshot があるか）。`is_installed` は GraphQL preresolve
+    /// 対象選別（未インストール + --update の除外）の判定根拠。
+    pub(crate) async fn is_installed(&self) -> bool {
+        self.ensure().await.latest.is_some()
+    }
+
+    /// 最新 snapshot の OID（update 比較用）。
+    async fn latest_oid(&self) -> Option<Oid> {
+        self.ensure().await.latest.as_ref().map(|l| l.oid)
+    }
+
+    /// 最新 snapshot の絶対パス（dependency runtimepath 解決等）。
+    async fn latest_dir(&self) -> Option<PathBuf> {
+        let res = self.ensure().await;
+        res.latest
+            .as_ref()
+            .map(|l| snapshot_root(&self.repo_root, &l.key))
+    }
+
+    /// exact な snapshot key が存在するか (U1 step 7)。広域 OID prefix ではなく build-variant
+    /// 込みの exact key で判定する。valid fast path で最新以外の key は1回の targeted stat で
+    /// 確定する（read_dir scan ではない）。
+    async fn contains_exact_key(&self, key: &str) -> bool {
+        let res = self.ensure().await;
+        if let Some(latest) = &res.latest
+            && latest.key == key
         {
             return true;
         }
+        if let Some(by_oid) = &res.by_oid {
+            return by_oid.values().flatten().any(|k| k == key);
+        }
+        // valid fast path で最新以外の key: read_dir せず1回の stat で確定（scan ではない）。
+        validate_snapshot_key(key).is_some()
+            && tokio::fs::symlink_metadata(self.worktrees.join(key))
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
     }
-    false
+
+    /// テスト用: 解決結果の (latest key, status, fallback scan したか)。
+    #[cfg(test)]
+    pub(super) async fn debug_resolution(&self) -> (Option<String>, IndexStatus, bool) {
+        let res = self.ensure().await;
+        (
+            res.latest.as_ref().map(|l| l.key.clone()),
+            res.status,
+            res.by_oid.is_some(),
+        )
+    }
+}
+
+/// scheduler-scope cache: canonical repo → Arc<SnapshotCatalog> (PLANS U1)。
+/// 同一 repo の全 specs が同じ catalog を共有し、1 run で高々1回の fallback scan にする。
+/// process global にはしない（test / 複数 cache root の state leak を防ぐ）。
+#[derive(Default)]
+pub struct SnapshotCatalogCache {
+    inner: tokio::sync::Mutex<HashMap<String, Arc<SnapshotCatalog>>>,
+}
+
+impl SnapshotCatalogCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// canonical で catalog を取得（無ければ作成）。解決は各 catalog が lazy (OnceCell) に行う。
+    /// Mutex は map 操作のみで保持し（FS I/O 中は保持しない）。
+    pub(crate) async fn get(&self, repo_root: PathBuf, canonical: String) -> Arc<SnapshotCatalog> {
+        let mut inner = self.inner.lock().await;
+        if let Some(c) = inner.get(&canonical) {
+            return Arc::clone(c);
+        }
+        let cat = Arc::new(SnapshotCatalog::new(repo_root));
+        inner.insert(canonical, Arc::clone(&cat));
+        cat
+    }
+
+    pub(crate) async fn is_installed(&self, repo_root: PathBuf, canonical: String) -> bool {
+        self.get(repo_root, canonical).await.is_installed().await
+    }
+}
+
+/// snapshot key の検証 (U1 step 1)。単一の相対 filename（`/`/`\`/`.`/`..` 禁止）、先頭が
+/// hidden でないこと、`__` 前の prefix が 40-hex OID であること。index 経由の path traversal
+/// を許さない。
+fn validate_snapshot_key(key: &str) -> Option<Oid> {
+    if key.is_empty() || key == "." || key == ".." || key.starts_with('.') {
+        return None;
+    }
+    // 単一 component 強制（index 経由の path traversal 防御）。MAIN_SEPARATOR も念のため。
+    if key.contains('/') || key.contains('\\') || key.contains(std::path::MAIN_SEPARATOR) {
+        return None;
+    }
+    let commit = key.split("__").next().unwrap_or(key);
+    if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Oid::from_str(commit).ok()
+}
+
+/// valid な latest-snapshot index を読む。候補が実在する directory であることを1回の
+/// metadata で検証する（read_dir scan ではない）。不正・陳腐化なら None（呼出元が fallback）。
+async fn try_read_valid_index(worktrees: &Path, index_path: &Path) -> Option<CatalogResolution> {
+    if !tokio::fs::symlink_metadata(index_path)
+        .await
+        .ok()?
+        .is_file()
+    {
+        return None;
+    }
+    let raw = tokio::fs::read_to_string(index_path).await.ok()?;
+    let key = raw.strip_suffix('\n').unwrap_or(&raw);
+    if key.is_empty() || key.contains('\n') || key.contains('\r') || key != raw {
+        return None;
+    }
+    let oid = validate_snapshot_key(key)?;
+    let candidate = worktrees.join(key);
+    // Do not follow the final path component: an index symlink must not escape
+    // the repository's worktrees directory.
+    let is_dir = tokio::fs::symlink_metadata(&candidate)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if !is_dir {
+        return None;
+    }
+    Some(CatalogResolution {
+        latest: Some(LatestSnapshot {
+            key: key.to_string(),
+            oid,
+        }),
+        by_oid: None,
+        status: IndexStatus::ValidIndex,
+    })
+}
+
+/// fallback scan の結果。
+struct Scanned {
+    latest: Option<LatestSnapshot>,
+    by_oid: HashMap<Oid, Vec<String>>,
+}
+
+/// worktrees/ を1回 scan し、hidden/invalid を無視して mtime 最新の snapshot を選ぶ。
+/// 選択基準は旧 `latest_snapshot_dir` と完全一致（deterministic に同じ結果を選ぶ）。
+/// 同時に oid -> keys map を構築する。non-UTF-8 名は無視し panic しない。
+async fn fallback_scan(worktrees: &Path) -> Scanned {
+    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::WorktreesScan);
+    let mut by_oid: HashMap<Oid, Vec<String>> = HashMap::new();
+    let mut newest: Option<(SystemTime, LatestSnapshot)> = None;
+    let Ok(mut rd) = tokio::fs::read_dir(worktrees).await else {
+        return Scanned {
+            latest: None,
+            by_oid,
+        };
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue; // non-UTF-8 name は無視
+        };
+        if name.starts_with('.') {
+            continue; // hidden (`.building-*`) は無視
+        }
+        let Some(commit) = name.split("__").next() else {
+            continue;
+        };
+        let Ok(oid) = Oid::from_str(commit) else {
+            continue;
+        };
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        by_oid.entry(oid).or_default().push(name.clone());
+        let mtime = tokio::fs::metadata(entry.path())
+            .await
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        match &newest {
+            Some((t, _)) if *t >= mtime => {}
+            _ => newest = Some((mtime, LatestSnapshot { key: name, oid })),
+        }
+    }
+    Scanned {
+        latest: newest.map(|(_, l)| l),
+        by_oid,
+    }
+}
+
+/// `<repo>/latest-snapshot` へ key を原子書き込みする（unique temp + rename）。
+/// temp 名は task/process ごとに一意（pid + nonce）で、同時書き込みが衝突しない。
+/// 同一 fs (repo_root 配下) の temp から rename するので原子公開される。cache なので
+/// 呼出元はエラーを無視（best-effort）してよい。
+pub(super) async fn publish_latest_snapshot(repo_root: &Path, key: &str) -> std::io::Result<()> {
+    let nonce = LATEST_INDEX_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = repo_root.join(format!(
+        ".{}-{}-{timestamp}-{nonce}.tmp",
+        LATEST_SNAPSHOT_FILE,
+        std::process::id()
+    ));
+    tokio::fs::write(&tmp, key.as_bytes()).await?;
+    tokio::fs::rename(&tmp, repo_root.join(LATEST_SNAPSHOT_FILE)).await?;
+    Ok(())
+}
+
+/// dependency cachedir (相対) から canonical identity 文字列へ変換。
+/// `default_cachedir()` は `canonical().split('/')` から作るので、components を `/` で
+/// 繋げば canonical に戻る（build_runtimepaths の dep catalog 解決用）。
+fn cachedir_to_canonical(cachedir: &Path) -> String {
+    cachedir
+        .iter()
+        .map(|c| c.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// URL末尾の `@rev` を分離する。authority部（`://` 〜 最初の `/`）内の `@` は無視する。
@@ -404,13 +704,15 @@ impl Plugin {
     /// キャッシュに既存 snapshot があるか（= インストール済み）。
     /// GraphQL preresolve の対象選別（main.rs）で未インストール + --update を除外するために使う。
     /// `repo` 無し（script-only）はインストール概念がないので false。
+    #[cfg(test)]
     pub(crate) async fn is_installed(&self, cache_dir: &Path) -> bool {
         let Some(repo) = self.cache.repo.as_ref() else {
             return false;
         };
         let r_root = repo_root(cache_dir, repo);
-        let worktrees = worktrees_dir(&r_root);
-        latest_snapshot_dir(&worktrees).await.is_some()
+        SnapshotCatalogCache::new()
+            .is_installed(r_root, repo.canonical())
+            .await
     }
 
     #[cfg(test)]
@@ -431,6 +733,8 @@ impl Plugin {
         http_client: reqwest::Client,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
+        // テスト経路は run-scope cache を新規作成（scheduler は ctx 経由で共有 cache を使う）。
+        let catalogs = SnapshotCatalogCache::new();
         let early = self
             .load_early(
                 install,
@@ -439,15 +743,17 @@ impl Plugin {
                 locked_rev.as_deref(),
                 &semaphore,
                 &http_client,
+                &catalogs,
             )
             .await?;
-        self.load_late(early, &cache_dir, update).await
+        self.load_late(early, &cache_dir, update, &catalogs).await
     }
 
     /// EARLY 相: rev 解決 → fetch/materialize まで。`dependency_cachedirs`・`order`・集約
     /// `lazy_type` を一切使わない（FACT 1）。ストリーミングでは per-TOML 到着時・rev 解決直後
     /// から実行可能。`&self` で repo/source 情報を読み、materialize 成果物を [`EarlyOutcome`]
     /// で返す（戻りは `self` に依存しない owned データのみ）。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load_early(
         &self,
         install: bool,
@@ -456,6 +762,7 @@ impl Plugin {
         locked_rev: Option<&str>,
         semaphore: &adaptive_semaphore::AdaptiveSemaphore,
         http_client: &reqwest::Client,
+        catalogs: &SnapshotCatalogCache,
     ) -> Result<EarlyOutcome, Error> {
         use super::util::git;
         use crate::rsplug::util::truncate;
@@ -474,6 +781,10 @@ impl Plugin {
         let url: Arc<str> = Arc::from(repo.url());
         // lock key 用の canonical identity（fetch/tarball/error 表示用の実 URL とは別）。
         let canonical = repo.canonical();
+
+        // U1: run-scope catalog で snapshot 一覧を O(1) fast path で引く。同一 repo の全 specs が
+        // 同じ Arc<SnapshotCatalog> を共有し、1 run で高々1回の fallback scan に制限される。
+        let catalog = catalogs.get(r_root.clone(), canonical.clone()).await;
 
         // GitHub HTTPS URL かつ環境変数に token があれば認証フェッチする。
         let token = if repo.is_github_https() {
@@ -516,7 +827,7 @@ impl Plugin {
             was_updated,
             was_installed,
         } = match resolve_target_commit(
-            &worktrees,
+            &catalog,
             &url,
             &rev,
             &token,
@@ -558,18 +869,10 @@ impl Plugin {
             logid: &logid,
         };
 
-        // GitFetch（非 tarball）の場合だけ source.git を確保する。ただし既存 snapshot
-        // （worktrees/ に <oid> または <oid>__... がある）があれば source.git 不要で再利用する
-        // （dotgit=true で TarballFetch 由来の snapshot を流用する移行ケース等）。
-        if !use_tarball
-            && !snapshot_exists_for_oid(&worktrees, &head_rev_str).await
-            && !ensure_source_git(&ctx).await?
-        {
-            return Ok(EarlyOutcome::Skipped);
-        }
-
-        // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
-        tokio::fs::create_dir_all(&worktrees).await?;
+        // exact snapshot key（build/lua_build 入力込み）を先に確定し、source.git 要否を exact
+        // build-variant で判定する (U1 step 7)。`snapshot_key` は dirty_diff を含まないので build
+        // 前に確定でき、広域 OID prefix ではなく exact key で再利用する。別 build variant の存在が
+        // 誤って取得を省くことはない（欲しい variant が無ければ source.git を取得する）。
         let has_build = !build.is_empty() || lua_build.is_some();
         let pre_identity = RepoSnapshotIdentity::new(
             cachedir.clone(),
@@ -578,7 +881,19 @@ impl Plugin {
             Arc::from(build.as_slice()),
             lua_build.map(Into::into),
         );
-        let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &pre_identity.snapshot_key()));
+        let final_key = pre_identity.snapshot_key();
+        let final_root: Arc<Path> = Arc::from(snapshot_root(&r_root, &final_key));
+
+        // GitFetch（非 tarball）の場合だけ source.git を確保する。exact snapshot が無ければ取得。
+        if !use_tarball
+            && !catalog.contains_exact_key(&final_key).await
+            && !ensure_source_git(&ctx).await?
+        {
+            return Ok(EarlyOutcome::Skipped);
+        }
+
+        // --- snapshot worktree の用意 (PLANS §7, §8 step 7-14) ---
+        tokio::fs::create_dir_all(&worktrees).await?;
 
         // EARLY 相の materialize。BUILD（lua_post_update/run_repo_build）と rename は LATE 相へ
         // 回す。has_build の場合、一時 building worktree に materialize して止める。
@@ -647,6 +962,7 @@ impl Plugin {
         early: EarlyOutcome,
         cache_dir: &Path,
         update: bool,
+        catalogs: &SnapshotCatalogCache,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         use super::util::git;
         use crate::{
@@ -720,9 +1036,13 @@ impl Plugin {
                 let snapshot_root_path: Arc<Path> = if needs_build {
                     // lua_post_update は update 検知時のみ building worktree で実行。
                     if update && let Some(lua_post_update) = lua_post_update.as_deref() {
-                        let rtp =
-                            build_runtimepaths(&worktree_path, cache_dir, &dependency_cachedirs)
-                                .await;
+                        let rtp = build_runtimepaths(
+                            &worktree_path,
+                            cache_dir,
+                            &dependency_cachedirs,
+                            catalogs,
+                        )
+                        .await;
                         let id = Arc::new(format!("{logid} (lua_post_update)"));
                         let result: Result<(), Error> = {
                             let id = id.clone();
@@ -760,8 +1080,13 @@ impl Plugin {
                         result?;
                     }
 
-                    let rtp =
-                        build_runtimepaths(&worktree_path, cache_dir, &dependency_cachedirs).await;
+                    let rtp = build_runtimepaths(
+                        &worktree_path,
+                        cache_dir,
+                        &dependency_cachedirs,
+                        catalogs,
+                    )
+                    .await;
                     crate::rsplug::perf::failpoint("build_before")?;
                     run_repo_build(
                         &build,
@@ -826,10 +1151,9 @@ impl Plugin {
                 if let (Some(worktrees), Some(key)) =
                     (snapshot_root_path.parent(), snapshot_root_path.file_name())
                     && let Some(repo_root) = worktrees.parent()
+                    && let Some(key) = key.to_str()
                 {
-                    let key = key.to_string_lossy();
-                    let _ =
-                        tokio::fs::write(repo_root.join("latest-snapshot"), key.as_bytes()).await;
+                    let _ = publish_latest_snapshot(repo_root, key).await;
                 }
 
                 // --- ステージ6: LoadedPlugin 構築（plugin_id 決定の核心） ---
@@ -928,7 +1252,7 @@ pub(crate) enum EarlyOutcome {
 // Plugin::load からの抽出。引数過多は LoadCtx 構造体化（巨大化）より局所的と判断し allow する。
 #[allow(clippy::too_many_arguments)]
 async fn resolve_target_commit(
-    worktrees: &Path,
+    catalog: &SnapshotCatalog,
     url: &Arc<str>,
     rev: &Option<Arc<str>>,
     token: &Option<Arc<str>>,
@@ -958,7 +1282,7 @@ async fn resolve_target_commit(
         //   - install     : 新規 fetch（was_installed=true で lua_post_update 実行）。
         //   - update 単独 : 新規 install しない（スキップ）。
         //   - --lock 単独 : キャッシュ前提なのでキャッシュ不足はエラー。
-        match latest_snapshot_oid(worktrees).await? {
+        match catalog.latest_oid().await {
             // インストール済み。update=true なら preresolved: 既存 snapshot と比較して
             // 「実際に更新された」を立て、lua_post_update を実行させる（新規 fetch 時のみ）。
             Some(existing) => (oid, update && existing != oid, false),
@@ -981,7 +1305,7 @@ async fn resolve_target_commit(
             }
         }
     } else {
-        match latest_snapshot_oid(worktrees).await? {
+        match catalog.latest_oid().await {
             Some(existing) if update => {
                 let _permit = semaphore.acquire().await;
                 msg(Message::Cache("Updating", url.clone()));
@@ -1409,68 +1733,23 @@ async fn build_runtimepaths(
     own: &Path,
     cache_dir: &Path,
     dependency_cachedirs: &[PathBuf],
+    catalogs: &SnapshotCatalogCache,
 ) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     seen.insert(own.to_path_buf());
     out.push(own.to_path_buf());
     for dep_cachedir in dependency_cachedirs {
-        let dep_worktrees = cache_dir.join(dep_cachedir).join("worktrees");
-        if let Some(dep_snap) = latest_snapshot_dir(&dep_worktrees).await
+        let dep_root = cache_dir.join(dep_cachedir);
+        let canonical = cachedir_to_canonical(dep_cachedir);
+        let catalog = catalogs.get(dep_root, canonical).await;
+        if let Some(dep_snap) = catalog.latest_dir().await
             && seen.insert(dep_snap.clone())
         {
             out.push(dep_snap);
         }
     }
     out
-}
-
-/// `worktrees/` 配下の snapshot のうち最新（mtime 順）の path を返す。
-/// hidden (`.building-*`) と先頭 40hex(commit) でない名前は無視する。
-async fn latest_snapshot_dir(worktrees: &Path) -> Option<PathBuf> {
-    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::WorktreesScan);
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
-    let Ok(mut rd) = tokio::fs::read_dir(worktrees).await else {
-        return None;
-    };
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        let Some(commit) = name.split("__").next() else {
-            continue;
-        };
-        if Oid::from_str(commit).is_err() {
-            continue;
-        }
-        let mtime = tokio::fs::metadata(entry.path())
-            .await
-            .and_then(|m| m.modified())
-            .unwrap_or(UNIX_EPOCH);
-        match &newest {
-            Some((t, _)) if *t >= mtime => {}
-            _ => newest = Some((mtime, entry.path())),
-        }
-    }
-    newest.map(|(_, p)| p)
-}
-
-/// 既存 snapshot worktree のうち最新（mtime 順）の commit を返す (PLANS §8 step 5 の
-/// install/update/locked 以外の case)。snapshot_dir 名の先頭 40hex を commit とみなす。
-async fn latest_snapshot_oid(worktrees: &Path) -> Result<Option<Oid>, Error> {
-    let Some(dir) = latest_snapshot_dir(worktrees).await else {
-        return Ok(None);
-    };
-    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-        return Ok(None);
-    };
-    let Some(commit) = name.split("__").next() else {
-        return Ok(None);
-    };
-    Ok(Oid::from_str(commit).ok())
 }
 
 /// snapshot の `lua/` 直下から Lua module 名を抽出する。
@@ -1805,6 +2084,92 @@ mod tests {
             snapshot_root(&root, "deadbeef"),
             PathBuf::from("cache/github.com/owner/repo/worktrees/deadbeef")
         );
+    }
+
+    #[test]
+    fn snapshot_key_validation_rejects_traversal_and_non_oid_prefixes() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        assert!(validate_snapshot_key(oid).is_some());
+        assert!(validate_snapshot_key(&format!("{oid}__build-v1")).is_some());
+        for key in [
+            "",
+            ".building",
+            "../outside",
+            "oid/child",
+            "oid\\child",
+            "0123456789abcdef0123456789abcdef0123456z",
+        ] {
+            assert!(validate_snapshot_key(key).is_none(), "accepted {key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_catalog_fast_path_and_fallback_repair_are_invariant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let worktrees = worktrees_dir(&root);
+        tokio::fs::create_dir_all(&worktrees).await.unwrap();
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let key = format!("{oid}__build-v1");
+        tokio::fs::create_dir(worktrees.join(&key)).await.unwrap();
+        let other_key = format!("{oid}__build-v2");
+        tokio::fs::create_dir(worktrees.join(&other_key))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(LATEST_SNAPSHOT_FILE), &key)
+            .await
+            .unwrap();
+
+        let fast = SnapshotCatalog::new(root.clone());
+        assert_eq!(
+            fast.debug_resolution().await,
+            (Some(key.clone()), IndexStatus::ValidIndex, false)
+        );
+        assert!(fast.contains_exact_key(&key).await);
+        assert!(fast.contains_exact_key(&other_key).await);
+        assert!(!fast.contains_exact_key(&format!("{oid}__missing")).await);
+
+        tokio::fs::write(root.join(LATEST_SNAPSHOT_FILE), b"../outside")
+            .await
+            .unwrap();
+        let fallback = SnapshotCatalog::new(root.clone());
+        let (latest, status, scanned) = fallback.debug_resolution().await;
+        assert_eq!(latest, Some(key.clone()));
+        assert_eq!(status, IndexStatus::Repaired);
+        assert!(scanned, "fallback must build the exact-key index");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(LATEST_SNAPSHOT_FILE))
+                .await
+                .unwrap(),
+            key
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_catalog_rejects_symlink_escape_and_shares_run_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        let oid = "fedcba9876543210fedcba9876543210fedcba98";
+        let key = format!("{oid}__variant");
+        tokio::fs::create_dir_all(worktrees_dir(&root))
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, worktrees_dir(&root).join(&key)).unwrap();
+        tokio::fs::write(root.join(LATEST_SNAPSHOT_FILE), &key)
+            .await
+            .unwrap();
+
+        let cache = SnapshotCatalogCache::new();
+        let first = cache.get(root.clone(), "host/repo".to_string()).await;
+        let second = cache.get(root, "host/repo".to_string()).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!first.is_installed().await);
+        assert_eq!(first.debug_resolution().await.1, IndexStatus::Unavailable);
+        #[cfg(unix)]
+        assert!(!first.contains_exact_key(&key).await);
     }
 
     #[test]

@@ -48,6 +48,7 @@ struct LoadCtx {
     fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore,
     http_client: reqwest::Client,
     cache_dir: PathBuf,
+    catalogs: Arc<rsplug::SnapshotCatalogCache>,
 }
 
 /// load_one への locked_rev 指定。
@@ -115,6 +116,7 @@ async fn run_load_early(
             locked_rev.as_deref(),
             &ctx.fetch_semaphore,
             &ctx.http_client,
+            &ctx.catalogs,
         )
         .await?;
     Ok((early, repo_canon))
@@ -133,7 +135,9 @@ async fn run_load_late(
     Error,
 > {
     let repo_canon = plugin.cache.repo.as_ref().map(|r| r.canonical());
-    let result = plugin.load_late(early, &ctx.cache_dir, ctx.update).await;
+    let result = plugin
+        .load_late(early, &ctx.cache_dir, ctx.update, &ctx.catalogs)
+        .await;
     msg(Message::LoadPluginDone);
     let canon_to_remove =
         if repo_canon.is_some() && result.is_ok() && result.as_ref().unwrap().is_none() {
@@ -182,6 +186,15 @@ struct EarlyDone {
     key: EarlyKey,
     plugin: rsplug::Plugin,
     outcome: Result<(rsplug::EarlyOutcome, Option<String>), Error>,
+}
+
+struct CatalogDone {
+    id: String,
+    canonical: String,
+    owner: String,
+    repo: String,
+    rev: Option<Arc<str>>,
+    installed: bool,
 }
 
 async fn app() -> Result<(), Error> {
@@ -336,6 +349,7 @@ async fn app() -> Result<(), Error> {
         fetch_semaphore: fetch_semaphore.clone(),
         http_client: http_client.clone(),
         cache_dir: DEFAULT_REPOCACHE_DIR.clone(),
+        catalogs: Arc::new(rsplug::SnapshotCatalogCache::new()),
     };
 
     let token = rsplug::util::github::token();
@@ -608,6 +622,10 @@ async fn run_load_scheduler(
     let mut early_tasks: JoinSet<EarlyDone> = JoinSet::new();
     let mut load_tasks: JoinSet<LoadDone> = JoinSet::new();
     let mut chunk_tasks: JoinSet<GraphqlChunkResult> = JoinSet::new();
+    let mut catalog_tasks: JoinSet<CatalogDone> = JoinSet::new();
+    // Catalog resolution is local filesystem I/O. Bound it without blocking
+    // the scheduler's parse and GraphQL event loop.
+    let catalog_io = Arc::new(tokio::sync::Semaphore::new(8));
     let mut finished: Vec<LoadOutcome> = Vec::new();
     let mut nodes: Vec<NodeState> = Vec::new();
     // pre-ParsePhaseDone の staging（id-keyed）と conflict 検出表。両方 loop scope。
@@ -668,10 +686,30 @@ async fn run_load_scheduler(
                                     && let Some((owner, rname)) =
                                         rsplug::util::github::parse_github_url(&repo.url())
                                 {
-                                    if ctx.update
-                                        && !dummy.is_installed(ctx.cache_dir.as_path()).await
-                                    {
-                                        Some(LoadRev::Resolved(None))
+                                    if ctx.update {
+                                        let io = Arc::clone(&catalog_io);
+                                        let catalogs = Arc::clone(&ctx.catalogs);
+                                        let repo_root = ctx.cache_dir.join(repo.default_cachedir());
+                                        let id_for_catalog = id.clone();
+                                        let canonical_for_catalog = canonical.clone();
+                                        let owner = owner.to_string();
+                                        let repo_name = rname.to_string();
+                                        let rev_for_catalog = repo_rev.clone();
+                                        catalog_tasks.spawn(async move {
+                                            let _permit = io.acquire_owned().await.expect("catalog semaphore");
+                                            let installed = catalogs
+                                                .is_installed(repo_root, canonical_for_catalog.clone())
+                                                .await;
+                                            CatalogDone {
+                                                id: id_for_catalog,
+                                                canonical: canonical_for_catalog,
+                                                owner,
+                                                repo: repo_name,
+                                                rev: rev_for_catalog,
+                                                installed,
+                                            }
+                                        });
+                                        None
                                     } else {
                                         graphql_batch.push(rsplug::util::github::GithubRev {
                                             owner,
@@ -993,6 +1031,36 @@ async fn run_load_scheduler(
                     });
                 }
             }
+            Some(jr) = catalog_tasks.join_next(), if !catalog_tasks.is_empty() => {
+                let done = jr.map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("catalog task panicked: {e}")))
+                })?;
+                if done.installed {
+                    graphql_batch.push(rsplug::util::github::GithubRev {
+                        owner: done.owner,
+                        repo: done.repo,
+                        rev: done.rev.as_deref().map(ToString::to_string),
+                    });
+                    graphql_total += 1;
+                    canonical_to_keys
+                        .entry(done.canonical)
+                        .or_default()
+                        .push(EarlyKey::Staged(done.id));
+                    flush_graphql_chunks(
+                        &mut graphql_batch,
+                        &mut chunk_tasks,
+                        &ctx.http_client,
+                        &token_str,
+                        false,
+                    );
+                } else if let Some(staged) = staging.get_mut(&done.id) {
+                    staged.rev = Some(LoadRev::Resolved(None));
+                    try_schedule_staged_early(&mut staging, &mut early_tasks, &ctx, &done.id);
+                } else if let Some(&idx) = staged_id_to_node_idx.get(&done.id) {
+                    nodes[idx].rev = Some(LoadRev::Resolved(None));
+                    try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
+                }
+            }
             else => {
                 // parse 完了 + 全 chunk/EARLY/LATE 完了。
                 // staging が残っていれば promotion 忘れ（論理バグ）。
@@ -1306,6 +1374,7 @@ mod tests {
             fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore::new(),
             http_client: reqwest::Client::new(),
             cache_dir: tmp.path().to_path_buf(),
+            catalogs: Arc::new(rsplug::SnapshotCatalogCache::new()),
         };
         let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<SchedEvent>();
         let c1: rsplug::Config =
@@ -1355,6 +1424,7 @@ mod tests {
             fetch_semaphore: adaptive_semaphore::AdaptiveSemaphore::new(),
             http_client: reqwest::Client::new(),
             cache_dir: tmp.path().to_path_buf(),
+            catalogs: Arc::new(rsplug::SnapshotCatalogCache::new()),
         };
         let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<SchedEvent>();
         // 到着順は依存逆順（child → base）。Plugin::resolve が topo 順に並べ直す。
