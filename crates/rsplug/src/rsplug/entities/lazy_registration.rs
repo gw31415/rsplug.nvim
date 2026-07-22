@@ -769,6 +769,22 @@ mod tests {
     }
 
     #[test]
+    fn on_func_runtime_template_closes_return_table() {
+        let func = "foo#bar".parse::<VimFunc>().unwrap();
+        let func2pkgid = BTreeMap::from([(func, Vec::new())]);
+        let rendered = OnFuncTemplate {
+            func2pkgid: &func2pkgid,
+        }
+        .render_once()
+        .unwrap();
+
+        assert!(
+            rendered.trim_end().ends_with('}'),
+            "rendered on_func.lua:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn custom_packadd_template_packadds_startup_plugins() {
         let startup_plugin = b"startup-plugin".plugin_id().as_str();
         let rendered = CustomPackaddTemplate {

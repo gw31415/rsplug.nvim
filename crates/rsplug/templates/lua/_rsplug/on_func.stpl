@@ -57,3 +57,4 @@ return {
 		vim.o.eventignore = save_eventignore
 		if not ok then error(err) end
 	end,
+}
