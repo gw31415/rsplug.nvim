@@ -924,7 +924,11 @@ impl ProgressManager {
                 pb.set_message_if_changed(format!("{} files", self.config_files.len()));
                 pb.bar.finish_and_clear();
                 let display = ConfigList::from_files(std::mem::take(&mut self.config_files));
-                self.multipb.println(display.to_string()).unwrap();
+                // MultiProgress::println は orphan 行として、後続バーの描画領域より上に
+                // 永続出力する。各行を独立して渡し、行末カーソル位置も確実に同期する。
+                for line in display.render_lines() {
+                    self.multipb.println(style(line).dim().to_string()).unwrap();
+                }
             }
             Message::MergeFinished { total, merged } => {
                 // total = ロード成功プラグイン数、merged = マージ後のパッケージ数。
@@ -1241,7 +1245,10 @@ impl ProgressManager {
                 pb.bar.set_position(resolved as u64);
                 if resolved >= total {
                     if let Some(bs) = self.progress_bars.remove(GRAPHQL_PROGRESS_ID) {
-                        bs.bar.finish_with_message("resolved");
+                        // GraphQL 解決は後続の Loading に先行する一時進捗であり、完了行を
+                        // 永続化しない。`finish_with_message` は完了済みバーを MultiProgress
+                        // 上に残すため、次のフェーズの罫線・行再描画と競合する。
+                        bs.bar.finish_and_clear();
                     }
                     self.child_order.retain(|k| k != &ChildKey::GraphQLResolve);
                     self.refresh_connectors();
@@ -1469,6 +1476,15 @@ mod tests {
                         }
                     }
                     _ => {
+                        // indicatif は行を端末幅まで埋めた後、改行文字を使わずに次の
+                        // 描画行へ移動する。実端末と同様に幅を超えた最初の文字で折り返す。
+                        if s.col >= self.width as usize {
+                            s.row += 1;
+                            s.col = 0;
+                            while s.rows.len() <= s.row {
+                                s.rows.push(String::new());
+                            }
+                        }
                         let (row, col) = (s.row, s.col);
                         while s.rows.len() <= row {
                             s.rows.push(String::new());
@@ -1606,6 +1622,130 @@ mod tests {
         assert!(
             !rendered.contains("Loading"),
             "loading bar must be cleared after the run; got:\n{rendered}"
+        );
+    }
+
+    /// GraphQL の解決進捗は一時表示であり、完了後の最終画面には残らない。
+    /// `finish_with_message` は MultiProgress 上で完了行を永続化するため、完了時には
+    /// `finish_and_clear` で描画領域からも取り除く必要がある。
+    #[test]
+    fn graphql_resolve_progress_clears_after_completion() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        m.process(Message::GraphQLResolveProgress {
+            resolved: 0,
+            total: 124,
+        });
+        m.process(Message::GraphQLResolveProgress {
+            resolved: 124,
+            total: 124,
+        });
+
+        let rendered = screen_rendered(&screen);
+        assert!(
+            !rendered.contains("Resolving"),
+            "completed GraphQL progress must be cleared; got:\n{rendered}"
+        );
+    }
+
+    /// Resolving を消去した直後に後続フェーズが描画されても、先に println した
+    /// Config サマリーの最終行が進捗の再描画で上書きされない。
+    #[test]
+    fn config_summary_survives_resolving_clear_before_following_progress() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        for name in ["alpha", "beta", "gamma"] {
+            m.process(Message::ConfigFound(PathBuf::from(format!(
+                "/tmp/rsplug/{name}.toml"
+            ))));
+        }
+        m.process(Message::ConfigWalkFinish);
+        m.process(Message::GraphQLResolveProgress {
+            resolved: 27,
+            total: 124,
+        });
+        m.process(Message::GraphQLResolveProgress {
+            resolved: 124,
+            total: 124,
+        });
+        m.process(Message::Cache(
+            "Updating",
+            Arc::from("https://example.test/plugin"),
+        ));
+        m.process(Message::LoadBegin { total: 128 });
+
+        std::thread::sleep(Duration::from_millis(160));
+        let rendered = screen_rendered(&screen);
+        let rendered_lines = rendered.lines().map(str::trim_end).collect::<Vec<_>>();
+        assert!(
+            rendered_lines.contains(&"        alpha beta gamma"),
+            "config summary's final line must survive Resolving clear; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Resolving"),
+            "completed Resolving bar must not remain; got:\n{rendered}"
+        );
+    }
+
+    /// 永続表示する Config サマリーは、その後に開始する進捗バーの描画領域より上に
+    /// 独立した行として残る。複数行の文字列を `MultiProgress::println` に直接渡すと、
+    /// 行末カーソル位置が同期されず、最初の進捗バーがサマリーを上書きしてしまう。
+    #[test]
+    fn config_summary_remains_on_separate_lines_above_active_progress() {
+        let (term, screen) = ScreenTermLike::new(120);
+        let mut m =
+            ProgressManager::with_draw_target(ProgressDrawTarget::term_like(Box::new(term)));
+
+        for name in ["alpha", "beta", "gamma"] {
+            m.process(Message::ConfigFound(PathBuf::from(format!(
+                "/tmp/rsplug/{name}.toml"
+            ))));
+        }
+        m.process(Message::ConfigWalkFinish);
+        let rendered_after_config = screen_rendered(&screen);
+        assert!(
+            rendered_after_config.contains("Config 3 files"),
+            "config summary must render before progress starts; got:\n{rendered_after_config}"
+        );
+        m.process(Message::GraphQLResolveProgress {
+            resolved: 27,
+            total: 124,
+        });
+        m.process(Message::Cache(
+            "Updating",
+            Arc::from("https://example.test/plugin"),
+        ));
+        m.process(Message::LoadBegin { total: 128 });
+
+        std::thread::sleep(Duration::from_millis(160));
+        let rendered = screen_rendered(&screen);
+        let rendered_lines = rendered.lines().map(str::trim_end).collect::<Vec<_>>();
+        let config_lines = [
+            "Config 3 files",
+            "    /tmp/rsplug (3)",
+            "        alpha beta gamma",
+        ];
+        for line in config_lines {
+            assert!(
+                rendered_lines.contains(&line),
+                "config line must remain separate; missing {line:?} in:\n{rendered}"
+            );
+        }
+        let config_last = rendered_lines
+            .iter()
+            .position(|line| *line == "        alpha beta gamma")
+            .unwrap();
+        let resolving = rendered_lines
+            .iter()
+            .position(|line| line.contains("Resolving"))
+            .unwrap();
+        assert!(
+            config_last < resolving,
+            "config summary must be above progress bars; got:\n{rendered}"
         );
     }
 
