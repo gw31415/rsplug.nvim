@@ -594,6 +594,86 @@ scenarios.duplicate_maps = function()
 	return check_expect()
 end
 
+-- L1: ユーザパッケージの opt id を1つ取り出す（control 生成 id を除外）。
+-- 1ユーザパッケージのフィクスチャで、control パッケージ以外の opt ディレクトリを返す。
+local function user_opt_id()
+	local packpath = assert(os.getenv 'RSPLUG_TEST_PACKPATH')
+	local control = {}
+	for c in string.gmatch(os.getenv 'RSPLUG_TEST_CONTROL_ID' or '', '[^,]+') do
+		control[c] = true
+	end
+	for name, type in vim.fs.dir(packpath .. '/pack/_gen/opt') do
+		if type == 'directory' and not control[name] then
+			return name
+		end
+	end
+	return nil
+end
+
+-- L1: packadd は成功の境界を通過したときだけ loaded になる。自己再入は loading ガードで
+-- 早期復帰し、plugin/ は1回だけ source される（loaded-once + recursion guard）。
+scenarios.transactional_loaded_after_success = function()
+	boot()
+	local ctl = require '_rsplug'
+	local id = user_opt_id()
+	if not id then
+		return 'no user opt id found'
+	end
+	vim.g.rsplug_self_id = id
+	-- packadd 前は unloaded。plugin/init.lua が自身を packadd しても再入しない。
+	local ok = pcall(ctl.packadd, id)
+	if not ok then
+		return 'packadd should succeed'
+	end
+	if not ctl.loaded[id] then
+		return 'package must be loaded only after the success boundary'
+	end
+	if vim.g.trans_self_count ~= 1 then
+		return ('plugin/ must source exactly once, got ' .. vim.inspect(vim.g.trans_self_count))
+	end
+	-- idempotent: 2回目の packadd は no-op（再 source しない）。
+	ctl.packadd(id)
+	if vim.g.trans_self_count ~= 1 then
+		return ('second packadd must not re-source, got ' .. vim.inspect(vim.g.trans_self_count))
+	end
+	return nil
+end
+
+-- L1: packadd 中のエラーは retryable な unloaded 状態に戻し、元のエラーメッセージを保存して
+-- 再送する。2回目（エラー無し）の packadd で loaded になる。
+scenarios.transactional_error_retry = function()
+	boot()
+	local ctl = require '_rsplug'
+	local id = user_opt_id()
+	if not id then
+		return 'no user opt id found'
+	end
+	local ok1, err1 = pcall(ctl.packadd, id)
+	if ok1 then
+		return 'first packadd should error'
+	end
+	if not string.find(tostring(err1), 'L1 transactional boom', 1, true) then
+		return ('error must preserve original message: ' .. tostring(err1))
+	end
+	if ctl.loaded[id] then
+		return 'package must NOT be loaded after error (retryable state restored)'
+	end
+	if vim.g.err_count ~= 1 then
+		return ('err_count should be 1 after first attempt, got ' .. vim.inspect(vim.g.err_count))
+	end
+	local ok2 = pcall(ctl.packadd, id)
+	if not ok2 then
+		return 'second packadd (retry) should succeed'
+	end
+	if not ctl.loaded[id] then
+		return 'package must be loaded after retry'
+	end
+	if not vim.g.err_ok then
+		return 'retry did not reach success body'
+	end
+	return nil
+end
+
 local name = os.getenv 'RSPLUG_TEST_SCENARIO' or ''
 local fn = scenarios[name]
 if not fn then

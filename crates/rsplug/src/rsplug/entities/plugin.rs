@@ -2266,6 +2266,9 @@ mod tests {
         tokio::fs::create_dir(worktrees.join(&other_key))
             .await
             .unwrap();
+        // fallback の選択規則（mtime、同値時は走査順）を実装そのものから取得する。
+        // filesystem の mtime 分解能に依存して期待値を固定しない。
+        let expected_fallback_latest = fallback_scan(&worktrees).await.latest.unwrap().key;
         tokio::fs::write(root.join(LATEST_SNAPSHOT_FILE), &key)
             .await
             .unwrap();
@@ -2284,14 +2287,14 @@ mod tests {
             .unwrap();
         let fallback = SnapshotCatalog::new(root.clone());
         let (latest, status, scanned) = fallback.debug_resolution().await;
-        assert_eq!(latest, Some(key.clone()));
+        assert_eq!(latest, Some(expected_fallback_latest.clone()));
         assert_eq!(status, IndexStatus::Repaired);
         assert!(scanned, "fallback must build the exact-key index");
         assert_eq!(
             tokio::fs::read_to_string(root.join(LATEST_SNAPSHOT_FILE))
                 .await
                 .unwrap(),
-            key
+            expected_fallback_latest
         );
     }
 

@@ -67,12 +67,18 @@ end
 
 table.insert(package.loaders, 1, searcher)
 
--- _rsplug.packadd の成功末尾から呼ばれる。pkgid2luam[id] のみを調べて reconcile する。
+-- L1: central on_loaded から呼ばれる。pkgid2luam[id] のみを調べて reconcile する。
+-- core の packadd 成功末尾から retire_all(id) 経由でこの関数が呼ばれる。
 state.on_packadd = function(id)
 	if state.reconcile(id) then
 		schedule_removal()
 	end
 end
+rsplug.on_loaded(function(id)
+	if state.on_packadd then
+		state.on_packadd(id)
+	end
+end)
 
 -- 別トリガで既にロード済みの mapped id を、インストール時に1回だけ reconcile する。
 for id, _ in pairs(state.pkgid2luam) do

@@ -3,13 +3,40 @@ local event2pkgid = { <% for (val, ids) in event2pkgid {%>['<%=val%>']={<% for i
 local group_name = 'rsplug.runtime.on_event'
 -- setup が生成した loader の autocmd id を登録する。callback は発火時に自身をここから除去する。
 local loader_ids = {}
+local pkgid2events = {}
+for event, ids in pairs(event2pkgid) do
+	for _, id in ipairs(ids) do
+		local events = pkgid2events[id]
+		if not events then events = {}; pkgid2events[id] = events end
+		events[#events + 1] = event
+	end
+end
+
+local function retire(id)
+	for _, event in ipairs(pkgid2events[id] or {}) do
+		local ids = event2pkgid[event]
+		if ids then
+			for i = #ids, 1, -1 do if ids[i] == id then table.remove(ids, i) end end
+			if #ids == 0 then
+				event2pkgid[event] = nil
+				local loader_id = loader_ids[event]
+				if loader_id then
+					pcall(vim.api.nvim_del_autocmd, loader_id)
+					loader_ids[event] = nil
+				end
+			end
+		end
+	end
+	pkgid2events[id] = nil
+end
+require '_rsplug'.on_loaded(retire)
 
 return {
 	group = group_name,
 	loader_ids = loader_ids,
 	---@param id integer?
-	register = function(id)
-		if id ~= nil then loader_ids[id] = true end
+	register = function(event, id)
+		if event ~= nil and id ~= nil then loader_ids[event] = id end
 	end,
 	---@param ctx vim.api.keyset.create_autocmd.callback_args
 	autocmd_callback = function(ctx)

@@ -1403,6 +1403,7 @@ mod runtime_hot_paths {
             .env("RSPLUG_TEST_PACKPATH", &packpath)
             .env("RSPLUG_TEST_SCENARIO", scenario)
             .env("RSPLUG_TEST_EXPECT", expect.join(","))
+            .env("RSPLUG_TEST_CONTROL_ID", pack.control_ids.join(","))
             .env("XDG_CONFIG_HOME", xdg("config"))
             .env("XDG_DATA_HOME", xdg("data"))
             .env("XDG_CACHE_HOME", xdg("cache"))
@@ -1608,5 +1609,45 @@ mod runtime_hot_paths {
         .await
         .expect("build_pack");
         run_scenario(&pack, "duplicate_maps", &["map_a", "map_b"]);
+    }
+
+    // ---- L1: common lazy runtime state + transactional packadd ----
+
+    /// L1: packadd は成功の境界を通過したときだけ loaded になる。plugin/init.lua が
+    /// 自身を packadd しても loading ガードで早期復帰し、plugin/ は1回だけ source される
+    /// （loaded-once + recursion guard + idempotent 再 packadd）。
+    #[tokio::test]
+    async fn l1_transactional_loaded_after_success_and_recursion_guard() {
+        let pack = build_pack(vec![FakePlugin {
+            tag: "trans_self",
+            files: vec![(
+                "plugin/init.lua",
+                b"vim.g.trans_self_count = (vim.g.trans_self_count or 0) + 1\n\
+                  require('_rsplug').packadd(vim.g.rsplug_self_id)\n",
+            )],
+            lazy: vec![FakeLazy::Event("L1Self")],
+        }])
+        .await
+        .expect("build_pack");
+        run_scenario(&pack, "transactional_loaded_after_success", &[]);
+    }
+
+    /// L1: packadd 本体のエラーは retryable な unloaded 状態に戻し、元のメッセージを
+    /// 保存（traceback 保持）して再送する。2回目（エラー無し）の packadd で loaded になる。
+    #[tokio::test]
+    async fn l1_transactional_error_restores_retryable_state() {
+        let pack = build_pack(vec![FakePlugin {
+            tag: "trans_err",
+            files: vec![(
+                "plugin/init.lua",
+                b"vim.g.err_count = (vim.g.err_count or 0) + 1\n\
+                  if vim.g.err_count == 1 then error('L1 transactional boom') end\n\
+                  vim.g.err_ok = true\n",
+            )],
+            lazy: vec![FakeLazy::Event("L1Err")],
+        }])
+        .await
+        .expect("build_pack");
+        run_scenario(&pack, "transactional_error_retry", &[]);
     }
 }
