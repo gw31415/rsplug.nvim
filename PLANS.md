@@ -75,17 +75,9 @@ Read these paths before changing anything:
 
 Important observations that must be verified by tests during implementation:
 
-- Network call sites acquire `AdaptiveSemaphorePermit` but the revision and
-  tarball paths usually drop it without `finish(is_error)`. Dropped permits
-  release capacity but contribute no latency/error sample, so the advertised
-  adaptive limit is not adapting on the main network path.
-- `load_late` writes `<repo>/latest-snapshot`, but
-  `latest_snapshot_dir` does not read it. It scans `worktrees/` and stats every
-  candidate. Update selection may repeat that work through `is_installed`,
-  `latest_snapshot_oid`, and `snapshot_exists_for_oid`.
 - The same canonical repository may appear in multiple plugin specs. Revision
   conflicts are rejected, but fetch/materialize/build work is not coalesced.
-  `.building-<pid>` and manifest temp names are not unique per in-process task.
+  Manifest temp names are not yet unique per in-process task.
 - A new snapshot can be walked independently for content hashing, manifest
   creation, root assembly, `lua/` roots, and recursive `doc/` extraction.
 - `SnapshotManifest::kind_of` and `child_names` linearly scan the serialized
@@ -94,15 +86,16 @@ Important observations that must be verified by tests during implementation:
   `deterministic_cmp`; that comparator can recompute a full `plugin_id` hash.
 - After package publication, `build_ft_index` re-scans output directories even
   though the snapshot inventory already knew the file set.
-- A warm, identical run still writes generation metadata/loader/`init.lua`,
-  scans retention state, performs cleanup, and writes/fsyncs the lock file.
+- The current no-op fast path still builds the ft index before it can compare a
+  generation, and does not yet use a pure `GenerationPlan` or an
+  inventory-derived ft index.
 - The install flock covers staging cleanup, all copy/helptags work, publish,
   and garbage collection rather than only the commit window.
 - `on_map/init.lua::remove_pattern` scans all `id_patterns` entries for every
   removed pattern; manifest path validation uses linear duplicate checks; and
   trigger stubs can remain after another trigger loads their package.
 
-Baseline verified on 2026-07-22:
+Historical runtime baseline, recorded on 2026-07-22:
 
     cargo test --workspace
 
@@ -117,12 +110,9 @@ values under the JSON key `median_ns` from five samples:
 | 10,000 unrelated `require` calls | 510,436,500 ns |
 | 10,000 unrelated mode changes | 3,749,266 ns |
 
-The current Lua `measure` helper divides the total by the sample count, so these
-are actually arithmetic means mislabeled as medians. M0 must correct this
-before any runtime performance claim. These wall times are comparison data,
-not CI thresholds. The unrelated-require value also includes failed standard
-Lua loader filesystem searches; measure an otherwise identical control without
-the rsplug searcher and compare the delta.
+These are pre-M0 comparison data, not CI thresholds. The runtime harness now
+reports sorted-sample medians/p95 and includes an otherwise identical
+temporarily removed-searcher control for the unrelated-require case.
 
 ## Invariants
 
@@ -158,56 +148,48 @@ a schema/ABI bump is expected:
 
 ## Milestone order
 
-Implement in this dependency order:
+Implement the remaining work in this dependency order:
 
-1. M0 measurement and reference behavior;
-2. U1 snapshot catalog and update selection;
-3. U2 adaptive remote resolution and request coalescing;
-4. I1 fetch/materialization pipeline;
-5. S1 single-pass inventory and indexed queries;
-6. S2 filesystem-free merge and generation planning;
-7. S3 no-op publication fast path;
-8. S4 narrow-lock bounded publisher;
-9. L1 common lazy runtime state and trigger retirement;
-10. L2 per-trigger hot-path improvements;
-11. C1 cleanup of orchestration boundaries after the fast paths are stable.
-12. D1 update user-facing documentation after behavior and measurements are
-    final.
+1. M0 non-runtime measurement and reference behavior;
+2. I1 fetch/materialization pipeline;
+3. S1 single-pass inventory and indexed queries;
+4. S2 filesystem-free merge and generation planning;
+5. S3 no-op publication fast path;
+6. S4 narrow-lock bounded publisher;
+7. L2 per-trigger hot-path improvements;
+8. C1 cleanup of orchestration boundaries after the fast paths are stable.
+9. D1 update user-facing documentation after behavior and measurements are
+   final.
 
 Do not start S2 before S1: optimizing the present manifest lookup API would
-cement its linear-query representation. Do not start the no-op shortcut before
-M0 records every invalidation input.
+cement its linear-query representation.
 
-## M0: measurement and reference behavior
+## M0: complete non-runtime measurement and reference behavior
 
 ### Deliverables
 
-Add an ignored performance harness without changing production behavior.
-Prefer test-only instrumentation behind a small `PerfCounters` trait or
-`#[cfg(test)]` hooks; do not put an atomic increment on every production file
-operation. Write reports below `target/`.
+The ignored runtime harness, test-only counters, and
+`target/runtime_hot_paths_bench.json` are implemented. Extend the same
+test-only instrumentation to the remaining phases without changing production
+behavior. Do not put an atomic increment on every production file operation.
+Write reports below `target/`.
 
 Create:
 
 - `target/update_bench.json`;
 - `target/install_bench.json`;
 - `target/snapshot_refresh_bench.json`;
-- keep and extend `target/runtime_hot_paths_bench.json`.
+- retain `target/runtime_hot_paths_bench.json` as the lazy-runtime reference.
 
 Each case records scenario name, scale, warmup count, measured iterations,
 median, p95, CPU time when available, peak RSS when available, and structural
 counters. Record toolchain, OS/filesystem, CPU count, and whether the build is
 debug or release.
 
-Fix `runtime_hot_paths.lua` measurement first: retain every sample, sort it,
-choose the middle item as median, and choose `ceil(samples * 0.95)` as p95.
-With five samples p95 is the maximum; state that in the report. JSON must expose
-`scale`, `iterations`, `samples`, `median_ns`, `p95_ns`, `min_ns`, `max_ns`, and
-`api_counts`, with deterministic key ordering. Measure 1k/2k/4k scales for
-autocmd records, ft paths, and mapping edges. For `require`, measure active
-rsplug searcher and otherwise identical temporarily-removed-searcher control
-in the same Neovim process; report both and their delta. Separate repeated-name
-dispatch from unique missing-module filesystem search.
+The runtime harness already retains/sorts samples, emits median/p95 and
+deterministic API counters, and compares the active require searcher with a
+temporarily removed-searcher control. Keep its report schema compatible when
+adding the remaining phase reports.
 
 ### Fixtures
 
@@ -254,128 +236,6 @@ pointer swap, lock write, and GC.
 M0 is complete only when a failing structural counter produces a readable test
 failure naming the scenario and unexpected operation.
 
-## U1: update selection must be O(repositories), not O(snapshot history)
-
-### Target code
-
-- `plugin.rs::{is_installed,latest_snapshot_dir,latest_snapshot_oid,
-  snapshot_exists_for_oid}`
-- the `ctx.update` selection branch in `main.rs::run_load_scheduler`
-- the `latest-snapshot` write at the end of `Plugin::load_late`
-
-### Data model
-
-Introduce a `SnapshotCatalog` for one canonical repository. It owns:
-
-- repository root and worktrees root;
-- an optional validated latest key and OID;
-- a lazily built `oid -> snapshot keys` map for fallback and build variants;
-- whether the on-disk index was valid, repaired, or unavailable.
-
-Use one scheduler-scope cache keyed by canonical repository. All specs for the
-same repository share the same `Arc<SnapshotCatalog>`. Do not use a process
-global cache because tests and multiple cache roots must not leak state.
-
-### Implementation steps
-
-1. Specify the index file format and validation. A key is a single relative
-   filename under `worktrees`, never absolute, never `.`/`..`, and its prefix
-   before `__` must be a 40-hex OID. Resolve the candidate and verify it is a
-   directory. Do not follow a path outside the repository root.
-2. Read and validate `<repo>/latest-snapshot` first. For a valid index, return
-   the path/OID without `read_dir(worktrees)` or per-entry metadata.
-3. For missing, malformed, stale, or unsafe indices, scan `worktrees` once,
-   ignore hidden building directories and invalid names, deterministically
-   choose the same latest result as today, build the OID map, and atomically
-   repair the index with a unique temp file plus rename.
-4. Replace the four independent helper calls with methods on the shared
-   catalog. A single run may perform at most one fallback scan per canonical
-   repository.
-5. Move update installed/uninstalled classification out of the serial
-   `Parsed` event loop. Resolve catalogs concurrently through a bounded local
-   I/O worker set, then route their results back to the scheduler. Do not await
-   one filesystem scan while preventing other parse/GraphQL events from being
-   consumed.
-6. Make all index publications unique per task/process and atomic. Never use a
-   PID-only temp name.
-7. Once the OID is known, calculate the exact snapshot key (including build
-   inputs) before deciding whether `source.git` is needed. Reuse only the exact
-   ready snapshot. The existence of a different build variant for the same OID
-   must not incorrectly skip acquisition needed by the desired variant.
-
-### Acceptance
-
-- A valid index causes zero `worktrees` `read_dir` calls and zero history-entry
-  metadata calls.
-- A missing/stale/bad index causes exactly one fallback scan per canonical
-  repository per run and repairs the index. A second run takes the fast path.
-- 100 historical snapshots cost the same number of catalog operations as one
-  snapshot on the valid-index path.
-- Path traversal, symlink escape, partial write, non-UTF-8 name, and concurrent
-  reader/writer fixtures are safe and preserve the current fallback result.
-- Uninstalled repositories under `--update` make zero remote requests and are
-  still reported as not installed; `--install` and `--locked` semantics remain
-  unchanged.
-
-## U2: make remote resolution adaptive, deduplicated, and failure-aware
-
-### Target code
-
-- `main.rs::{flush_graphql_chunks,run_load_scheduler}`
-- `plugin.rs::{resolve_target_commit,resolve_remote_oid,materialize}`
-- `util.rs::github` and `adaptive_semaphore`
-
-### Implementation steps
-
-1. Add one outcome helper around every adaptive permit:
-
-       let permit = limit.acquire().await;
-       let result = operation.await;
-       permit.finish(result.is_err());
-       result
-
-   Use it for GraphQL chunks, REST resolution, ls-remote, tarball download, and
-   Git fetch as appropriate. Ensure cancellation/drop releases a permit but is
-   separately counted as cancelled rather than a successful sample.
-2. Write an integration test proving real call sites, not only semaphore unit
-   tests, change the limit after synthetic good and error windows.
-3. Deduplicate GraphQL inputs by `(canonical repository, requested rev)` before
-   chunking. Preserve a deterministic list of every waiting plugin key and fan
-   one result out to those keys. One repository in multiple plugin specs must
-   produce one remote resolution.
-4. Bound chunk tasks. Calculate chunk capacity from GraphQL fields/cost (a
-   named ref emits head and tag fields) rather than assuming every repository
-   costs one field. Keep request and result ordering independent from output
-   ordering.
-5. Replace chunk-error per-repository fallback bursts with a shared fallback
-   policy. Rate-limit responses open a run-scoped circuit breaker for the API;
-   subsequent work goes directly to bounded Git fallback. Transient failures
-   receive a small, jittered, capped retry budget before fallback. Auth/404 and
-   invalid-ref errors do not retry blindly.
-6. Add per-host limits so GitHub API, codeload, and arbitrary Git hosts cannot
-   consume one another's entire global budget. The global budget remains an
-   upper bound.
-7. Separate `ResolvedRevision` from `LoadRev`. It carries canonical ID, OID,
-   resolution backend, old OID, and `Changed|Unchanged|Missing`. Use this value
-   through EARLY instead of recomputing installed state.
-8. Before LATE work starts, calculate the set of repositories whose OID or
-   semantic configuration changed. Preserve dependency scheduling, but allow
-   unchanged snapshots to reuse their catalog/inventory handle directly.
-
-### Acceptance
-
-- N duplicate specs for one canonical/rev perform one resolution and at most
-  one fetch/materialization job.
-- Every completed remote operation contributes exactly one adaptive success or
-  error sample. The final limit decreases in the 429/reset fixture and can
-  increase in the sustained-success fixture, within configured min/max.
-- The number of simultaneously running GraphQL/fallback/host requests never
-  exceeds its declared budget; queued work is bounded.
-- One failed GraphQL chunk cannot start an unbounded per-repo fallback herd.
-- Output and lockfile are byte-identical for different completion orders.
-- No-change update has zero fetch, tarball, checkout, build, and inventory-build
-  operations. Remote resolution remains the only network cost.
-
 ## I1: coalesce and pipeline repository acquisition
 
 ### Target code
@@ -402,10 +262,9 @@ second destructive attempt.
 
 ### Implementation steps
 
-1. Replace `.building-<pid>` with a unique, repository-local staging directory
-   owned by one job. Publish with rename. If another winner already published
-   the same final key, validate and reuse the winner, then delete only this
-   job's staging directory.
+1. Build the registry around the existing unique, repository-local staging
+   directory. If another winner already published the same final key, validate
+   and reuse it, then delete only this job's staging directory.
 2. Serialize initialization/mutation of one `source.git` while allowing
    different repositories to proceed concurrently. Re-check whether the OID
    exists after acquiring that repository lock.
@@ -667,76 +526,6 @@ the plan must force the implementer to decide whether it belongs in the hash.
 - Copy, helptags, package rename, metadata write, loader write, pointer swap,
   and GC failpoints preserve the atomicity invariants.
 
-## L1: introduce common lazy runtime state and retire stale trigger stubs
-
-The completed R0-R5 work remains the baseline: linear autocmd discovery,
-manifest-driven ft loading, require-root reconciliation/searcher retirement,
-and map observer retirement must not be reimplemented or regressed.
-
-### Target code
-
-- `lazy_registration.rs::From<LazyRegistration> for Vec<LoadedPlugin>`
-- `templates/lua/_rsplug/init.stpl`
-- all `_rsplug/on_*.{lua,stpl}` and `plugin/on_*.{lua,stpl}` templates
-
-### Data model
-
-Generate one `RuntimeState`/`TriggerRegistry` with:
-
-- package state `unloaded | loading | loaded`;
-- trigger kind/key -> ordered package IDs;
-- package ID -> registrations that can be removed or reduced after load;
-- one cached local reference to the core runtime in each module;
-- optional counters enabled only in the headless benchmark fixture.
-
-Do not generate a generic abstraction that adds table lookups to every hot
-call. Specialized trigger modules may hold direct local references into this
-state.
-
-### Implementation steps
-
-1. Make `packadd` a transaction. Return immediately for `loaded`; prevent
-   recursion for `loading`; run `lua_before`, `packadd`, `lua_after`, dependency
-   and on-source order exactly as today; mark `loaded` only after the successful
-   boundary defined by reference tests. On error, restore a retryable state and
-   preserve the original traceback.
-2. Register trigger cleanup callbacks/reverse records at startup. After a
-   package loads by any trigger, remove that package from event, ft, require,
-   command, function, mapping, and source registrations. Remove an actual stub
-   only when no unloaded package still needs its key.
-3. Event: remove the package ID from shared `event2pkgid`; delete the one-shot
-   loader when the event has no remaining IDs. Preserve shared-event loading
-   order and the existing autocmd replay algorithm.
-4. Command/function: delete a dummy only when all packages registered for it
-   are loaded or immediately before delegating to the real definition. A plugin
-   loaded through another trigger must not leave a dummy that shadows the real
-   command/function.
-5. Filetype: reconcile `processed` and loaded state centrally so another
-   trigger removes the ID without sourcing its ftplugin later. Retain the
-   current at-most-once ftplugin rule.
-6. Require: reuse the existing root counters and searcher retirement. Feed
-   central `on_loaded(id)` into reconciliation instead of a separate callback
-   scan. Unknown modules still allocate/store no per-module state.
-7. Mapping: remove only the mappings whose remaining ID set became empty. Do
-   not scan all plugin IDs or all patterns.
-8. On-source/dependency cascades use an iterative work queue with a visited/
-   state check to avoid deep Lua recursion while preserving deterministic
-   before/packadd/after ordering. Prove equivalence before changing this part;
-   keep recursion if the queue changes hook semantics.
-
-### Acceptance
-
-- Each package transitions to loaded once. Recursive, simultaneous-trigger,
-  hook-error, packadd-error, and retry fixtures have explicit expected state.
-- Loading through any trigger removes/reduces every other registration in time
-  proportional to that package's reverse records, not all registrations.
-- No stale dummy command/function/mapping shadows the plugin's real object.
-- Shared trigger keys remain until their final unloaded package is handled.
-- After all packages are loaded, rsplug-owned searcher/autocmd observers,
-  commands/functions, and mappings that have no remaining work are absent.
-- Generated output is deterministic and movable. The runtime ABI/schema is
-  bumped if generated layout changes.
-
 ## L2: remove remaining per-trigger avoidable work
 
 ### Mapping hot path
@@ -771,19 +560,13 @@ callback-time `nvim_replace_termcodes`, or nested function in `parse_mode`.
 1. S3 generation metadata is trusted only after one load-time schema/path
    validation. Validate relative path, `..`, package membership, and ft ordering
    once, then cache generation-root-relative or absolute resolved lists.
-2. Replace `vim.list_contains(result, full)` linear dedup with a set or remove it
-   when the Rust plan proves paths unique. Keep stable output order.
-3. Hoist `entries['opt/' .. id]` and `prefix = 'opt/' .. id .. '/'` outside the
-   per-path loop. If the package is not a generation entry, do not visit its
-   paths. Use `result[#result + 1]` on the append path.
-4. Cache `manifest`, `gen_root`, and `entries` without repeated
+2. Cache `manifest`, `gen_root`, and `entries` without repeated
    `debug.getinfo`, `fnamemodify`, `readfile`, or JSON decode.
 
 Acceptance: first use reads/decodes metadata once; later filetypes do no path
 component revalidation for already validated records; one ft trigger performs
 zero `nvim_get_runtime_file` calls and sources each indexed path once. Valid
-1k/2k/4k indices perform exactly that many path visits, contain no
-`vim.list_contains`, and scale linearly.
+1k/2k/4k indices perform exactly that many path visits and scale linearly.
 
 ### Event hot path
 
@@ -1006,19 +789,16 @@ only when an interactive/TUI failure cannot be explained headlessly. If it is
 needed, use a named session, inspect with `wait`/`eval`/`snapshot`, and close the
 session afterward.
 
-## Completion checklist
+## Remaining completion checklist
 
-- [ ] M0 reports and structural counters exist.
-- [ ] U1 valid snapshot lookup performs no history scan.
-- [ ] U2 adaptive samples, deduplication, bounded fallback, and update change
-      selection pass.
+- [ ] M0 update/install/snapshot-refresh reports and their reference gates
+      exist.
 - [ ] I1 duplicate repository work is coalesced and acquisition queues are
       bounded.
 - [ ] S1 uses one inventory traversal and indexed queries.
 - [ ] S2 merge is filesystem-free and avoids repeated full hashes.
 - [ ] S3 identical generation/lock publication is a zero-mutation fast path.
 - [ ] S4 lock window and copy/GC queues satisfy their bounds.
-- [ ] L1 cross-trigger retirement and transactional package state pass.
 - [ ] L2 mapping/ft/event/require/command/function structural gates pass.
 - [ ] C1 cleanup is performance-neutral relative to the optimized baseline.
 - [ ] D1 README, Vim help, examples, and any affected CLI/Nix documentation
@@ -1029,44 +809,25 @@ session afterward.
 
 ## Progress
 
-Planning and baseline inspection are complete. M0 runtime measurement work is
-implemented: the Lua harness now computes a sorted-sample median and p95,
-records the requested scale/iteration fields and deterministic API counters,
-and compares the active rsplug require searcher with an otherwise identical
-temporarily removed-searcher control. The ignored benchmark produced
-`target/runtime_hot_paths_bench.json` on 2026-07-22. The update, install, and
-snapshot-refresh reports and structural counter infrastructure remain to be
-implemented. A first scoped L2 filetype hot-path change is now implemented:
-the valid v2 manifest resolver uses a reverse path set for stable de-duplication
-and hoists package-entry checks outside its path loop. The broader L2 milestone
-and U1/U2/I1/S1/S2/S3/S4/L1/C1/D1 remain incomplete. A user-prioritized S3
-slice is implemented: `--install` checks the local snapshot catalog before
-GraphQL and only resolves missing repositories; an unchanged, intact
-generation skips package copy, manifest/loader/init publication, GC, and an
-equivalent v2 lockfile write. Inventory-derived ft indices and the strict
-zero-scan generation plan remain future S3 work.
+Completed recipes are removed from this active plan: runtime measurement,
+snapshot-catalog update selection, adaptive remote resolution, and common lazy
+trigger retirement. The remaining plan begins with non-runtime M0 reporting,
+then I1/S1-S4/L2/C1/D1. Existing partial work is reflected inline: the current
+generation fast path can reuse an intact generation and avoid package,
+metadata/loader/init, GC, and equivalent-lock writes; the L2 filetype resolver
+already uses stable set de-duplication and hoists package-entry checks. Neither
+partial implementation satisfies its full remaining milestone acceptance gates.
 
 ## Discoveries and decision log
 
 - 2026-07-22: Defined “snapshot update” as snapshot-to-generation refresh
   because the CLI has no snapshot operation. Repository snapshot creation is a
   shared install/update layer.
-- 2026-07-22: Existing R0-R5 runtime plan is fully implemented and was removed
-  from the active plan rather than duplicated.
 - 2026-07-22: Chose structural counters as CI gates and same-machine wall/RSS as
   evidence. Network benchmarks use local deterministic fixtures.
-- 2026-07-22: Prioritized making existing mechanisms effective (adaptive
-  permit completion, latest index reads, indexed manifests) before adding more
-  concurrency.
 - 2026-07-22: A content/generation identity mismatch across install, flagless,
   and locked modes is treated as a performance bug because it defeats warm
   package reuse, even if the resulting file bytes happen to match.
-- 2026-07-22: The first bounded implementation slice after M0 targets the
-  valid-manifest filetype resolver: a set replaces linear result membership
-  checks while preserving manifest order and path validation.
-- 2026-07-22: Warm `--install` favors a catalog probe over unconditional
-  GraphQL. A generation is a no-op only after validating package directories,
-  manifest, loader, and init symlink; any inconsistency falls back to repair.
 - 2026-07-22: Split tarball acquisition at the HTTP/archive boundary. Network
   permits now cover download plus its durable staging write only; bounded
   extraction runs after permit release while the owned staging directory keeps
