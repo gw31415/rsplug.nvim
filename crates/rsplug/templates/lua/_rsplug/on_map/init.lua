@@ -41,9 +41,11 @@ local function add_unique(list, value)
 	table.insert(list, value)
 end
 
+local rsplug = require '_rsplug'
+
 local function all_loaded(ids)
 	for _, id in ipairs(ids) do
-		if not require('_rsplug').loaded[id] then
+		if not rsplug.loaded[id] then
 			return false
 		end
 	end
@@ -59,21 +61,45 @@ local pattern_ids = {}
 -- id_patterns[id] = { pattern1, pattern2, ... }
 local id_patterns = {}
 
+---Retire one package from only the patterns registered by that package.
+local function retire(id)
+	for _, pattern in ipairs(id_patterns[id] or {}) do
+		local ids = pattern_ids[pattern]
+		if ids then
+			for i = #ids, 1, -1 do
+				if ids[i] == id then table.remove(ids, i) end
+			end
+			if #ids == 0 then
+				for _, mode in ipairs(pattern_modes[pattern] or {}) do
+					pcall(vim.keymap.del, mode, pattern, {})
+				end
+				pattern_modes[pattern] = nil
+				pattern_ids[pattern] = nil
+			end
+		end
+	end
+	id_patterns[id] = nil
+end
+
+rsplug.on_loaded(retire)
+
 local M = {}
 -- 到達可能モードのうち未 setup のもの。plugin/on_map.stpl が設定する。
 M.pending_modes = {}
 
 ---pattern 関連の追跡を一括クリアする（pattern_modes / pattern_ids / 当該 pattern を含む id_patterns エントリ）。
 local function remove_pattern(pattern)
-	pattern_modes[pattern] = nil
-	pattern_ids[pattern] = nil
-	for _, plist in pairs(id_patterns) do
-		for i = #plist, 1, -1 do
-			if plist[i] == pattern then
-				table.remove(plist, i)
+	for _, id in ipairs(pattern_ids[pattern] or {}) do
+		local patterns = id_patterns[id]
+		if patterns then
+			for i = #patterns, 1, -1 do
+				if patterns[i] == pattern then table.remove(patterns, i) end
 			end
+			if #patterns == 0 then id_patterns[id] = nil end
 		end
 	end
+	pattern_modes[pattern] = nil
+	pattern_ids[pattern] = nil
 end
 
 ---全 pending モードが setup されたら watcher 用 augroup を削除する。pcall ガード・冪等。
@@ -152,9 +178,7 @@ function M.setup(mode)
 
 					-- Load all plugins that registered this pattern
 					for _, id in ipairs(all_ids) do
-						require('_rsplug').packadd(id)
-						-- Clear tracking for this plugin ID
-						id_patterns[id] = nil
+						rsplug.packadd(id)
 					end
 
 					vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
