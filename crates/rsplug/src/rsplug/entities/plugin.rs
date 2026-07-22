@@ -168,6 +168,7 @@ pub(super) fn snapshot_root(repo_root: &Path, snapshot_key: &str) -> PathBuf {
 /// `worktrees/` に `<oid>` または `<oid>__...` の snapshot が既にあるか。
 /// GitFetch（source.git 不要）で既存 snapshot を再利用する判定に使う。
 async fn snapshot_exists_for_oid(worktrees: &Path, oid: &str) -> bool {
+    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::WorktreesScan);
     let Ok(mut rd) = tokio::fs::read_dir(worktrees).await else {
         return false;
     };
@@ -761,6 +762,7 @@ impl Plugin {
 
                     let rtp =
                         build_runtimepaths(&worktree_path, cache_dir, &dependency_cachedirs).await;
+                    crate::rsplug::perf::failpoint("build_before")?;
                     run_repo_build(
                         &build,
                         lua_build.as_deref(),
@@ -770,6 +772,7 @@ impl Plugin {
                         &repo_name,
                     )
                     .await?;
+                    crate::rsplug::perf::failpoint("build_after")?;
 
                     // build 後 dirty を反映した最終 identity → key へ原子リネーム。
                     // 失敗しても final_root は作られない。
@@ -807,6 +810,7 @@ impl Plugin {
                 // Phase 2: snapshot が ready になったので manifest を記録する（best-effort cache）。
                 // 以降の merge/copy 計画は manifest からパス集合を引ける（Part B）。欠損時は filesystem
                 // fallback。既存 snapshot の再利用時は書き込みを省き、重複 walk を避ける。
+                crate::rsplug::perf::failpoint("inventory_write_before")?;
                 let manifest_path = snapshot_root_path.join(MANIFEST_FILE);
                 if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
                     let _ = SnapshotManifest::build_and_write(
@@ -816,6 +820,7 @@ impl Plugin {
                     )
                     .await;
                 }
+                crate::rsplug::perf::failpoint("inventory_write_after")?;
                 // per-repo latest-snapshot index: `<repo>/latest-snapshot` に snapshot_key を記録する。
                 // worktrees/ を scan せずに最新 snapshot を特定できる（best-effort）。
                 if let (Some(worktrees), Some(key)) =
@@ -1034,6 +1039,8 @@ async fn assemble_loaded_plugin(
 ) -> Result<LoadedPlugin, Error> {
     use crate::log::{Message, msg};
 
+    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::SnapshotWalk);
+
     // ls-files 列挙を廃止し、snapshot ルート直下を read_dir で1階層列挙する。
     // ディレクトリ（lua/plugin 等）も1エントリにまとめ、install で copy_tree する
     //（ファイル数分の syscall を削減）。`doc` だけは盗み集約のため個別ファイルに展開する（下記）。
@@ -1138,6 +1145,7 @@ async fn resolve_remote_oid(
         // ワイルドカード ref（`*` を含む）は REST API で解決できない → git protocol
         let is_wildcard = rev.as_deref().is_some_and(|r| r.contains('*'));
         if !is_wildcard {
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::RestResolveRequest);
             match github::resolve_rev_via_api(http_client, url, rev.as_deref(), token.as_deref())
                 .await
             {
@@ -1155,6 +1163,7 @@ async fn resolve_remote_oid(
     }
 
     // フォールバック: git smart HTTP protocol (ls_remote)
+    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::LsRemoteRequest);
     git::ls_remote(url.clone(), rev.clone(), token.clone()).await
 }
 
@@ -1188,6 +1197,7 @@ async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
     {
         let _git = super::util::resources::git().await?;
         msg(Message::Cache("Fetching", ctx.url.clone()));
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::GitFetch);
         repo.fetch_oid(ctx.oid, ctx.token.clone()).await?;
         msg(Message::Cache("Fetching:done", ctx.url.clone()));
     }
@@ -1216,11 +1226,13 @@ async fn materialize(
     use crate::log::{Message, msg};
 
     if use_tarball {
+        crate::rsplug::perf::failpoint("materialize_before")?;
         let tarball_ok = {
-            let _permit = ctx.semaphore.acquire().await;
+            let permit = ctx.semaphore.acquire().await;
             msg(Message::Cache("Fetching", ctx.url.clone()));
             let head_rev = ctx.oid.to_string();
-            match TarballFetch
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::TarballFetch);
+            let result = match TarballFetch
                 .fetch_to_snapshot(
                     ctx.http_client,
                     ctx.url.as_ref(),
@@ -1235,7 +1247,14 @@ async fn materialize(
                     true
                 }
                 Err(_) => false,
-            }
+            };
+            permit.finish(!result);
+            crate::rsplug::perf::incr(if result {
+                crate::rsplug::perf::PerfOp::PermitSuccess
+            } else {
+                crate::rsplug::perf::PerfOp::PermitError
+            });
+            result
         };
         if tarball_ok {
             // Phase 7: tarball は `.git` を作らない。identity/dirty は内容ハッシュで計算。
@@ -1248,6 +1267,7 @@ async fn materialize(
     }
 
     let _git = super::util::resources::git().await?;
+    crate::rsplug::perf::failpoint("materialize_after")?;
     Ok(Some(MaterializedRepo::Git(
         git::init_snapshot(dest.to_path_buf(), ctx.source_git, ctx.oid).await?,
     )))
@@ -1408,6 +1428,7 @@ async fn build_runtimepaths(
 /// `worktrees/` 配下の snapshot のうち最新（mtime 順）の path を返す。
 /// hidden (`.building-*`) と先頭 40hex(commit) でない名前は無視する。
 async fn latest_snapshot_dir(worktrees: &Path) -> Option<PathBuf> {
+    crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::WorktreesScan);
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     let Ok(mut rd) = tokio::fs::read_dir(worktrees).await else {
         return None;

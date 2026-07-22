@@ -77,6 +77,9 @@ impl LockFile {
     /// Write the lock file to disk
     pub async fn write(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let path = path.as_ref().to_path_buf();
+        crate::rsplug::perf::failpoint("lock_write_before")
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::LockWrite);
         let content = serde_json::to_string_pretty(self).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

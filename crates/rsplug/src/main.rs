@@ -525,6 +525,7 @@ fn flush_graphql_chunks(
         let client = http_client.clone();
         let token_owned = token_str.to_string();
         chunk_tasks.spawn(async move {
+            rsplug::perf::incr(rsplug::perf::PerfOp::GraphqlRequest);
             let result =
                 rsplug::util::github::resolve_graphql_chunk(client, token_owned, chunk).await;
             (result, chunk_canonicals)

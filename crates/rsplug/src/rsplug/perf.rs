@@ -1,0 +1,751 @@
+//! M0 構造計測・故障注入基盤（PLANS「M0: measurement and reference behavior」）。
+//!
+//! production build では全エントリポイントが no-op になる: `incr` は何もせず、`failpoint`
+//! は常に `Ok(())` を返す。`#[cfg(test)]` build でのみ thread-local の計数 map と
+//! 故障点名 set を install するため、計測が production 挙動を変えることはなく、hot path
+//! に atomic を置くこともない。
+//!
+//! install は複数の Tokio worker thread で copy/GC を実行するため、テスト時の map は
+//! thread-local にせず mutex で共有する。これは `cfg(test)` のみで、production の
+//! hot path には atomic も mutex も存在しない。
+
+/// M0 ハーネスが計測する粗粒度の構造操作。各 variant の名前（[`PerfOp::name`]）が
+/// report の安定キーになる。意味の変わない限り改名しないこと。
+#[allow(dead_code)] // variants are consumed by cfg(test) benchmarks and production hooks selectively
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PerfOp {
+    // --- network (update/install) ---
+    /// GraphQL バッチ解決リクエスト1件。
+    GraphqlRequest,
+    /// GitHub REST API による rev 解決リクエスト1件。
+    RestResolveRequest,
+    /// git smart-HTTP ls-remote フォールバック1件。
+    LsRemoteRequest,
+    /// tarball ダウンロード1件。
+    TarballFetch,
+    /// git fetch（source.git への OID 取り込み）1件。
+    GitFetch,
+    // --- filesystem / inventory (update/install) ---
+    /// `worktrees/` の `read_dir` scan 1件。
+    WorktreesScan,
+    /// snapshot manifest の inventory 構築（1回の再帰 walk）1件。
+    InventoryBuild,
+    /// snapshot ツリーの再帰 walk（assemble / content-hash）1件。
+    SnapshotWalk,
+    // --- refresh (PackPlan::install) ---
+    /// パッケージ yank/copy 1件。
+    PackageCopy,
+    /// headless `nvim` helptags 起動1件。
+    HelptagsProcess,
+    /// generation manifest 書き込み1件。
+    GenerationManifestWrite,
+    /// `init.lua` ポインタ swap（ブータビリティ公開点）1件。
+    InitLuaSwap,
+    /// 公開済み `opt/` の ftplugin index scan 1件。
+    FtIndexScan,
+    /// GC による `remove_dir_all` 1件。
+    GcDelete,
+    /// retention 判定のための旧 generation manifest 読み込み1件。
+    RetentionManifestRead,
+    // --- merge (coarse) ---
+    /// `LoadedPlugin::merge` の1回の併合試行。
+    MergeAttempt,
+    /// `manifest_for` での同期 fs read（cache miss 時）1件。
+    ManifestFsRead,
+    /// `SnapshotManifest::kind_of` / `child_names` の線形 scan 1件。
+    ManifestLinearScan,
+    // --- lock ---
+    /// lockfile 書き込み1件。
+    LockWrite,
+    /// ディレクトリを読み取ったエントリ数。
+    DirectoryEntry,
+    /// metadata/stat 呼び出し1件。
+    MetadataCall,
+    /// 複製したファイル数。
+    FileCopied,
+    /// 複製したバイト数。
+    BytesCopied,
+    /// 生成物の書き込み。
+    GenerationWrite,
+    /// loader.lua の書き込み。
+    LoaderWrite,
+    /// 実行中のタスク数（ハーネスカウンタ）。
+    QueuedJob,
+    /// ワーカー生成数。
+    SpawnedWorker,
+    /// adaptive permit の成功完了。
+    PermitSuccess,
+    /// adaptive permit のエラー完了。
+    PermitError,
+    /// キャッシュの重複 materialize job。
+    DuplicateMaterializeJob,
+    /// キャッシュの重複 build job。
+    DuplicateBuildJob,
+    /// コンテンツハッシュで読んだバイト数。
+    ContentBytesHashed,
+    /// 重試行回数。
+    Retry,
+    /// fallback の展開数。
+    FallbackFanout,
+    /// reflink/clonefile 成功数。
+    ReflinkCopy,
+    /// hardlink 成功数。
+    HardlinkCopy,
+    /// 通常 copy 成功数。
+    PlainCopy,
+}
+
+impl PerfOp {
+    /// report キーとして使う安定名。
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            PerfOp::GraphqlRequest => "graphql_request",
+            PerfOp::RestResolveRequest => "rest_resolve_request",
+            PerfOp::LsRemoteRequest => "ls_remote_request",
+            PerfOp::TarballFetch => "tarball_fetch",
+            PerfOp::GitFetch => "git_fetch",
+            PerfOp::WorktreesScan => "worktrees_scan",
+            PerfOp::InventoryBuild => "inventory_build",
+            PerfOp::SnapshotWalk => "snapshot_walk",
+            PerfOp::PackageCopy => "package_copy",
+            PerfOp::HelptagsProcess => "helptags_process",
+            PerfOp::GenerationManifestWrite => "generation_manifest_write",
+            PerfOp::InitLuaSwap => "init_lua_swap",
+            PerfOp::FtIndexScan => "ft_index_scan",
+            PerfOp::GcDelete => "gc_delete",
+            PerfOp::RetentionManifestRead => "retention_manifest_read",
+            PerfOp::MergeAttempt => "merge_attempt",
+            PerfOp::ManifestFsRead => "manifest_fs_read",
+            PerfOp::ManifestLinearScan => "manifest_linear_scan",
+            PerfOp::LockWrite => "lock_write",
+            PerfOp::DirectoryEntry => "directory_entry",
+            PerfOp::MetadataCall => "metadata_call",
+            PerfOp::FileCopied => "file_copied",
+            PerfOp::BytesCopied => "bytes_copied",
+            PerfOp::GenerationWrite => "generation_write",
+            PerfOp::LoaderWrite => "loader_write",
+            PerfOp::QueuedJob => "queued_job",
+            PerfOp::SpawnedWorker => "spawned_worker",
+            PerfOp::PermitSuccess => "permit_success",
+            PerfOp::PermitError => "permit_error",
+            PerfOp::DuplicateMaterializeJob => "duplicate_materialize_job",
+            PerfOp::DuplicateBuildJob => "duplicate_build_job",
+            PerfOp::ContentBytesHashed => "content_bytes_hashed",
+            PerfOp::Retry => "retry",
+            PerfOp::FallbackFanout => "fallback_fanout",
+            PerfOp::ReflinkCopy => "reflink_copy",
+            PerfOp::HardlinkCopy => "hardlink_copy",
+            PerfOp::PlainCopy => "plain_copy",
+        }
+    }
+}
+
+#[cfg(test)]
+static CURRENT: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static FAILPOINTS: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// 粗粒度境界で構造操作を1件計数する。production build では完全 no-op。
+#[inline]
+pub(crate) fn incr(op: PerfOp) {
+    #[cfg(test)]
+    {
+        *CURRENT.lock().unwrap().entry(op.name()).or_insert(0) += 1;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = op;
+    }
+}
+
+/// バイト数カウンタは個数と別の数値として記録する。production では完全 no-op。
+#[inline]
+pub(crate) fn incr_bytes(bytes: u64) {
+    #[cfg(test)]
+    {
+        *CURRENT
+            .lock()
+            .unwrap()
+            .entry(PerfOp::BytesCopied.name())
+            .or_insert(0) += bytes;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bytes;
+    }
+}
+
+/// 故障注入点。arm されていれば `Err`、それ以外は `Ok(())`。production build では常に `Ok`。
+/// 呼出側は `perf::failpoint("name")?;` のように使う（production では inline 展開で消える）。
+#[inline]
+pub(crate) fn failpoint(name: &'static str) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAILPOINTS.lock().unwrap().contains(name) {
+            return Err(std::io::Error::other(format!("rsplug failpoint: {name}")));
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+    }
+    Ok(())
+}
+
+/// 計測区間の RAII guard。生成時にこの thread の counter と故障点を clear する。
+/// `cfg(test)` 以外では zero-sized no-op。
+pub(crate) struct PerfGuard {
+    _private: (),
+}
+
+impl PerfGuard {
+    /// 計測を開始する: この thread の counter/failpoint を clear した上で guard を返す。
+    #[allow(dead_code)]
+    pub(crate) fn install() -> Self {
+        #[cfg(test)]
+        {
+            CURRENT.lock().unwrap().clear();
+            FAILPOINTS.lock().unwrap().clear();
+        }
+        PerfGuard { _private: () }
+    }
+
+    /// この thread の counter を（名前昇順で）取り出す。`cfg(test)` 以外では空。
+    #[allow(dead_code)] // benchmark/gate から使用
+    pub(crate) fn snapshot() -> Vec<(&'static str, u64)> {
+        #[cfg(test)]
+        {
+            CURRENT
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect()
+        }
+        #[cfg(not(test))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// `op` の現在の計数。未計測なら 0。
+    #[cfg(test)]
+    pub(crate) fn count(op: PerfOp) -> u64 {
+        *CURRENT.lock().unwrap().get(op.name()).unwrap_or(&0)
+    }
+}
+
+/// 故障点 `name` を arm する（`cfg(test)` のみ）。
+#[cfg(test)]
+pub(crate) fn arm_failpoint(name: &'static str) {
+    FAILPOINTS.lock().unwrap().insert(name);
+}
+
+/// 故障点 `name` を disarm する（`cfg(test)` のみ）。
+#[cfg(test)]
+pub(crate) fn disarm_failpoint(name: &'static str) {
+    FAILPOINTS.lock().unwrap().remove(name);
+}
+
+/// 構造 counter が期待値と一致するか検査し、不一致なら**シナリオ名と操作名を含む**
+/// 可読エラーメッセージを返す（PLANS「M0 is complete only when a failing structural
+/// counter produces a readable test failure naming the scenario and unexpected operation」）。
+/// 一致なら `Ok(())`。`cfg(test)` 以外では常に `Ok`。
+#[allow(dead_code)] // gate test から使用
+pub(crate) fn expect_count(scenario: &str, op: PerfOp, expected: u64) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let actual = PerfGuard::count(op);
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "[{scenario}] structural counter '{}' expected {expected} but observed {actual}",
+                op.name()
+            ))
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (scenario, op, expected);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn incr_records_on_runtime_thread() {
+        let _g = PerfGuard::install();
+        incr(PerfOp::WorktreesScan);
+        incr(PerfOp::WorktreesScan);
+        incr(PerfOp::InventoryBuild);
+        assert_eq!(PerfGuard::count(PerfOp::WorktreesScan), 2);
+        assert_eq!(PerfGuard::count(PerfOp::InventoryBuild), 1);
+        assert_eq!(PerfGuard::count(PerfOp::GitFetch), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_sorted_and_names_are_stable() {
+        let _g = PerfGuard::install();
+        incr(PerfOp::LockWrite);
+        incr(PerfOp::WorktreesScan);
+        let snap = PerfGuard::snapshot();
+        let names: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+        assert_eq!(names, vec!["lock_write", "worktrees_scan"]);
+    }
+
+    /// 完了基準の実証: 期待値を外した構造 counter が、シナリオ名と操作名を名指しする
+    /// 可読メッセージを生成すること。このテスト自体は（メッセージ形式を検査するので）成功する。
+    #[tokio::test]
+    async fn failing_counter_names_scenario_and_operation() {
+        let _g = PerfGuard::install();
+        incr(PerfOp::WorktreesScan); // 実際の計数は 1
+        // 正しい期待値 → Ok
+        assert!(expect_count("scenario_a", PerfOp::WorktreesScan, 1).is_ok());
+        // 間違った期待値 → シナリオ名・操作名・観測値を含む可読メッセージ
+        let msg = expect_count("scenario_a", PerfOp::WorktreesScan, 0).unwrap_err();
+        assert!(msg.contains("scenario_a"), "must name scenario: {msg}");
+        assert!(msg.contains("worktrees_scan"), "must name operation: {msg}");
+        assert!(
+            msg.contains("observed 1"),
+            "must report observed count: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failpoint_armed_returns_error_disarmed_ok() {
+        let _g = PerfGuard::install();
+        assert!(failpoint("materialize_before").is_ok());
+        arm_failpoint("materialize_before");
+        let err = failpoint("materialize_before").unwrap_err();
+        assert!(err.to_string().contains("materialize_before"));
+        disarm_failpoint("materialize_before");
+        assert!(failpoint("materialize_before").is_ok());
+    }
+
+    /// guard 生成時に前テストの計数が clear されること。
+    #[tokio::test]
+    async fn install_clears_prior_counts() {
+        incr(PerfOp::GitFetch);
+        let _g = PerfGuard::install();
+        assert_eq!(PerfGuard::count(PerfOp::GitFetch), 0);
+    }
+}
+
+/// M0 のローカルフィクスチャー・ベンチ。実行は ignored とし、ネットワークや
+/// GitHub の状態に依存させない。レポートのキーとシナリオ順は BTreeMap/固定順序で決定的にする。
+#[cfg(test)]
+mod m0_harness {
+    use super::{PerfGuard, PerfOp, arm_failpoint, disarm_failpoint, failpoint, incr, incr_bytes};
+    use serde::Serialize;
+    use std::{
+        collections::BTreeMap,
+        fs,
+        io::{self, Read, Write},
+        net::{TcpListener, TcpStream},
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread::{self, JoinHandle},
+        time::Duration,
+        time::Instant,
+    };
+
+    const SAMPLES: usize = 5;
+    const WARMUPS: usize = 1;
+
+    #[derive(Serialize)]
+    struct Case {
+        scenario: String,
+        scale: usize,
+        warmup_count: usize,
+        iterations: usize,
+        samples: usize,
+        median_ns: u128,
+        p95_ns: u128,
+        min_ns: u128,
+        max_ns: u128,
+        cpu_time_ns: Option<u128>,
+        peak_rss_bytes: Option<u64>,
+        structural_counters: BTreeMap<String, u64>,
+    }
+
+    #[derive(Serialize)]
+    struct Report {
+        schema: u32,
+        phase: &'static str,
+        environment: BTreeMap<String, String>,
+        cases: Vec<Case>,
+    }
+
+    fn environment() -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        out.insert(
+            "build_profile".into(),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .into(),
+        );
+        out.insert(
+            "cpu_count".into(),
+            std::thread::available_parallelism()
+                .map(|n| n.get().to_string())
+                .unwrap_or_else(|_| "unknown".into()),
+        );
+        out.insert("filesystem".into(), "local-tempdir".into());
+        out.insert("os".into(), std::env::consts::OS.into());
+        out.insert(
+            "toolchain".into(),
+            option_env!("RUSTC_VERSION").unwrap_or("unknown").into(),
+        );
+        out
+    }
+
+    fn fixture(root: &Path, scale: usize) -> io::Result<()> {
+        for i in 0..scale {
+            let repo = root.join(format!("repo-{i:04}"));
+            fs::create_dir_all(repo.join("lua"))?;
+            fs::write(
+                repo.join("lua/init.lua"),
+                format!("return {{ id = {i} }}\n"),
+            )?;
+            fs::write(
+                repo.join("revision"),
+                if i % 20 == 0 { "B\n" } else { "A\n" },
+            )?;
+            fs::write(
+                repo.join("deps"),
+                if i == 0 {
+                    "\n".to_string()
+                } else {
+                    format!("repo-{:04}\n", i / 2)
+                },
+            )?;
+        }
+        // Local-server response fixtures: callers can serve this directory with any
+        // localhost HTTP server without changing the benchmark or contacting GitHub.
+        fs::write(
+            root.join("graphql.json"),
+            r#"{"data":{"repository":null}}\n"#,
+        )?;
+        fs::write(root.join("tarball-A.tgz"), b"local fixture placeholder\n")?;
+        fs::write(root.join("tarball-B.tgz"), b"local fixture placeholder\n")?;
+        Ok(())
+    }
+
+    fn sorted_repos(root: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut paths = fs::read_dir(root)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect::<Vec<_>>();
+        paths.sort();
+        Ok(paths)
+    }
+
+    struct LocalHttpServer {
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl LocalHttpServer {
+        fn start(root: &Path) -> io::Result<Self> {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            listener.set_nonblocking(true)?;
+            let root = root.to_path_buf();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => handle_http(stream, &root),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Ok(Self {
+                stop,
+                thread: Some(thread),
+            })
+        }
+    }
+
+    impl Drop for LocalHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn handle_http(mut stream: TcpStream, root: &Path) {
+        let mut request = [0u8; 2048];
+        let Ok(size) = stream.read(&mut request) else {
+            return;
+        };
+        let request = String::from_utf8_lossy(&request[..size]);
+        let path = request.split_whitespace().nth(1).unwrap_or("/");
+        if path.starts_with("/reset") {
+            return;
+        }
+        if path.starts_with("/delay") {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let (status, headers, body) = match path.split('?').next().unwrap_or(path) {
+            "/graphql" => (
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                fs::read(root.join("graphql.json")).unwrap_or_default(),
+            ),
+            "/tarball/A" => (
+                "200 OK",
+                "Content-Type: application/gzip\r\n",
+                fs::read(root.join("tarball-A.tgz")).unwrap_or_default(),
+            ),
+            "/tarball/B" => (
+                "200 OK",
+                "Content-Type: application/gzip\r\n",
+                fs::read(root.join("tarball-B.tgz")).unwrap_or_default(),
+            ),
+            "/404" => ("404 Not Found", "", b"not found\n".to_vec()),
+            "/429" => (
+                "429 Too Many Requests",
+                "Retry-After: 1\r\nX-RateLimit-Remaining: 0\r\n",
+                b"rate limited\n".to_vec(),
+            ),
+            "/truncated" => {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
+                return;
+            }
+            _ => ("200 OK", "", b"ok\n".to_vec()),
+        };
+        let header = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&body);
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            incr(PerfOp::DirectoryEntry);
+            incr(PerfOp::MetadataCall);
+            if src_path.is_dir() {
+                fs::create_dir_all(&dst_path)?;
+                copy_tree(&src_path, &dst_path)?;
+            } else {
+                let bytes = fs::copy(&src_path, &dst_path)?;
+                incr(PerfOp::FileCopied);
+                incr_bytes(bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn measure(scenario: &str, scale: usize, iterations: usize, f: impl Fn()) -> Case {
+        for _ in 0..WARMUPS {
+            f();
+        }
+        let mut values = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let start = Instant::now();
+            f();
+            values.push(start.elapsed().as_nanos());
+        }
+        values.sort_unstable();
+        let counters = PerfGuard::snapshot()
+            .into_iter()
+            .map(|(name, count)| (name.to_string(), count))
+            .collect();
+        Case {
+            scenario: scenario.into(),
+            scale,
+            warmup_count: WARMUPS,
+            iterations,
+            samples: SAMPLES,
+            median_ns: values[SAMPLES / 2],
+            p95_ns: values[(SAMPLES * 95).div_ceil(100).saturating_sub(1)],
+            min_ns: values[0],
+            max_ns: values[SAMPLES - 1],
+            cpu_time_ns: None,
+            peak_rss_bytes: None,
+            structural_counters: counters,
+        }
+    }
+
+    fn run(phase: &'static str, file: &str, operation: impl Fn(&Path)) {
+        let mut cases = Vec::new();
+        for scale in [128usize, 512] {
+            let tmp = tempfile::tempdir().expect("M0 fixture tempdir");
+            fixture(tmp.path(), scale).expect("M0 fixture");
+            let _server = LocalHttpServer::start(tmp.path()).expect("M0 local HTTP fixture");
+            for (name, factor) in [("cold", 1usize), ("warm", 2usize)] {
+                let _guard = PerfGuard::install();
+                incr(PerfOp::QueuedJob);
+                incr(PerfOp::SpawnedWorker);
+                cases.push(measure(&format!("{phase}_{name}"), scale, factor, || {
+                    operation(tmp.path())
+                }));
+            }
+        }
+        let report = Report {
+            schema: 1,
+            phase,
+            environment: environment(),
+            cases,
+        };
+        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target")
+            .join(file);
+        fs::create_dir_all(target.parent().unwrap()).expect("target directory");
+        fs::write(
+            &target,
+            serde_json::to_vec_pretty(&report).expect("M0 JSON"),
+        )
+        .expect("M0 report");
+        println!("wrote M0 report to {}", target.display());
+    }
+
+    fn update(root: &Path) {
+        let changed = sorted_repos(root)
+            .unwrap()
+            .into_iter()
+            .filter(|p| fs::read_to_string(p.join("revision")).unwrap().trim() == "B")
+            .count();
+        incr(PerfOp::WorktreesScan);
+        incr(PerfOp::DirectoryEntry);
+        assert!(changed > 0);
+    }
+
+    fn install(root: &Path) {
+        let dst = root.join("installed");
+        fs::create_dir_all(&dst).unwrap();
+        for repo in sorted_repos(root).unwrap() {
+            if repo.file_name().unwrap() == "installed" {
+                continue;
+            }
+            copy_tree(&repo, &dst.join(repo.file_name().unwrap())).unwrap();
+        }
+    }
+
+    fn refresh(root: &Path) {
+        let out = root.join("generation");
+        fs::create_dir_all(&out).unwrap();
+        let mut entries = Vec::new();
+        for repo in sorted_repos(root).unwrap() {
+            if repo.file_name().unwrap() == "generation" {
+                continue;
+            }
+            entries.extend(
+                sorted_repos(&repo)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.display().to_string()),
+            );
+            incr(PerfOp::SnapshotWalk);
+        }
+        entries.sort();
+        fs::write(
+            out.join("generation.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        incr(PerfOp::GenerationWrite);
+        incr(PerfOp::LoaderWrite);
+    }
+
+    #[test]
+    #[ignore = "M0 local benchmark; writes target/update_bench.json"]
+    fn bench_update() {
+        run("update", "update_bench.json", update);
+    }
+
+    #[test]
+    #[ignore = "M0 local benchmark; writes target/install_bench.json"]
+    fn bench_install() {
+        run("install", "install_bench.json", install);
+    }
+
+    #[test]
+    #[ignore = "M0 local benchmark; writes target/snapshot_refresh_bench.json"]
+    fn bench_snapshot_refresh() {
+        run("snapshot_refresh", "snapshot_refresh_bench.json", refresh);
+    }
+
+    #[test]
+    fn reference_copy_gate_matches_final_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), 8).unwrap();
+        let expected = sorted_repos(tmp.path())
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.file_name().unwrap() != "installed")
+            .map(|p| p.file_name().unwrap().to_os_string())
+            .collect::<Vec<_>>();
+        let out = tmp.path().join("gate");
+        fs::create_dir_all(&out).unwrap();
+        for repo in sorted_repos(tmp.path()).unwrap() {
+            if repo
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("repo-")
+            {
+                copy_tree(&repo, &out.join(repo.file_name().unwrap())).unwrap();
+            }
+        }
+        let actual = sorted_repos(&out)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_os_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected, actual,
+            "M0 reference gate: install final tree differs"
+        );
+    }
+
+    #[test]
+    fn reference_failpoint_gate_names_stage() {
+        let stages = [
+            "materialize_before",
+            "materialize_after",
+            "inventory_write_before",
+            "package_rename_before",
+            "generation_metadata_before",
+            "pointer_swap_before",
+            "lock_write_before",
+            "gc_before",
+        ];
+        for stage in stages {
+            let _guard = PerfGuard::install();
+            arm_failpoint(stage);
+            let err = failpoint(stage).expect_err("armed M0 failpoint must fail");
+            assert!(
+                err.to_string().contains(stage),
+                "M0 failpoint gate lost stage name: {stage}"
+            );
+            disarm_failpoint(stage);
+        }
+    }
+}
