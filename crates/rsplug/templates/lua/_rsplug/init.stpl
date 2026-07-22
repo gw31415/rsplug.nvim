@@ -21,6 +21,12 @@ return setmetatable({
 		for _, on_source_id in ipairs(source2pkgid[id] or {}) do
 			require '_rsplug'.packadd(on_source_id)
 		end
+		-- R4: on_lua モジュールが既に読み込まれていれば、root reconcile のために通知する。
+		-- 通知のためにモジュールを require し直さない（package.loaded を見る）。
+		local on_lua = package.loaded['_rsplug/on_lua']
+		if on_lua and on_lua.on_packadd then
+			on_lua.on_packadd(id)
+		end
 	end,
 	startup = function()
 		for _, id in ipairs(startup_plugins) do
@@ -28,52 +34,99 @@ return setmetatable({
 		end
 	end,
 	---@param ft string
+	---v1 / 破損 manifest 互換のフォールバック。runtimepath の ftplugin を3回の
+	---`nvim_get_runtime_file` で舐める（遅い）。有効な v2 manifest では使われない。
 	get_ft_runtime_file = function(ft)
 		local files = vim.api.nvim_get_runtime_file('ftplugin/' .. ft .. '.{vim,lua}', true)
 		files = vim.list_extend(files, vim.api.nvim_get_runtime_file('ftplugin/' .. ft .. '_*.{vim,lua}', true))
 		files = vim.list_extend(files, vim.api.nvim_get_runtime_file('ftplugin/' .. ft .. '/*.{vim,lua}', true))
 		return files
 	end,
-	---@param current vim.api.keyset.get_autocmds.ret
-	---@param old vim.api.keyset.get_autocmds.ret
-	get_new_autocmds = function(current, old)
-		---@param item vim.api.keyset.get_autocmds.ret
-		return vim.tbl_filter(function(item)
-			for _, o in ipairs(old) do
-				if item.id and item.id == o.id then
-					return false
-				end
-				if item.group and item.group == o.group then
-					return false
-				end
-				if item.callback and item.callback == o.callback then
-					return false
-				end
-				local is_same = true
-				for _, property in ipairs { 'buffer', 'buflocal', 'command', 'desc', 'once', 'pattern' } do
-					if item[property] ~= o[property] then
-						is_same = false
-						break
+	---@param ids string[]  ロード対象パッケージ id 一覧
+	---@param ft string
+	---@return string[]  v2 manifest でインデックスされた ftplugin の絶対パス（重複なし・検証済み）
+	get_ft_runtime_files = function(ids, ft)
+		local rsplug = require '_rsplug'
+		local manifest = rsplug.manifest or {}
+		local fttbl = ((manifest.runtime or {}).ftplugin or {})[ft]
+		if not fttbl then return {} end
+		local gen_root = rsplug.gen_root
+		local entries = rsplug.entries or {}
+		local result = {}
+		for _, id in ipairs(ids) do
+			local paths = fttbl[id]
+			if paths then
+				local prefix = 'opt/' .. id .. '/'
+				for _, rel in ipairs(paths) do
+					-- 絶対パス・`..` 成分・entries に無い opt/<id> は拒否する。
+					if rel:sub(1, 1) ~= '/' and rel:sub(1, #prefix) == prefix then
+						local danger = false
+						for comp in rel:gmatch('[^/]+') do
+							if comp == '..' then danger = true; break end
+						end
+						if not danger and entries['opt/' .. id] then
+							local full = gen_root .. '/' .. rel
+							if not vim.list_contains(result, full) then
+								table.insert(result, full)
+							end
+						end
 					end
 				end
-				if is_same then
-					return false
-				end
 			end
-			return true
-		end, current)
+		end
+		return result
+	end,
+	---@param items vim.api.keyset.get_autocmds.ret[]  autocmd レコード一覧
+	---@param excluded_groups table<string,true>  再生対象外（rsplug 所有）グループ名
+	---@return table  `{ by_id = {[id]=true}, groups = {[group]=true} }`（O(n) 1パス）
+	index_autocmds = function(items, excluded_groups)
+		local by_id, groups = {}, {}
+		for _, a in ipairs(items) do
+			if a.id ~= nil then by_id[a.id] = true end
+			if a.group ~= nil and not excluded_groups[a.group] then
+				groups[a.group] = true
+			end
+		end
+		return { by_id = by_id, groups = groups }
+	end,
+	---@param items vim.api.keyset.get_autocmds.ret[]  packadd 後の autocmd 一覧
+	---@param before table  `index_autocmds` の packadd 前スナップショット
+	---@param excluded_groups table<string,true>  rsplug 所有グループ
+	---@return vim.api.keyset.get_autocmds.ret[]  新規 autocmd（Neovim 順序を維持、O(n) 1パス）
+	new_autocmds = function(items, before, excluded_groups)
+		local out = {}
+		for _, a in ipairs(items) do
+			-- 旧 id は除外。rsplug 所有グループも除外（再生しない）。
+			if (a.id ~= nil and before.by_id[a.id]) or (a.group ~= nil and excluded_groups[a.group]) then
+				-- skip
+			else
+				out[#out + 1] = a
+			end
+		end
+		return out
 	end,
 }, {
 	__index = function(t, key)
-		if key ~= 'manifest' then return nil end
-		local source = debug.getinfo(1, 'S').source
-		local script = source:sub(1, 1) == '@' and source:sub(2) or source
-		local manifest_path = vim.fn.fnamemodify(script, ':h:h:h') .. '/manifest.json'
-		local ok, decoded = pcall(function()
-			return vim.json.decode(table.concat(vim.fn.readfile(manifest_path), '\n'))
-		end)
-		local m = (ok and type(decoded) == 'table') and decoded or {}
-		rawset(t, key, m)
-		return m
+		-- manifest / gen_root / entries は同一ファイルから遅延キャッシュする。
+		if key ~= 'manifest' and key ~= 'gen_root' and key ~= 'entries' then
+			return nil
+		end
+		if rawget(t, 'manifest') == nil then
+			local source = debug.getinfo(1, 'S').source
+			local script = source:sub(1, 1) == '@' and source:sub(2) or source
+			-- ファイルは <gen>/opt/<control-id>/manifest.json。
+			local manifest_path = vim.fn.fnamemodify(script, ':h:h:h') .. '/manifest.json'
+			local gen_root = vim.fn.fnamemodify(manifest_path, ':h:h:h')
+			local ok, decoded = pcall(function()
+				return vim.json.decode(table.concat(vim.fn.readfile(manifest_path), '\n'))
+			end)
+			local m = (ok and type(decoded) == 'table') and decoded or {}
+			local entries_set = {}
+			for _, e in ipairs(m.entries or {}) do entries_set[e] = true end
+			rawset(t, 'manifest', m)
+			rawset(t, 'gen_root', gen_root)
+			rawset(t, 'entries', entries_set)
+		end
+		return rawget(t, key)
 	end,
 })

@@ -907,10 +907,22 @@ async fn acquire_install_lock(gen_root: &Path) -> io::Result<std::fs::File> {
 
 const RETAIN_GENERATIONS: usize = 3;
 
-#[derive(Serialize, Deserialize)]
+/// 生成 manifest（R1: v2）。`runtime` は `#[serde(default)]` により、保持されている
+/// v1 manifest（`runtime` 無し）もそのままデシリアライズできる。
+#[derive(Serialize, Deserialize, Default)]
 struct GenerationManifest {
     version: u8,
     entries: Vec<String>,
+    #[serde(default)]
+    runtime: RuntimeManifest,
+}
+
+/// v2 manifest のランタイム側インデックス。現在は ftplugin のみ。
+/// `ftplugin`: `ft -> id -> [opt/<id>/ftplugin/...]`（generation root 相対パス）。
+#[derive(Serialize, Deserialize, Default)]
+struct RuntimeManifest {
+    #[serde(default)]
+    ftplugin: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(TemplateSimple)]
@@ -1262,6 +1274,136 @@ async fn retained_manifest_entries(
     Ok(retained_entries)
 }
 
+/// R1: 公開済み `gen_root/opt/<id>/ftplugin/` を走査し、登録済み `(ft, id)` 対について
+/// ftplugin ファイル一覧（`opt/<id>/ftplugin/...` = generation root 相対）を構築する。
+/// 戻り値は `ft -> id -> [path]`。走査順は Invariants の ft 順序（exact → suffix → subdir）。
+async fn build_ft_index(
+    gen_root: &Path,
+    ft_pairs: &BTreeMap<String, Vec<String>>,
+) -> io::Result<BTreeMap<String, BTreeMap<String, Vec<String>>>> {
+    let opt_root = gen_root.join("opt");
+    let mut out: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for (ft, ids) in ft_pairs {
+        for id in ids {
+            let pkg_ftplugin = opt_root.join(id).join("ftplugin");
+            let paths = collect_ftplugin_files(&pkg_ftplugin, ft, id).await?;
+            if paths.is_empty() {
+                continue;
+            }
+            out.entry(ft.clone()).or_default().insert(id.clone(), paths);
+        }
+    }
+    Ok(out)
+}
+
+/// 1つの `(ft, id)` について `pkg_ftplugin`（=`gen_root/opt/<id>/ftplugin`）配下の
+/// ftplugin ファイルを収集する。3 グループ（exact / `<ft>_*` / `<ft>/`）をこの順で連結し
+/// stable-dedup する。`ftplugin/` または `<ft>/` が無ければ該当グループは空。
+/// ファイル・1段ディレクトリの symlink follow を許容し、それ以外の読み取りエラーは
+/// 不完全な v2 を避けるため `Err` で公開を中断する。
+async fn collect_ftplugin_files(
+    pkg_ftplugin: &Path,
+    ft: &str,
+    id: &str,
+) -> io::Result<Vec<String>> {
+    let prefix = format!("opt/{id}/ftplugin");
+    let mut paths: Vec<String> = Vec::new();
+
+    // ftplugin/ が無ければ ft 依存ファイルは一切無い。
+    if !is_dir_follow(pkg_ftplugin).await? {
+        return Ok(paths);
+    }
+
+    // (1) exact: <ft>.vim, <ft>.lua （この順）
+    for ext in ["vim", "lua"] {
+        let name = format!("{ft}.{ext}");
+        if is_file_follow(&pkg_ftplugin.join(&name)).await? {
+            push_unique(&mut paths, &format!("{prefix}/{name}"));
+        }
+    }
+
+    // (2) 直下の <ft>_*.vim|lua を相対パス昇順
+    let mut suffix_names = read_dir_matching(pkg_ftplugin, ft, true).await?;
+    suffix_names.sort();
+    for name in &suffix_names {
+        push_unique(&mut paths, &format!("{prefix}/{name}"));
+    }
+
+    // (3) <ft>/ ディレクトリ直下の *.vim|lua を相対パス昇順
+    let ft_dir = pkg_ftplugin.join(ft);
+    if is_dir_follow(&ft_dir).await? {
+        let mut child_names = read_dir_matching(&ft_dir, "", false).await?;
+        child_names.sort();
+        for name in &child_names {
+            push_unique(&mut paths, &format!("{prefix}/{ft}/{name}"));
+        }
+    }
+
+    Ok(paths)
+}
+
+/// `dir` 直下のファイル名のうち条件を満たすものを返す。
+/// `ft_prefix=true` なら `<ft>_*.vim|lua`、`false` なら `*.vim|lua`（`ft` 無視）。
+/// `dir` が見つからない（NotFound）場合は空。それ以外の読み取りエラーは伝播する。
+async fn read_dir_matching(dir: &Path, ft: &str, ft_prefix: bool) -> io::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let required_prefix = ft_prefix.then(|| format!("{ft}_"));
+    let rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    let mut entries = Vec::new();
+    let mut rd = rd;
+    while let Some(entry) = rd.next_entry().await? {
+        entries.push(entry);
+    }
+    for entry in entries {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some(p) = &required_prefix
+            && !name.starts_with(p)
+        {
+            continue;
+        }
+        if !(name.ends_with(".vim") || name.ends_with(".lua")) {
+            continue;
+        }
+        // symlink を1段 follow して実体がファイルか確認する。
+        if !is_file_follow(&entry.path()).await? {
+            continue;
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
+/// `path` がファイルか（symlink は follow）。NotFound は false、それ以外は Err を伝播。
+async fn is_file_follow(path: &Path) -> io::Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) => Ok(m.is_file()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// `path` がディレクトリか（symlink は follow）。NotFound は false、それ以外は Err を伝播。
+async fn is_dir_follow(path: &Path) -> io::Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) => Ok(m.is_dir()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// `paths` へ `p` を stable-dedup で追加する（既存なら何もしない）。
+fn push_unique(paths: &mut Vec<String>, p: &str) {
+    if !paths.iter().any(|x| x == p) {
+        paths.push(p.to_string());
+    }
+}
+
 /// PackPath の象徴となる状態。この構造体に PluginLoaded をインサートしていき、最後に実際のパスを指定して install を行う。
 #[derive(Default)]
 pub struct PackPlan {
@@ -1349,6 +1491,9 @@ impl PackPlan {
     /// NOTE: インストール後のディレクトリ構成は以下のようになる。
     /// {packpath}/pack/_gen/opt/{id}/
     pub async fn install(mut self, packpath: &Path) -> io::Result<()> {
+        // R1: control マージが self.ctl を消費する前に、on_ft の (ft,id) を取り出す。
+        // 公開後に gen_root/opt/<id>/ を走査して ftplugin インデックスを構築する。
+        let ft_pairs = self.ctl.ft_index_pairs();
         {
             // LazyRegistration（lazy 実行制御）と分割された doc プラグイン群を control マージで統一する。
             // rsplug-doc・lazy loader・doc 分割群が1つの `_rsplug:doc`（+ 制御パック）に集約される。
@@ -1388,11 +1533,7 @@ impl PackPlan {
             })
             .collect();
         generation_entries.sort();
-        let manifest = GenerationManifest {
-            version: 1,
-            entries: generation_entries,
-        };
-        let manifest_content = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+        // R1: manifest の生成は publish 後（ftplugin インデックス構築の後）へ移動した。
         let mut control_ids: Vec<PluginIDStr> = files
             .iter()
             .filter(|(_, files)| files.is_lazy_registration)
@@ -1536,6 +1677,19 @@ impl PackPlan {
                 tokio::fs::rename(entry.path(), gen_root.join("opt").join(name)).await?;
             }
         }
+
+        // === R1: 公開済み opt/<id>/ を走査し、登録済み (ft,id) の ftplugin インデックスを構築する。===
+        // 新規・再利用パッケージ問わず opt/<id>/ が揃ったこの時点で走査する。読み取りエラーは
+        // 不完全な v2 manifest を避けるため公開全体を中断する。
+        let ftplugin_index = build_ft_index(&gen_root, &ft_pairs).await?;
+        let manifest = GenerationManifest {
+            version: 2,
+            entries: generation_entries,
+            runtime: RuntimeManifest {
+                ftplugin: ftplugin_index,
+            },
+        };
+        let manifest_content = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
 
         // generation manifest を各コントロールパッケージに書く（コントロールは再利用 or
         // 新規 rename 済みで、いずれも opt/<id> にある）。manifest 内容は世代固有。
@@ -1738,11 +1892,172 @@ mod tests {
                 "opt/22222222222222222222222222222222".to_string(),
                 "opt/11111111111111111111111111111111".to_string(),
             ],
+            ..Default::default()
         };
         let parsed = manifest_entries(&manifest);
 
         assert!(parsed.contains("opt/22222222222222222222222222222222".as_bytes()));
         assert!(parsed.contains("opt/11111111111111111111111111111111".as_bytes()));
+    }
+
+    // ---- R1: generation manifest v2 + ft index ----
+
+    #[test]
+    fn manifest_v2_roundtrips_runtime_ftplugin() {
+        let manifest = GenerationManifest {
+            version: 2,
+            entries: vec!["opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+            runtime: RuntimeManifest {
+                ftplugin: BTreeMap::from([(
+                    "lua".to_string(),
+                    BTreeMap::from([(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                        vec![
+                            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua.vim".to_string(),
+                            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua/settings.lua"
+                                .to_string(),
+                        ],
+                    )]),
+                )]),
+            },
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let back: GenerationManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.version, 2);
+        let lua = back.runtime.ftplugin.get("lua").unwrap();
+        let paths = lua.get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        assert_eq!(
+            paths,
+            &vec![
+                "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua.vim".to_string(),
+                "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua/settings.lua".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_v1_manifest_deserializes_without_runtime() {
+        // 保持されている v1 manifest には `runtime` が無い。`#[serde(default)]` で空になる。
+        let v1_json = r#"{"version":1,"entries":["opt/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}"#;
+        let parsed: GenerationManifest = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.entries, vec!["opt/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]);
+        assert!(parsed.runtime.ftplugin.is_empty());
+    }
+
+    const FT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// `gen_root/opt/<id>/ftplugin/` を作り、指定ファイルを配置する。
+    async fn ft_fixture(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("opt").join(FT_ID).join("ftplugin");
+        for (rel, data) in files {
+            let p = base.join(rel);
+            tokio::fs::create_dir_all(p.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(p, data).await.unwrap();
+        }
+        tmp
+    }
+
+    #[tokio::test]
+    async fn build_ft_index_collects_three_groups_sorted_and_dedup() {
+        // exact: lua.vim, lua.lua (この順) / suffix: lua_a.lua, lua_b.vim (ソート) /
+        // subdir: lua/a.lua, lua/x.vim (ソート) / 関係ない foo.txt は除外。
+        let tmp = ft_fixture(&[
+            ("lua.lua", b"x"),
+            ("lua.vim", b"x"),
+            ("lua_b.vim", b"x"),
+            ("lua_a.lua", b"x"),
+            ("lua/x.vim", b"x"),
+            ("lua/a.lua", b"x"),
+            ("foo.txt", b"x"),
+        ])
+        .await;
+        let ft_pairs = BTreeMap::from([("lua".to_string(), vec![FT_ID.to_string()])]);
+        let idx = build_ft_index(tmp.path(), &ft_pairs).await.unwrap();
+        let paths = idx.get("lua").unwrap().get(FT_ID).unwrap();
+        let expected: Vec<String> = [
+            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua.vim",
+            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua.lua",
+            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua_a.lua",
+            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua_b.vim",
+            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua/a.lua",
+            "opt/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ftplugin/lua/x.vim",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(paths, &expected);
+    }
+
+    #[tokio::test]
+    async fn build_ft_index_empty_when_ftplugin_missing() {
+        // ftplugin/ が無ければ空。新規・再利用パッケージ問わず opt/<id> を見る。
+        let tmp = tempfile::tempdir().unwrap();
+        let ft_pairs = BTreeMap::from([("lua".to_string(), vec![FT_ID.to_string()])]);
+        let idx = build_ft_index(tmp.path(), &ft_pairs).await.unwrap();
+        assert!(idx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_ft_index_skips_unrelated_extensions() {
+        let tmp = ft_fixture(&[("lua.vim", b"x"), ("lua_notes.md", b"x")]).await;
+        let ft_pairs = BTreeMap::from([("lua".to_string(), vec![FT_ID.to_string()])]);
+        let idx = build_ft_index(tmp.path(), &ft_pairs).await.unwrap();
+        let paths = idx.get("lua").unwrap().get(FT_ID).unwrap();
+        // .md は対象外。lua_notes.md は lua_* だが .vim/.lua でないので除外。
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("/ftplugin/lua.vim"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_ft_index_aborts_on_read_error() {
+        // root はディレクトリ権限を無視して読めるため、このテストの前提が成立しない。
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // <ft>/ ディレクトリを読めない（権限なし）場合は Err で公開を中断する。
+        let tmp = ft_fixture(&[("lua.vim", b"x")]).await;
+        let ft_dir = tmp
+            .path()
+            .join("opt")
+            .join(FT_ID)
+            .join("ftplugin")
+            .join("lua");
+        tokio::fs::create_dir_all(&ft_dir).await.unwrap();
+        tokio::fs::write(ft_dir.join("a.lua"), b"x").await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = tokio::fs::metadata(&ft_dir).await.unwrap().permissions();
+        perms.set_mode(0o000);
+        tokio::fs::set_permissions(&ft_dir, perms).await.unwrap();
+        let ft_pairs = BTreeMap::from([("lua".to_string(), vec![FT_ID.to_string()])]);
+        let result = build_ft_index(tmp.path(), &ft_pairs).await;
+        // tempdir の cleanup が失敗しないよう権限を戻す。
+        let mut perms = tokio::fs::metadata(&ft_dir).await.unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = tokio::fs::set_permissions(&ft_dir, perms).await;
+        assert!(result.is_err(), "unreadable ft dir must abort publication");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_ft_index_follows_symlink_dir() {
+        // <ft>/ がディレクトリへの symlink でも1段 follow して子を収集する。
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("opt").join(FT_ID).join("ftplugin");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        // 実ディレクトリを別場所に置き、ftplugin/lua を symlink にする。
+        let real = tmp.path().join("real-lua");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::write(real.join("a.lua"), b"x").await.unwrap();
+        tokio::fs::symlink(&real, base.join("lua")).await.unwrap();
+        let ft_pairs = BTreeMap::from([("lua".to_string(), vec![FT_ID.to_string()])]);
+        let idx = build_ft_index(tmp.path(), &ft_pairs).await.unwrap();
+        let paths = idx.get("lua").unwrap().get(FT_ID).unwrap();
+        assert!(paths.iter().any(|p| p.ends_with("/ftplugin/lua/a.lua")));
     }
 
     // ---- identity / hash 安全性 (PLANS §15.1) ----

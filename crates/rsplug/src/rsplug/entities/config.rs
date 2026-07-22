@@ -563,6 +563,15 @@ pub struct KeyPattern(pub BTreeMap<ModeChar, Vec<Arc<String>>>);
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct ModeChar(Option<char>);
 
+impl ModeChar {
+    /// 指定文字（`None` で全モード `''`）から構築する。
+    /// フィールドは非公開のため、テストフィクスチャ等の外部生成はこれを経由する。
+    #[cfg(test)]
+    pub(super) fn new(c: Option<char>) -> Self {
+        ModeChar(c)
+    }
+}
+
 impl std::fmt::Display for ModeChar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {

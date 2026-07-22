@@ -43,7 +43,7 @@ end
 
 local function all_loaded(ids)
 	for _, id in ipairs(ids) do
-		if not require '_rsplug'.loaded[id] then
+		if not require('_rsplug').loaded[id] then
 			return false
 		end
 	end
@@ -59,81 +59,131 @@ local pattern_ids = {}
 -- id_patterns[id] = { pattern1, pattern2, ... }
 local id_patterns = {}
 
-return {
-	---@param mode string
-	setup = function(mode)
-		for _, mode_char in ipairs(parse_mode(mode)) do
-			if not setup_done[mode_char] then
-				setup_done[mode_char] = true
-				local exists, mod = pcall(require, '_rsplug/on_map/mode_' .. mode_char)
-				for pattern, ids in pairs(exists and mod or {}) do
-					-- Skip setup if plugin is already loaded (real mappings exist)
-					if all_loaded(ids) then
-						goto continue
-					end
+local M = {}
+-- 到達可能モードのうち未 setup のもの。plugin/on_map.stpl が設定する。
+M.pending_modes = {}
 
-					-- Track that this pattern is set up in this mode
-					if not pattern_modes[pattern] then
-						pattern_modes[pattern] = {}
-						pattern_ids[pattern] = {}
-					end
-					table.insert(pattern_modes[pattern], mode_char)
-					-- Collect all unique plugin IDs for this pattern
-					for _, id in ipairs(ids) do
-						add_unique(pattern_ids[pattern], id)
-						-- Track reverse mapping: plugin ID to patterns
-						if not id_patterns[id] then
-							id_patterns[id] = {}
-						end
-						add_unique(id_patterns[id], pattern)
-					end
-
-					vim.keymap.set(mode_char, pattern, function()
-						-- Get all plugin IDs for this pattern
-						local all_ids = pattern_ids[pattern] or ids
-
-						-- If plugin is already loaded, delete only this mapping and feed keys
-						if all_loaded(all_ids) then
-							pcall(vim.keymap.del, mode_char, pattern, {})
-							vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
-							return ''
-						end
-
-						-- Collect all patterns that need to be deleted
-						-- (all patterns associated with the plugins being loaded)
-						local patterns_to_delete = {}
-						for _, id in ipairs(all_ids) do
-							local related_patterns = id_patterns[id] or {}
-							for _, related_pattern in ipairs(related_patterns) do
-								patterns_to_delete[related_pattern] = true
-							end
-						end
-
-						-- Delete all related pattern mappings in all their modes
-						for pattern_to_delete, _ in pairs(patterns_to_delete) do
-							local modes = pattern_modes[pattern_to_delete] or {}
-							for _, m in ipairs(modes) do
-								pcall(vim.keymap.del, m, pattern_to_delete, {})
-							end
-							-- Clear tracking for this pattern
-							pattern_modes[pattern_to_delete] = nil
-							pattern_ids[pattern_to_delete] = nil
-						end
-
-						-- Load all plugins that registered this pattern
-						for _, id in ipairs(all_ids) do
-							require '_rsplug'.packadd(id)
-							-- Clear tracking for this plugin ID
-							id_patterns[id] = nil
-						end
-
-						vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
-						return ''
-					end, { expr = true, silent = true })
-
-					::continue::
-				end
+---pattern 関連の追跡を一括クリアする（pattern_modes / pattern_ids / 当該 pattern を含む id_patterns エントリ）。
+local function remove_pattern(pattern)
+	pattern_modes[pattern] = nil
+	pattern_ids[pattern] = nil
+	for _, plist in pairs(id_patterns) do
+		for i = #plist, 1, -1 do
+			if plist[i] == pattern then
+				table.remove(plist, i)
 			end
 		end
-	end,
-}
+	end
+end
+
+---全 pending モードが setup されたら watcher 用 augroup を削除する。pcall ガード・冪等。
+function M.retire()
+	if M._retired then
+		return
+	end
+	if next(M.pending_modes) ~= nil then
+		return
+	end
+	M._retired = true
+	-- nvim_del_augroup は存在しないことがあるため by_name を使う。
+	pcall(vim.api.nvim_del_augroup_by_name, 'rsplug.runtime.on_map')
+end
+
+---@param mode string
+function M.setup(mode)
+	for _, mode_char in ipairs(parse_mode(mode)) do
+		-- 到達可能かつ未 setup かつ pending のモードだけ処理する。
+		if not setup_done[mode_char] and M.pending_modes[mode_char] then
+			setup_done[mode_char] = true
+			M.pending_modes[mode_char] = nil
+			local exists, mod = pcall(require, '_rsplug/on_map/mode_' .. mode_char)
+			for pattern, ids in pairs(exists and mod or {}) do
+				-- Skip setup if plugin is already loaded (real mappings exist)
+				if all_loaded(ids) then
+					goto continue
+				end
+
+				-- Track that this pattern is set up in this mode
+				if not pattern_modes[pattern] then
+					pattern_modes[pattern] = {}
+					pattern_ids[pattern] = {}
+				end
+				table.insert(pattern_modes[pattern], mode_char)
+				-- Collect all unique plugin IDs for this pattern
+				for _, id in ipairs(ids) do
+					add_unique(pattern_ids[pattern], id)
+					-- Track reverse mapping: plugin ID to patterns
+					if not id_patterns[id] then
+						id_patterns[id] = {}
+					end
+					add_unique(id_patterns[id], pattern)
+				end
+
+				vim.keymap.set(mode_char, pattern, function()
+					-- Get all plugin IDs for this pattern
+					local all_ids = pattern_ids[pattern] or ids
+
+					-- If plugin is already loaded, delete only this mapping and feed keys
+					if all_loaded(all_ids) then
+						pcall(vim.keymap.del, mode_char, pattern, {})
+						vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
+						return ''
+					end
+
+					-- Collect all patterns that need to be deleted
+					-- (all patterns associated with the plugins being loaded)
+					local patterns_to_delete = {}
+					for _, id in ipairs(all_ids) do
+						local related_patterns = id_patterns[id] or {}
+						for _, related_pattern in ipairs(related_patterns) do
+							patterns_to_delete[related_pattern] = true
+						end
+					end
+
+					-- Delete all related pattern mappings in all their modes
+					for pattern_to_delete, _ in pairs(patterns_to_delete) do
+						local modes = pattern_modes[pattern_to_delete] or {}
+						for _, m in ipairs(modes) do
+							pcall(vim.keymap.del, m, pattern_to_delete, {})
+						end
+						-- Clear tracking for this pattern (centralized removal)
+						remove_pattern(pattern_to_delete)
+					end
+
+					-- Load all plugins that registered this pattern
+					for _, id in ipairs(all_ids) do
+						require('_rsplug').packadd(id)
+						-- Clear tracking for this plugin ID
+						id_patterns[id] = nil
+					end
+
+					vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
+					return ''
+				end, { expr = true, silent = true })
+
+				::continue::
+			end
+			M.retire()
+		end
+	end
+end
+
+---ModeChanged コールバック。new_mode を parse し、pending モードと一致したときだけ
+---setup する。一致が無ければモジュールを require せず復帰する（全モード走査しない）。
+---@param new_mode string
+function M.on_mode_changed(new_mode)
+	local chars = parse_mode(new_mode)
+	local hit = false
+	for _, c in ipairs(chars) do
+		if M.pending_modes[c] then
+			hit = true
+			break
+		end
+	end
+	if not hit then
+		return
+	end
+	M.setup(new_mode)
+end
+
+return M
