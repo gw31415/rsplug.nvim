@@ -430,13 +430,16 @@ impl Plugin {
         http_client: reqwest::Client,
     ) -> Result<Option<(LoadedPlugin, Option<(String, String)>)>, Error> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
+        let network = adaptive_semaphore::NetworkLimits::new(semaphore, 16);
+        let breaker = util::github::CircuitBreaker::new();
         let early = self
             .load_early(
                 install,
                 update,
                 &cache_dir,
                 locked_rev.as_deref(),
-                &semaphore,
+                &network,
+                &breaker,
                 &http_client,
             )
             .await?;
@@ -447,13 +450,15 @@ impl Plugin {
     /// `lazy_type` を一切使わない（FACT 1）。ストリーミングでは per-TOML 到着時・rev 解決直後
     /// から実行可能。`&self` で repo/source 情報を読み、materialize 成果物を [`EarlyOutcome`]
     /// で返す（戻りは `self` に依存しない owned データのみ）。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load_early(
         &self,
         install: bool,
         update: bool,
         cache_dir: &Path,
         locked_rev: Option<&str>,
-        semaphore: &adaptive_semaphore::AdaptiveSemaphore,
+        network: &adaptive_semaphore::NetworkLimits,
+        breaker: &util::github::CircuitBreaker,
         http_client: &reqwest::Client,
     ) -> Result<EarlyOutcome, Error> {
         use super::util::git;
@@ -510,22 +515,22 @@ impl Plugin {
         let dotgit = self.cache.dotgit;
 
         // --- ステージ1: target commit 解決（install/update/locked の分岐とリモート解決） ---
-        let RevOutcome {
-            oid,
-            was_updated,
-            was_installed,
-        } = match resolve_target_commit(
+        // ResolvedRevision は oid/旧 OID/変更状態/バックエンドを一度で運ぶ (PLANS U2 step 7)。
+        // EARLY で使うのは oid と was_updated/was_installed のみ（LATE/main が残りを参照可能）。
+        let revision @ ResolvedRevision { oid, .. } = match resolve_target_commit(
             &worktrees,
             &url,
             &rev,
             &token,
-            semaphore,
+            network,
+            breaker,
             http_client,
             install,
             update,
             locked_rev,
             &self.source_name,
             &logid,
+            canonical.clone(),
         )
         .await?
         {
@@ -549,7 +554,7 @@ impl Plugin {
             source_git: &source_git,
             token: &token,
             source_name: &self.source_name,
-            semaphore,
+            network,
             http_client,
             install,
             update,
@@ -620,6 +625,7 @@ impl Plugin {
         Ok(EarlyOutcome::Materialized {
             guard,
             outcome: MaterializeOutcome {
+                revision,
                 worktree_path,
                 repository,
                 has_build,
@@ -628,8 +634,6 @@ impl Plugin {
                 final_root,
                 cachedir,
                 head_rev_str,
-                was_updated,
-                was_installed,
                 logid,
                 repo_name,
                 canonical,
@@ -681,6 +685,7 @@ impl Plugin {
                 // RunningGuard は LATE 相の終了まで保持（従来 Plugin::load スコープと同一ライフサイクル）。
                 let _guard = guard;
                 let MaterializeOutcome {
+                    revision,
                     worktree_path,
                     mut repository,
                     has_build,
@@ -689,12 +694,28 @@ impl Plugin {
                     final_root,
                     cachedir,
                     head_rev_str,
-                    was_updated,
-                    was_installed,
                     logid,
                     repo_name,
                     canonical,
                 } = outcome;
+                let ResolvedRevision {
+                    canonical: revision_canonical,
+                    backend,
+                    old_oid,
+                    status,
+                    was_updated,
+                    was_installed,
+                    ..
+                } = revision;
+                let changed = matches!(status, ChangeStatus::Changed);
+                debug_assert_eq!(revision_canonical, canonical);
+                debug_assert_eq!(
+                    was_updated,
+                    update && changed && old_oid.is_some() && !was_installed
+                );
+                // Keep the resolution backend in the carried outcome even though
+                // the current publisher only needs the deterministic change bit.
+                let _resolution_backend = backend;
 
                 let Plugin {
                     source_name,
@@ -853,11 +874,41 @@ impl Plugin {
     }
 }
 
-/// target commit 解決の結果（ステージ1）。`resolve_target_commit` の `Ok(None)` が
-/// `Plugin::load` のスキップ（`Ok(None)`）を表す。
-struct RevOutcome {
+/// リモート解決のバックエンド (PLANS U2 step 7)。
+#[derive(Clone, Copy, Debug)]
+enum ResolutionBackend {
+    /// lockfile / preresolved OID（GraphQL・full-hash rev 含む）。リモート解決なし。
+    Locked,
+    /// 既存 snapshot の commit 再利用（リモート解決なし、no-change）。
+    Cached,
+    /// GitHub REST API で解決。
+    Api,
+    /// git smart HTTP / ls-remote で解決。
+    Git,
+}
+
+/// リポジトリの変更状態 (PLANS U2 step 7)。`Missing`（= 未インストールでスキップ）は
+/// `resolve_target_commit` の `Ok(None)` で表現する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangeStatus {
+    /// OID が変化した、または新規 install。
+    Changed,
+    /// 既存 snapshot と同一 OID（更新不要）。
+    Unchanged,
+}
+
+/// target commit 解決の結果（ステージ1, PLANS U2 step 7）。canonical ID・OID・解決バックエンド・
+/// 旧 OID・変更状態を運び、LATE/main がインストール状態を再計算せずに変更選別できるようにする。
+/// `resolve_target_commit` の `Ok(None)` が `Plugin::load` のスキップ（`Ok(None)`）を表す。
+struct ResolvedRevision {
+    canonical: String,
     oid: Oid,
+    backend: ResolutionBackend,
+    old_oid: Option<Oid>,
+    status: ChangeStatus,
+    /// 従来通り lua_post_update 実行判定・通知に使う。
     was_updated: bool,
+    /// 従来通り 新規 install 通知に使う。
     was_installed: bool,
 }
 
@@ -866,6 +917,9 @@ struct RevOutcome {
 /// は一切含まない**（FACT 1: fetch/materialize/identity-core は依存不要）。LATE 相がこれと
 /// 確定済み `Plugin` フィールドで build/assemble を行う。
 pub(crate) struct MaterializeOutcome {
+    /// Resolved target and deterministic changed selection carried from EARLY.
+    /// LATE does not re-read installed state or recompute the remote result.
+    revision: ResolvedRevision,
     /// materialize 済み worktree。`has_build` なら一時 `building` worktree、
     /// それ以外（reuse/no-build）は `final_root` と同一。
     worktree_path: Arc<Path>,
@@ -884,9 +938,6 @@ pub(crate) struct MaterializeOutcome {
     cachedir: PathBuf,
     /// HEAD commit ハッシュ文字列（identity・lock_info 用）。
     head_rev_str: String,
-    /// 更新検知（lua_post_update 実行・通知用）。
-    was_updated: bool,
-    was_installed: bool,
     /// ログ/エラー表示用。
     logid: String,
     repo_name: Arc<str>,
@@ -895,6 +946,7 @@ pub(crate) struct MaterializeOutcome {
 }
 
 /// EARLY 相の結果。LATE 相への引き継ぎを3ケースで表現する。
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum EarlyOutcome {
     /// repo 無し（script-only）。LATE で `LoadedPlugin` を構築
     /// （`order`/`lazy_type` は resolve 確定済みなので plugin_id は安定）。
@@ -919,7 +971,10 @@ pub(crate) enum EarlyOutcome {
 /// install は未インストールならリモートから新規 fetch する。それ以外(通常起動) は既存 snapshot
 /// の commit をそのまま使い、無ければスキップ。
 ///
-/// `Ok(None)` = スキップ（未インストール等）。
+/// 戻り [`ResolvedRevision`] は canonical ID・OID・バックエンド・旧 OID・変更状態を運び、
+/// 以降の LATE/main がインストール状態を再計算せずに変更選別できるようにする (PLANS U2 step 7)。
+/// `Ok(None)` = スキップ（未インストール等）。ネットワーク許可・サンプル計上は
+/// [`resolve_remote_oid`] 内の [`NetworkLimits::run`] に一元化し、ここではpermit を保持しない。
 // Plugin::load からの抽出。引数過多は LoadCtx 構造体化（巨大化）より局所的と判断し allow する。
 #[allow(clippy::too_many_arguments)]
 async fn resolve_target_commit(
@@ -927,20 +982,22 @@ async fn resolve_target_commit(
     url: &Arc<str>,
     rev: &Option<Arc<str>>,
     token: &Option<Arc<str>>,
-    semaphore: &adaptive_semaphore::AdaptiveSemaphore,
+    network: &adaptive_semaphore::NetworkLimits,
+    breaker: &util::github::CircuitBreaker,
     http_client: &reqwest::Client,
     install: bool,
     update: bool,
     locked_rev: Option<&str>,
     source_name: &Option<String>,
     logid: &str,
-) -> Result<Option<RevOutcome>, Error> {
+    canonical: String,
+) -> Result<Option<ResolvedRevision>, Error> {
     use crate::log::{Message, msg};
 
     let invalid_data =
         |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
 
-    let (oid, was_updated, was_installed) = if let Some(locked_rev) = locked_rev {
+    let resolved = if let Some(locked_rev) = locked_rev {
         if !util::github::is_full_hex_hash(locked_rev) {
             return Err(invalid_data(format!(
                 "Locked revision must be full hash for {}: got {}",
@@ -956,8 +1013,31 @@ async fn resolve_target_commit(
         match latest_snapshot_oid(worktrees).await? {
             // インストール済み。update=true なら preresolved: 既存 snapshot と比較して
             // 「実際に更新された」を立て、lua_post_update を実行させる（新規 fetch 時のみ）。
-            Some(existing) => (oid, update && existing != oid, false),
-            None if install => (oid, false, true),
+            Some(existing) => {
+                let was_updated = update && existing != oid;
+                ResolvedRevision {
+                    canonical,
+                    oid,
+                    backend: ResolutionBackend::Locked,
+                    old_oid: Some(existing),
+                    status: if was_updated {
+                        ChangeStatus::Changed
+                    } else {
+                        ChangeStatus::Unchanged
+                    },
+                    was_updated,
+                    was_installed: false,
+                }
+            }
+            None if install => ResolvedRevision {
+                canonical,
+                oid,
+                backend: ResolutionBackend::Locked,
+                old_oid: None,
+                status: ChangeStatus::Changed,
+                was_updated: false,
+                was_installed: true,
+            },
             None if update => {
                 // 未インストール + --update 単独: 新規 install はしない
                 // （防御。通常は main.rs で GraphQL 対象外になり、この経路には来ない）。
@@ -978,20 +1058,49 @@ async fn resolve_target_commit(
     } else {
         match latest_snapshot_oid(worktrees).await? {
             Some(existing) if update => {
-                let _permit = semaphore.acquire().await;
                 msg(Message::Cache("Updating", url.clone()));
-                let oid = resolve_remote_oid(http_client, url, rev, token).await?;
+                let (oid, backend) =
+                    resolve_remote_oid(network, breaker, http_client, url, rev, token).await?;
                 msg(Message::Cache("Updating:done", url.clone()));
                 // リモートの最新 rev が既存 snapshot と異なれば「実際に更新された」。
-                (oid, existing != oid, false)
+                let was_updated = existing != oid;
+                ResolvedRevision {
+                    canonical,
+                    oid,
+                    backend,
+                    old_oid: Some(existing),
+                    status: if was_updated {
+                        ChangeStatus::Changed
+                    } else {
+                        ChangeStatus::Unchanged
+                    },
+                    was_updated,
+                    was_installed: false,
+                }
             }
-            Some(existing) => (existing, false, false),
+            Some(existing) => ResolvedRevision {
+                canonical,
+                oid: existing,
+                backend: ResolutionBackend::Cached,
+                old_oid: Some(existing),
+                status: ChangeStatus::Unchanged,
+                was_updated: false,
+                was_installed: false,
+            },
             None if install => {
-                let _permit = semaphore.acquire().await;
                 msg(Message::Cache("Updating", url.clone()));
-                let oid = resolve_remote_oid(http_client, url, rev, token).await?;
+                let (oid, backend) =
+                    resolve_remote_oid(network, breaker, http_client, url, rev, token).await?;
                 msg(Message::Cache("Updating:done", url.clone()));
-                (oid, false, true)
+                ResolvedRevision {
+                    canonical,
+                    oid,
+                    backend,
+                    old_oid: None,
+                    status: ChangeStatus::Changed,
+                    was_updated: false,
+                    was_installed: true,
+                }
             }
             None => {
                 // 未インストール。install も update(既存更新) も対象外なのでスキップ。
@@ -1003,11 +1112,7 @@ async fn resolve_target_commit(
             }
         }
     };
-    Ok(Some(RevOutcome {
-        oid,
-        was_updated,
-        was_installed,
-    }))
+    Ok(Some(resolved))
 }
 
 /// ステージ6: snapshot から `LoadedPlugin` を構築する（**plugin_id 決定の核心**）。
@@ -1113,7 +1218,7 @@ struct FetchCtx<'a> {
     source_git: &'a Path,
     token: &'a Option<Arc<str>>,
     source_name: &'a Option<String>,
-    semaphore: &'a adaptive_semaphore::AdaptiveSemaphore,
+    network: &'a adaptive_semaphore::NetworkLimits,
     http_client: &'a reqwest::Client,
     install: bool,
     update: bool,
@@ -1121,41 +1226,82 @@ struct FetchCtx<'a> {
     logid: &'a str,
 }
 
-/// リモートの最新コミットハッシュを解決する。
-/// GitHub HTTPS + token の場合は REST API（軽量・1リクエスト）を試行し、
-/// 失敗・ワイルドカード ref・レートリミット残量不足時は git protocol にフォールバックする。
-/// それ以外は常に git protocol (`ls_remote`) を使う。
+/// リモートの最新コミットハッシュを解決する (PLANS U2 step 5)。
+///
+/// GitHub HTTPS + token かつサーキットブレーカーが閉じていれば REST API（軽量・1リクエスト）
+/// を試行する。一時エラー（5xx・ネットワーク）は少額の決定的再試行予算内で再試行し、
+/// レートリミットはブレーカーを開いて Git フォールバックへ、認証/404/無効 ref は即フォールバック
+/// する（盲目的再試行しない）。ワイルドカード ref・ブレーカー開放時は Git に直行する。
+/// いずれの経路も最終的に git protocol (`ls_remote`) で解決する。戻り値は OID と使用バックエンド。
+///
+/// 各ネットワーク操作（API 解決・ls-remote）は [`NetworkLimits::run`] を通過し、
+/// global 上限 + per-host 上限の許可を 1 つずつ消費して適応サンプルを正確に 1 つ寄与する。
 async fn resolve_remote_oid(
+    network: &adaptive_semaphore::NetworkLimits,
+    breaker: &util::github::CircuitBreaker,
     http_client: &reqwest::Client,
     url: &Arc<str>,
     rev: &Option<Arc<str>>,
     token: &Option<Arc<str>>,
-) -> Result<Oid, Error> {
+) -> Result<(Oid, ResolutionBackend), Error> {
     use super::util::{git, github};
 
-    // GitHub HTTPS + token なら REST API を試行
-    if github::supports_tarball(url) && token.is_some() {
-        // ワイルドカード ref（`*` を含む）は REST API で解決できない → git protocol
+    const API_HOST: &str = "api.github.com";
+    const MAX_TRANSIENT_RETRIES: usize = 2;
+
+    // GitHub HTTPS + token かつブレーカー閉鎖時のみ REST API を試行。
+    if github::supports_tarball(url) && token.is_some() && !breaker.is_open() {
+        // ワイルドカード ref（`*` を含む）は REST API で解決できない → git protocol。
         let is_wildcard = rev.as_deref().is_some_and(|r| r.contains('*'));
         if !is_wildcard {
-            match github::resolve_rev_via_api(http_client, url, rev.as_deref(), token.as_deref())
-                .await
-            {
-                Ok(oid_str) => {
-                    return Oid::from_str(&oid_str).map_err(Error::Git2);
-                }
-                Err(github::ApiError::RateLimited) => {
-                    // レートリミット残量不足 → git protocol にフォールバック
-                }
-                Err(github::ApiError::Other(_)) => {
-                    // API エラー（404, ネットワーク等）→ git protocol にフォールバック
+            let mut attempt = 0usize;
+            loop {
+                let result = network
+                    .run(API_HOST, async {
+                        github::resolve_rev_via_api(
+                            http_client,
+                            url,
+                            rev.as_deref(),
+                            token.as_deref(),
+                        )
+                        .await
+                    })
+                    .await;
+                match result {
+                    Ok(oid_str) => {
+                        let oid = Oid::from_str(&oid_str).map_err(Error::Git2)?;
+                        return Ok((oid, ResolutionBackend::Api));
+                    }
+                    Err(err) => {
+                        match github::api_error_policy(&err, attempt, MAX_TRANSIENT_RETRIES) {
+                            github::ApiFallbackPolicy::Retry => {
+                                tokio::time::sleep(github::transient_backoff(attempt)).await;
+                                attempt += 1;
+                            }
+                            github::ApiFallbackPolicy::RateLimited => {
+                                // レートリミット → ブレーカーを開き、以降は Git フォールバックへ直行。
+                                breaker.trip();
+                                break;
+                            }
+                            github::ApiFallbackPolicy::GiveUp => {
+                                // 認証/404/その他、または一時エラー予算切れ → Git フォールバック。
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    // フォールバック: git smart HTTP protocol (ls_remote)
-    git::ls_remote(url.clone(), rev.clone(), token.clone()).await
+    // フォールバック: git smart HTTP protocol (ls_remote)。ホスト別上限の下で実行。
+    let host = util::repo::host_of(url);
+    let oid = network
+        .run(&host, async {
+            git::ls_remote(url.clone(), rev.clone(), token.clone()).await
+        })
+        .await?;
+    Ok((oid, ResolutionBackend::Git))
 }
 
 /// 戻り値 `Ok(true)` = source.git に oid を fetch 済み、`Ok(false)` = 未インストールなのでスキップ。
@@ -1188,7 +1334,10 @@ async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
     {
         let _git = super::util::resources::git().await?;
         msg(Message::Cache("Fetching", ctx.url.clone()));
-        repo.fetch_oid(ctx.oid, ctx.token.clone()).await?;
+        let host = util::repo::host_of(ctx.url);
+        ctx.network
+            .run(&host, repo.fetch_oid(ctx.oid, ctx.token.clone()))
+            .await?;
         msg(Message::Cache("Fetching:done", ctx.url.clone()));
     }
     Ok(true)
@@ -1217,16 +1366,19 @@ async fn materialize(
 
     if use_tarball {
         let tarball_ok = {
-            let _permit = ctx.semaphore.acquire().await;
             msg(Message::Cache("Fetching", ctx.url.clone()));
             let head_rev = ctx.oid.to_string();
-            match TarballFetch
-                .fetch_to_snapshot(
-                    ctx.http_client,
-                    ctx.url.as_ref(),
-                    &head_rev,
-                    dest,
-                    ctx.token.as_deref(),
+            match ctx
+                .network
+                .run(
+                    "codeload.github.com",
+                    TarballFetch.fetch_to_snapshot(
+                        ctx.http_client,
+                        ctx.url.as_ref(),
+                        &head_rev,
+                        dest,
+                        ctx.token.as_deref(),
+                    ),
                 )
                 .await
             {
