@@ -267,6 +267,22 @@ Default paths below `~/.cache/rsplug/` are `init.lua`, `repos/`,
 - [GitHub issues](https://github.com/gw31415/rsplug.nvim/issues) — known work
   and discussions.
 
+## Development measurements
+
+The runtime characterization benchmark is intentionally ignored and is not a
+CI performance gate. Run it with:
+
+```bash
+cargo test -p rsplug bench_runtime_hot_paths -- --ignored --nocapture
+```
+
+It writes `target/runtime_hot_paths_bench.json`. Each result retains all five
+samples, reports the sorted-sample median and p95 (therefore p95 is the
+maximum with five samples), and includes scale, iteration count, and
+deterministic structural API counters. The require workload also records an
+otherwise identical control with the rsplug searcher temporarily removed; the
+reported delta is workload- and machine-dependent.
+
 ## Updates
 
 The current release includes bounded parallel work, staged GitHub tarball

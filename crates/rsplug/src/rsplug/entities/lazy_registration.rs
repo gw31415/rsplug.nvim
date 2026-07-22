@@ -1238,36 +1238,39 @@ mod runtime_hot_paths {
     #[tokio::test]
     #[ignore = "non-gating benchmark: run with --ignored"]
     async fn bench_runtime_hot_paths() {
-        // 1k ftplugin（lua_NNN.lua, suffix 形）+ lua root + map + event を1パッケージに。
+        // 4k ftplugin（lua_NNN.lua, suffix 形）+ lua root + map + event を1パッケージに。
         // 静的ライフタイム要件があるため、ファイル名/内容は Box::leak で 'static に保持する
         // （ignored ベンチマークなので解放しない）。
-        let mut files: Vec<(&'static str, &'static [u8])> = Vec::with_capacity(1002);
-        for i in 0..1000u32 {
-            let name: &'static str = Box::leak(format!("ftplugin/lua_{i:03}.lua").into_boxed_str());
-            let data: &'static [u8] = Box::leak(b"-- bench\n".to_vec().into_boxed_slice());
-            files.push((name, data));
+        let mut plugins = Vec::with_capacity(4);
+        for package in 0..4u32 {
+            let mut files = Vec::with_capacity(1002);
+            for i in 0..1000u32 {
+                let name: &'static str =
+                    Box::leak(format!("ftplugin/lua_{package}_{i:03}.lua").into_boxed_str());
+                let data: &'static [u8] = Box::leak(b"-- bench\n".to_vec().into_boxed_slice());
+                files.push((name, data));
+            }
+            files.push(("plugin/init.lua", b"vim.g.bench_pkg = true"));
+            files.push(("lua/mymod/init.lua", b"vim.g.bench_lua = true\nreturn {}\n"));
+            plugins.push(FakePlugin {
+                tag: Box::leak(format!("bench_pkg_{package}").into_boxed_str()),
+                files,
+                lazy: vec![
+                    FakeLazy::Event("R0BenchEv"),
+                    FakeLazy::Ft("lua"),
+                    FakeLazy::Lua("mymod"),
+                    FakeLazy::Map {
+                        mode: Some('n'),
+                        pattern: "zL",
+                    },
+                ],
+            });
         }
-        files.push(("plugin/init.lua", b"vim.g.bench_pkg = true"));
-        files.push(("lua/mymod/init.lua", b"vim.g.bench_lua = true\nreturn {}\n"));
-        let lazy = vec![
-            FakeLazy::Event("R0BenchEv"),
-            FakeLazy::Ft("lua"),
-            FakeLazy::Lua("mymod"),
-            FakeLazy::Map {
-                mode: Some('n'),
-                pattern: "zL",
-            },
-        ];
-        let pack = build_pack(vec![FakePlugin {
-            tag: "bench_pkg",
-            files,
-            lazy,
-        }])
-        .await
-        .expect("build_pack");
+        let pack = build_pack(plugins).await.expect("build_pack");
 
         let out = nvim_output(&pack, "bench", "");
-        // BENCH <name> samples=N median_ns=.. min_ns=.. max_ns=.. ft_count=N
+        // BENCH <name> scale=N iterations=N samples=N median_ns=.. p95_ns=..
+        //   min_ns=.. max_ns=.. api_counts=<json> ft_count=N
         let mut json = String::from("{\n  \"benchmarks\": {\n");
         let mut first = true;
         for line in out.lines() {
@@ -1287,12 +1290,17 @@ mod runtime_hot_paths {
                 json.push_str(",\n");
             }
             first = false;
+            let api_counts = fields.get("api_counts").copied().unwrap_or("{}");
             json.push_str(&format!(
-                "    \"{name}\": {{\"samples\":{s}, \"median_ns\":{med}, \"min_ns\":{mn}, \"max_ns\":{mx}}}",
+                "    \"{name}\": {{\"scale\":{scale}, \"iterations\":{iterations}, \"samples\":{s}, \"median_ns\":{med}, \"p95_ns\":{p95}, \"min_ns\":{mn}, \"max_ns\":{mx}, \"delta_ns\":{delta}, \"api_counts\":{api_counts}}}",
+                scale = fields.get("scale").copied().unwrap_or("0"),
+                iterations = fields.get("iterations").copied().unwrap_or("0"),
                 s = fields.get("samples").copied().unwrap_or("0"),
                 med = fields.get("median_ns").copied().unwrap_or("0"),
+                p95 = fields.get("p95_ns").copied().unwrap_or("0"),
                 mn = fields.get("min_ns").copied().unwrap_or("0"),
                 mx = fields.get("max_ns").copied().unwrap_or("0"),
+                delta = fields.get("delta_ns").copied().unwrap_or("0"),
             ));
         }
         json.push_str("\n  }\n}\n");

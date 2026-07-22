@@ -1029,8 +1029,14 @@ session afterward.
 
 ## Progress
 
-Planning and baseline inspection are complete. No production implementation in
-this plan has started.
+Planning and baseline inspection are complete. M0 runtime measurement work is
+implemented: the Lua harness now computes a sorted-sample median and p95,
+records the requested scale/iteration fields and deterministic API counters,
+and compares the active rsplug require searcher with an otherwise identical
+temporarily removed-searcher control. The ignored benchmark produced
+`target/runtime_hot_paths_bench.json` on 2026-07-22. The update, install, and
+snapshot-refresh reports and structural counter infrastructure remain to be
+implemented; U1 and later production milestones have not started.
 
 ## Discoveries and decision log
 

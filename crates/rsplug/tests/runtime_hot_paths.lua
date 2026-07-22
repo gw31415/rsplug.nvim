@@ -397,84 +397,131 @@ scenarios.event_diff_two_queries = function()
 end
 
 -- Validation bench（非gating）: 各ホットパスを5サンプルで計測し BENCH 行を出力する。
--- 入力規模は autocmd 1k / ft 1k / require 10k / mode 10k。
+-- サンプルは保持してソートする。5サンプルでは p95 は最大値になる。
 scenarios.bench = function()
 	boot()
 	local ctl = require '_rsplug'
 	local uv = vim.uv or vim.loop
 	local hr = uv.hrtime
 	local samples = 5
+	local function encode_counts(counts)
+		local keys = {}
+		for key in pairs(counts) do keys[#keys + 1] = key end
+		table.sort(keys)
+		local fields = {}
+		for _, key in ipairs(keys) do
+			fields[#fields + 1] = vim.json.encode(key) .. ':' .. tostring(counts[key])
+		end
+		return '{' .. table.concat(fields, ',') .. '}'
+	end
 
-	local function measure(name, fn)
-		local total, mn, mx = 0, math.huge, 0
+	local function measure(name, scale, iterations, api_counts, fn)
+		local values = {}
 		for _ = 1, samples do
 			local t0 = hr()
 			fn()
 			local dt = hr() - t0
-			total = total + dt
-			if dt < mn then
-				mn = dt
-			end
-			if dt > mx then
-				mx = dt
-			end
+			values[#values + 1] = dt
 		end
+		table.sort(values)
+		local mn, mx = values[1], values[#values]
+		local median = values[math.ceil(#values / 2)]
+		local p95 = values[math.ceil(#values * 0.95)]
 		return {
 			name = name,
-			median_ns = total / samples,
+			scale = scale,
+			iterations = iterations,
+			median_ns = median,
+			p95_ns = p95,
 			min_ns = mn,
 			max_ns = mx,
 			samples = samples,
+			api_counts = api_counts,
 		}
 	end
 
 	-- (1) 1000 autocmds: index_autocmds + new_autocmds（合成レコード）。
 	local before_items, items = {}, {}
-	for i = 1, 1000 do
+	for i = 1, 4000 do
 		before_items[i] = { id = i, event = 'X' }
 		items[i] = before_items[i]
 	end
-	items[1001] = { id = 1001, event = 'X', group = 'newgrp' }
+	items[4001] = { id = 4001, event = 'X', group = 'newgrp' }
 	local excluded = { ['rsplug.runtime.on_event'] = true }
 
-	-- (2) 1000 ft files: get_ft_runtime_files。
+	-- (2) 4000 ft files: get_ft_runtime_files。
 	local lua = ((ctl.manifest.runtime or {}).ftplugin or {}).lua or {}
 	local ft_ids = {}
 	for k in pairs(lua) do
 		ft_ids[#ft_ids + 1] = k
 	end
+	table.sort(ft_ids)
 
 	local results = {}
-	results[#results + 1] = measure('autocmd_1k', function()
-		local b = ctl.index_autocmds(before_items, excluded)
-		ctl.new_autocmds(items, b, excluded)
-	end)
+	for _, scale in ipairs({ 1000, 2000, 4000 }) do
+		results[#results + 1] = measure('autocmd_' .. (scale / 1000) .. 'k', scale, 1,
+			{ index_autocmds = 1, new_autocmds = 1 }, function()
+				local b = ctl.index_autocmds({ unpack(before_items, 1, scale) }, excluded)
+				local new_items = { unpack(items, 1, scale + 1) }
+				ctl.new_autocmds(new_items, b, excluded)
+			end)
+	end
 	local ft_count = 0
-	results[#results + 1] = measure('ft_files', function()
-		local p = ctl.get_ft_runtime_files(ft_ids, 'lua')
-		ft_count = #p
-	end)
-	results[#results + 1] = measure('requires_10k', function()
-		for i = 1, 10000 do
-			pcall(require, 'unrelated.module.' .. i)
-		end
-	end)
+	for _, scale in ipairs({ 1000, 2000, 4000 }) do
+		results[#results + 1] = measure('ft_files_' .. (scale / 1000) .. 'k', scale, 1,
+			{ get_ft_runtime_files = 1, paths_visited = scale }, function()
+				local ids = { unpack(ft_ids, 1, math.min(scale, #ft_ids)) }
+				local p = ctl.get_ft_runtime_files(ids, 'lua')
+				ft_count = #p
+			end)
+	end
+	local function require_workload(prefix, count)
+		for i = 1, count do pcall(require, prefix .. i) end
+	end
+	local function run_require_control()
+		local searchers = package.searchers or package.loaders
+		local removed = table.remove(searchers, 1)
+		require_workload('rsplug.control.missing.', 10000)
+		table.insert(searchers, 1, removed)
+	end
+	results[#results + 1] = measure('require_unique_10k_rsplug', 10000, 10000,
+		{ searcher_invocations = 10000 }, function()
+			require_workload('rsplug.unique.missing.', 10000)
+		end)
+	results[#results + 1] = measure('require_unique_10k_control', 10000, 10000,
+		{ searcher_invocations = 0 }, run_require_control)
+	results[#results + 1] = measure('require_repeated_10k', 10000, 10000,
+		{ searcher_invocations = 10000 }, function()
+			require_workload('rsplug.repeated.missing.', 10000)
+		end)
+	local active, control
+	for _, r in ipairs(results) do
+		if r.name == 'require_unique_10k_rsplug' then active = r end
+		if r.name == 'require_unique_10k_control' then control = r end
+	end
+	if active and control then active.delta_ns = active.median_ns - control.median_ns end
 	local on_map = require '_rsplug/on_map'
-	results[#results + 1] = measure('mode_changes_10k', function()
-		for _ = 1, 10000 do
-			on_map.on_mode_changed 'i'
-		end
-	end)
+	for _, scale in ipairs({ 1000, 2000, 4000 }) do
+		results[#results + 1] = measure('mode_changes_' .. (scale / 1000) .. 'k', scale, scale,
+			{ on_mode_changed = scale }, function()
+				for _ = 1, scale do on_map.on_mode_changed 'i' end
+			end)
+	end
 
 	for _, r in ipairs(results) do
 		print(
 			string.format(
-				'BENCH %s samples=%d median_ns=%.0f min_ns=%.0f max_ns=%.0f ft_count=%d',
+				'BENCH %s scale=%d iterations=%d samples=%d median_ns=%.0f p95_ns=%.0f min_ns=%.0f max_ns=%.0f delta_ns=%.0f api_counts=%s ft_count=%d',
 				r.name,
+				r.scale,
+				r.iterations,
 				r.samples,
 				r.median_ns,
+				r.p95_ns,
 				r.min_ns,
 				r.max_ns,
+				r.delta_ns or 0,
+				encode_counts(r.api_counts),
 				ft_count
 			)
 		)
