@@ -199,6 +199,14 @@ struct CatalogDone {
     repo: String,
     rev: Option<Arc<str>>,
     installed: bool,
+    install: bool,
+    update: bool,
+}
+
+/// `--install` は未インストール分だけ、`--update` は既存分だけリモート解決する。
+/// 両方指定時は両集合が対象になる。
+fn should_resolve_graphql(install: bool, update: bool, installed: bool) -> bool {
+    (update && installed) || (install && !installed)
 }
 
 async fn app() -> Result<(), Error> {
@@ -305,20 +313,23 @@ async fn app() -> Result<(), Error> {
     // revisions; non-`--locked` runs use it as the starting point for the
     // output lock file so that entries for plugins not in the config are
     // preserved.
-    let locked_map = match rsplug::LockFile::read(lockfile.as_path()).await {
+    let (locked_map, lockfile_is_current) = match rsplug::LockFile::read(lockfile.as_path()).await {
         Ok(lock) => {
             // 全キーを canonical identity に正規化（旧形式の生 URL キーを含む）。
             // 以降の get/insert/remove はすべて canonical キーで行う。
-            let rsplug::LockFile { locked: map, .. } = lock.normalize_keys()?;
+            let normalized = lock.clone().normalize_keys()?;
+            let lockfile_is_current = lock.version == "2" && lock.locked == normalized.locked;
+            let rsplug::LockFile { locked: map, .. } = normalized;
             if locked {
                 msg(Message::DetectLockFile(lockfile.clone()));
             }
-            map
+            (map, lockfile_is_current)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), false),
         Err(e) => return Err(e.into()),
     };
 
+    let initial_locked_map = locked_map.clone();
     let locked_map = Arc::new(locked_map);
 
     // 全 plugin のネットワークフェッチ並列度を制限する（初期 CPU*2・最大 64・エラー時半減）。
@@ -404,12 +415,13 @@ async fn app() -> Result<(), Error> {
                 },
             );
         }
-        rsplug::LockFile {
+        let desired_lock = rsplug::LockFile {
             version: "2".into(),
             locked: merged_locked,
+        };
+        if !lockfile_is_current || desired_lock.locked != initial_locked_map {
+            desired_lock.write(lockfile.as_path()).await?;
         }
-        .write(lockfile.as_path())
-        .await?;
     }
     Ok(())
 }
@@ -773,7 +785,7 @@ async fn run_load_scheduler(
                                     && let Some((owner, rname)) =
                                         rsplug::util::github::parse_github_url(&repo.url())
                                 {
-                                    if ctx.update {
+                                    if ctx.update || ctx.install {
                                         let io = Arc::clone(&catalog_io);
                                         let catalogs = Arc::clone(&ctx.catalogs);
                                         let repo_root = ctx.cache_dir.join(repo.default_cachedir());
@@ -794,6 +806,8 @@ async fn run_load_scheduler(
                                                 repo: repo_name,
                                                 rev: rev_for_catalog,
                                                 installed,
+                                                install: ctx.install,
+                                                update: ctx.update,
                                             }
                                         });
                                         None
@@ -1163,7 +1177,7 @@ async fn run_load_scheduler(
                 let done = jr.map_err(|e| {
                     Error::Io(std::io::Error::other(format!("catalog task panicked: {e}")))
                 })?;
-                if done.installed {
+                if should_resolve_graphql(done.install, done.update, done.installed) {
                     graphql_batch.push(rsplug::util::github::GithubRev {
                         owner: done.owner,
                         repo: done.repo,
@@ -1184,10 +1198,10 @@ async fn run_load_scheduler(
                         false,
                     );
                 } else if let Some(staged) = staging.get_mut(&done.id) {
-                    staged.rev = Some(LoadRev::Resolved(None));
+                    staged.rev = Some(LoadRev::Auto);
                     try_schedule_staged_early(&mut staging, &mut early_tasks, &ctx, &done.id);
                 } else if let Some(&idx) = staged_id_to_node_idx.get(&done.id) {
-                    nodes[idx].rev = Some(LoadRev::Resolved(None));
+                    nodes[idx].rev = Some(LoadRev::Auto);
                     try_schedule_early(&mut nodes, &mut early_tasks, &ctx, idx);
                 }
             }
@@ -1490,6 +1504,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn graphql_resolution_only_targets_repositories_selected_by_mode() {
+        assert!(should_resolve_graphql(true, false, false));
+        assert!(!should_resolve_graphql(true, false, true));
+        assert!(!should_resolve_graphql(false, true, false));
+        assert!(should_resolve_graphql(false, true, true));
+        assert!(should_resolve_graphql(true, true, false));
+        assert!(should_resolve_graphql(true, true, true));
+    }
+
     /// Step 4: `run_load_scheduler` が Parsed 到着順で EARLY を kick し、ParsePhaseDone
     /// 後に LATE を実行して、正しい LoadedPlugin を生成することを検証する。
     /// script-only プラグイン（repo なし）でネットワーク・キャッシュ不要。
@@ -1639,17 +1663,18 @@ mod tests {
             .unwrap();
         drop(parse_tx);
 
-        let (plugins, _locks, remove_canons) = run_load_scheduler(parse_rx, ctx, None, false)
+        let (plugins, _locks, mut remove_canons) = run_load_scheduler(parse_rx, ctx, None, false)
             .await
             .unwrap();
 
         assert!(plugins.is_empty());
+        remove_canons.sort();
         assert_eq!(
             remove_canons,
             vec![
                 "github.com/owner/missing-one",
-                "github.com/owner/missing-two",
                 "github.com/owner/missing-three",
+                "github.com/owner/missing-two",
             ]
         );
     }

@@ -1039,7 +1039,12 @@ snapshot-refresh reports and structural counter infrastructure remain to be
 implemented. A first scoped L2 filetype hot-path change is now implemented:
 the valid v2 manifest resolver uses a reverse path set for stable de-duplication
 and hoists package-entry checks outside its path loop. The broader L2 milestone
-and U1/U2/I1/S1/S2/S3/S4/L1/C1/D1 remain incomplete.
+and U1/U2/I1/S1/S2/S3/S4/L1/C1/D1 remain incomplete. A user-prioritized S3
+slice is implemented: `--install` checks the local snapshot catalog before
+GraphQL and only resolves missing repositories; an unchanged, intact
+generation skips package copy, manifest/loader/init publication, GC, and an
+equivalent v2 lockfile write. Inventory-derived ft indices and the strict
+zero-scan generation plan remain future S3 work.
 
 ## Discoveries and decision log
 
@@ -1059,3 +1064,6 @@ and U1/U2/I1/S1/S2/S3/S4/L1/C1/D1 remain incomplete.
 - 2026-07-22: The first bounded implementation slice after M0 targets the
   valid-manifest filetype resolver: a set replaces linear result membership
   checks while preserving manifest order and path validation.
+- 2026-07-22: Warm `--install` favors a catalog probe over unconditional
+  GraphQL. A generation is a no-op only after validating package directories,
+  manifest, loader, and init symlink; any inconsistency falls back to repair.

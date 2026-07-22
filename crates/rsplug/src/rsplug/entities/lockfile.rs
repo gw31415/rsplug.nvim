@@ -6,7 +6,7 @@ use super::util;
 
 /// Lock file structure that contains all necessary information to build the pack directory.
 /// This is serialized to JSON format.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockFile {
     /// Version of the lock file format
     pub version: Cow<'static, str>,
@@ -15,7 +15,7 @@ pub struct LockFile {
 }
 
 /// Locked resource information for network-dependent resources
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedResource {
     /// Resource type (e.g. git)
     #[serde(rename = "type")]
@@ -25,7 +25,7 @@ pub struct LockedResource {
 }
 
 /// Resource type discriminator for lock entries
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LockedResourceType {
     Git,

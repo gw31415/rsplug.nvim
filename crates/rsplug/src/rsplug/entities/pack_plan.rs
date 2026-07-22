@@ -912,7 +912,7 @@ const RETAIN_GENERATIONS: usize = 3;
 
 /// 生成 manifest（R1: v2）。`runtime` は `#[serde(default)]` により、保持されている
 /// v1 manifest（`runtime` 無し）もそのままデシリアライズできる。
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq)]
 struct GenerationManifest {
     version: u8,
     entries: Vec<String>,
@@ -922,7 +922,7 @@ struct GenerationManifest {
 
 /// v2 manifest のランタイム側インデックス。現在は ftplugin のみ。
 /// `ftplugin`: `ft -> id -> [opt/<id>/ftplugin/...]`（generation root 相対パス）。
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq)]
 struct RuntimeManifest {
     #[serde(default)]
     ftplugin: BTreeMap<String, BTreeMap<String, Vec<String>>>,
@@ -940,6 +940,57 @@ fn render_init(control_ids: &[PluginIDStr]) -> Vec<u8> {
         .render_once()
         .map(String::into_bytes)
         .unwrap_or_else(|_| Vec::new())
+}
+
+/// `true` は生成物を公開し、`false` は既存の完全な generation を再利用した。
+pub type GenerationPublished = bool;
+
+/// 既存 generation が今回の計画と完全に一致し、ローダーも正常なら再公開を省略する。
+///
+/// S1 前のため ft index の読み取り自体は必要だが、コピー・metadata/loader/init の書き込みと
+/// retention/GC を避けられる。欠損や破損はすべて `false` に倒し通常 publish で修復する。
+async fn generation_is_current(
+    gen_root: &Path,
+    control_ids: &[PluginIDStr],
+    manifest: &GenerationManifest,
+    init_content: &[u8],
+    packpath: &Path,
+) -> bool {
+    let Some(control_id) = control_ids.first() else {
+        return false;
+    };
+    if !manifest.entries.iter().all(|entry| {
+        let path = gen_root.join(entry);
+        path.is_dir() && !path.is_symlink()
+    }) {
+        return false;
+    }
+    let manifest_path = gen_root
+        .join("opt")
+        .join(<PluginIDStr as AsRef<Path>>::as_ref(control_id))
+        .join("manifest.json");
+    let Ok(content) = tokio::fs::read(manifest_path).await else {
+        return false;
+    };
+    let Ok(current) = serde_json::from_slice::<GenerationManifest>(&content) else {
+        return false;
+    };
+    if current != *manifest {
+        return false;
+    }
+    let loader = packpath
+        .join("generations")
+        .join(<PluginIDStr as AsRef<Path>>::as_ref(control_id))
+        .with_extension("lua");
+    let Ok(loader_content) = tokio::fs::read(loader).await else {
+        return false;
+    };
+    if loader_content != init_content {
+        return false;
+    }
+    tokio::fs::symlink_metadata(packpath.join("init.lua"))
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 // ---- pack copy 戦略（Phase 6c） ----
@@ -1510,7 +1561,7 @@ impl PackPlan {
     /// PackPlan を指定されたパスにインストールする。パスは Vim の 'packpath' に基づく。
     /// NOTE: インストール後のディレクトリ構成は以下のようになる。
     /// {packpath}/pack/_gen/opt/{id}/
-    pub async fn install(mut self, packpath: &Path) -> io::Result<()> {
+    pub async fn install(mut self, packpath: &Path) -> io::Result<GenerationPublished> {
         // R1: control マージが self.ctl を消費する前に、on_ft の (ft,id) を取り出す。
         // 公開後に gen_root/opt/<id>/ を走査して ftplugin インデックスを構築する。
         let ft_pairs = self.ctl.ft_index_pairs();
@@ -1561,6 +1612,30 @@ impl PackPlan {
             .collect();
         control_ids.sort();
         let init_content = render_init(&control_ids);
+        // 全パッケージが既にある場合だけ、既存 generation と比較する。足りない package が
+        // あれば ft index は構築不能なので、通常の staging/publish 経路へ進む。
+        let existing_ftplugin_index = if generation_entries.iter().all(|entry| {
+            let path = gen_root.join(entry);
+            path.is_dir() && !path.is_symlink()
+        }) {
+            let ftplugin_index = build_ft_index(&gen_root, &ft_pairs).await?;
+            let manifest = GenerationManifest {
+                version: 2,
+                entries: generation_entries.clone(),
+                runtime: RuntimeManifest {
+                    ftplugin: ftplugin_index.clone(),
+                },
+            };
+            if generation_is_current(&gen_root, &control_ids, &manifest, &init_content, packpath)
+                .await
+            {
+                msg(Message::InstallDone);
+                return Ok(false);
+            }
+            Some(ftplugin_index)
+        } else {
+            None
+        };
         // 新世代は staging 配下に構築し、copy/manifest/loader 全成功後に opt/ へ rename で
         // 公開する（publication 失敗が公開ツリーを壊さないようにする）。
         let staging_control_id = control_ids
@@ -1704,7 +1779,10 @@ impl PackPlan {
         // === R1: 公開済み opt/<id>/ を走査し、登録済み (ft,id) の ftplugin インデックスを構築する。===
         // 新規・再利用パッケージ問わず opt/<id>/ が揃ったこの時点で走査する。読み取りエラーは
         // 不完全な v2 manifest を避けるため公開全体を中断する。
-        let ftplugin_index = build_ft_index(&gen_root, &ft_pairs).await?;
+        let ftplugin_index = match existing_ftplugin_index {
+            Some(index) => index,
+            None => build_ft_index(&gen_root, &ft_pairs).await?,
+        };
         let manifest = GenerationManifest {
             version: 2,
             entries: generation_entries,
@@ -1825,7 +1903,7 @@ impl PackPlan {
         // staging は成功・失敗を問わず掃除（残れば次回のクラッシュ残骸になる）。
         cleanup_stale_staging(&gen_root).await;
         msg(Message::InstallDone);
-        res
+        res.map(|()| true)
     }
 }
 
@@ -3085,6 +3163,45 @@ mod tests {
             "reuse must not recopy the changed snapshot"
         );
         assert!(no_staging_dirs(&genpath), "no staging dirs must remain");
+    }
+
+    #[tokio::test]
+    async fn install_skips_publication_when_generation_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let packpath = dir.path().to_path_buf();
+        let snap_root = dir.path().join("snap");
+        std::fs::create_dir_all(snap_root.join("plugin")).unwrap();
+        std::fs::write(snap_root.join("plugin/a.lua"), b"-- a\n").unwrap();
+
+        let mut plugin =
+            one_file_plugin("github.com/owner/a", b"rev-a", "plugin/a.lua", &snap_root);
+        plugin.lazy_type = LazyType::Opt(BTreeSet::from([LoadEvent::Autocmd(
+            "BufEnter".parse().unwrap(),
+        )]));
+
+        let mut first = PackPlan::new();
+        first.insert(plugin);
+        assert!(first.install(&packpath).await.unwrap());
+
+        let mut plugin =
+            one_file_plugin("github.com/owner/a", b"rev-a", "plugin/a.lua", &snap_root);
+        plugin.lazy_type = LazyType::Opt(BTreeSet::from([LoadEvent::Autocmd(
+            "BufEnter".parse().unwrap(),
+        )]));
+        let mut second = PackPlan::new();
+        second.insert(plugin);
+        let _perf = crate::rsplug::perf::PerfGuard::install();
+        assert!(
+            !second.install(&packpath).await.unwrap(),
+            "an identical generation must not be republished"
+        );
+        let operations = crate::rsplug::perf::PerfGuard::snapshot();
+        for operation in ["package_copy", "generation_manifest_write", "init_lua_swap"] {
+            assert!(
+                !operations.iter().any(|(name, _)| *name == operation),
+                "unchanged generation performed {operation}: {operations:?}"
+            );
+        }
     }
 
     /// install 入口で前回クラッシュの `.staging-*` 残骸が掃除される。
