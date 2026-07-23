@@ -116,10 +116,23 @@ impl SnapshotManifest {
             }
             if let Ok(relative) = entry.path.strip_prefix("lua")
                 && let Some(first) = relative.components().next()
-                && let Some(name) = first.as_os_str().to_str()
-                && lua_seen.insert(name.to_owned())
             {
-                self.lua_roots.push(name.to_owned());
+                // A directory is a module root as-is (`lua/foo/...` -> `foo`),
+                // while a top-level Lua file is required without its suffix
+                // (`lua/foo.lua` -> `foo`).  The filesystem fallback has always
+                // applied this distinction; preserve it when deriving from the
+                // persisted inventory too.
+                let root = if entry.kind == ManifestKind::Dir {
+                    first.as_os_str().to_str()
+                } else {
+                    Path::new(first.as_os_str()).file_stem().and_then(|stem| stem.to_str())
+                };
+                if let Some(root) = root
+                    && !root.is_empty()
+                    && lua_seen.insert(root.to_owned())
+                {
+                    self.lua_roots.push(root.to_owned());
+                }
             }
         }
         self.top_level.sort();
@@ -573,7 +586,7 @@ mod tests {
             HashSet::from([OsString::from("init.lua")])
         );
         assert_eq!(manifest.top_level(), &[PathBuf::from("lua")]);
-        assert_eq!(manifest.lua_roots(), &["init.lua".to_string()]);
+        assert_eq!(manifest.lua_roots(), &["init".to_string()]);
         assert!(manifest.validate());
     }
 
@@ -643,5 +656,29 @@ mod tests {
         assert!(!manifest.validate());
         manifest.schema = MANIFEST_SCHEMA;
         assert!(!manifest.validate());
+    }
+
+    #[tokio::test]
+    async fn reindex_derives_lua_file_stems_as_module_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join("lua/dir_module"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("lua/file_module.lua"), b"return {}")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("lua/dir_module/init.lua"), b"return {}")
+            .await
+            .unwrap();
+
+        let manifest = SnapshotManifest::build(root, false, ".rsplug_build_success")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manifest.lua_roots(),
+            ["dir_module".to_string(), "file_module".to_string()]
+        );
     }
 }
