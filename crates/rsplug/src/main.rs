@@ -236,13 +236,13 @@ async fn app() -> Result<(), Error> {
     let initial_locked_map = locked_map.clone();
     let locked_map = Arc::new(locked_map);
 
-    // 全 plugin のネットワークフェッチ並列度を制限する（初期 CPU*2・最大 64・エラー時半減）。
-    let cpu_count = rsplug::util::resources::available_cpus();
-    let fetch_initial_limit = (cpu_count * 2).min(16);
+    // Tarball downloads are I/O-bound and use codeload's CDN. Start enough of
+    // them to fill a typical broadband connection, while retaining room below
+    // GitHub's documented 100-request API concurrency ceiling.
     let fetch_semaphore = adaptive_semaphore::AdaptiveSemaphore::with_limits(
-        fetch_initial_limit,
-        1,
         64,
+        1,
+        96,
         std::time::Duration::from_millis(64),
     );
 
@@ -260,7 +260,10 @@ async fn app() -> Result<(), Error> {
             )))
         })?;
 
-    let network = adaptive_semaphore::NetworkLimits::new(fetch_semaphore, 16);
+    // Keep the conservative default for API/Git hosts. codeload is a separate
+    // CDN download workload, so it gets its own 64-request ceiling.
+    let network = adaptive_semaphore::NetworkLimits::new(fetch_semaphore, 16)
+        .with_host_cap("codeload.github.com", 64);
     let ctx = LoadCtx {
         mode,
         locked_map: Arc::clone(&locked_map),

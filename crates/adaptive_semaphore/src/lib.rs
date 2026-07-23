@@ -308,6 +308,7 @@ pub struct HostPermit {
 pub struct NetworkLimits {
     global: AdaptiveSemaphore,
     hosts: HostLimits,
+    host_overrides: HashMap<Arc<str>, HostLimits>,
 }
 
 impl NetworkLimits {
@@ -315,7 +316,18 @@ impl NetworkLimits {
         Self {
             global,
             hosts: HostLimits::new(per_host_cap),
+            host_overrides: HashMap::new(),
         }
+    }
+
+    /// Override the per-host cap for a host with a separate workload profile.
+    ///
+    /// For example, large CDN downloads can use more connections without
+    /// loosening the small cap that protects API endpoints from rate limits.
+    pub fn with_host_cap(mut self, host: impl Into<Arc<str>>, cap: usize) -> Self {
+        self.host_overrides
+            .insert(host.into(), HostLimits::new(cap));
+        self
     }
 
     pub fn global(&self) -> &AdaptiveSemaphore {
@@ -331,7 +343,7 @@ impl NetworkLimits {
     /// guard without finishing counts as cancelled.
     pub async fn acquire(&self, host: &str) -> NetworkPermit {
         let host = Arc::<str>::from(host);
-        let host_permit = self.hosts.acquire(host).await;
+        let host_permit = self.host_limits(&host).acquire(host).await;
         let adaptive = self.global.acquire().await;
         NetworkPermit {
             adaptive,
@@ -350,8 +362,12 @@ impl NetworkLimits {
         F: std::future::Future<Output = Result<T, E>>,
     {
         let host = Arc::<str>::from(host);
-        let _host = self.hosts.acquire(host).await;
+        let _host = self.host_limits(&host).acquire(host).await;
         self.global.run(future).await
+    }
+
+    fn host_limits(&self, host: &Arc<str>) -> &HostLimits {
+        self.host_overrides.get(host).unwrap_or(&self.hosts)
     }
 }
 
@@ -818,5 +834,30 @@ mod tests {
         }
         assert_eq!(net.global().completed(), 3);
         assert_eq!(net.hosts().host_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn network_limits_can_raise_a_cdn_host_cap_without_raising_api_cap() {
+        let net = NetworkLimits::new(
+            AdaptiveSemaphore::with_limits(8, 1, 64, MIN_ADJUST_INTERVAL),
+            1,
+        )
+        .with_host_cap("codeload.github.com", 2);
+
+        let _api = net.acquire("api.github.com").await;
+        let _cdn_first = net.acquire("codeload.github.com").await;
+        let cdn_second = tokio::time::timeout(
+            Duration::from_millis(100),
+            net.acquire("codeload.github.com"),
+        )
+        .await;
+        assert!(
+            cdn_second.is_ok(),
+            "CDN override should allow a second download"
+        );
+
+        let api_second =
+            tokio::time::timeout(Duration::from_millis(20), net.acquire("api.github.com")).await;
+        assert!(api_second.is_err(), "default API cap must remain in effect");
     }
 }

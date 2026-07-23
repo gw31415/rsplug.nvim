@@ -4,7 +4,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::error::Error;
 
 /// プロセス全体で共有する、リソース別の並列度予算（PLANS Phase 1）。
-/// 予算: fetch=min(16, CPU*2)・上限64（main.rs の AdaptiveSemaphore）・
+/// 予算: network 初期64・上限96（main.rs の AdaptiveSemaphore、codeload は最大64）・
 /// tarball 展開=min(4, CPU)（`fetch::EXTRACTION_SEMAPHORE`）・Git 実体化=CPU・
 /// build=max(1, CPU/2)・copy=min(16, max(2, CPU*2))。fetch/展開以外はここで集中管理する。
 pub(crate) mod resources {
