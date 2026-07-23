@@ -346,6 +346,33 @@ struct BuildFailureGuard {
     cell: BuildCell,
 }
 
+/// Removes an unpublished build worktree when a later build stage returns an
+/// error. A successful rename disarms the guard, so immutable snapshots are
+/// never removed. This deliberately uses synchronous cleanup only on failure:
+/// leaving build products behind makes every retry accumulate a full worktree.
+struct BuildingWorktreeGuard {
+    path: Arc<Path>,
+    armed: bool,
+}
+
+impl BuildingWorktreeGuard {
+    fn new(path: Arc<Path>) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BuildingWorktreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(self.path.as_ref());
+        }
+    }
+}
+
 impl Drop for BuildFailureGuard {
     fn drop(&mut self) {
         if self.cell.get().is_none() {
@@ -1204,6 +1231,10 @@ impl Plugin {
                     lua_build,
                     lua_post_update,
                 } = cache;
+                // A newly materialized build worktree is unpublished. Remove
+                // it on every error path until the final atomic rename.
+                let mut building_worktree =
+                    needs_build.then(|| BuildingWorktreeGuard::new(worktree_path.clone()));
 
                 // --- BUILD（has_build なら building worktree で実行 → rename → reopen） ---
                 // Duplicate specs with identical build inputs may finish EARLY
@@ -1330,6 +1361,9 @@ impl Plugin {
                         // 失敗しても final_root は作られない。
                         drop(repository);
                         tokio::fs::rename(worktree_path.as_ref(), final_root.as_ref()).await?;
+                        if let Some(worktree) = &mut building_worktree {
+                            worktree.disarm();
+                        }
                         if let Some(cell) = &build_cell {
                             let _ = cell.set(Ok(()));
                         }
@@ -2255,6 +2289,8 @@ async fn run_repo_build(
                         code,
                         build,
                         repo: repo_name.clone(),
+                        output: "(test-only legacy build runner does not retain output)"
+                            .to_string(),
                     });
                 }
                 Ok(())
@@ -3493,6 +3529,91 @@ mod tests {
         assert_eq!(
             lines_after_second, 1,
             "re-load must reuse the snapshot and skip build"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_build_retains_stderr_and_removes_staging_worktree() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("rsplug-build-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let remote = dir.join("remote");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(remote.join("plugin")).unwrap();
+        std::fs::write(remote.join("plugin/init.vim"), "\"x\n").unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&remote)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let commit = Command::new("git")
+            .current_dir(&remote)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success());
+
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [[plugins]]
+            repo = "file://{}"
+            build = ["sh", "-c", "printf 'RSPLUG_BUILD_STDERR_MARKER\\n' >&2; exit 23"]
+            "#,
+            remote.display()
+        ))
+        .unwrap();
+        let plugin = Plugin::new(config).unwrap().next().unwrap();
+        let repo_root = cache.join(plugin.cache.repo.as_ref().unwrap().default_cachedir());
+
+        let error = plugin
+            .load(
+                true,
+                false,
+                &cache,
+                None,
+                adaptive_semaphore::AdaptiveSemaphore::new(),
+                reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("exit code 23"), "got: {message}");
+        assert!(
+            message.contains("RSPLUG_BUILD_STDERR_MARKER"),
+            "failed build stderr must be retained, got: {message}"
+        );
+
+        let worktrees = repo_root.join("worktrees");
+        let entries = std::fs::read_dir(&worktrees).unwrap();
+        assert!(entries.into_iter().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".building-")
+        }));
+        assert!(
+            std::fs::read_dir(&worktrees).unwrap().next().is_none(),
+            "a failed build must not publish a snapshot"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
