@@ -192,7 +192,7 @@ Default locations:
     repositories      ~/.cache/rsplug/repos/
     pack output       ~/.cache/rsplug/pack/_gen/
     bootstrap         ~/.cache/rsplug/init.lua
-    generations       ~/.cache/rsplug/generations/
+    generations       ~/.cache/rsplug/pack/_gen/generations/
     lock file         ~/.cache/rsplug/rsplug.lock.json
 
 The application root is fixed by the current binary.  `--lockfile` changes
@@ -760,8 +760,8 @@ path, subject to the locked revision.
 The generated pack uses this layout:
 >
     ~/.cache/rsplug/
-      init.lua -> generations/<control-id>.lua
-      generations/<control-id>.lua
+      init.lua -> generations/<generation-id>.lua
+      generations/<generation-id>.lua
       pack/_gen/opt/<package-id>/...
 <
 
@@ -823,16 +823,22 @@ normal repository file collisions remain conflicts for merging.
 
 8.3 Generations and cleanup                                  *rsplug-generations*
 
-The first control package ID is used as the generation ID.  Its loader is
-stored at `generations/<id>.lua`, and `init.lua` is a symlink to that loader.
-The loader's control manifest lists the `pack/_gen/opt/` entries it references.
+The content-addressed hash of the complete generation plan is the generation
+ID.  Its loader is stored at `generations/<generation-id>.lua`, and `init.lua`
+is a symlink to that loader.  The loader's control manifest lists the
+`pack/_gen/opt/` entries it references.
 
 During installation rsplug retains entries referenced by the current and the
 small set of previous generation manifests.  Unreferenced package directories
 are removed from generated `start/` and `opt/` output.  Generation loader files
 whose control package has been removed are also deleted.  Cleanup is best
 effort after a successful install; a current/retained generation is not
-removed merely because a newer generation was created.
+removed merely because a newer generation was created.  The retained
+generation list is stored in `pack/_gen/generations/registry.json`; older
+installations without this registry are treated as a cache-migration case and
+are rebuilt or conservatively retained as needed.  If the desired generation
+metadata and referenced packages are already intact, refresh is a no-op (no
+package copy or helptags process).
 
 ==============================================================================
 9. Environment variables and paths                         *rsplug-environment*

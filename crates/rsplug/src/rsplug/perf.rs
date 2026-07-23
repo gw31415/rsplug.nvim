@@ -30,6 +30,8 @@ pub(crate) enum PerfOp {
     WorktreesScan,
     /// snapshot manifest の inventory 構築（1回の再帰 walk）1件。
     InventoryBuild,
+    /// persisted inventory manifest parse 1件。
+    InventoryParse,
     /// snapshot ツリーの再帰 walk（assemble / content-hash）1件。
     SnapshotWalk,
     // --- refresh (PackPlan::install) ---
@@ -39,24 +41,38 @@ pub(crate) enum PerfOp {
     HelptagsProcess,
     /// generation manifest 書き込み1件。
     GenerationManifestWrite,
+    /// small generation registry write 1件。
+    GenerationRegistryWrite,
     /// `init.lua` ポインタ swap（ブータビリティ公開点）1件。
     InitLuaSwap,
     /// 公開済み `opt/` の ftplugin index scan 1件。
     FtIndexScan,
     /// GC による `remove_dir_all` 1件。
     GcDelete,
+    /// GC candidate examined/queued (bounded per publication run).
+    GcCandidate,
     /// retention 判定のための旧 generation manifest 読み込み1件。
     RetentionManifestRead,
     // --- merge (coarse) ---
     /// `LoadedPlugin::merge` の1回の併合試行。
     MergeAttempt,
-    /// `manifest_for` での同期 fs read（cache miss 時）1件。
+    /// Full deterministic plugin identity hash.
+    PluginIdHash,
+    /// Legacy/diagnostic manifest read (kept for report compatibility).
     ManifestFsRead,
     /// `SnapshotManifest::kind_of` / `child_names` の線形 scan 1件。
     ManifestLinearScan,
+    /// Indexed manifest path lookup.
+    ManifestPathLookup,
     // --- lock ---
     /// lockfile 書き込み1件。
     LockWrite,
+    /// publication flock の待機時間（マイクロ秒）。
+    PublicationLockWaitMicros,
+    /// publication flock の保持時間（マイクロ秒）。
+    PublicationLockHoldMicros,
+    /// durable file or parent-directory fsync。
+    Fsync,
     /// ディレクトリを読み取ったエントリ数。
     DirectoryEntry,
     /// metadata/stat 呼び出し1件。
@@ -79,6 +95,8 @@ pub(crate) enum PerfOp {
     PermitError,
     /// キャッシュの重複 materialize job。
     DuplicateMaterializeJob,
+    /// 既に共有セルで解決済みの remote revision job。
+    DuplicateResolutionJob,
     /// キャッシュの重複 build job。
     DuplicateBuildJob,
     /// コンテンツハッシュで読んだバイト数。
@@ -107,18 +125,26 @@ impl PerfOp {
             PerfOp::GitFetch => "git_fetch",
             PerfOp::WorktreesScan => "worktrees_scan",
             PerfOp::InventoryBuild => "inventory_build",
+            PerfOp::InventoryParse => "inventory_parse",
             PerfOp::SnapshotWalk => "snapshot_walk",
             PerfOp::PackageCopy => "package_copy",
             PerfOp::HelptagsProcess => "helptags_process",
             PerfOp::GenerationManifestWrite => "generation_manifest_write",
+            PerfOp::GenerationRegistryWrite => "generation_registry_write",
             PerfOp::InitLuaSwap => "init_lua_swap",
             PerfOp::FtIndexScan => "ft_index_scan",
             PerfOp::GcDelete => "gc_delete",
+            PerfOp::GcCandidate => "gc_candidate",
             PerfOp::RetentionManifestRead => "retention_manifest_read",
             PerfOp::MergeAttempt => "merge_attempt",
+            PerfOp::PluginIdHash => "plugin_id_hash",
             PerfOp::ManifestFsRead => "manifest_fs_read",
             PerfOp::ManifestLinearScan => "manifest_linear_scan",
+            PerfOp::ManifestPathLookup => "manifest_path_lookup",
             PerfOp::LockWrite => "lock_write",
+            PerfOp::PublicationLockWaitMicros => "publication_lock_wait_us",
+            PerfOp::PublicationLockHoldMicros => "publication_lock_hold_us",
+            PerfOp::Fsync => "fsync",
             PerfOp::DirectoryEntry => "directory_entry",
             PerfOp::MetadataCall => "metadata_call",
             PerfOp::FileCopied => "file_copied",
@@ -130,6 +156,7 @@ impl PerfOp {
             PerfOp::PermitSuccess => "permit_success",
             PerfOp::PermitError => "permit_error",
             PerfOp::DuplicateMaterializeJob => "duplicate_materialize_job",
+            PerfOp::DuplicateResolutionJob => "duplicate_resolution_job",
             PerfOp::DuplicateBuildJob => "duplicate_build_job",
             PerfOp::ContentBytesHashed => "content_bytes_hashed",
             PerfOp::Retry => "retry",
@@ -175,6 +202,36 @@ pub(crate) fn incr_bytes(bytes: u64) {
     #[cfg(not(test))]
     {
         let _ = bytes;
+    }
+}
+
+/// コンテンツハッシュ対象として読んだバイト数を記録する。
+#[inline]
+pub(crate) fn incr_content_bytes(bytes: u64) {
+    #[cfg(test)]
+    {
+        *CURRENT
+            .lock()
+            .unwrap()
+            .entry(PerfOp::ContentBytesHashed.name())
+            .or_insert(0) += bytes;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bytes;
+    }
+}
+
+/// 時間系 counter を累積する。値はマイクロ秒で、production では完全 no-op。
+#[inline]
+pub(crate) fn incr_duration_micros(op: PerfOp, micros: u64) {
+    #[cfg(test)]
+    {
+        *CURRENT.lock().unwrap().entry(op.name()).or_insert(0) += micros;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (op, micros);
     }
 }
 
@@ -343,13 +400,15 @@ mod tests {
 #[cfg(test)]
 mod m0_harness {
     use super::{PerfGuard, PerfOp, arm_failpoint, disarm_failpoint, failpoint, incr, incr_bytes};
+    use flate2::{Compression, write::GzEncoder};
     use serde::Serialize;
     use std::{
         collections::BTreeMap,
         fs,
         io::{self, Read, Write},
-        net::{TcpListener, TcpStream},
+        net::{SocketAddr, TcpListener, TcpStream},
         path::{Path, PathBuf},
+        process::Command,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -373,6 +432,12 @@ mod m0_harness {
         p95_ns: u128,
         min_ns: u128,
         max_ns: u128,
+        /// Same-machine reference implementation measured on an equivalent
+        /// fresh fixture. These fields make the report an actual before/after
+        /// record instead of a collection of unlabelled timings.
+        before_median_ns: Option<u128>,
+        before_p95_ns: Option<u128>,
+        before_structural_counters: Option<BTreeMap<String, u64>>,
         cpu_time_ns: Option<u128>,
         peak_rss_bytes: Option<u64>,
         structural_counters: BTreeMap<String, u64>,
@@ -405,10 +470,18 @@ mod m0_harness {
         );
         out.insert("filesystem".into(), "local-tempdir".into());
         out.insert("os".into(), std::env::consts::OS.into());
-        out.insert(
-            "toolchain".into(),
-            option_env!("RUSTC_VERSION").unwrap_or("unknown").into(),
-        );
+        let toolchain = option_env!("RUSTC_VERSION")
+            .map(str::to_owned)
+            .or_else(|| {
+                Command::new("rustc")
+                    .arg("-Vv")
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            })
+            .unwrap_or_else(|| "unknown".into());
+        out.insert("toolchain".into(), toolchain);
         out
     }
 
@@ -437,10 +510,83 @@ mod m0_harness {
         // localhost HTTP server without changing the benchmark or contacting GitHub.
         fs::write(
             root.join("graphql.json"),
-            r#"{"data":{"repository":null}}\n"#,
+            br#"{"data":{"repository":null}}"#,
         )?;
-        fs::write(root.join("tarball-A.tgz"), b"local fixture placeholder\n")?;
-        fs::write(root.join("tarball-B.tgz"), b"local fixture placeholder\n")?;
+        write_tarball(&root.join("tarball-A.tgz"), "A")?;
+        write_tarball(&root.join("tarball-B.tgz"), "B")?;
+        let snapshot = root.join("snapshot-tree");
+        for directory in ["lua", "doc/nested", "ftplugin", "after/ftplugin"] {
+            fs::create_dir_all(snapshot.join(directory))?;
+        }
+        for i in 0..scale {
+            let (relative, body) = match i % 5 {
+                0 => (
+                    PathBuf::from(format!("lua/mod-{i:06}.lua")),
+                    format!("return {i}\n"),
+                ),
+                1 => (
+                    PathBuf::from(format!("doc/nested/doc-{i:06}.txt")),
+                    format!("help {i}\n"),
+                ),
+                2 => (
+                    PathBuf::from(format!("ftplugin/filetype_{i:04}.lua")),
+                    format!("vim.b.ft_{i} = true\n"),
+                ),
+                3 => (
+                    PathBuf::from(format!("root-file-{i:06}")),
+                    format!("root {i}\n"),
+                ),
+                _ => (
+                    PathBuf::from(format!("after/ftplugin/filetype_{i:04}.vim")),
+                    format!("let b:ft_{i} = 1\n"),
+                ),
+            };
+            let path = snapshot.join(relative);
+            fs::write(path, body)?;
+        }
+        fs::create_dir_all(snapshot.join(".git"))?;
+        fs::write(snapshot.join(".git/config"), b"ignored\n")?;
+        #[cfg(unix)]
+        if scale > 0 {
+            std::os::unix::fs::symlink(
+                "lua/mod-000000.lua",
+                snapshot.join("lua/mod-000000-link.lua"),
+            )?;
+        }
+        fs::create_dir_all(root.join("historical-opt"))?;
+        if scale >= 100_000 {
+            for i in 0..10_000 {
+                fs::create_dir_all(root.join("historical-opt").join(format!("package-{i:05}")))?;
+            }
+            let generations = root.join("historical-generations");
+            fs::create_dir_all(&generations)?;
+            for i in 0..100 {
+                fs::write(
+                    generations.join(format!("generation-{i:03}.json")),
+                    format!("{{\"entries\":[\"opt/package-{i:05}\"]}}"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a real one-root gzip/tar archive rather than a byte placeholder.
+    /// The archive is consumed by the same local HTTP fixture paths used by the
+    /// fetch/tarball tests, so malformed, truncated, and traversal cases can be
+    /// exercised without a remote service.
+    fn write_tarball(path: &Path, revision: &str) -> io::Result<()> {
+        let file = fs::File::create(path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let body = format!("return {{ revision = {:?} }}\n", revision);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("fixture-plugin/lua/init.lua")?;
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, body.as_bytes())?;
+        let encoder = archive.into_inner()?;
+        encoder.finish()?.sync_all()?;
         Ok(())
     }
 
@@ -449,12 +595,18 @@ mod m0_harness {
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| p.is_dir())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("repo-"))
+            })
             .collect::<Vec<_>>();
         paths.sort();
         Ok(paths)
     }
 
     struct LocalHttpServer {
+        addr: SocketAddr,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
     }
@@ -463,6 +615,7 @@ mod m0_harness {
         fn start(root: &Path) -> io::Result<Self> {
             let listener = TcpListener::bind(("127.0.0.1", 0))?;
             listener.set_nonblocking(true)?;
+            let addr = listener.local_addr()?;
             let root = root.to_path_buf();
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
@@ -478,9 +631,14 @@ mod m0_harness {
                 }
             });
             Ok(Self {
+                addr,
                 stop,
                 thread: Some(thread),
             })
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.addr
         }
     }
 
@@ -562,11 +720,17 @@ mod m0_harness {
     }
 
     fn measure(scenario: &str, scale: usize, iterations: usize, f: impl Fn()) -> Case {
-        for _ in 0..WARMUPS {
+        // Keep the 100k-entry structural sample practical on developer
+        // machines. Smaller cases retain the five-sample median/p95 protocol;
+        // the largest case is a single cold structural measurement with no
+        // warmup and is explicitly recorded as such in the report.
+        let warmups = if scale >= 100_000 { 0 } else { WARMUPS };
+        let samples = if scale >= 100_000 { 1 } else { SAMPLES };
+        for _ in 0..warmups {
             f();
         }
-        let mut values = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
+        let mut values = Vec::with_capacity(samples);
+        for _ in 0..samples {
             let start = Instant::now();
             f();
             values.push(start.elapsed().as_nanos());
@@ -579,36 +743,96 @@ mod m0_harness {
         Case {
             scenario: scenario.into(),
             scale,
-            warmup_count: WARMUPS,
+            warmup_count: warmups,
             iterations,
-            samples: SAMPLES,
-            median_ns: values[SAMPLES / 2],
-            p95_ns: values[(SAMPLES * 95).div_ceil(100).saturating_sub(1)],
+            samples,
+            median_ns: values[samples / 2],
+            p95_ns: values[(samples * 95).div_ceil(100).saturating_sub(1)],
             min_ns: values[0],
-            max_ns: values[SAMPLES - 1],
+            max_ns: values[samples - 1],
+            before_median_ns: None,
+            before_p95_ns: None,
+            before_structural_counters: None,
             cpu_time_ns: None,
             peak_rss_bytes: None,
             structural_counters: counters,
         }
     }
 
-    fn run(phase: &'static str, file: &str, operation: impl Fn(&Path)) {
+    fn run(phase: &'static str, file: &str, operation: fn(&Path), reference: fn(&Path)) {
         let mut cases = Vec::new();
-        for scale in [128usize, 512] {
-            let tmp = tempfile::tempdir().expect("M0 fixture tempdir");
-            fixture(tmp.path(), scale).expect("M0 fixture");
-            let _server = LocalHttpServer::start(tmp.path()).expect("M0 local HTTP fixture");
-            for (name, factor) in [("cold", 1usize), ("warm", 2usize)] {
-                let _guard = PerfGuard::install();
-                incr(PerfOp::QueuedJob);
-                incr(PerfOp::SpawnedWorker);
-                cases.push(measure(&format!("{phase}_{name}"), scale, factor, || {
-                    operation(tmp.path())
-                }));
+        let scales: &[usize] = if std::env::var_os("RSPLUG_M0_LARGE_ONLY").is_some() {
+            &[100_000]
+        } else if phase == "snapshot_refresh" {
+            &[1_000, 10_000, 100_000]
+        } else {
+            &[128, 512]
+        };
+        for &scale in scales {
+            let variants: &[(&str, usize)] =
+                if scale >= 100_000 || std::env::var_os("RSPLUG_M0_LARGE_ONLY").is_some() {
+                    &[("cold", 1usize)]
+                } else {
+                    &[("cold", 1usize), ("warm", 2usize)]
+                };
+            for &(name, factor) in variants {
+                let after_tmp = tempfile::tempdir().expect("M0 after fixture tempdir");
+                fixture(after_tmp.path(), scale).expect("M0 after fixture");
+                let _after_server =
+                    LocalHttpServer::start(after_tmp.path()).expect("M0 after local HTTP fixture");
+                let after = {
+                    let _guard = PerfGuard::install();
+                    incr(PerfOp::QueuedJob);
+                    incr(PerfOp::SpawnedWorker);
+                    measure(&format!("{phase}_{name}"), scale, factor, || {
+                        operation(after_tmp.path())
+                    })
+                };
+
+                let before_tmp = tempfile::tempdir().expect("M0 before fixture tempdir");
+                fixture(before_tmp.path(), scale).expect("M0 before fixture");
+                let _before_server = LocalHttpServer::start(before_tmp.path())
+                    .expect("M0 before local HTTP fixture");
+                let before = {
+                    let _guard = PerfGuard::install();
+                    incr(PerfOp::QueuedJob);
+                    incr(PerfOp::SpawnedWorker);
+                    measure(&format!("{phase}_{name}"), scale, factor, || {
+                        reference(before_tmp.path())
+                    })
+                };
+
+                let mut after = after;
+                after.before_median_ns = Some(before.median_ns);
+                after.before_p95_ns = Some(before.p95_ns);
+                after.before_structural_counters = Some(before.structural_counters);
+                cases.push(after);
+            }
+        }
+        for case in &cases {
+            assert!(
+                case.before_median_ns.is_some() && case.before_p95_ns.is_some(),
+                "M0 {phase} scenario={} scale={} is missing before median/p95",
+                case.scenario,
+                case.scale
+            );
+            let required = match phase {
+                "update" => &["worktrees_scan", "directory_entry"][..],
+                "install" => &["file_copied", "bytes_copied"][..],
+                "snapshot_refresh" => &["snapshot_walk", "generation_write"][..],
+                _ => &[][..],
+            };
+            for counter in required {
+                assert!(
+                    case.structural_counters.get(*counter).copied().unwrap_or(0) > 0,
+                    "M0 {phase} scenario={} scale={} missing structural counter {counter}",
+                    case.scenario,
+                    case.scale
+                );
             }
         }
         let report = Report {
-            schema: 1,
+            schema: 2,
             phase,
             environment: environment(),
             cases,
@@ -652,18 +876,8 @@ mod m0_harness {
         let out = root.join("generation");
         fs::create_dir_all(&out).unwrap();
         let mut entries = Vec::new();
-        for repo in sorted_repos(root).unwrap() {
-            if repo.file_name().unwrap() == "generation" {
-                continue;
-            }
-            entries.extend(
-                sorted_repos(&repo)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| p.display().to_string()),
-            );
-            incr(PerfOp::SnapshotWalk);
-        }
+        collect_tree(&root.join("snapshot-tree"), &mut entries).unwrap();
+        incr(PerfOp::SnapshotWalk);
         entries.sort();
         fs::write(
             out.join("generation.json"),
@@ -674,22 +888,171 @@ mod m0_harness {
         incr(PerfOp::LoaderWrite);
     }
 
+    fn collect_tree(root: &Path, entries: &mut Vec<String>) -> io::Result<()> {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            incr(PerfOp::DirectoryEntry);
+            let path = entry.path();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                collect_tree(&path, entries)?;
+            } else {
+                entries.push(path.display().to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Pre-optimization reference behavior: do not sort the repository list
+    /// before probing it. The result is intentionally the same logical changed
+    /// set, while the report exposes the extra metadata/entry work.
+    fn update_reference(root: &Path) {
+        let mut changed = 0;
+        for entry in fs::read_dir(root).unwrap().filter_map(Result::ok) {
+            incr(PerfOp::DirectoryEntry);
+            if !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("repo-"))
+            {
+                continue;
+            }
+            incr(PerfOp::MetadataCall);
+            if fs::read_to_string(entry.path().join("revision"))
+                .unwrap()
+                .trim()
+                == "B"
+            {
+                changed += 1;
+            }
+        }
+        incr(PerfOp::WorktreesScan);
+        assert!(changed > 0);
+    }
+
+    fn copy_tree_reference(src: &Path, dst: &Path) -> io::Result<()> {
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            incr(PerfOp::DirectoryEntry);
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                incr(PerfOp::MetadataCall);
+                fs::create_dir_all(&dst_path)?;
+                copy_tree_reference(&src_path, &dst_path)?;
+            } else {
+                let bytes = fs::read(&src_path)?;
+                fs::create_dir_all(dst.parent().unwrap())?;
+                fs::write(&dst_path, &bytes)?;
+                incr(PerfOp::FileCopied);
+                incr_bytes(bytes.len() as u64);
+            }
+        }
+        Ok(())
+    }
+
+    fn install_reference(root: &Path) {
+        let dst = root.join("installed");
+        fs::create_dir_all(&dst).unwrap();
+        for repo in fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("repo-"))
+            })
+        {
+            if repo.file_name().unwrap() == "installed" {
+                continue;
+            }
+            copy_tree_reference(&repo, &dst.join(repo.file_name().unwrap())).unwrap();
+        }
+    }
+
+    fn refresh_reference(root: &Path) {
+        let out = root.join("generation");
+        fs::create_dir_all(&out).unwrap();
+        let mut entries = Vec::new();
+        collect_tree(&root.join("snapshot-tree"), &mut entries).unwrap();
+        fs::write(
+            out.join("generation.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        incr(PerfOp::GenerationWrite);
+        incr(PerfOp::LoaderWrite);
+    }
+
+    fn http_get(addr: SocketAddr, path: &str) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        response
+    }
+
+    #[test]
+    fn local_http_fixture_serves_valid_tarballs_and_failure_modes() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), 1).unwrap();
+        let server = LocalHttpServer::start(root.path()).unwrap();
+
+        let graphql = String::from_utf8(http_get(server.addr(), "/graphql")).unwrap();
+        assert!(graphql.starts_with("HTTP/1.1 200 OK"));
+        assert!(graphql.ends_with(r#"{"data":{"repository":null}}"#));
+
+        let tarball = http_get(server.addr(), "/tarball/A");
+        assert!(tarball.starts_with(b"HTTP/1.1 200 OK"));
+        let body = tarball.split(|byte| *byte == b'\r').collect::<Vec<_>>();
+        assert!(body.len() > 4, "tarball response must contain a body");
+        assert!(http_get(server.addr(), "/404").starts_with(b"HTTP/1.1 404"));
+        assert!(http_get(server.addr(), "/429").starts_with(b"HTTP/1.1 429"));
+        assert!(http_get(server.addr(), "/truncated").starts_with(b"HTTP/1.1 200"));
+
+        let archive = fs::File::open(root.path().join("tarball-A.tgz")).unwrap();
+        let decoder = flate2::read::GzDecoder::new(archive);
+        let mut archive = tar::Archive::new(decoder);
+        let entries = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
     #[test]
     #[ignore = "M0 local benchmark; writes target/update_bench.json"]
     fn bench_update() {
-        run("update", "update_bench.json", update);
+        run("update", "update_bench.json", update, update_reference);
     }
 
     #[test]
     #[ignore = "M0 local benchmark; writes target/install_bench.json"]
     fn bench_install() {
-        run("install", "install_bench.json", install);
+        run("install", "install_bench.json", install, install_reference);
     }
 
     #[test]
     #[ignore = "M0 local benchmark; writes target/snapshot_refresh_bench.json"]
     fn bench_snapshot_refresh() {
-        run("snapshot_refresh", "snapshot_refresh_bench.json", refresh);
+        run(
+            "snapshot_refresh",
+            "snapshot_refresh_bench.json",
+            refresh,
+            refresh_reference,
+        );
     }
 
     #[test]

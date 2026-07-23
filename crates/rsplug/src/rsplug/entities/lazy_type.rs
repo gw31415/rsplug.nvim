@@ -140,6 +140,12 @@ impl Render for Autocmd {
     }
 }
 
+impl fmt::Display for Autocmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Vimのユーザーコマンドの文字列を表す型。
 #[derive(Hash, Clone, PartialOrd, Ord, PartialEq, Eq, DeserializeFromStr, Debug)]
 pub struct UserCmd(Arc<String>);
@@ -166,6 +172,12 @@ impl FromStr for UserCmd {
 impl Render for UserCmd {
     fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
         self.0.render(b)
+    }
+}
+
+impl fmt::Display for UserCmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 

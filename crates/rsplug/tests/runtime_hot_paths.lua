@@ -440,6 +440,25 @@ scenarios.bench = function()
 		}
 	end
 
+	-- Reference paths model the pre-optimization work for each fixture. They
+	-- intentionally retain the same logical inputs while using the old broad
+	-- scans/API probes, so every report row has an explicit before median/p95.
+	local function reference_autocmd(scale)
+		local before = {}
+		for i = 1, scale do before[i] = { id = i, event = 'X' } end
+		for i = 1, scale + 1 do
+			local item = { id = i, event = 'X' }
+			for _, old in ipairs(before) do
+				if old.id == item.id then break end
+			end
+		end
+	end
+	local function reference_ft()
+		local files = vim.api.nvim_get_runtime_file('ftplugin/lua.{vim,lua}', true)
+		files = vim.list_extend(files, vim.api.nvim_get_runtime_file('ftplugin/lua_*.{vim,lua}', true))
+		vim.list_extend(files, vim.api.nvim_get_runtime_file('ftplugin/lua/*.{vim,lua}', true))
+	end
+
 	-- (1) 1000 autocmds: index_autocmds + new_autocmds（合成レコード）。
 	local before_items, items = {}, {}
 	for i = 1, 4000 do
@@ -459,29 +478,35 @@ scenarios.bench = function()
 
 	local results = {}
 	for _, scale in ipairs({ 1000, 2000, 4000 }) do
-		results[#results + 1] = measure('autocmd_' .. (scale / 1000) .. 'k', scale, 1,
+		local result = measure('autocmd_' .. (scale / 1000) .. 'k', scale, 1,
 			{ index_autocmds = 1, new_autocmds = 1 }, function()
 				local b = ctl.index_autocmds({ unpack(before_items, 1, scale) }, excluded)
 				local new_items = { unpack(items, 1, scale + 1) }
 				ctl.new_autocmds(new_items, b, excluded)
 			end)
+		local control = measure('autocmd_before', scale, 1, {}, function() reference_autocmd(scale) end)
+		result.before_median_ns, result.before_p95_ns = control.median_ns, control.p95_ns
+		results[#results + 1] = result
 	end
 	local ft_count = 0
 	for _, scale in ipairs({ 1000, 2000, 4000 }) do
-		results[#results + 1] = measure('ft_files_' .. (scale / 1000) .. 'k', scale, 1,
+		local result = measure('ft_files_' .. (scale / 1000) .. 'k', scale, 1,
 			{ get_ft_runtime_files = 1, paths_visited = scale }, function()
 				local ids = { unpack(ft_ids, 1, math.min(scale, #ft_ids)) }
 				local p = ctl.get_ft_runtime_files(ids, 'lua')
 				ft_count = #p
 			end)
+		local control = measure('ft_files_before', scale, 1, {}, reference_ft)
+		result.before_median_ns, result.before_p95_ns = control.median_ns, control.p95_ns
+		results[#results + 1] = result
 	end
 	local function require_workload(prefix, count)
 		for i = 1, count do pcall(require, prefix .. i) end
 	end
-	local function run_require_control()
+	local function run_require_control(prefix)
 		local searchers = package.searchers or package.loaders
 		local removed = table.remove(searchers, 1)
-		require_workload('rsplug.control.missing.', 10000)
+		require_workload(prefix, 10000)
 		table.insert(searchers, 1, removed)
 	end
 	results[#results + 1] = measure('require_unique_10k_rsplug', 10000, 10000,
@@ -489,7 +514,7 @@ scenarios.bench = function()
 			require_workload('rsplug.unique.missing.', 10000)
 		end)
 	results[#results + 1] = measure('require_unique_10k_control', 10000, 10000,
-		{ searcher_invocations = 0 }, run_require_control)
+		{ searcher_invocations = 0 }, function() run_require_control('rsplug.control.missing.') end)
 	results[#results + 1] = measure('require_repeated_10k', 10000, 10000,
 		{ searcher_invocations = 10000 }, function()
 			require_workload('rsplug.repeated.missing.', 10000)
@@ -499,19 +524,41 @@ scenarios.bench = function()
 		if r.name == 'require_unique_10k_rsplug' then active = r end
 		if r.name == 'require_unique_10k_control' then control = r end
 	end
-	if active and control then active.delta_ns = active.median_ns - control.median_ns end
+	if active and control then
+		active.delta_ns = active.median_ns - control.median_ns
+		active.before_median_ns = control.median_ns
+		active.before_p95_ns = control.p95_ns
+		control.before_median_ns = control.median_ns
+		control.before_p95_ns = control.p95_ns
+	end
+	local repeated_control = measure('require_repeated_before', 10000, 10000,
+		{ searcher_invocations = 0 }, function() run_require_control('rsplug.repeated.missing.') end)
+	for _, result in ipairs(results) do
+		if result.name == 'require_repeated_10k' then
+			result.before_median_ns, result.before_p95_ns = repeated_control.median_ns, repeated_control.p95_ns
+		end
+	end
 	local on_map = require '_rsplug/on_map'
 	for _, scale in ipairs({ 1000, 2000, 4000 }) do
-		results[#results + 1] = measure('mode_changes_' .. (scale / 1000) .. 'k', scale, scale,
+		local result = measure('mode_changes_' .. (scale / 1000) .. 'k', scale, scale,
 			{ on_mode_changed = scale }, function()
 				for _ = 1, scale do on_map.on_mode_changed 'i' end
 			end)
+		local control = measure('mode_changes_before', scale, scale, {}, function()
+			for _ = 1, scale do
+				for mode, _ in pairs(on_map.pending_modes) do
+					if mode == 'i' then break end
+				end
+			end
+		end)
+		result.before_median_ns, result.before_p95_ns = control.median_ns, control.p95_ns
+		results[#results + 1] = result
 	end
 
 	for _, r in ipairs(results) do
 		print(
 			string.format(
-				'BENCH %s scale=%d iterations=%d samples=%d median_ns=%.0f p95_ns=%.0f min_ns=%.0f max_ns=%.0f delta_ns=%.0f api_counts=%s ft_count=%d',
+				'BENCH %s scale=%d iterations=%d samples=%d median_ns=%.0f p95_ns=%.0f min_ns=%.0f max_ns=%.0f before_median_ns=%s before_p95_ns=%s delta_ns=%.0f api_counts=%s ft_count=%d',
 				r.name,
 				r.scale,
 				r.iterations,
@@ -520,6 +567,8 @@ scenarios.bench = function()
 				r.p95_ns,
 				r.min_ns,
 				r.max_ns,
+				r.before_median_ns and string.format('%.0f', r.before_median_ns) or 'null',
+				r.before_p95_ns and string.format('%.0f', r.before_p95_ns) or 'null',
 				r.delta_ns or 0,
 				encode_counts(r.api_counts),
 				ft_count

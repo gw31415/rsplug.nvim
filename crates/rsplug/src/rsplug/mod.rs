@@ -14,4 +14,4 @@ pub use pack_plan::LoadedPlugin;
 pub use pack_plan::PackPlan;
 pub(crate) use plugin::EarlyOutcome;
 pub use plugin::Plugin;
-pub use plugin::SnapshotCatalogCache;
+pub use plugin::RepoJobRegistry;

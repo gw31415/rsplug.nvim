@@ -12,7 +12,7 @@ local root = vim.fn.fnamemodify(vim.fn.resolve(source), ':h:h')
 vim.opt.packpath:prepend(root)
 
 <% if !control_ids.is_empty() { %>local requested = vim.env.RSPLUG_GENERATION
-local ids = { <% for id in control_ids {%>'<%= id %>',<%}%> }
+local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }
 if requested ~= nil and requested ~= ''
 	and #requested == 32
 	and string.match(requested, '^[0-9a-fA-F]+$') ~= nil

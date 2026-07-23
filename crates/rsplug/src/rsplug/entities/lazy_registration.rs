@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Keys},
-    fmt::Display,
     iter::Sum,
     ops::AddAssign,
     path::PathBuf,
@@ -13,6 +12,43 @@ use sailfish::{TemplateSimple, runtime::Render};
 use super::*;
 use crate::rsplug::util::hash;
 
+/// Render untrusted configuration text as a Lua string literal.  Generated
+/// runtime files are Lua source, so Sailfish's HTML escaping is deliberately
+/// disabled and every value entering a quoted literal must use this helper.
+#[derive(Debug, Clone)]
+pub(super) struct LuaStringLiteral(String);
+
+impl std::fmt::Display for LuaStringLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Render for LuaStringLiteral {
+    fn render(&self, buffer: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
+        self.0.render(buffer)
+    }
+}
+
+pub(super) fn lua_string(value: impl std::fmt::Display) -> LuaStringLiteral {
+    let input = value.to_string();
+    let mut out = String::with_capacity(input.len() + 8);
+    out.push('"');
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\{:03}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    LuaStringLiteral(out)
+}
+
 /// docファイルを束ねたヘルプ専用プラグインの source_name。
 /// `pack/_gen/start/` への配置判定に使われる。
 pub(super) const DOC_PLUGIN_NAME: &str = "_rsplug:doc";
@@ -22,34 +58,6 @@ struct PkgId2ScriptsItem {
     script: SetupScript,
     order: usize,
     start: bool, // もし読み込みプラグイン元が LazyType::Start なら、他のスクリプトと別の仕組みでスクリプトを呼び出す必要があるため
-}
-
-#[derive(Hash, Eq, PartialEq, PartialOrd, Ord)]
-enum AfterOrBefore {
-    After,
-    Before,
-}
-
-impl AfterOrBefore {
-    fn as_str(&self) -> &'static str {
-        match self {
-            AfterOrBefore::After => "lua_after",
-            AfterOrBefore::Before => "lua_before",
-        }
-    }
-}
-
-impl Display for AfterOrBefore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl Render for AfterOrBefore {
-    fn render(&self, b: &mut sailfish::runtime::Buffer) -> Result<(), sailfish::RenderError> {
-        b.push_str(self.as_str());
-        Ok(())
-    }
 }
 
 /// プラグインの読み込み制御・ロード後の設定 (after_lua等)を行う構造体
@@ -137,18 +145,23 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
                         lua_after,
                         lua_before,
                     } = script;
-                    let lua_after = lua_after.into_iter().map(|s| (AfterOrBefore::After, s));
-                    let lua_before = lua_before.into_iter().map(|s| (AfterOrBefore::Before, s));
-                    let mut script_set: BTreeMap<AfterOrBefore, Vec<String>> = Default::default();
-                    for (script_type, content) in lua_after.chain(lua_before) {
+                    let before_scripts: Vec<String> = lua_before.into_iter().collect();
+                    let after_scripts: Vec<String> = lua_after.into_iter().collect();
+                    let hook_module = if before_scripts.is_empty() && after_scripts.is_empty() {
+                        None
+                    } else {
+                        let data = HookModuleTemplate {
+                            before: &before_scripts,
+                            after: &after_scripts,
+                        }
+                        .render_once()
+                        .unwrap()
+                        .into_bytes();
                         let module_id =
-                            format!("{script_type}_{}", hash::digest_hash_hex_string(&content));
-                        plugs.push(instant_startup_pkg(
-                            &format!("lua/{module_id}.lua"),
-                            content.into_bytes(),
-                        ));
-                        script_set.entry(script_type).or_default().push(module_id);
-                    }
+                            format!("_rsplug/hooks_{}", hash::digest_hash_hex_string(&data));
+                        plugs.push(instant_startup_pkg(&format!("lua/{module_id}.lua"), data));
+                        Some(module_id)
+                    };
                     for content in lua_start {
                         scripts_startup.push((order, pkgid.clone(), content));
                     }
@@ -156,8 +169,8 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
                     if start {
                         scripts_start.push((order, pkgid.clone()));
                     }
-                    if !script_set.is_empty() {
-                        scripts_lazy.push((pkgid, script_set));
+                    if let Some(hook_module) = hook_module {
+                        scripts_lazy.push((pkgid, hook_module));
                     }
                     (scripts_lazy, scripts_start, scripts_startup)
                 },
@@ -470,6 +483,28 @@ impl AddAssign for LazyRegistration {
                 mode_entry.entry(pattern).or_default().extend(ids);
             }
         }
+
+        // Trigger records are rendered in insertion order. Deduplicate once while
+        // composing the registration so generated Lua need not linearly scan lists.
+        dedup_trigger_ids(&mut self.event2pkgid);
+        dedup_trigger_ids(&mut self.cmd2pkgid);
+        dedup_trigger_ids(&mut self.ft2pkgid);
+        dedup_trigger_ids(&mut self.func2pkgid);
+        dedup_trigger_ids(&mut self.luam2pkgid);
+        dedup_trigger_ids(&mut self.source_name2pkgid);
+        for patterns in self.keypattern2pkgid.values_mut() {
+            dedup_trigger_ids(patterns);
+        }
+    }
+}
+
+fn dedup_trigger_ids<K>(records: &mut BTreeMap<K, Vec<PluginIDStr>>)
+where
+    K: Ord,
+{
+    for ids in records.values_mut() {
+        let mut seen = BTreeSet::new();
+        ids.retain(|id| seen.insert(id.clone()));
     }
 }
 
@@ -524,6 +559,16 @@ impl LazyRegistration {
                     ids.iter().map(|id| id.to_string()).collect(),
                 )
             })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn event_ids_for_test(&self, event: &Autocmd) -> Vec<String> {
+        self.event2pkgid
+            .get(event)
+            .into_iter()
+            .flatten()
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -639,9 +684,17 @@ struct FtpluginTemplate {
 #[template(path = "lua/_rsplug/init.stpl")]
 #[template(escape = false)]
 struct CustomPackaddTemplate {
-    pkgid2scripts: Vec<(PluginIDStr, BTreeMap<AfterOrBefore, Vec<String>>)>,
+    pkgid2scripts: Vec<(PluginIDStr, String)>,
     startup_plugins: Vec<PluginIDStr>,
     source2pkgid: Vec<(PluginIDStr, Vec<PluginIDStr>)>,
+}
+
+#[derive(TemplateSimple)]
+#[template(path = "lua/_rsplug/hooks.stpl")]
+#[template(escape = false)]
+struct HookModuleTemplate<'a> {
+    before: &'a [String],
+    after: &'a [String],
 }
 
 #[derive(TemplateSimple)]
@@ -736,6 +789,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lua_string_literal_handles_quotes_controls_and_utf8() {
+        assert_eq!(
+            lua_string("quote\" slash\\ line\n\r\t\0 日本語").to_string(),
+            "\"quote\\\" slash\\\\ line\\n\\r\\t\\000 日本語\""
+        );
+    }
+
+    #[test]
     fn on_func_template_uses_funcundefined_for_autoload_functions() {
         let func = "foo#bar".parse::<VimFunc>().unwrap();
         let mut func2pkgid = BTreeMap::new();
@@ -747,7 +808,7 @@ mod tests {
         .unwrap();
 
         assert!(rendered.contains("FuncUndefined"));
-        assert!(rendered.contains("autoload_handler('foo#bar')"));
+        assert!(rendered.contains("autoload_handler(\"foo#bar\")"));
         assert!(!rendered.contains("function! foo#bar"));
     }
 
@@ -785,6 +846,24 @@ mod tests {
     }
 
     #[test]
+    fn on_cmd_delegates_once_with_command_metadata_and_arguments() {
+        let cmd = "MyCommand".parse::<UserCmd>().unwrap();
+        let id = b"command-plugin".plugin_id().as_str();
+        let cmd2pkgid = BTreeMap::from([(cmd, vec![id])]);
+        let rendered = OnCmdTemplate {
+            cmd2pkgid: &cmd2pkgid,
+        }
+        .render_once()
+        .unwrap();
+
+        assert!(rendered.contains("local function command_line"));
+        assert!(rendered.contains("nvim_get_commands { builtin = false }"));
+        assert!(rendered.contains("vim.cmd(command_line(cmd, args, cmdinfo))"));
+        assert!(!rendered.contains("match '^E481:'"));
+        assert!(!rendered.contains("vim.cmd(range .. cmdline)"));
+    }
+
+    #[test]
     fn custom_packadd_template_packadds_startup_plugins() {
         let startup_plugin = b"startup-plugin".plugin_id().as_str();
         let rendered = CustomPackaddTemplate {
@@ -795,7 +874,9 @@ mod tests {
         .render_once()
         .unwrap();
 
-        assert!(rendered.contains(&format!("local startup_plugins = {{'{startup_plugin}',}}")));
+        assert!(rendered.contains(&format!(
+            "local startup_plugins = {{\"{startup_plugin}\",}}"
+        )));
         assert!(!rendered.contains("startup_scripts"));
         assert!(rendered.contains("require '_rsplug'.packadd(id, true)"));
         assert!(!rendered.contains("vim.list_contains(result"));
@@ -915,6 +996,8 @@ mod runtime_hot_paths {
             );
             let source = Arc::new(FileSource::Directory {
                 path: Arc::from(snap.clone()),
+                inventory: None,
+                handle: None,
             });
             let mut files: BTreeMap<PathBuf, FileItem> = BTreeMap::new();
             for (rel, data) in &p.files {
@@ -951,13 +1034,25 @@ mod runtime_hot_paths {
         plan.install(&packpath).await?;
 
         let mut control_ids = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(packpath.join("generations")) {
+        if let Ok(rd) = std::fs::read_dir(packpath.join("pack/_gen/generations")) {
             for e in rd.flatten() {
                 let path = e.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("lua")
-                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                if path.extension().and_then(|s| s.to_str()) == Some("json")
+                    && let Ok(bytes) = std::fs::read(&path)
                 {
-                    control_ids.push(stem.to_string());
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_default();
+                    if let Some(ids) = value
+                        .get("plan")
+                        .and_then(|plan| plan.get("control_ids"))
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        control_ids.extend(
+                            ids.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_string),
+                        );
+                    }
                 }
             }
         }
@@ -1288,7 +1383,27 @@ mod runtime_hot_paths {
         let out = nvim_output(&pack, "bench", "");
         // BENCH <name> scale=N iterations=N samples=N median_ns=.. p95_ns=..
         //   min_ns=.. max_ns=.. api_counts=<json> ft_count=N
-        let mut json = String::from("{\n  \"benchmarks\": {\n");
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let toolchain = Command::new("rustc")
+            .arg("-V")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut json = format!(
+            "{{\n  \"schema\": 2,\n  \"phase\": \"lazy_runtime\",\n  \"environment\": {{\"build_profile\": \"{}\", \"cpu_count\": \"{}\", \"filesystem\": \"local-tempdir\", \"os\": \"{}\", \"toolchain\": \"{}\"}},\n  \"benchmarks\": {{\n",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            cpu_count,
+            std::env::consts::OS,
+            toolchain,
+        );
         let mut first = true;
         for line in out.lines() {
             let line = line.trim_start_matches('\x0d').trim();
@@ -1309,7 +1424,7 @@ mod runtime_hot_paths {
             first = false;
             let api_counts = fields.get("api_counts").copied().unwrap_or("{}");
             json.push_str(&format!(
-                "    \"{name}\": {{\"scale\":{scale}, \"iterations\":{iterations}, \"samples\":{s}, \"median_ns\":{med}, \"p95_ns\":{p95}, \"min_ns\":{mn}, \"max_ns\":{mx}, \"delta_ns\":{delta}, \"api_counts\":{api_counts}}}",
+                "    \"{name}\": {{\"scale\":{scale}, \"iterations\":{iterations}, \"samples\":{s}, \"median_ns\":{med}, \"p95_ns\":{p95}, \"min_ns\":{mn}, \"max_ns\":{mx}, \"before_median_ns\":{before_med}, \"before_p95_ns\":{before_p95}, \"delta_ns\":{delta}, \"api_counts\":{api_counts}}}",
                 scale = fields.get("scale").copied().unwrap_or("0"),
                 iterations = fields.get("iterations").copied().unwrap_or("0"),
                 s = fields.get("samples").copied().unwrap_or("0"),
@@ -1317,6 +1432,8 @@ mod runtime_hot_paths {
                 p95 = fields.get("p95_ns").copied().unwrap_or("0"),
                 mn = fields.get("min_ns").copied().unwrap_or("0"),
                 mx = fields.get("max_ns").copied().unwrap_or("0"),
+                before_med = fields.get("before_median_ns").copied().unwrap_or("null"),
+                before_p95 = fields.get("before_p95_ns").copied().unwrap_or("null"),
                 delta = fields.get("delta_ns").copied().unwrap_or("0"),
             ));
         }
@@ -1546,10 +1663,19 @@ mod runtime_hot_paths {
         .await
         .expect("build_pack");
         let manifest_path = pack.packpath.join(format!(
-            "pack/_gen/opt/{}/manifest.json",
+            "pack/_gen/generations/{}.json",
             pack.control_ids[0]
         ));
         let content = std::fs::read_to_string(&manifest_path).expect("manifest.json");
+        assert!(
+            !pack
+                .packpath
+                .join(format!(
+                    "pack/_gen/opt/{}/manifest.json",
+                    pack.control_ids[0]
+                ))
+                .exists()
+        );
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid json");
         assert_eq!(v["version"], 2, "manifest must be v2: {content}");
         let lua = &v["runtime"]["ftplugin"]["lua"];

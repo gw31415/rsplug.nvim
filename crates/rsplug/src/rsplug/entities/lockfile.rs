@@ -97,6 +97,7 @@ impl LockFile {
             std::fs::create_dir_all(parent)?;
             let mut temp = tempfile::NamedTempFile::new_in(parent)?;
             temp.write_all(content.as_bytes())?;
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::Fsync);
             temp.as_file().sync_all()?;
             temp.persist(&path).map_err(|e| e.error)?;
             // Persisting does not guarantee the directory entry itself reached
@@ -104,6 +105,7 @@ impl LockFile {
             // opened/synced this is best-effort, while the atomic rename still
             // protects readers.
             if let Ok(dir) = std::fs::File::open(parent) {
+                crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::Fsync);
                 let _ = dir.sync_all();
             }
             Ok(())

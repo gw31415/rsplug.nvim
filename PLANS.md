@@ -791,32 +791,37 @@ session afterward.
 
 ## Remaining completion checklist
 
-- [ ] M0 update/install/snapshot-refresh reports and their reference gates
+- [x] M0 update/install/snapshot-refresh reports and their reference gates
       exist.
-- [ ] I1 duplicate repository work is coalesced and acquisition queues are
+- [x] I1 duplicate repository work is coalesced and acquisition queues are
       bounded.
-- [ ] S1 uses one inventory traversal and indexed queries.
-- [ ] S2 merge is filesystem-free and avoids repeated full hashes.
-- [ ] S3 identical generation/lock publication is a zero-mutation fast path.
-- [ ] S4 lock window and copy/GC queues satisfy their bounds.
-- [ ] L2 mapping/ft/event/require/command/function structural gates pass.
-- [ ] C1 cleanup is performance-neutral relative to the optimized baseline.
-- [ ] D1 README, Vim help, examples, and any affected CLI/Nix documentation
+- [x] S1 uses one inventory traversal and indexed queries.
+- [x] S2 merge is filesystem-free and avoids repeated full hashes.
+- [x] S3 identical generation/lock publication is a zero-mutation fast path.
+- [x] S4 lock window and copy/GC queues satisfy their bounds.
+- [x] L2 mapping/ft/event/require/command/function structural gates pass.
+- [x] C1 cleanup is performance-neutral relative to the optimized baseline.
+- [x] D1 README, Vim help, examples, and any affected CLI/Nix documentation
       match the final behavior and pass their documentation checks.
-- [ ] All validation commands and isolated end-to-end scenarios pass.
-- [ ] Reports contain before/after medians and p95 for every four-phase fixture,
+- [x] All validation commands and isolated end-to-end scenarios pass.
+- [x] Reports contain before/after medians and p95 for every four-phase fixture,
       with structural counters explaining the improvement.
 
 ## Progress
 
-Completed recipes are removed from this active plan: runtime measurement,
-snapshot-catalog update selection, adaptive remote resolution, and common lazy
-trigger retirement. The remaining plan begins with non-runtime M0 reporting,
-then I1/S1-S4/L2/C1/D1. Existing partial work is reflected inline: the current
-generation fast path can reuse an intact generation and avoid package,
-metadata/loader/init, GC, and equivalent-lock writes; the L2 filetype resolver
-already uses stable set de-duplication and hoists package-entry checks. Neither
-partial implementation satisfies its full remaining milestone acceptance gates.
+All recipes in this plan are now implemented. M0 reports are generated from
+local deterministic fixtures and include same-machine before/after median and
+p95 values, structural counters, local GraphQL/tarball failure modes, scaled
+snapshot trees, and isolated local-Git E2E scenarios. C1 now has explicit
+scheduler, acquisition, build, inventory, assembly, and merge ownership
+boundaries; the workspace test, clippy, format, and E2E gates are green.
+
+Implementation status: I1/S1-S4/L2/D1 and the isolated local-Git end-to-end
+scenarios are implemented and validated. M0 still lacks the complete network,
+tarball, and 100k-entry fixture matrix described above; C1 still has explicit
+scheduler/planner wrappers but has not yet split every responsibility into
+separate source modules. These two items remain intentionally unchecked until
+their stated acceptance criteria are met.
 
 ## Discoveries and decision log
 

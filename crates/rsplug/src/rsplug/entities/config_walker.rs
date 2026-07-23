@@ -7,7 +7,7 @@ use walker::{
 };
 
 pub struct ConfigWalker {
-    rx: mpsc::UnboundedReceiver<Result<PathBuf, io::Error>>,
+    rx: mpsc::Receiver<Result<PathBuf, io::Error>>,
     _handle: JoinHandle<()>,
     /// Materialized stdin content for the "-" argument, kept alive for the
     /// walker's lifetime so downstream path-based readers can read it; it is
@@ -75,7 +75,10 @@ impl ConfigWalker {
             }
         }
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Keep glob expansion backpressured: callers consume configuration
+        // paths while the walker is still running, so a large glob cannot
+        // retain an unbounded result queue.
+        let (tx, rx) = mpsc::channel(256);
         let _cwd = current_dir()?;
         let options = WalkerOptions {
             files_only: true,
@@ -83,7 +86,9 @@ impl ConfigWalker {
         };
         let handle = tokio::spawn(async move {
             for path in direct_files {
-                let _ = tx.send(Ok(path));
+                if tx.send(Ok(path)).await.is_err() {
+                    return;
+                }
             }
 
             if compiled_patterns.is_empty() {
@@ -94,18 +99,26 @@ impl ConfigWalker {
             while let Some(item) = walker.recv().await {
                 match item {
                     Ok(event) => {
-                        if event.kind == EntryKind::File {
-                            let _ = tx.send(Ok(event.path));
+                        if event.kind == EntryKind::File && tx.send(Ok(event.path)).await.is_err() {
+                            return;
                         }
                     }
                     Err(WalkError::Io { source, .. }) => {
                         if is_ignorable_walk_error(&source) {
                             continue;
                         }
-                        let _ = tx.send(Err(source));
+                        if tx.send(Err(source)).await.is_err() {
+                            return;
+                        }
                     }
                     Err(err) => {
-                        let _ = tx.send(Err(io::Error::other(err.to_string())));
+                        if tx
+                            .send(Err(io::Error::other(err.to_string())))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
             }

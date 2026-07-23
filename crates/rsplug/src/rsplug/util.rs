@@ -166,6 +166,15 @@ pub mod git {
             Repository(Arc::new(Mutex::new(value)))
         }
 
+        /// Check for an already acquired object without fetching or changing
+        /// the worktree. Callers coordinate this with repository mutation.
+        pub async fn contains_oid(&self, oid: Oid) -> Result<bool, Error> {
+            let repo = self.0.clone();
+            spawn_blocking(move || Ok(repo.lock().unwrap().find_object(oid, None).is_ok()))
+                .await
+                .unwrap()
+        }
+
         /// source.git に指定 oid を fetch する（HEAD も作業ツリーも変えない）。
         pub async fn fetch_oid(&mut self, oid: Oid, token: Option<Arc<str>>) -> Result<(), Error> {
             let repo = self.0.clone();
@@ -188,48 +197,36 @@ pub mod git {
             .unwrap()
         }
 
-        /// diff のハッシュの出力
-        pub async fn diff_hash(&self) -> Result<[u8; 16], Error> {
+        /// Compute the dirty diff digest and dirty state in one Git query.
+        /// Untracked files are included explicitly so callers do not need a
+        /// status query followed by a second diff walk.
+        pub async fn dirty_diff_hash(&self) -> Result<Option<[u8; 16]>, Error> {
             let repo = self.0.clone();
             spawn_blocking(move || {
                 let repo = repo.lock().unwrap();
+                // rsplug-owned snapshot metadata is cache state, not plugin content.
+                // Ignoring it keeps the repository identity stable after the first
+                // inventory is written; otherwise a warm refresh would acquire a
+                // new dirty-diff/plugin id solely because the cache populated.
                 repo.add_ignore_rule(RSPLUG_BUILD_SUCCESS_FILE).unwrap();
-                // HEAD ツリー
+                repo.add_ignore_rule(".rsplug-manifest-v1.json").unwrap();
                 let head_commit = repo.head()?.peel_to_commit()?;
                 let head_tree = head_commit.tree()?;
-
-                // diff（git diff HEAD 相当）
                 let mut diff_opts = DiffOptions::new();
-                // 未追跡も含めたいなら: diff_opts.include_untracked(true);
+                diff_opts
+                    .include_untracked(true)
+                    .recurse_untracked_dirs(true)
+                    .show_untracked_content(true);
                 let diff = repo.diff_tree_to_workdir(Some(&head_tree), Some(&mut diff_opts))?;
-
-                // パッチ出力を逐次ハッシュ化
+                if diff.deltas().len() == 0 {
+                    return Ok(None);
+                }
                 let mut hasher = Xxh3::new();
                 diff.print(DiffFormat::Raw, |_delta, _hunk, line| {
                     hasher.update(line.content());
                     true
                 })?;
-
-                // 128bit のダイジェストを hex で
-                let digest = hasher.digest128();
-                Ok(digest.to_ne_bytes())
-            })
-            .await
-            .unwrap()
-        }
-
-        /// ワークツリーに変更があるかどうか
-        pub async fn is_dirty(&self) -> Result<bool, Error> {
-            let repo = self.0.clone();
-            spawn_blocking(move || {
-                let repo = repo.lock().unwrap();
-                repo.add_ignore_rule(RSPLUG_BUILD_SUCCESS_FILE).unwrap();
-                let mut opts = git2::StatusOptions::new();
-                opts.include_untracked(true)
-                    .recurse_untracked_dirs(true)
-                    .include_unmodified(false);
-                let statuses = repo.statuses(Some(&mut opts))?;
-                Ok(!statuses.is_empty())
+                Ok(Some(hasher.digest128().to_ne_bytes()))
             })
             .await
             .unwrap()
@@ -554,6 +551,10 @@ pub mod repo {
     pub fn canonicalize_lock_key(key: &str) -> String {
         if key.contains("://") {
             canonicalize_url(key)
+        } else if key.starts_with('/') {
+            // A canonical file:// identity may have an empty authority and
+            // therefore begin with `/`. It is not GitHub shorthand.
+            canonicalize_url(key)
         } else {
             let first = key.split('/').next().unwrap_or(key);
             if first.contains('.') {
@@ -628,6 +629,10 @@ pub mod repo {
             );
             // GitHub shorthand（第1セグメントに `.` を含まない）
             assert_eq!(canonicalize_lock_key("owner/repo"), "github.com/owner/repo");
+            assert_eq!(
+                canonicalize_lock_key("/tmp/rsplug/remote"),
+                "/tmp/rsplug/remote"
+            );
         }
 
         #[test]
@@ -1274,6 +1279,7 @@ pub mod fetch {
     //! GitHub 固有の知識（tarball URL・対象判定・top-level dir strip）は
     //! `super::github` と本モジュール内に局所化し、コアロジックには晒さない。
 
+    use std::io::Read;
     use std::path::Path;
 
     use once_cell::sync::Lazy;
@@ -1283,11 +1289,11 @@ pub mod fetch {
     /// number of concurrent HTTP requests: on a large plugin set that otherwise
     /// creates a blocking task per response and makes both the runtime and disk
     /// scheduler thrash.
-    static EXTRACTION_SEMAPHORE: Lazy<tokio::sync::Semaphore> = Lazy::new(|| {
+    static EXTRACTION_SEMAPHORE: Lazy<std::sync::Arc<tokio::sync::Semaphore>> = Lazy::new(|| {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        tokio::sync::Semaphore::new(cpus.min(4))
+        std::sync::Arc::new(tokio::sync::Semaphore::new(cpus.min(4)))
     });
 
     use super::super::error::Error;
@@ -1297,6 +1303,7 @@ pub mod fetch {
     ///
     /// HTTP 完了後に network permit を解放しても archive を安全に展開できるよう、TempDir の
     /// 所有権をこの値へ移す。成功・失敗・fallback のいずれでも Drop で archive を掃除する。
+    #[allow(dead_code)]
     pub struct DownloadedTarball {
         staging: tempfile::TempDir,
         archive_path: std::path::PathBuf,
@@ -1305,10 +1312,208 @@ pub mod fetch {
     /// Phase 2: HTTP tarball fetch。
     pub struct TarballFetch;
 
+    #[allow(dead_code)]
+    pub(super) enum StreamChunk {
+        Data(Vec<u8>),
+        Error(String),
+    }
+
+    #[allow(dead_code)]
+    pub(super) struct ChunkReader {
+        pub(super) rx: tokio::sync::mpsc::Receiver<StreamChunk>,
+        pub(super) current: Vec<u8>,
+        pub(super) offset: usize,
+    }
+
+    /// A cancelled caller must also cancel the producer/consumer tasks.  A
+    /// dropped `JoinHandle` otherwise detaches the task and can leave a
+    /// request or blocking extraction alive after the staging owner returned.
+    #[allow(dead_code)]
+    struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+    #[allow(dead_code)]
+    impl<T> AbortOnDrop<T> {
+        fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+            Self(Some(handle))
+        }
+
+        fn abort(&self) {
+            if let Some(handle) = &self.0 {
+                handle.abort();
+            }
+        }
+
+        async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+            self.0
+                .take()
+                .expect("AbortOnDrop handle must exist before join")
+                .await
+        }
+    }
+
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            if let Some(handle) = &self.0 {
+                handle.abort();
+            }
+        }
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if output.is_empty() {
+                return Ok(0);
+            }
+            loop {
+                if self.offset < self.current.len() {
+                    let count = (self.current.len() - self.offset).min(output.len());
+                    output[..count]
+                        .copy_from_slice(&self.current[self.offset..self.offset + count]);
+                    self.offset += count;
+                    return Ok(count);
+                }
+                self.current.clear();
+                self.offset = 0;
+                match self.rx.blocking_recv() {
+                    Some(StreamChunk::Data(data)) => self.current = data,
+                    Some(StreamChunk::Error(error)) => return Err(std::io::Error::other(error)),
+                    None => return Ok(0),
+                }
+            }
+        }
+    }
+
     impl TarballFetch {
+        /// Stream the compressed response through a bounded byte bridge while
+        /// a blocking gzip/tar consumer extracts into private staging.
+        #[allow(dead_code)]
+        pub async fn stream_to_snapshot(
+            &self,
+            client: &reqwest::Client,
+            url: &str,
+            oid: &str,
+            snapshot_root: &Path,
+            token: Option<&str>,
+        ) -> Result<(), Error> {
+            let (owner, repo) = github::parse_github_url(url).ok_or_else(|| {
+                Error::Io(std::io::Error::other(format!(
+                    "not a GitHub HTTPS URL for tarball: {url}"
+                )))
+            })?;
+            let tarball_url = github::tarball_url(&owner, &repo, oid);
+            let parent = snapshot_root.parent().ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "snapshot root has no parent",
+                ))
+            })?;
+            tokio::fs::create_dir_all(parent).await?;
+            let staging = tempfile::Builder::new()
+                .prefix(".rsplug-tarball-")
+                .tempdir_in(parent)
+                .map_err(Error::Io)?;
+            let extract_dir = staging.path().join("extract");
+            tokio::fs::create_dir(&extract_dir).await?;
+
+            const STREAM_QUEUE: usize = 8;
+            let (tx, rx) = tokio::sync::mpsc::channel(STREAM_QUEUE);
+            let client = client.clone();
+            let token = token.map(str::to_owned);
+            let producer = AbortOnDrop::new(tokio::spawn(async move {
+                let mut request = client.get(tarball_url.clone());
+                if let Some(token) = token {
+                    request = request.header("Authorization", format!("Bearer {token}"));
+                }
+                let response = match request.send().await {
+                    Ok(response) if response.status().is_success() => response,
+                    Ok(response) => {
+                        let _ = tx
+                            .send(StreamChunk::Error(format!(
+                                "tarball download HTTP {} for {tarball_url}",
+                                response.status()
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(StreamChunk::Error(format!(
+                                "tarball download failed: {error}"
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                let mut response = response;
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if tx.send(StreamChunk::Data(chunk.to_vec())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(error) => {
+                            let _ = tx
+                                .send(StreamChunk::Error(format!(
+                                    "tarball read body failed: {error}"
+                                )))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            }));
+
+            let extract_dir_for_unpack = extract_dir.clone();
+            let extraction_permit =
+                EXTRACTION_SEMAPHORE
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        Error::Io(std::io::Error::other("tarball extraction semaphore closed"))
+                    })?;
+            let extraction = AbortOnDrop::new(tokio::task::spawn_blocking(
+                move || -> std::io::Result<()> {
+                    let _permit = extraction_permit;
+                    let reader = ChunkReader {
+                        rx,
+                        current: Vec::new(),
+                        offset: 0,
+                    };
+                    let decoder = flate2::read::GzDecoder::new(reader);
+                    let mut archive = tar::Archive::new(decoder);
+                    for entry in archive.entries()? {
+                        let mut entry = entry?;
+                        if !entry.unpack_in(&extract_dir_for_unpack)? {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "tarball entry escapes staging directory",
+                            ));
+                        }
+                    }
+                    Ok(())
+                },
+            ));
+            let extraction_result = extraction.join().await.map_err(|error| {
+                Error::Io(std::io::Error::other(format!("join error: {error}")))
+            })?;
+            if extraction_result.is_err() {
+                producer.abort();
+            }
+            let _ = producer.join().await;
+            extraction_result.map_err(Error::Io)?;
+
+            let extracted_root = Self::single_archive_root(&extract_dir)?;
+            tokio::fs::rename(extracted_root, snapshot_root).await?;
+            Ok(())
+        }
+
         /// `url`（GitHub HTTPS）のコミット `oid` の tarball を staging file へ保存する。
         /// 呼出側は network permit の内側でこの段階だけを実行し、その後
         /// [`DownloadedTarball::extract_to_snapshot`] を別の展開予算で呼ぶ。
+        #[allow(dead_code)]
         pub async fn download(
             &self,
             client: &reqwest::Client,
@@ -1350,6 +1555,7 @@ pub mod fetch {
         /// tarball を共有 `Client` で staging file にストリーミング保存する。
         /// レスポンス全体をメモリに保持しないため、大きな repository を多数同時に取得しても
         /// RSS が archive size の合計に比例しない。
+        #[allow(dead_code)]
         async fn download_to_archive(
             client: &reqwest::Client,
             url: &str,
@@ -1382,13 +1588,13 @@ pub mod fetch {
                 archive_file.write_all(&chunk).await?;
             }
             archive_file.flush().await?;
-            archive_file.sync_all().await?;
             Ok(())
         }
     }
 
     impl DownloadedTarball {
         /// gzip 展開 + tar 展開を、HTTP とは別の展開予算で実行して snapshot を原子的に公開する。
+        #[allow(dead_code)]
         pub async fn extract_to_snapshot(self, snapshot_root: &Path) -> Result<(), Error> {
             let extract_dir = self.staging.path().join("extract");
             tokio::fs::create_dir(&extract_dir).await?;
@@ -1526,11 +1732,14 @@ pub async fn execute(
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<std::io::Result<(usize, String)>>();
+        // Bound the stdout/stderr bridge so a noisy build cannot accumulate an
+        // unbounded number of lines while the consumer is busy.
+        // Two fixed reader producers (stdout/stderr); keep the bridge small
+        // enough to provide backpressure instead of retaining every output line.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<(usize, String)>>(4);
 
         fn create_task(
-            tx: tokio::sync::mpsc::UnboundedSender<Result<(usize, String), std::io::Error>>,
+            tx: tokio::sync::mpsc::Sender<Result<(usize, String), std::io::Error>>,
             id: usize,
             reader: impl AsyncRead + Unpin + Send + 'static,
         ) -> tokio::task::JoinHandle<std::io::Result<()>> {
@@ -1541,7 +1750,7 @@ pub async fn execute(
                     match reader.next_line().await {
                         Ok(line) => line,
                         Err(e) => {
-                            if tx.send(Err(e)).is_err() {
+                            if tx.send(Err(e)).await.is_err() {
                                 return Ok(());
                             }
                             continue 'line;
@@ -1549,7 +1758,7 @@ pub async fn execute(
                     }
                 } {
                     // 受信側が先に終了した場合は子プロセス出力の転送を静かに止める。
-                    if tx.send(Ok((id, line))).is_err() {
+                    if tx.send(Ok((id, line))).await.is_err() {
                         return Ok(());
                     }
                 }
@@ -1618,6 +1827,28 @@ pub fn truncate(val: &impl ToString, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tarball_stream_bridge_propagates_producer_errors() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(fetch::StreamChunk::Error("truncated body".to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut reader = fetch::ChunkReader {
+                rx,
+                current: Vec::new(),
+                offset: 0,
+            };
+            let mut buf = [0u8; 8];
+            std::io::Read::read(&mut reader, &mut buf)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated body"));
+    }
 
     #[test]
     fn tarball_requires_one_top_level_directory_before_publish() {

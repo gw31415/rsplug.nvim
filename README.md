@@ -236,10 +236,12 @@ files are collected for a single helptags pass. Snapshot manifests make the
 merge and copy decisions without repeatedly walking repository trees; their
 indexed filetype paths are validated while resolving and de-duplicated in
 stable manifest order. Manifests are only a cache and filesystem fallback
-preserves correctness.
+preserves correctness. The current and retained generation IDs are tracked in
+`pack/_gen/generations/registry.json`; an identical, intact generation is a
+true no-op and does not recopy packages or regenerate help files.
 
-To boot a retained generation, list `~/.cache/rsplug/generations/` and pass its
-32-character ID:
+To boot a retained generation, list `~/.cache/rsplug/pack/_gen/generations/`
+and pass its 32-character generation-plan ID:
 
 ```bash
 RSPLUG_GENERATION=<id> nvim

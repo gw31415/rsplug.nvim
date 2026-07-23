@@ -17,7 +17,7 @@ local function schedule_removal()
 	removal_scheduled = true
 	vim.schedule(function()
 		removal_scheduled = false
-		if next(state.remaining_roots) ~= nil then
+		if state.remaining_count ~= 0 then
 			return
 		end
 		for i = #package.loaders, 1, -1 do
@@ -51,7 +51,7 @@ searcher = function(mod_name)
 	if not ok then
 		error(err, 0)
 	end
-	if next(state.remaining_roots) == nil then
+	if state.remaining_count == 0 then
 		schedule_removal()
 	end
 	-- packadd で既に読み込まれていればそのクロージャを返す。そうでなければ nil を返し、
@@ -86,6 +86,6 @@ for id, _ in pairs(state.pkgid2luam) do
 		state.reconcile(id)
 	end
 end
-if next(state.remaining_roots) == nil then
+if state.remaining_count == 0 then
 	schedule_removal()
 end

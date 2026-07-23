@@ -99,6 +99,7 @@ pub(super) trait HasPluginId {
 impl<T: std::hash::Hash + ?Sized> HasPluginId for T {
     #[inline]
     fn plugin_id(&self) -> PluginID {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::PluginIdHash);
         PluginID(hash::digest_hash(self))
     }
 }

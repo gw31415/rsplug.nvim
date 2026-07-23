@@ -20,6 +20,15 @@ use serde_with::DeserializeFromStr;
 
 use super::*;
 
+#[path = "acquisition.rs"]
+mod acquisition;
+#[path = "assembly.rs"]
+mod assembly;
+#[path = "build.rs"]
+mod build;
+#[path = "inventory.rs"]
+mod inventory;
+
 /// 設定を構成する基本単位
 pub struct Plugin {
     /// `on_source` から参照される設定上の名前
@@ -321,10 +330,70 @@ impl SnapshotCatalog {
 /// scheduler-scope cache: canonical repo → Arc<SnapshotCatalog> (PLANS U1)。
 /// 同一 repo の全 specs が同じ catalog を共有し、1 run で高々1回の fallback scan にする。
 /// process global にはしない（test / 複数 cache root の state leak を防ぐ）。
+type InventoryCell = Arc<tokio::sync::OnceCell<Option<Arc<SnapshotManifest>>>>;
+type ResolutionResult = Result<(Oid, ResolutionBackend), Arc<str>>;
+type ResolutionCell = Arc<tokio::sync::OnceCell<ResolutionResult>>;
+type ResolutionKey = (String, Option<String>);
+type AcquisitionResult = Result<bool, Arc<str>>;
+type AcquisitionCell = Arc<tokio::sync::OnceCell<AcquisitionResult>>;
+type AcquisitionKey = (PathBuf, String, bool);
+type MaterializationResult = Result<Option<MaterializedSnapshot>, Arc<str>>;
+type MaterializationCell = Arc<tokio::sync::OnceCell<MaterializationResult>>;
+type BuildResult = Result<(), Arc<str>>;
+type BuildCell = Arc<tokio::sync::OnceCell<BuildResult>>;
+
+struct BuildFailureGuard {
+    cell: BuildCell,
+}
+
+impl Drop for BuildFailureGuard {
+    fn drop(&mut self) {
+        if self.cell.get().is_none() {
+            let _ = self
+                .cell
+                .set(Err(Arc::from("build job failed or was cancelled")));
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MaterializationKey {
+    canonical: String,
+    oid: String,
+    use_tarball: bool,
+    dotgit: bool,
+    destination: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BuildKey {
+    canonical: String,
+    oid: String,
+    build: Arc<[String]>,
+    lua_build: Option<Arc<str>>,
+    lua_post_update: Option<Arc<str>>,
+    update: bool,
+    destination: PathBuf,
+}
+
 #[derive(Default)]
 pub struct SnapshotCatalogCache {
     inner: tokio::sync::Mutex<HashMap<String, Arc<SnapshotCatalog>>>,
+    inventories: tokio::sync::Mutex<HashMap<PathBuf, InventoryCell>>,
+    resolutions: tokio::sync::Mutex<HashMap<ResolutionKey, ResolutionCell>>,
+    acquisitions: tokio::sync::Mutex<HashMap<AcquisitionKey, AcquisitionCell>>,
+    materializations: tokio::sync::Mutex<HashMap<MaterializationKey, MaterializationCell>>,
+    builds: tokio::sync::Mutex<HashMap<BuildKey, BuildCell>>,
+    source_git_locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    materialize_locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    build_locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// Scheduler-owned repository job registry. The historical cache name remains
+/// as the implementation type for compatibility with focused tests and the
+/// catalog API; all per-run resolution, acquisition, materialization, and
+/// inventory cells live in this registry rather than process-global state.
+pub type RepoJobRegistry = SnapshotCatalogCache;
 
 impl SnapshotCatalogCache {
     pub(crate) fn new() -> Self {
@@ -345,6 +414,80 @@ impl SnapshotCatalogCache {
 
     pub(crate) async fn is_installed(&self, repo_root: PathBuf, canonical: String) -> bool {
         self.get(repo_root, canonical).await.is_installed().await
+    }
+
+    /// Run-scoped snapshot inventory cache. The OnceCell is per immutable
+    /// snapshot root, so duplicate plugin specs parse its manifest once while
+    /// avoiding a process-global lock/cache.
+    async fn inventory(&self, root: PathBuf) -> Option<Arc<SnapshotManifest>> {
+        let cell = {
+            let mut inventories = self.inventories.lock().await;
+            inventories
+                .entry(root.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        cell.get_or_init(
+            || async move { inventory::load_snapshot_manifest(&root).await.map(Arc::new) },
+        )
+        .await
+        .clone()
+    }
+
+    async fn resolution_cell(&self, canonical: &str, rev: &Option<Arc<str>>) -> ResolutionCell {
+        let mut resolutions = self.resolutions.lock().await;
+        resolutions
+            .entry((canonical.to_string(), rev.as_deref().map(str::to_owned)))
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    }
+
+    async fn acquisition_cell(&self, source_git: &Path, oid: Oid, dotgit: bool) -> AcquisitionCell {
+        let mut acquisitions = self.acquisitions.lock().await;
+        acquisitions
+            .entry((source_git.to_path_buf(), oid.to_string(), dotgit))
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    }
+
+    async fn materialization_cell(&self, key: MaterializationKey) -> MaterializationCell {
+        let mut materializations = self.materializations.lock().await;
+        materializations
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    }
+
+    async fn build_cell(&self, key: BuildKey) -> BuildCell {
+        let mut builds = self.builds.lock().await;
+        builds
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    }
+
+    fn source_git_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.source_git_locks.lock().unwrap();
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn materialize_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.materialize_locks.lock().unwrap();
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn build_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.build_locks.lock().unwrap();
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -842,6 +985,7 @@ impl Plugin {
             &self.source_name,
             &logid,
             canonical.clone(),
+            catalogs,
         )
         .await?
         {
@@ -863,6 +1007,7 @@ impl Plugin {
             url: &url,
             oid,
             source_git: &source_git,
+            canonical: &canonical,
             token: &token,
             source_name: &self.source_name,
             network,
@@ -870,7 +1015,9 @@ impl Plugin {
             install,
             update,
             locked,
+            dotgit,
             logid: &logid,
+            jobs: catalogs,
         };
 
         // exact snapshot key（build/lua_build 入力込み）を先に確定し、source.git 要否を exact
@@ -891,7 +1038,7 @@ impl Plugin {
         // GitFetch（非 tarball）の場合だけ source.git を確保する。exact snapshot が無ければ取得。
         if !use_tarball
             && !catalog.contains_exact_key(&final_key).await
-            && !ensure_source_git(&ctx).await?
+            && !acquisition::ensure_source_git(&ctx).await?
         {
             return Ok(EarlyOutcome::Skipped);
         }
@@ -906,10 +1053,16 @@ impl Plugin {
             MaterializedRepo,
             bool,
             bool,
-        ) = if final_root.exists() {
+        ) = if tokio::fs::symlink_metadata(final_root.as_ref())
+            .await
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
             // 同一 key の snapshot が既存 → 再利用（build/lua_post_update をスキップ）。
             // Phase 7 以降の tarball snapshot は `.git` 無し → Plain、旧 snapshot は Git。
-            let repo = if final_root.join(".git").exists() {
+            let repo = if tokio::fs::symlink_metadata(final_root.join(".git"))
+                .await
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
                 MaterializedRepo::Git(git::open(final_root.clone()).await?)
             } else {
                 MaterializedRepo::Plain
@@ -918,10 +1071,9 @@ impl Plugin {
         } else if has_build {
             // build がある: 一時 worktree で materialize まで。build/dirty/rename は LATE。
             // dirty_diff を snapshot_key に含めるため、build 後でないと最終 key が確定しない。
-            let building = building_worktree_dir(&worktrees);
-            let _ = tokio::fs::remove_dir_all(&building).await;
+            let building = building_worktree_dir(&worktrees, &final_key);
             let building: Arc<Path> = Arc::from(building);
-            let repo = match materialize(&ctx, building.as_ref(), use_tarball).await? {
+            let repo = match acquisition::materialize(&ctx, building.as_ref(), use_tarball).await? {
                 Some(r) => r,
                 None => return Ok(EarlyOutcome::Skipped),
             };
@@ -930,10 +1082,11 @@ impl Plugin {
             (building, repo, is_plain, true)
         } else {
             // build 無し: key は確定（dirty=None）。final に materialize。
-            let repo = match materialize(&ctx, final_root.as_ref(), use_tarball).await? {
-                Some(r) => r,
-                None => return Ok(EarlyOutcome::Skipped),
-            };
+            let repo =
+                match acquisition::materialize(&ctx, final_root.as_ref(), use_tarball).await? {
+                    Some(r) => r,
+                    None => return Ok(EarlyOutcome::Skipped),
+                };
             (final_root.clone(), repo, false, false)
         };
 
@@ -1053,9 +1206,67 @@ impl Plugin {
                 } = cache;
 
                 // --- BUILD（has_build なら building worktree で実行 → rename → reopen） ---
+                // Duplicate specs with identical build inputs may finish EARLY
+                // concurrently. Serialize only the final built snapshot key;
+                // the first publisher performs the build and later waiters
+                // reuse its immutable result.
+                let build_cell = if needs_build {
+                    let cell = catalogs
+                        .build_cell(BuildKey {
+                            canonical: canonical.clone(),
+                            oid: head_rev_str.clone(),
+                            build: Arc::from(build.clone().into_boxed_slice()),
+                            lua_build: lua_build.clone().map(Arc::from),
+                            lua_post_update: lua_post_update.clone().map(Arc::from),
+                            update,
+                            destination: final_root.to_path_buf(),
+                        })
+                        .await;
+                    if cell.get().is_some() {
+                        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::DuplicateBuildJob);
+                    }
+                    Some(cell)
+                } else {
+                    None
+                };
+                let _build_guard = if needs_build {
+                    Some(catalogs.build_lock(final_root.as_ref()).lock_owned().await)
+                } else {
+                    None
+                };
                 let snapshot_root_path: Arc<Path> = if needs_build {
-                    // lua_post_update は update 検知時のみ building worktree で実行。
-                    if update && let Some(lua_post_update) = lua_post_update.as_deref() {
+                    let _build_failure_guard = build_cell
+                        .as_ref()
+                        .map(|cell| BuildFailureGuard { cell: cell.clone() });
+                    if let Some(cell) = &build_cell
+                        && let Some(result) = cell.get()
+                    {
+                        result.clone().map_err(|message| {
+                            Error::Io(std::io::Error::other(message.as_ref()))
+                        })?;
+                    }
+                    let already_built =
+                        tokio::fs::metadata(final_root.as_ref())
+                            .await
+                            .is_ok_and(|metadata| {
+                                metadata.is_dir() && !metadata.file_type().is_symlink()
+                            });
+                    if already_built {
+                        if let Some(cell) = &build_cell {
+                            let _ = cell.set(Ok(()));
+                        }
+                        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::DuplicateBuildJob);
+                        drop(repository);
+                        let _ = tokio::fs::remove_dir_all(worktree_path.as_ref()).await;
+                        repository = if is_plain {
+                            MaterializedRepo::Plain
+                        } else {
+                            MaterializedRepo::Git(git::open(final_root.clone()).await?)
+                        };
+                        final_root.clone()
+                    } else {
+                        // Both hooks consume the same dependency-completion-ordered
+                        // runtimepath. Construct it once for this snapshot job.
                         let rtp = build_runtimepaths(
                             &worktree_path,
                             cache_dir,
@@ -1063,75 +1274,104 @@ impl Plugin {
                             catalogs,
                         )
                         .await;
-                        let id = Arc::new(format!("{logid} (lua_post_update)"));
-                        let result: Result<(), Error> = {
-                            let id = id.clone();
-                            async {
-                                let path = create_lua_build_script(lua_post_update, &rtp).await?;
-                                let _build = super::util::resources::build().await?;
-                                let code = execute(
-                                    lua_build_nvim_command(path.as_os_str()),
-                                    worktree_path.clone(),
-                                    move |(stdtype, line)| {
-                                        msg(Message::CacheBuildProgress {
-                                            id: id.clone(),
-                                            stdtype,
-                                            line,
+                        // lua_post_update は update 検知時のみ building worktree で実行。
+                        if update && let Some(lua_post_update) = lua_post_update.as_deref() {
+                            let id = Arc::new(format!("{logid} (lua_post_update)"));
+                            let result: Result<(), Error> = {
+                                let id = id.clone();
+                                async {
+                                    let path =
+                                        create_lua_build_script(lua_post_update, &rtp).await?;
+                                    let _build = super::util::resources::build().await?;
+                                    let code = execute(
+                                        lua_build_nvim_command(path.as_os_str()),
+                                        worktree_path.clone(),
+                                        move |(stdtype, line)| {
+                                            msg(Message::CacheBuildProgress {
+                                                id: id.clone(),
+                                                stdtype,
+                                                line,
+                                            });
+                                        },
+                                    )
+                                    .await;
+                                    let _ = tokio::fs::remove_file(&path).await;
+                                    let code = code?;
+                                    if code != 0 {
+                                        return Err(Error::BuildLuaScriptFailed {
+                                            code,
+                                            repo: repo_name.clone(),
                                         });
-                                    },
-                                )
-                                .await;
-                                let _ = tokio::fs::remove_file(&path).await;
-                                let code = code?;
-                                if code != 0 {
-                                    return Err(Error::BuildLuaScriptFailed {
-                                        code,
-                                        repo: repo_name.clone(),
-                                    });
+                                    }
+                                    Ok(())
                                 }
-                                Ok(())
                             }
+                            .await;
+                            msg(Message::CacheBuildFinished {
+                                id,
+                                success: result.is_ok(),
+                            });
+                            result?;
                         }
-                        .await;
-                        msg(Message::CacheBuildFinished {
-                            id,
-                            success: result.is_ok(),
-                        });
-                        result?;
+
+                        crate::rsplug::perf::failpoint("build_before")?;
+                        build::run_repo_build(
+                            &build,
+                            lua_build.as_deref(),
+                            worktree_path.clone(),
+                            rtp,
+                            &logid,
+                            &repo_name,
+                        )
+                        .await?;
+                        crate::rsplug::perf::failpoint("build_after")?;
+
+                        // build 後 dirty を反映した最終 identity → key へ原子リネーム。
+                        // 失敗しても final_root は作られない。
+                        drop(repository);
+                        tokio::fs::rename(worktree_path.as_ref(), final_root.as_ref()).await?;
+                        if let Some(cell) = &build_cell {
+                            let _ = cell.set(Ok(()));
+                        }
+                        // Plain は `.git` 無しで開き直せない。Git のみ git::open する。
+                        repository = if is_plain {
+                            MaterializedRepo::Plain
+                        } else {
+                            MaterializedRepo::Git(git::open(final_root.clone()).await?)
+                        };
+                        final_root.clone()
                     }
-
-                    let rtp = build_runtimepaths(
-                        &worktree_path,
-                        cache_dir,
-                        &dependency_cachedirs,
-                        catalogs,
-                    )
-                    .await;
-                    crate::rsplug::perf::failpoint("build_before")?;
-                    run_repo_build(
-                        &build,
-                        lua_build.as_deref(),
-                        worktree_path.clone(),
-                        rtp,
-                        &logid,
-                        &repo_name,
-                    )
-                    .await?;
-                    crate::rsplug::perf::failpoint("build_after")?;
-
-                    // build 後 dirty を反映した最終 identity → key へ原子リネーム。
-                    // 失敗しても final_root は作られない。
-                    drop(repository);
-                    tokio::fs::rename(worktree_path.as_ref(), final_root.as_ref()).await?;
-                    // Plain は `.git` 無しで開き直せない。Git のみ git::open する。
-                    repository = if is_plain {
-                        MaterializedRepo::Plain
-                    } else {
-                        MaterializedRepo::Git(git::open(final_root.clone()).await?)
-                    };
-                    final_root.clone()
                 } else {
                     worktree_path.clone()
+                };
+
+                // Plain built snapshots need a content identity. Build the
+                // inventory once and retain it for publication instead of
+                // doing a second recursive content-hash walk.
+                let mut prepared_manifest = None;
+                let plain_content_digest = if is_plain && has_build {
+                    let manifest_path = snapshot_root_path.join(MANIFEST_FILE);
+                    let cached_digest = tokio::fs::read(&manifest_path)
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<SnapshotManifest>(&bytes).ok())
+                        .filter(|manifest| manifest.validate())
+                        .and_then(|manifest| manifest.content_digest);
+                    if cached_digest.is_some() {
+                        cached_digest
+                    } else {
+                        let (manifest, digest) = SnapshotManifest::build_with_content_digest(
+                            snapshot_root_path.as_ref(),
+                            dotgit,
+                            RSPLUG_BUILD_SUCCESS_FILE,
+                            true,
+                        )
+                        .await?;
+                        prepared_manifest = Some(manifest);
+                        digest
+                    }
+                } else {
+                    None
                 };
 
                 // --- 最終 identity と build 成功 marker (snapshot_root 単位, PLANS §11) ---
@@ -1142,6 +1382,7 @@ impl Plugin {
                     head_rev_str.as_bytes().to_vec(),
                     &build,
                     lua_build.as_deref(),
+                    plain_content_digest,
                 )
                 .await?;
                 if has_build {
@@ -1157,7 +1398,9 @@ impl Plugin {
                 // fallback。既存 snapshot の再利用時は書き込みを省き、重複 walk を避ける。
                 crate::rsplug::perf::failpoint("inventory_write_before")?;
                 let manifest_path = snapshot_root_path.join(MANIFEST_FILE);
-                if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
+                if let Some(manifest) = prepared_manifest {
+                    let _ = manifest.write(snapshot_root_path.as_ref()).await;
+                } else if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
                     let _ = SnapshotManifest::build_and_write(
                         snapshot_root_path.as_ref(),
                         dotgit,
@@ -1179,9 +1422,10 @@ impl Plugin {
                 // --- ステージ6: LoadedPlugin 構築（plugin_id 決定の核心） ---
                 // filesource/entries/lazy_type 合成/FileItem 構築/通知は assemble_loaded_plugin 内へ
                 // 抽出した。計算式・順序は旧インライン実装と完全同一（plugin_id 安定性）。
-                let loaded = assemble_loaded_plugin(
+                let loaded = assembly::assemble_loaded_plugin(
                     &snapshot_root_path,
                     &identity,
+                    catalogs,
                     dotgit,
                     &merge,
                     lazy_type,
@@ -1303,6 +1547,34 @@ pub(crate) enum EarlyOutcome {
 /// 以降の LATE/main がインストール状態を再計算せずに変更選別できるようにする (PLANS U2 step 7)。
 /// `Ok(None)` = スキップ（未インストール等）。ネットワーク許可・サンプル計上は
 /// [`resolve_remote_oid`] 内の [`NetworkLimits::run`] に一元化し、ここではpermit を保持しない。
+#[allow(clippy::too_many_arguments)]
+async fn resolve_shared_remote_oid(
+    catalogs: &SnapshotCatalogCache,
+    canonical: &str,
+    rev: &Option<Arc<str>>,
+    network: &adaptive_semaphore::NetworkLimits,
+    breaker: &util::github::CircuitBreaker,
+    http_client: &reqwest::Client,
+    url: &Arc<str>,
+    token: &Option<Arc<str>>,
+) -> Result<(Oid, ResolutionBackend), Error> {
+    let cell = catalogs.resolution_cell(canonical, rev).await;
+    if cell.get().is_some() {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::DuplicateResolutionJob);
+    }
+    let result = cell
+        .get_or_init(|| async {
+            resolve_remote_oid(network, breaker, http_client, url, rev, token)
+                .await
+                .map_err(|error| Arc::<str>::from(error.to_string()))
+        })
+        .await;
+    match result {
+        Ok(value) => Ok(*value),
+        Err(error) => Err(Error::Io(std::io::Error::other(error.as_ref()))),
+    }
+}
+
 // Plugin::load からの抽出。引数過多は LoadCtx 構造体化（巨大化）より局所的と判断し allow する。
 #[allow(clippy::too_many_arguments)]
 async fn resolve_target_commit(
@@ -1319,6 +1591,7 @@ async fn resolve_target_commit(
     source_name: &Option<String>,
     logid: &str,
     canonical: String,
+    catalogs: &SnapshotCatalogCache,
 ) -> Result<Option<ResolvedRevision>, Error> {
     use crate::log::{Message, msg};
 
@@ -1387,8 +1660,17 @@ async fn resolve_target_commit(
         match catalog.latest_oid().await {
             Some(existing) if update => {
                 msg(Message::Cache("Updating", url.clone()));
-                let (oid, backend) =
-                    resolve_remote_oid(network, breaker, http_client, url, rev, token).await?;
+                let (oid, backend) = resolve_shared_remote_oid(
+                    catalogs,
+                    &canonical,
+                    rev,
+                    network,
+                    breaker,
+                    http_client,
+                    url,
+                    token,
+                )
+                .await?;
                 msg(Message::Cache("Updating:done", url.clone()));
                 // リモートの最新 rev が既存 snapshot と異なれば「実際に更新された」。
                 let was_updated = existing != oid;
@@ -1417,8 +1699,17 @@ async fn resolve_target_commit(
             },
             None if install => {
                 msg(Message::Cache("Updating", url.clone()));
-                let (oid, backend) =
-                    resolve_remote_oid(network, breaker, http_client, url, rev, token).await?;
+                let (oid, backend) = resolve_shared_remote_oid(
+                    catalogs,
+                    &canonical,
+                    rev,
+                    network,
+                    breaker,
+                    http_client,
+                    url,
+                    token,
+                )
+                .await?;
                 msg(Message::Cache("Updating:done", url.clone()));
                 ResolvedRevision {
                     canonical,
@@ -1454,6 +1745,7 @@ async fn resolve_target_commit(
 async fn assemble_loaded_plugin(
     snapshot_root_path: &Arc<Path>,
     identity: &RepoSnapshotIdentity,
+    catalogs: &SnapshotCatalogCache,
     dotgit: bool,
     merge: &MergeConfig,
     mut lazy_type: LazyType,
@@ -1475,18 +1767,48 @@ async fn assemble_loaded_plugin(
     // target/ 等の build 成果物は ignore 対象外なので pack に残る。.rsplug_build_success は
     // ignore.gitignore で除外される。`.git` は通常 ignore 対象だが、dotgit=true のときは
     // 例外扱いせず通常ディレクトリと同じくエントリに含める。
+    // A valid inventory is the authoritative immutable snapshot view.  It avoids
+    // re-reading the root, lua/, and doc/ trees on every warm refresh; an absent or
+    // invalid cache deliberately falls back to the historical filesystem path.
+    let inventory = catalogs
+        .inventory(snapshot_root_path.as_ref().to_path_buf())
+        .await;
     let filesource = Arc::new(FileSource::Directory {
         path: snapshot_root_path.clone(),
+        inventory: inventory.clone(),
+        handle: inventory.clone().map(|inventory| {
+            Arc::new(SnapshotHandle {
+                root: snapshot_root_path.clone(),
+                identity: identity.clone(),
+                inventory,
+            })
+        }),
     });
-    let mut entries: Vec<PathBuf> = Vec::new();
-    {
+    let (entries, mut manifest_doc_entries, lua_modules) = if let Some(manifest) = &inventory {
+        let mut top = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.path.parent() == Some(Path::new("")))
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        top.sort();
+        let docs = inventory::manifest_doc_entries(manifest, &filesource, identity);
+        let lua = inventory::manifest_lua_modules(manifest);
+        (top, Some(docs), lua)
+    } else {
+        let mut top = Vec::new();
         let mut rd = tokio::fs::read_dir(snapshot_root_path.as_ref()).await?;
         while let Some(entry) = rd.next_entry().await? {
-            entries.push(PathBuf::from(entry.file_name()));
+            top.push(PathBuf::from(entry.file_name()));
         }
-    }
-    entries.sort(); // 決定論的順序（plugin_id 安定化）
-    for luam in extract_unique_lua_modules_from_snapshot(snapshot_root_path.as_ref()).await {
+        top.sort();
+        (
+            top,
+            None,
+            inventory::extract_unique_lua_modules_from_snapshot(snapshot_root_path.as_ref()).await,
+        )
+    };
+    for luam in lua_modules {
         lazy_type &= LoadEvent::LuaModule(LuaModule(luam.into()));
     }
     // 各トップレベルエントリを配置対象に組み立てる。`doc` だけは例外:
@@ -1505,8 +1827,14 @@ async fn assemble_loaded_plugin(
             continue;
         }
         if name == Path::new("doc") {
-            file_entries
-                .extend(doc_file_entries(snapshot_root_path.as_ref(), &filesource, identity).await);
+            if let Some(docs) = manifest_doc_entries.take() {
+                file_entries.extend(docs);
+            } else {
+                file_entries.extend(
+                    inventory::doc_file_entries(snapshot_root_path.as_ref(), &filesource, identity)
+                        .await,
+                );
+            }
         } else {
             file_entries.push((
                 name.clone(),
@@ -1546,6 +1874,7 @@ struct FetchCtx<'a> {
     url: &'a Arc<str>,
     oid: Oid,
     source_git: &'a Path,
+    canonical: &'a str,
     token: &'a Option<Arc<str>>,
     source_name: &'a Option<String>,
     network: &'a adaptive_semaphore::NetworkLimits,
@@ -1553,7 +1882,9 @@ struct FetchCtx<'a> {
     install: bool,
     update: bool,
     locked: bool,
+    dotgit: bool,
     logid: &'a str,
+    jobs: &'a SnapshotCatalogCache,
 }
 
 /// リモートの最新コミットハッシュを解決する (PLANS U2 step 5)。
@@ -1638,9 +1969,33 @@ async fn resolve_remote_oid(
 
 /// 戻り値 `Ok(true)` = source.git に oid を fetch 済み、`Ok(false)` = 未インストールなのでスキップ。
 /// `Err` = locked で cache 不足、または fetch 失敗。
+#[cfg(test)]
+#[allow(dead_code)]
 async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
+    let cell = ctx
+        .jobs
+        .acquisition_cell(ctx.source_git, ctx.oid, ctx.dotgit)
+        .await;
+    let result = cell
+        .get_or_init(|| async {
+            ensure_source_git_inner(ctx)
+                .await
+                .map_err(|error| Arc::from(error.to_string()))
+        })
+        .await;
+    result
+        .clone()
+        .map_err(|message| Error::Io(std::io::Error::other(message.as_ref())))
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn ensure_source_git_inner(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
     use super::util::git;
     use crate::log::{Message, msg};
+
+    let source_lock = ctx.jobs.source_git_lock(ctx.source_git);
+    let _source_guard = source_lock.lock().await;
 
     let mut repo = match git::open_source(ctx.source_git).await {
         Ok(r) => r,
@@ -1663,6 +2018,9 @@ async fn ensure_source_git(ctx: &FetchCtx<'_>) -> Result<bool, Error> {
             return Ok(false);
         }
     };
+    if repo.contains_oid(ctx.oid).await? {
+        return Ok(true);
+    }
     {
         let _git = super::util::resources::git().await?;
         msg(Message::Cache("Fetching", ctx.url.clone()));
@@ -1684,18 +2042,81 @@ enum MaterializedRepo {
     Plain,
 }
 
+#[derive(Clone, Debug)]
+struct MaterializedSnapshot {
+    root: Arc<Path>,
+    plain: bool,
+}
+
 /// snapshot worktree を `dest` に実体化し、そのバックエンド [`MaterializedRepo`] を返す。
 /// `use_tarball` なら TarballFetch を試行（成功すれば `.git` を作らない `Plain`）、
 /// 失敗時は GitFetch（source.git）にフォールバック（`Git`）。
 /// `use_tarball` でない場合は source.git 経由で init_snapshot する（呼出元で source.git 確保済みが前提、`Git`）。
 /// 戻り値 `Ok(None)` = 未インストールスキップ。
+#[cfg(test)]
+#[allow(dead_code)]
 async fn materialize(
     ctx: &FetchCtx<'_>,
     dest: &Path,
     use_tarball: bool,
 ) -> Result<Option<MaterializedRepo>, Error> {
+    use super::util::git;
+
+    let key = MaterializationKey {
+        canonical: ctx.canonical.to_owned(),
+        oid: ctx.oid.to_string(),
+        use_tarball,
+        dotgit: ctx.dotgit,
+        destination: dest.to_path_buf(),
+    };
+    let cell = ctx.jobs.materialization_cell(key).await;
+    if cell.get().is_some() {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::DuplicateMaterializeJob);
+    }
+    let result = cell
+        .get_or_init(|| async {
+            materialize_inner(ctx, dest, use_tarball)
+                .await
+                .map_err(|error| Arc::<str>::from(error.to_string()))
+        })
+        .await;
+    let snapshot = result
+        .clone()
+        .map_err(|message| Error::Io(std::io::Error::other(message.as_ref())))?;
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    if snapshot.plain {
+        Ok(Some(MaterializedRepo::Plain))
+    } else {
+        Ok(Some(MaterializedRepo::Git(git::open(snapshot.root).await?)))
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn materialize_inner(
+    ctx: &FetchCtx<'_>,
+    dest: &Path,
+    use_tarball: bool,
+) -> Result<Option<MaterializedSnapshot>, Error> {
     use super::util::{fetch::TarballFetch, git};
     use crate::log::{Message, msg};
+
+    let _materialize_guard = ctx.jobs.materialize_lock(dest).lock_owned().await;
+    // Duplicate specs can arrive at this boundary concurrently. Once the first
+    // waiter has published the immutable destination, reuse it instead of
+    // downloading/extracting the same revision again.
+    if tokio::fs::try_exists(dest).await.unwrap_or(false) {
+        crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::DuplicateMaterializeJob);
+        let plain = !tokio::fs::try_exists(dest.join(".git"))
+            .await
+            .unwrap_or(false);
+        return Ok(Some(MaterializedSnapshot {
+            root: Arc::from(dest.to_path_buf()),
+            plain,
+        }));
+    }
 
     if use_tarball {
         crate::rsplug::perf::failpoint("materialize_before")?;
@@ -1703,8 +2124,9 @@ async fn materialize(
             msg(Message::Cache("Fetching", ctx.url.clone()));
             let head_rev = ctx.oid.to_string();
             crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::TarballFetch);
-            // Network permit covers only HTTP download.  Archive extraction is CPU/disk bound
-            // and runs afterwards under TarballFetch's separate bounded semaphore.
+            // The network permit covers only the file-backed HTTP download.
+            // Extraction is CPU/disk bound and runs afterwards under the
+            // tarball extractor's independent bounded semaphore.
             let download = ctx
                 .network
                 .run(
@@ -1719,15 +2141,12 @@ async fn materialize(
                 )
                 .await;
             let tarball_ok = match download {
-                Ok(tarball) => match tarball.extract_to_snapshot(dest).await {
-                    Ok(()) => {
-                        msg(Message::Cache("Fetching:done", ctx.url.clone()));
-                        true
-                    }
-                    Err(_) => false,
-                },
+                Ok(archive) => archive.extract_to_snapshot(dest).await.is_ok(),
                 Err(_) => false,
             };
+            if tarball_ok {
+                msg(Message::Cache("Fetching:done", ctx.url.clone()));
+            }
             crate::rsplug::perf::incr(if tarball_ok {
                 crate::rsplug::perf::PerfOp::PermitSuccess
             } else {
@@ -1737,7 +2156,10 @@ async fn materialize(
         };
         if tarball_ok {
             // Phase 7: tarball は `.git` を作らない。identity/dirty は内容ハッシュで計算。
-            return Ok(Some(MaterializedRepo::Plain));
+            return Ok(Some(MaterializedSnapshot {
+                root: Arc::from(dest.to_path_buf()),
+                plain: true,
+            }));
         }
         // TarballFetch 失敗 → GitFetch（source.git）にフォールバック
         if !ensure_source_git(ctx).await? {
@@ -1747,9 +2169,11 @@ async fn materialize(
 
     let _git = super::util::resources::git().await?;
     crate::rsplug::perf::failpoint("materialize_after")?;
-    Ok(Some(MaterializedRepo::Git(
-        git::init_snapshot(dest.to_path_buf(), ctx.source_git, ctx.oid).await?,
-    )))
+    git::init_snapshot(dest.to_path_buf(), ctx.source_git, ctx.oid).await?;
+    Ok(Some(MaterializedSnapshot {
+        root: Arc::from(dest.to_path_buf()),
+        plain: false,
+    }))
 }
 
 /// 未インストール警告の表示名。`source_name`（`dep_name` 由来）を優先し、
@@ -1783,16 +2207,19 @@ impl Drop for RunningGuard {
 
 /// build 中の一時 worktree: `worktrees/.building-<pid>-<nonce>` (PLANS §7)。
 /// `worktrees/` 内の hidden directory なので scan 対象にならない（先頭 `.`）。
-fn building_worktree_dir(worktrees: &Path) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    worktrees.join(format!(".building-{}-{}", std::process::id(), nonce))
+fn building_worktree_dir(worktrees: &Path, snapshot_key: &str) -> PathBuf {
+    // Keep the path process-private for cross-process safety, but stable for
+    // duplicate specs in one scheduler run. The materialize job lock then
+    // coalesces the checkout/extraction before the build lock coalesces the
+    // mutable build and final publication.
+    let key = util::hash::digest_hash_hex_string(&snapshot_key);
+    worktrees.join(format!(".building-{}-{}", std::process::id(), key))
 }
 
 /// repo の `build`(sh) と `lua_build` を `workdir` で実行する。
 /// `runtimepaths` は lua_build 実行時に nvim の runtimepath に追加する（依存先 snapshot 含む）。
+#[cfg(test)]
+#[allow(dead_code)]
 async fn run_repo_build(
     build: &[String],
     lua_build: Option<&str>,
@@ -1915,102 +2342,6 @@ async fn build_runtimepaths(
 /// `doc` を sealed-dir 1エントリではなく個別ファイルとして列挙する
 ///（origin/main `collect_doc_files_from_root` 相当。同期 IO を避けるため async で走査）。
 /// doc_root が無い/ディレクトリでなければ空。エラーは寛容に skip し得た分だけ返す。
-async fn doc_file_entries(
-    snapshot_root: &Path,
-    filesource: &Arc<FileSource>,
-    identity: &RepoSnapshotIdentity,
-) -> Vec<(PathBuf, FileItem)> {
-    let doc_root = snapshot_root.join("doc");
-    let is_dir = tokio::fs::metadata(&doc_root)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
-    if !is_dir {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut seen_dirs: hashbrown::HashSet<PathBuf> = hashbrown::HashSet::new();
-    let mut stack: Vec<(PathBuf, usize)> = vec![(doc_root.clone(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > 128 {
-            continue;
-        }
-        // symlink ループ保護（origin/main collect_doc_files_from_root 準拠）。
-        if let Ok(canonical) = tokio::fs::canonicalize(&dir).await
-            && !seen_dirs.insert(canonical)
-        {
-            continue;
-        }
-        let mut rd = match tokio::fs::read_dir(&dir).await {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let path = entry.path();
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push((path, depth + 1));
-                continue;
-            }
-            let is_file = if ft.is_symlink() {
-                tokio::fs::metadata(&path)
-                    .await
-                    .map(|m| m.is_file())
-                    .unwrap_or(false)
-            } else {
-                ft.is_file()
-            };
-            if !is_file {
-                continue;
-            }
-            let Ok(rel) = path.strip_prefix(&doc_root) else {
-                continue;
-            };
-            let key = PathBuf::from("doc").join(rel);
-            out.push((
-                key.clone(),
-                FileItem::new(
-                    filesource.clone(),
-                    FileIdentity::RepoFile(RepoFileIdentity::new(identity.clone(), key)),
-                    MergeType::Conflict,
-                ),
-            ));
-        }
-    }
-    out
-}
-
-async fn extract_unique_lua_modules_from_snapshot(snapshot_root: &Path) -> Vec<String> {
-    let mut rd = match tokio::fs::read_dir(snapshot_root.join("lua")).await {
-        Ok(rd) => rd,
-        Err(_) => return Vec::new(),
-    };
-    let mut seen = hashbrown::HashSet::new();
-    let mut out = Vec::new();
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let name = match entry.file_name().to_str() {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        let stem = if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-            name
-        } else {
-            Path::new(&name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        if !stem.is_empty() && seen.insert(stem.clone()) {
-            out.push(stem);
-        }
-    }
-    out
-}
-
 async fn build_repo_snapshot_identity(
     repo: &MaterializedRepo,
     snapshot_root: &Path,
@@ -2018,20 +2349,16 @@ async fn build_repo_snapshot_identity(
     head_rev: Vec<u8>,
     build: &[String],
     lua_build: Option<&str>,
+    plain_content_digest: Option<[u8; 16]>,
 ) -> Result<RepoSnapshotIdentity, Error> {
     let has_build = !build.is_empty() || lua_build.is_some();
     // Git は git diff、tarball（Plain）は build があればファイル内容ハッシュ（Phase 7）。
     let dirty_diff = match repo {
-        MaterializedRepo::Git(g) => {
-            if g.is_dirty().await? {
-                Some(g.diff_hash().await?)
-            } else {
-                None
-            }
-        }
-        MaterializedRepo::Plain if has_build => {
-            Some(util::dirty_diff_from_content(snapshot_root).await?)
-        }
+        MaterializedRepo::Git(g) => g.dirty_diff_hash().await?,
+        MaterializedRepo::Plain if has_build => Some(match plain_content_digest {
+            Some(digest) => digest,
+            None => util::dirty_diff_from_content(snapshot_root).await?,
+        }),
         MaterializedRepo::Plain => None,
     };
 
@@ -2067,24 +2394,9 @@ struct LuaBuildTemplate<'a> {
 }
 
 fn lua_build_wrapper(lua_script: &str, runtimepaths: &[PathBuf]) -> String {
-    fn lua_single_quoted(s: &str) -> String {
-        let mut escaped = String::with_capacity(s.len() + 8);
-        escaped.push('\'');
-        for ch in s.chars() {
-            match ch {
-                '\\' => escaped.push_str("\\\\"),
-                '\'' => escaped.push_str("\\'"),
-                '\n' => escaped.push_str("\\n"),
-                '\r' => escaped.push_str("\\r"),
-                _ => escaped.push(ch),
-            }
-        }
-        escaped.push('\'');
-        escaped
-    }
     let quoted: Vec<String> = runtimepaths
         .iter()
-        .map(|p| lua_single_quoted(p.to_string_lossy().as_ref()))
+        .map(|p| super::lazy_registration::lua_string(p.to_string_lossy()).to_string())
         .collect();
     LuaBuildTemplate {
         runtimepaths: quoted,
@@ -2258,6 +2570,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_staging_path_coalesces_equal_snapshot_inputs_per_process() {
+        let root = Path::new("/tmp/worktrees");
+        let first = building_worktree_dir(root, "0123456789abcdef");
+        let second = building_worktree_dir(root, "0123456789abcdef");
+        let different = building_worktree_dir(root, "fedcba9876543210");
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!(".building-{}-", std::process::id()))
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_catalog_fast_path_and_fallback_repair_are_invariant() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2330,18 +2659,61 @@ mod tests {
         assert!(!first.contains_exact_key(&key).await);
     }
 
+    #[tokio::test]
+    async fn materialization_jobs_share_typed_once_cell_results() {
+        let cache = SnapshotCatalogCache::new();
+        let key = MaterializationKey {
+            canonical: "github.com/example/plugin".into(),
+            oid: "0123456789abcdef0123456789abcdef01234567".into(),
+            use_tarball: false,
+            dotgit: false,
+            destination: PathBuf::from("/tmp/rsplug-materialization"),
+        };
+        let first = cache.materialization_cell(key.clone()).await;
+        let second = cache.materialization_cell(key).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        first
+            .set(Ok(Some(MaterializedSnapshot {
+                root: Arc::from(PathBuf::from("/tmp/rsplug-materialization")),
+                plain: false,
+            })))
+            .unwrap();
+        assert!(second.get().unwrap().as_ref().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn build_jobs_share_typed_once_cell_errors_and_results() {
+        let cache = SnapshotCatalogCache::new();
+        let key = BuildKey {
+            canonical: "github.com/example/build".into(),
+            oid: "0123456789012345678901234567890123456789".into(),
+            build: Arc::from(vec!["make".to_string()].into_boxed_slice()),
+            lua_build: Some(Arc::from("return true")),
+            lua_post_update: None,
+            update: true,
+            destination: PathBuf::from("worktrees/build"),
+        };
+        let first = cache.build_cell(key.clone()).await;
+        let second = cache.build_cell(key).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        first.set(Err(Arc::from("stable build failure"))).unwrap();
+        assert_eq!(
+            second.get().unwrap().as_ref().unwrap_err().as_ref(),
+            "stable build failure"
+        );
+    }
+
     #[test]
     fn lua_build_wrapper_wraps_script_and_runtimepaths() {
         let script = "vim.cmd('echo hi')";
         let rtp = vec![PathBuf::from("/path/with'quote"), PathBuf::from("/normal")];
         let out = lua_build_wrapper(script, &rtp);
 
-        // ponytail: locks in the xpcall/ipairs wrapper shape and single-quote escaping.
+        // Locks in the xpcall/ipairs wrapper shape and Lua literal escaping.
         assert!(out.starts_with("local ok, err = xpcall(function()\n"));
         assert!(out.contains("for _, rtp in ipairs({"));
-        // single-quote escaping applied to runtimepath entries
-        assert!(out.contains("\t'/path/with\\'quote',\n"));
-        assert!(out.contains("\t'/normal',\n"));
+        assert!(out.contains("\t\"/path/with'quote\",\n"));
+        assert!(out.contains("\t\"/normal\",\n"));
         // the user script body is embedded verbatim
         assert!(out.contains("vim.cmd('echo hi')"));
         assert!(out.contains("end, debug.traceback)"));
@@ -3177,6 +3549,8 @@ mod tests {
 
         let filesource = Arc::new(FileSource::Directory {
             path: Arc::from(root.to_path_buf()),
+            inventory: None,
+            handle: None,
         });
         let identity = RepoSnapshotIdentity::new(
             PathBuf::from("github.com/o/r"),
@@ -3186,7 +3560,7 @@ mod tests {
             None,
         );
 
-        let mut entries = doc_file_entries(root, &filesource, &identity).await;
+        let mut entries = inventory::doc_file_entries(root, &filesource, &identity).await;
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         let keys: Vec<&Path> = entries.iter().map(|(k, _)| k.as_path()).collect();
         assert_eq!(
@@ -3201,7 +3575,7 @@ mod tests {
         // doc 無し snapshot は空。
         let nodoc = tempfile::tempdir().unwrap();
         assert!(
-            doc_file_entries(nodoc.path(), &filesource, &identity)
+            inventory::doc_file_entries(nodoc.path(), &filesource, &identity)
                 .await
                 .is_empty()
         );

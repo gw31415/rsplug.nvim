@@ -2,45 +2,31 @@
 ---@param mode string
 ---@return string[]
 local function parse_mode(mode)
-	---@param prefix string
-	---@return boolean
-	local function startswith(prefix)
-		return mode:find(prefix, 1, true) == 1
-	end
-
-	if startswith 'no' then
+	local first = mode:sub(1, 1)
+	if mode:sub(1, 2) == 'no' then
 		return { 'o', '' }
-	elseif startswith 'n' then
+	elseif first == 'n' then
 		return { 'n', '' }
 	end
-	if startswith 'v' or startswith 'V' or startswith '' then
+	if first == 'v' or first == 'V' or first == '' then
 		return { 'x', 'v', '' }
 	end
-	if startswith 's' or startswith 'S' or startswith '' then
+	if first == 's' or first == 'S' or first == '' then
 		return { 's', 'v' }
 	end
-	if startswith 'i' or startswith 'R' then
+	if first == 'i' or first == 'R' then
 		return { 'i' }
 	end
-	if startswith 'c' then
+	if first == 'c' then
 		return { 'c' }
 	end
-	if startswith 't' then
+	if first == 't' then
 		return { 't' }
 	end
 	return {}
 end
 
 local setup_done = {}
-local function add_unique(list, value)
-	for _, existing in ipairs(list) do
-		if existing == value then
-			return
-		end
-	end
-	table.insert(list, value)
-end
-
 local rsplug = require '_rsplug'
 
 local function all_loaded(ids)
@@ -57,13 +43,15 @@ local pattern_modes = {}
 -- Track all plugin IDs for each pattern across all modes
 -- pattern_ids[pattern] = { id1, id2, ... }
 local pattern_ids = {}
+local pattern_id_set = {}
 -- Track which patterns are associated with each plugin ID
--- id_patterns[id] = { pattern1, pattern2, ... }
+-- id_patterns[id] = { [pattern] = true, ... }
 local id_patterns = {}
+local id_pattern_order = {}
 
 ---Retire one package from only the patterns registered by that package.
 local function retire(id)
-	for _, pattern in ipairs(id_patterns[id] or {}) do
+	for _, pattern in ipairs(id_pattern_order[id] or {}) do
 		local ids = pattern_ids[pattern]
 		if ids then
 			for i = #ids, 1, -1 do
@@ -75,10 +63,12 @@ local function retire(id)
 				end
 				pattern_modes[pattern] = nil
 				pattern_ids[pattern] = nil
+				pattern_id_set[pattern] = nil
 			end
 		end
 	end
 	id_patterns[id] = nil
+	id_pattern_order[id] = nil
 end
 
 rsplug.on_loaded(retire)
@@ -92,14 +82,16 @@ local function remove_pattern(pattern)
 	for _, id in ipairs(pattern_ids[pattern] or {}) do
 		local patterns = id_patterns[id]
 		if patterns then
-			for i = #patterns, 1, -1 do
-				if patterns[i] == pattern then table.remove(patterns, i) end
+			patterns[pattern] = nil
+			if next(patterns) == nil then
+				id_patterns[id] = nil
+				id_pattern_order[id] = nil
 			end
-			if #patterns == 0 then id_patterns[id] = nil end
 		end
 	end
 	pattern_modes[pattern] = nil
 	pattern_ids[pattern] = nil
+	pattern_id_set[pattern] = nil
 end
 
 ---全 pending モードが setup されたら watcher 用 augroup を削除する。pcall ガード・冪等。
@@ -123,7 +115,9 @@ function M.setup(mode)
 			setup_done[mode_char] = true
 			M.pending_modes[mode_char] = nil
 			local exists, mod = pcall(require, '_rsplug/on_map/mode_' .. mode_char)
-			for pattern, ids in pairs(exists and mod or {}) do
+			for _, record in ipairs(exists and mod or {}) do
+				local pattern = record.pattern
+				local ids = record.ids
 				-- Skip setup if plugin is already loaded (real mappings exist)
 				if all_loaded(ids) then
 					goto continue
@@ -133,18 +127,27 @@ function M.setup(mode)
 				if not pattern_modes[pattern] then
 					pattern_modes[pattern] = {}
 					pattern_ids[pattern] = {}
+					pattern_id_set[pattern] = {}
 				end
 				table.insert(pattern_modes[pattern], mode_char)
 				-- Collect all unique plugin IDs for this pattern
 				for _, id in ipairs(ids) do
-					add_unique(pattern_ids[pattern], id)
+					if not pattern_id_set[pattern][id] then
+						pattern_id_set[pattern][id] = true
+						table.insert(pattern_ids[pattern], id)
+					end
 					-- Track reverse mapping: plugin ID to patterns
 					if not id_patterns[id] then
 						id_patterns[id] = {}
+						id_pattern_order[id] = {}
 					end
-					add_unique(id_patterns[id], pattern)
+					if not id_patterns[id][pattern] then
+						id_patterns[id][pattern] = true
+						table.insert(id_pattern_order[id], pattern)
+					end
 				end
 
+				local replay = vim.api.nvim_replace_termcodes(pattern, true, false, true)
 				vim.keymap.set(mode_char, pattern, function()
 					-- Get all plugin IDs for this pattern
 					local all_ids = pattern_ids[pattern] or ids
@@ -152,7 +155,7 @@ function M.setup(mode)
 					-- If plugin is already loaded, delete only this mapping and feed keys
 					if all_loaded(all_ids) then
 						pcall(vim.keymap.del, mode_char, pattern, {})
-						vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
+						vim.api.nvim_feedkeys(replay, 'imt', true)
 						return ''
 					end
 
@@ -160,8 +163,7 @@ function M.setup(mode)
 					-- (all patterns associated with the plugins being loaded)
 					local patterns_to_delete = {}
 					for _, id in ipairs(all_ids) do
-						local related_patterns = id_patterns[id] or {}
-						for _, related_pattern in ipairs(related_patterns) do
+						for _, related_pattern in ipairs(id_pattern_order[id] or {}) do
 							patterns_to_delete[related_pattern] = true
 						end
 					end
@@ -181,7 +183,7 @@ function M.setup(mode)
 						rsplug.packadd(id)
 					end
 
-					vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(pattern, true, false, true), 'imt', true)
+					vim.api.nvim_feedkeys(replay, 'imt', true)
 					return ''
 				end, { expr = true, silent = true })
 
