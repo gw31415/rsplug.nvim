@@ -998,15 +998,23 @@ mod m0_harness {
     }
 
     fn http_get(addr: SocketAddr, path: &str) -> Vec<u8> {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        write!(
-            stream,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
-        response
+        for attempt in 0..3 {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = Vec::new();
+            match stream.read_to_end(&mut response) {
+                Ok(_) => return response,
+                Err(error) if attempt < 2 && error.kind() == io::ErrorKind::ConnectionReset => {
+                    thread::yield_now();
+                }
+                Err(error) => panic!("HTTP fixture read failed: {error}"),
+            }
+        }
+        unreachable!("HTTP fixture retries exhausted")
     }
 
     #[test]

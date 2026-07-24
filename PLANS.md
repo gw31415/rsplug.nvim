@@ -544,3 +544,7 @@ crates.io settings remain unchecked until a maintainer performs them.
 - 2026-07-24: The vendored fts unit tests share process-global fixture state;
   hosted parallel test scheduling caused nondeterministic failures. The
   release quality gate now serializes workspace tests with `RUST_TEST_THREADS=1`.
+- 2026-07-24: The local HTTP performance fixture can observe a transient
+  connection reset while its single-threaded server accepts a socket. Its test
+  client now retries that transport-only condition without weakening response
+  assertions.
