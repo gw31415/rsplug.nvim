@@ -224,12 +224,10 @@ jobs:
             rm -f "$remote"
             if [[ "$local_sha" != "$remote_sha" ]]; then
               echo "replacing stale draft asset: $name" >&2
-              gh api --method DELETE \
-                "repos/$GITHUB_REPOSITORY/releases/$release_id/assets/$asset_id"
               missing+=("$file")
             fi
           done
-          ((${#missing[@]} == 0)) || gh release upload "$GITHUB_REF_NAME" "${missing[@]}"
+          ((${#missing[@]} == 0)) || gh release upload --clobber "$GITHUB_REF_NAME" "${missing[@]}"
 
   publish-crates:
     name: Publish crates.io packages
