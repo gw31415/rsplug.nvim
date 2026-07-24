@@ -204,7 +204,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_id="$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq .databaseId)"
+          release_id="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
           release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
           missing=()
           for file in artifacts/*; do
@@ -263,7 +263,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_id="$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq .databaseId)"
+          release_id="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
           release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
           [[ "$(jq -r .draft <<<"$release")" == true ]] || {
             echo "expected an unpublished draft release" >&2; exit 1;

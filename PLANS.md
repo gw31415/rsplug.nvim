@@ -483,29 +483,29 @@ created for that drill, and never reuse its version.
 
 ## Progress
 
-- [ ] R0 release contract and regression fixtures are implemented.
+- [x] R0 release contract and regression fixtures are implemented.
 - [x] R1 preparation/check scripts update all six crates and lock data
       idempotently; local temporary-copy tests pass.
 - [x] R2 tag preflight and quality/package gates are read-only and green in
-      local script/YAML validation; hosted execution remains pending.
-- [ ] R3 all platform artifacts, versions, checksums, and attestations validate.
-- [ ] R4 draft staging is complete and idempotent.
-- [ ] R5 crates publish in dependency order with checksum-safe resume.
-- [ ] R6 final release dependency, permissions, SHA pins, and concurrency are
-      complete.
-- [ ] Maintainer documentation and external GitHub/crates.io settings are
-      verified.
-- [ ] The full validation matrix passes without publishing a production
-      version.
-- [ ] An explicitly approved temporary prerelease drill has passed, or its
-      deferral and remaining risk are documented.
+      local and hosted validation.
+- [x] R3 all five platform artifacts, versions, checksums, and attestations
+      validate in the hosted v0.4.0 run.
+- [x] R4 draft staging is complete and idempotent; stale assets are replaced
+      safely on reruns.
+- [x] R5 all six crates published in dependency order with checksum-safe
+      resume in the hosted v0.4.0 run.
+- [x] R6 final release dependency, permissions, SHA pins, and concurrency are
+      complete; v0.4.0 is public.
+- [x] Maintainer documentation and external GitHub/crates.io settings are
+      verified through the v0.4.0 release.
+- [x] The full hosted validation matrix passes before production publication.
+- [x] The explicitly approved production v0.4.0 release completed; no
+      temporary prerelease drill was needed.
 
-Implementation status: R1 is locally verified. R2-R6 repository changes are in
-place, including the read-only preflight, build/checksum/attestation pipeline,
-draft asset staging, dependency-ordered crate publication, finalization gate,
-Action SHA pins, Dependabot configuration, and recovery checks. Hosted
-workflow execution, an approved draft-tag drill, and the external GitHub and
-crates.io settings remain unchecked until a maintainer performs them.
+Implementation status: The release automation plan is complete. Hosted run
+30089028497 validated the matrix, staged the draft, published all six crates,
+and produced the v0.4.0 assets; the draft was then finalized after correcting
+the no-checkout `gh release view` context in the final job.
 
 ## Discoveries and decision log
 
@@ -566,3 +566,11 @@ crates.io settings remain unchecked until a maintainer performs them.
   the authenticated API URL instead.
 - 2026-07-24: A rerun can rebuild assets after a workflow-only commit; draft
   staging now replaces stale draft assets before uploading the new bytes.
+- 2026-07-24: The first successful crates.io publication exposed that the
+  final release job has no checkout; its `gh release view` call now uses an
+  explicit `--repo` so future tag runs can finalize the draft without Git
+  context.
+- 2026-07-24: Hosted run `30089028497` passed tag validation, tests, five
+  target builds, checksums, attestations, draft staging, and all six crates.io
+  uploads. The GitHub Release was finalized manually once, then the workflow
+  fix was committed for subsequent releases.
