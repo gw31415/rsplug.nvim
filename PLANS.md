@@ -548,3 +548,7 @@ crates.io settings remain unchecked until a maintainer performs them.
   connection reset while its single-threaded server accepts a socket. Its test
   client now retries that transport-only condition without weakening response
   assertions.
+- 2026-07-24: Vendored fts tests use relative `test_data` paths, so running
+  them from the workspace root made hosted tests read the wrong directory.
+  CI now excludes that crate from the workspace run and invokes its tests from
+  the vendored crate directory.
