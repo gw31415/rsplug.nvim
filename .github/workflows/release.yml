@@ -159,7 +159,7 @@ jobs:
           sha256sum rsplug-* > SHA256SUMS
           sha256sum -c SHA256SUMS
       - name: Attest release assets
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-checksums: artifacts/SHA256SUMS
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
