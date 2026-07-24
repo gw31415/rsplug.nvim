@@ -702,6 +702,11 @@ mod m0_harness {
     }
 
     fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+        // `read_dir` order is filesystem-dependent.  Create the destination
+        // root before copying files so a regular file encountered before a
+        // subdirectory does not fail with `NotFound` on filesystems such as
+        // the Ubuntu runner's ext4 layout.
+        fs::create_dir_all(dst)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
             let src_path = entry.path();

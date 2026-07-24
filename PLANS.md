@@ -529,3 +529,8 @@ crates.io settings remain unchecked until a maintainer performs them.
 - 2026-07-24: Existing performance recipes were removed after completion.
   Their two ambiguous expanded follow-ups are deferred and require a fresh plan
   if resumed.
+- 2026-07-24: Hosted Ubuntu runs exposed two environment-sensitive release gates:
+  Neovim must be installed explicitly for the workspace tests, and the M0
+  reference copier must create each destination root before `fs::copy` because
+  filesystem directory-entry order is not portable. Both are now covered by
+  the workflow or test implementation.
