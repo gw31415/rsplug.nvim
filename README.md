@@ -305,6 +305,18 @@ the v0.2 package layout; older configurations using only
 `vim.opt.packpath:prepend '~/.cache/rsplug'` should switch to the `dofile` line
 shown above.
 
+## Maintainer release procedure
+
+Release versions are committed before their tags are created. From a clean
+branch, run `scripts/prepare-release.sh <version>`, review the manifest and
+lockfile diff, run the normal checks, commit the result, and create an annotated
+`v<version>` tag on that commit. The tag-triggered workflow verifies the source
+without rewriting it, builds the platform archives, stages a draft GitHub
+Release, publishes crates in dependency order, and only then makes the release
+public. Never move or reuse a published release tag. If publication stops after
+some crates are visible, rerun the same tag after the transient cause is fixed;
+the workflow checks package bytes before skipping an already-published version.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).

@@ -16,7 +16,7 @@ use std::{
 };
 
 #[derive(clap::Parser, Debug)]
-#[command(about)]
+#[command(about, version)]
 struct Args {
     /// Install plugins which are not installed yet
     #[arg(short, long)]

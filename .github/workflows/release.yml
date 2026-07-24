@@ -6,138 +6,255 @@ on:
       - "v*"
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Build cross-platform binaries ──────────────────────────────
+  preflight:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify immutable tag and source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || {
+            echo "invalid release tag: $GITHUB_REF_NAME" >&2; exit 1;
+          }
+          [[ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" == tag ]] || {
+            echo "release tags must be annotated" >&2; exit 1;
+          }
+          [[ "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{}")" == "$GITHUB_SHA" ]] || {
+            echo "tag does not resolve to workflow commit" >&2; exit 1;
+          }
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}"
+          scripts/check-release.sh "$version"
+          scripts/release-metadata.sh "$version" > "$RUNNER_TEMP/release-metadata.json"
+          git diff --exit-code
+          git status --short --untracked-files=all
+          test -z "$(git status --short --untracked-files=all)"
+
+  test-and-package:
+    name: Test and inspect packages
+    runs-on: ubuntu-24.04
+    needs: preflight
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Package leaf crates
+        run: |
+          cargo package --locked -p rsplug-adaptive-semaphore
+          cargo package --locked -p rsplug-dag
+          cargo package --locked -p rsplug-file-specifier
+          cargo package --locked -p rsplug-fts
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: [preflight, test-and-package]
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux (native runners — no cross-linker needed)
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
-          # macOS
-          - os: macos-15          # ARM64
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-15-intel    # Intel
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
-          # Windows
+          # Keep this label until a supported fixed Windows image is selected.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Set version from tag
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "Setting version to ${VERSION}"
-          bash scripts/set-version.sh "${VERSION}"
-
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
-
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }} -p rsplug
-
-      - name: Package (Unix)
+        run: cargo build --release --locked --target ${{ matrix.target }} -p rsplug
+      - name: Package and verify version (Unix)
         if: matrix.archive == 'tar.gz'
+        shell: bash
         run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          binary="target/${{ matrix.target }}/release/rsplug"
+          test "$("$binary" --version | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' | head -n1)" = "$version"
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/rsplug dist/
-          tar czf rsplug-${{ matrix.target }}.tar.gz -C dist rsplug
-
-      - name: Package (Windows)
+          cp "$binary" dist/rsplug
+          tar czf "rsplug-${{ matrix.target }}-${version}.tar.gz" -C dist rsplug
+      - name: Package and verify version (Windows)
         if: matrix.archive == 'zip'
         shell: bash
         run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          binary="target/${{ matrix.target }}/release/rsplug.exe"
+          test "$("$binary" --version | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' | head -n1)" = "$version"
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/rsplug.exe dist/
-          cd dist && 7z a ../rsplug-${{ matrix.target }}.zip rsplug.exe
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
+          cp "$binary" dist/rsplug.exe
+          7z a -tzip -mtc=off "rsplug-${{ matrix.target }}-${version}.zip" dist/rsplug.exe
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rsplug-${{ matrix.target }}
-          path: rsplug-${{ matrix.target }}.${{ matrix.archive }}
+          path: rsplug-${{ matrix.target }}-*
+          if-no-files-found: error
           retention-days: 7
 
-  # ── Publish to crates.io (dependency order) ─────────────────────
-  publish-crates:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
+  assemble-and-attest:
+    name: Assemble checksums and attest
+    runs-on: ubuntu-24.04
     needs: build
     permissions:
-      id-token: write   # Required for trusted publishing
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Set version from tag
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "Setting version to ${VERSION}"
-          bash scripts/set-version.sh "${VERSION}"
-
-      - name: Authenticate to crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1
-
-      - name: Publish (dependency order)
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          for crate in rsplug-adaptive-semaphore rsplug-dag rsplug-file-specifier rsplug-fts rsplug-walker rsplug; do
-            CRATE_VERSION="$(cargo pkgid -p "${crate}" | sed -E 's/.*@//')"
-            echo "→ Checking ${crate} ${CRATE_VERSION}…"
-            if curl -fsS -A "rsplug.nvim release workflow" "https://crates.io/api/v1/crates/${crate}/${CRATE_VERSION}" >/dev/null; then
-              echo "✓ ${crate} ${CRATE_VERSION} is already published; skipping"
-              continue
-            fi
-
-            echo "→ Publishing ${crate} ${CRATE_VERSION}…"
-            cargo publish -p "${crate}" --no-verify --allow-dirty
-            sleep 10
-          done
-
-  # ── Create GitHub Release with all binary assets ───────────────
-  github-release:
-    name: GitHub Release
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: artifacts
           merge-multiple: true
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Generate and verify checksums
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 5
+          sha256sum rsplug-* > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
-          files: artifacts/*
+          subject-checksums: artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-assets
+          path: artifacts
+          retention-days: 7
+
+  stage-draft:
+    name: Stage draft GitHub Release
+    runs-on: ubuntu-24.04
+    needs: assemble-and-attest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: release-assets
+          path: artifacts
+      - name: Create or validate draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          repo="$GITHUB_REPOSITORY"
+          release="$(gh api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)"
+          if [[ -n "$release" ]]; then
+            [[ "$(jq -r .draft <<<"$release")" == true ]] || {
+              echo "a public release already exists for $tag" >&2; exit 1;
+            }
+            echo "draft already exists; finalization will recheck its assets"
+          else
+            gh release create "$tag" --draft --generate-notes \
+              --title "$tag" artifacts/*
+          fi
+      - name: Upload assets to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")"
+          missing=()
+          for file in artifacts/*; do
+            name="$(basename "$file")"
+            asset="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")"
+            if [[ -z "$asset" ]]; then
+              missing+=("$file")
+              continue
+            fi
+            remote="$(mktemp)"
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' "$asset" -o "$remote"
+            local_sha="$(sha256sum "$file" | awk '{print $1}')"
+            remote_sha="$(sha256sum "$remote" | awk '{print $1}')"
+            rm -f "$remote"
+            [[ "$local_sha" == "$remote_sha" ]] || {
+              echo "existing draft asset differs: $name" >&2; exit 1;
+            }
+          done
+          ((${#missing[@]} == 0)) || gh release upload "$GITHUB_REF_NAME" "${missing[@]}"
+
+  publish-crates:
+    name: Publish crates.io packages
+    runs-on: ubuntu-24.04
+    needs: stage-draft
+    timeout-minutes: 45
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: scripts/publish-crates.sh "${GITHUB_REF_NAME#v}"
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [stage-draft, publish-crates]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")"
+          [[ "$(jq -r .draft <<<"$release")" == true ]] || {
+            echo "expected an unpublished draft release" >&2; exit 1;
+          }
+          version="${GITHUB_REF_NAME#v}"
+          prerelease=false
+          [[ "$version" == *-* ]] && prerelease=true
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$(jq -r .id <<<"$release")" \
+            -f draft=false -F prerelease="$prerelease"

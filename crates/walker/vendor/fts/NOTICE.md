@@ -46,7 +46,7 @@ macOS. The upstream crates.io package name `fts` is not used by `rsplug-walker`:
 `rsplug-walker` depends on this package as:
 
 ```toml
-fts = { package = "rsplug-fts", version = "0.3.0" }
+fts = { package = "rsplug-fts", version = "0.4.0" }
 ```
 
 while the Rust library crate name remains `fts`.

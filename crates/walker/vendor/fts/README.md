@@ -31,7 +31,7 @@ library crate name remains `fts` for source compatibility.
 
 ```toml
 [dependencies]
-fts = { package = "rsplug-fts", version = "0.3.0" }
+fts = { package = "rsplug-fts", version = "0.4.0" }
 ```
 
 Then use the library as `fts` in Rust code:
@@ -74,7 +74,7 @@ The dependency is intentionally written with a different package name but the
 same Rust crate name:
 
 ```toml
-fts = { package = "rsplug-fts", version = "0.3.0" }
+fts = { package = "rsplug-fts", version = "0.4.0" }
 ```
 
 This was done because the upstream `fts` registry package caused downstream
