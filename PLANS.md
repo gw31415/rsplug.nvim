@@ -541,3 +541,6 @@ crates.io settings remain unchecked until a maintainer performs them.
 - 2026-07-24: The hosted E2E fixture relied on a bare repository's implicit
   default branch. It now sets the bare `HEAD` explicitly to `main`, avoiding
   Git-version-dependent `HEAD` resolution failures.
+- 2026-07-24: The vendored fts unit tests share process-global fixture state;
+  hosted parallel test scheduling caused nondeterministic failures. The
+  release quality gate now serializes workspace tests with `RUST_TEST_THREADS=1`.
