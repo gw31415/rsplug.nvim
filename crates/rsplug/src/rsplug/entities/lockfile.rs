@@ -90,28 +90,34 @@ impl LockFile {
         // rsplug invocation (or by Nix tooling).  Publish a fully synced temp
         // file with rename instead.  The blocking filesystem calls are kept off
         // the async runtime because sync_all can stall on networked homes.
-        tokio::task::spawn_blocking(move || {
+        let fsyncs = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
             use std::io::Write;
 
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
             std::fs::create_dir_all(parent)?;
             let mut temp = tempfile::NamedTempFile::new_in(parent)?;
             temp.write_all(content.as_bytes())?;
-            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::Fsync);
             temp.as_file().sync_all()?;
+            let mut fsyncs = 1;
             temp.persist(&path).map_err(|e| e.error)?;
             // Persisting does not guarantee the directory entry itself reached
             // durable storage.  On platforms where directories cannot be
             // opened/synced this is best-effort, while the atomic rename still
             // protects readers.
             if let Ok(dir) = std::fs::File::open(parent) {
-                crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::Fsync);
                 let _ = dir.sync_all();
+                fsyncs += 1;
             }
-            Ok(())
+            Ok(fsyncs)
         })
         .await
-        .map_err(|e| std::io::Error::other(format!("lockfile write join failed: {e}")))?
+        .map_err(|e| std::io::Error::other(format!("lockfile write join failed: {e}")))??;
+        // perf の計数は thread-local なので、blocking pool の別スレッドではなく
+        // 呼出元スレッドで計上する。
+        for _ in 0..fsyncs {
+            crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::Fsync);
+        }
+        Ok(())
     }
 }
 

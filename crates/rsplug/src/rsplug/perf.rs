@@ -5,9 +5,10 @@
 //! 故障点名 set を install するため、計測が production 挙動を変えることはなく、hot path
 //! に atomic を置くこともない。
 //!
-//! install は複数の Tokio worker thread で copy/GC を実行するため、テスト時の map は
-//! thread-local にせず mutex で共有する。これは `cfg(test)` のみで、production の
-//! hot path には atomic も mutex も存在しない。
+//! テスト時の計数 map と故障点 set は thread-local とする。`#[tokio::test]` はすべて
+//! current-thread runtime で実行されるため、1 テストの計測は単一スレッドに閉じ、並列テスト
+//! 実行で別テストの計数が混入することがない。`cfg(test)` のみで、production の hot path に
+//! atomic も mutex も存在しない。
 
 /// M0 ハーネスが計測する粗粒度の構造操作。各 variant の名前（[`PerfOp::name`]）が
 /// report の安定キーになる。意味の変わない限り改名しないこと。
@@ -169,18 +170,19 @@ impl PerfOp {
 }
 
 #[cfg(test)]
-static CURRENT: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-#[cfg(test)]
-static FAILPOINTS: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+thread_local! {
+    static CURRENT: std::cell::RefCell<std::collections::BTreeMap<&'static str, u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    static FAILPOINTS: std::cell::RefCell<std::collections::BTreeSet<&'static str>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
 
 /// 粗粒度境界で構造操作を1件計数する。production build では完全 no-op。
 #[inline]
 pub(crate) fn incr(op: PerfOp) {
     #[cfg(test)]
     {
-        *CURRENT.lock().unwrap().entry(op.name()).or_insert(0) += 1;
+        CURRENT.with(|c| *c.borrow_mut().entry(op.name()).or_insert(0) += 1);
     }
     #[cfg(not(test))]
     {
@@ -193,11 +195,11 @@ pub(crate) fn incr(op: PerfOp) {
 pub(crate) fn incr_bytes(bytes: u64) {
     #[cfg(test)]
     {
-        *CURRENT
-            .lock()
-            .unwrap()
-            .entry(PerfOp::BytesCopied.name())
-            .or_insert(0) += bytes;
+        CURRENT.with(|c| {
+            *c.borrow_mut()
+                .entry(PerfOp::BytesCopied.name())
+                .or_insert(0) += bytes
+        });
     }
     #[cfg(not(test))]
     {
@@ -210,11 +212,11 @@ pub(crate) fn incr_bytes(bytes: u64) {
 pub(crate) fn incr_content_bytes(bytes: u64) {
     #[cfg(test)]
     {
-        *CURRENT
-            .lock()
-            .unwrap()
-            .entry(PerfOp::ContentBytesHashed.name())
-            .or_insert(0) += bytes;
+        CURRENT.with(|c| {
+            *c.borrow_mut()
+                .entry(PerfOp::ContentBytesHashed.name())
+                .or_insert(0) += bytes
+        });
     }
     #[cfg(not(test))]
     {
@@ -227,7 +229,7 @@ pub(crate) fn incr_content_bytes(bytes: u64) {
 pub(crate) fn incr_duration_micros(op: PerfOp, micros: u64) {
     #[cfg(test)]
     {
-        *CURRENT.lock().unwrap().entry(op.name()).or_insert(0) += micros;
+        CURRENT.with(|c| *c.borrow_mut().entry(op.name()).or_insert(0) += micros);
     }
     #[cfg(not(test))]
     {
@@ -241,7 +243,7 @@ pub(crate) fn incr_duration_micros(op: PerfOp, micros: u64) {
 pub(crate) fn failpoint(name: &'static str) -> std::io::Result<()> {
     #[cfg(test)]
     {
-        if FAILPOINTS.lock().unwrap().contains(name) {
+        if FAILPOINTS.with(|f| f.borrow().contains(name)) {
             return Err(std::io::Error::other(format!("rsplug failpoint: {name}")));
         }
     }
@@ -264,8 +266,8 @@ impl PerfGuard {
     pub(crate) fn install() -> Self {
         #[cfg(test)]
         {
-            CURRENT.lock().unwrap().clear();
-            FAILPOINTS.lock().unwrap().clear();
+            CURRENT.with(|c| c.borrow_mut().clear());
+            FAILPOINTS.with(|f| f.borrow_mut().clear());
         }
         PerfGuard { _private: () }
     }
@@ -275,12 +277,7 @@ impl PerfGuard {
     pub(crate) fn snapshot() -> Vec<(&'static str, u64)> {
         #[cfg(test)]
         {
-            CURRENT
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(&k, &v)| (k, v))
-                .collect()
+            CURRENT.with(|c| c.borrow().iter().map(|(&k, &v)| (k, v)).collect())
         }
         #[cfg(not(test))]
         {
@@ -291,20 +288,20 @@ impl PerfGuard {
     /// `op` の現在の計数。未計測なら 0。
     #[cfg(test)]
     pub(crate) fn count(op: PerfOp) -> u64 {
-        *CURRENT.lock().unwrap().get(op.name()).unwrap_or(&0)
+        CURRENT.with(|c| *c.borrow().get(op.name()).unwrap_or(&0))
     }
 }
 
 /// 故障点 `name` を arm する（`cfg(test)` のみ）。
 #[cfg(test)]
 pub(crate) fn arm_failpoint(name: &'static str) {
-    FAILPOINTS.lock().unwrap().insert(name);
+    FAILPOINTS.with(|f| f.borrow_mut().insert(name));
 }
 
 /// 故障点 `name` を disarm する（`cfg(test)` のみ）。
 #[cfg(test)]
 pub(crate) fn disarm_failpoint(name: &'static str) {
-    FAILPOINTS.lock().unwrap().remove(name);
+    FAILPOINTS.with(|f| f.borrow_mut().remove(name));
 }
 
 /// 構造 counter が期待値と一致するか検査し、不一致なら**シナリオ名と操作名を含む**
@@ -652,6 +649,10 @@ mod m0_harness {
     }
 
     fn handle_http(mut stream: TcpStream, root: &Path) {
+        // macOS では accept されたソケットがリスナーの nonblocking を継承する。継承した
+        // まま read するとデータ未到着で WouldBlock → 応答未送信のまま接続を閉じてしまう
+        // ので、確実にリクエストを読み切れるよう blocking に戻す。
+        let _ = stream.set_nonblocking(false);
         let mut request = [0u8; 2048];
         let Ok(size) = stream.read(&mut request) else {
             return;
