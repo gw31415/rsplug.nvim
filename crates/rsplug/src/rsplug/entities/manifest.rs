@@ -125,7 +125,9 @@ impl SnapshotManifest {
                 let root = if entry.kind == ManifestKind::Dir {
                     first.as_os_str().to_str()
                 } else {
-                    Path::new(first.as_os_str()).file_stem().and_then(|stem| stem.to_str())
+                    Path::new(first.as_os_str())
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
                 };
                 if let Some(root) = root
                     && !root.is_empty()
