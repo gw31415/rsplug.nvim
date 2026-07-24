@@ -558,3 +558,6 @@ crates.io settings remain unchecked until a maintainer performs them.
   public release.
 - 2026-07-24: `gh release create --generate-notes` requires a Git checkout;
   the staging job now checks out the tagged source before creating the draft.
+- 2026-07-24: GitHub's tag lookup endpoint does not return draft releases. Draft
+  staging and finalization now resolve the draft through `gh release view`, then
+  address it by numeric release id; retries can validate already-uploaded assets.

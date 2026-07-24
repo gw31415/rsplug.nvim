@@ -189,9 +189,9 @@ jobs:
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
           repo="$GITHUB_REPOSITORY"
-          release="$(gh api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)"
-          if jq -e '(.id | type) == "number"' >/dev/null 2>&1 <<<"$release"; then
-            [[ "$(jq -r .draft <<<"$release")" == true ]] || {
+          release="$(gh release view "$tag" --json databaseId,isDraft 2>/dev/null || true)"
+          if jq -e '(.databaseId | type) == "number"' >/dev/null 2>&1 <<<"$release"; then
+            [[ "$(jq -r .isDraft <<<"$release")" == true ]] || {
               echo "a public release already exists for $tag" >&2; exit 1;
             }
             echo "draft already exists; finalization will recheck its assets"
@@ -204,7 +204,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")"
+          release_id="$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq .databaseId)"
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
           missing=()
           for file in artifacts/*; do
             name="$(basename "$file")"
@@ -258,7 +259,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")"
+          release_id="$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq .databaseId)"
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
           [[ "$(jq -r .draft <<<"$release")" == true ]] || {
             echo "expected an unpublished draft release" >&2; exit 1;
           }
@@ -266,5 +268,5 @@ jobs:
           prerelease=false
           [[ "$version" == *-* ]] && prerelease=true
           gh api --method PATCH \
-            "repos/$GITHUB_REPOSITORY/releases/$(jq -r .id <<<"$release")" \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             -f draft=false -F prerelease="$prerelease"
