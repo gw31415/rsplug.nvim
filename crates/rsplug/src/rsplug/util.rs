@@ -664,10 +664,13 @@ pub mod github {
     }
 
     /// GitHub 認証 token を環境変数から取得する。
-    /// `GITHUB_TOKEN` → `GH_TOKEN` の順でチェック（gh CLI と同じ規約）。
-    /// どちらもなければ `None`（anonymous フォールバック）。
+    /// `RSPLUG_GITHUB_TOKEN` → `GITHUB_TOKEN` → `GH_TOKEN` の順でチェック。
+    /// `RSPLUG_GITHUB_TOKEN` があれば最優先、それ以外は gh CLI と同じ規約で
+    /// `GITHUB_TOKEN` → `GH_TOKEN` へフォールバックする。
+    /// どれもなければ `None`（anonymous フォールバック）。
     pub fn token() -> Option<&'static str> {
-        let val = std::env::var("GITHUB_TOKEN")
+        let val = std::env::var("RSPLUG_GITHUB_TOKEN")
+            .or_else(|_| std::env::var("GITHUB_TOKEN"))
             .or_else(|_| std::env::var("GH_TOKEN"))
             .ok()?;
         Some(Box::leak(val.into_boxed_str()))
@@ -1958,19 +1961,24 @@ mod tests {
     }
 
     #[test]
-    fn github_token_prefers_github_token_over_gh_token() {
+    fn github_token_priority() {
         // SAFETY: テストは直列実行される。環境変数を設定・復元する。
         unsafe {
-            // GITHUB_TOKEN があればそちらを優先
+            // RSPLUG_GITHUB_TOKEN があれば最優先
+            std::env::set_var("RSPLUG_GITHUB_TOKEN", "rsplug-token");
             std::env::set_var("GITHUB_TOKEN", "primary-token");
             std::env::set_var("GH_TOKEN", "secondary-token");
+            assert_eq!(github::token(), Some("rsplug-token"));
+
+            // RSPLUG_GITHUB_TOKEN がなければ GITHUB_TOKEN
+            std::env::remove_var("RSPLUG_GITHUB_TOKEN");
             assert_eq!(github::token(), Some("primary-token"));
 
-            // GITHUB_TOKEN がなければ GH_TOKEN
+            // GITHUB_TOKEN もなければ GH_TOKEN
             std::env::remove_var("GITHUB_TOKEN");
             assert_eq!(github::token(), Some("secondary-token"));
 
-            // どちらもなければ None
+            // どれもなければ None
             std::env::remove_var("GH_TOKEN");
         }
         assert_eq!(github::token(), None);
