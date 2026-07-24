@@ -187,7 +187,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           repo="$GITHUB_REPOSITORY"
           release="$(gh api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)"
-          if [[ -n "$release" ]]; then
+          if jq -e '(.id | type) == "number"' >/dev/null 2>&1 <<<"$release"; then
             [[ "$(jq -r .draft <<<"$release")" == true ]] || {
               echo "a public release already exists for $tag" >&2; exit 1;
             }

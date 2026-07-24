@@ -552,3 +552,7 @@ crates.io settings remain unchecked until a maintainer performs them.
   hosted CI to inspect the wrong fixture directory. Tests now resolve fixtures
   from `CARGO_MANIFEST_DIR`; three upstream permission/stat/sort assertions are
   explicitly ignored on Linux where their libc/filesystem semantics differ.
+- 2026-07-24: GitHub's `gh api` emits a JSON 404 body while the shell command
+  can still be treated as successful under `|| true`. Draft staging now checks
+  for a numeric release id rather than treating any non-empty error body as a
+  public release.
