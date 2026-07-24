@@ -209,7 +209,9 @@ jobs:
           missing=()
           for file in artifacts/*; do
             name="$(basename "$file")"
-            asset="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")"
+            # Draft releases have an untagged browser URL that returns 404;
+            # use the authenticated asset API endpoint for checksum reads.
+            asset="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .url' <<<"$release")"
             if [[ -z "$asset" ]]; then
               missing+=("$file")
               continue

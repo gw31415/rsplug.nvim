@@ -561,3 +561,6 @@ crates.io settings remain unchecked until a maintainer performs them.
 - 2026-07-24: GitHub's tag lookup endpoint does not return draft releases. Draft
   staging and finalization now resolve the draft through `gh release view`, then
   address it by numeric release id; retries can validate already-uploaded assets.
+- 2026-07-24: Draft asset browser URLs are intentionally untagged and return
+  404 until publication. Checksum validation now downloads each asset through
+  the authenticated API URL instead.
