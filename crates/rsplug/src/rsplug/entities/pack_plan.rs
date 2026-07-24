@@ -1327,15 +1327,8 @@ fn copy_strategy() -> u8 {
 }
 
 /// 失敗に応じて戦略を昇格（単調）。ハードリンクは内容共有のため経由しない。
-fn advance_strategy(error: &io::Error) {
-    let target = if error.raw_os_error() == Some(EXDEV) {
-        STRATEGY_COPY
-    } else if copy_strategy() == STRATEGY_REFLINK {
-        STRATEGY_COPY
-    } else {
-        copy_strategy().saturating_add(1).min(STRATEGY_COPY)
-    };
-    COPY_STRATEGY.fetch_max(target, AtomicOrdering::AcqRel);
+fn advance_strategy(_error: &io::Error) {
+    COPY_STRATEGY.fetch_max(STRATEGY_COPY, AtomicOrdering::AcqRel);
 }
 
 /// reflink が「この環境では使えない」エラーか（内容複製へフォールバック）。
