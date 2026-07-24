@@ -64,11 +64,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y neovim
       - run: cargo fmt --all -- --check
-      # The vendored fts tests use relative fixture paths and process-global
-      # state, so run them from their crate directory and outside the main
-      # workspace invocation.
-      - run: RUST_TEST_THREADS=1 cargo test --workspace --exclude rsplug-fts --locked
-      - run: cd crates/walker/vendor/fts && RUST_TEST_THREADS=1 cargo test --locked
+      - run: RUST_TEST_THREADS=1 cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Package leaf crates
         run: |

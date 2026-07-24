@@ -416,13 +416,18 @@ mod test {
     // race each other under `cargo test`'s default parallel runner.
     use crate::test_support::DIR2_LOCK;
 
+    fn test_data() -> &'static Path {
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test_data"))
+    }
+
     #[test]
     fn normal() {
         let _guard = DIR2_LOCK.lock().unwrap();
-        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0o0));
+        let data = test_data();
+        let _ = set_permissions(data.join("dir2"), Permissions::from_mode(0o0));
 
-        let path = Path::new("test_data");
-        let iter = WalkDir::new(WalkDirConf::new(path).no_chdir())
+        let path = data;
+        let iter = WalkDir::new(WalkDirConf::new(&path).no_chdir())
             .into_iter()
             .filter_map(|x| x.ok());
         let mut cnt = 0;
@@ -431,16 +436,17 @@ mod test {
         }
         assert_eq!(cnt, 22);
 
-        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0o755));
+        let _ = set_permissions(test_data().join("dir2"), Permissions::from_mode(0o755));
     }
 
     #[test]
     fn filter() {
         let _guard = DIR2_LOCK.lock().unwrap();
-        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0o0));
+        let data = test_data();
+        let _ = set_permissions(data.join("dir2"), Permissions::from_mode(0o0));
 
-        let path = Path::new("test_data");
-        let iter = WalkDir::new(WalkDirConf::new(path).no_chdir())
+        let path = data;
+        let iter = WalkDir::new(WalkDirConf::new(&path).no_chdir())
             .into_iter()
             .filter_map(|x| x.ok());
         let mut cnt = 0;
@@ -452,13 +458,13 @@ mod test {
         assert_eq!(cnt, 10);
         assert_eq!(len, 150);
 
-        let _ = set_permissions("test_data/dir2", Permissions::from_mode(0o755));
+        let _ = set_permissions(test_data().join("dir2"), Permissions::from_mode(0o755));
     }
 
     #[test]
     fn no_stat() {
-        let path = Path::new("test_data");
-        let iter = WalkDir::new(WalkDirConf::new(path).no_metadata().no_chdir())
+        let path = test_data();
+        let iter = WalkDir::new(WalkDirConf::new(&path).no_metadata().no_chdir())
             .into_iter()
             .filter_map(|x| x.ok());
         for p in iter {
@@ -469,7 +475,7 @@ mod test {
     #[test]
     fn dir_not_found() {
         let path = Path::new("aaa");
-        for p in WalkDir::new(WalkDirConf::new(path).no_chdir()) {
+        for p in WalkDir::new(WalkDirConf::new(&path).no_chdir()) {
             match p {
                 Ok(_) => assert!(false),
                 Err(x) => assert_eq!(x.kind(), ErrorKind::NotFound),
@@ -479,9 +485,9 @@ mod test {
 
     #[test]
     fn sort() {
-        let path = Path::new("test_data/sort");
+        let path = test_data().join("sort");
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_name()
                 .sort_ascending();
@@ -493,7 +499,7 @@ mod test {
         }
 
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_name()
                 .sort_descending();
@@ -505,7 +511,7 @@ mod test {
         }
 
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_len()
                 .sort_ascending();
@@ -517,7 +523,7 @@ mod test {
         }
 
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_len()
                 .sort_descending();
@@ -531,51 +537,51 @@ mod test {
 
     #[test]
     fn sort_time() {
-        let path = Path::new("test_data/sort");
+        let path = test_data().join("sort");
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_atime()
                 .sort_ascending();
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_atime()
                 .sort_descending();
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_mtime()
                 .sort_ascending();
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_mtime()
                 .sort_descending();
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_ctime()
                 .sort_ascending();
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_chdir()
                 .sort_by_ctime()
                 .sort_descending();
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_metadata()
                 .no_chdir()
                 .sort_by_atime()
@@ -583,7 +589,7 @@ mod test {
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_metadata()
                 .no_chdir()
                 .sort_by_atime()
@@ -591,7 +597,7 @@ mod test {
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_metadata()
                 .no_chdir()
                 .sort_by_mtime()
@@ -599,7 +605,7 @@ mod test {
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_metadata()
                 .no_chdir()
                 .sort_by_mtime()
@@ -607,7 +613,7 @@ mod test {
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_metadata()
                 .no_chdir()
                 .sort_by_ctime()
@@ -615,7 +621,7 @@ mod test {
             for _ in WalkDir::new(conf) {}
         }
         {
-            let conf = WalkDirConf::new(path)
+            let conf = WalkDirConf::new(&path)
                 .no_metadata()
                 .no_chdir()
                 .sort_by_ctime()
