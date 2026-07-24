@@ -34,10 +34,13 @@ jobs:
           [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || {
             echo "invalid release tag: $GITHUB_REF_NAME" >&2; exit 1;
           }
-          [[ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" == tag ]] || {
+          tag_refs="$(git ls-remote origin "refs/tags/$GITHUB_REF_NAME" "refs/tags/$GITHUB_REF_NAME^{}")"
+          [[ "$(wc -l <<<"$tag_refs" | tr -d ' ')" == 2 ]] || {
             echo "release tags must be annotated" >&2; exit 1;
           }
-          [[ "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{}")" == "$GITHUB_SHA" ]] || {
+          tag_object="$(awk 'NR == 1 { print $1 }' <<<"$tag_refs")"
+          peeled_commit="$(awk 'NR == 2 { print $1 }' <<<"$tag_refs")"
+          [[ "$tag_object" != "$peeled_commit" && "$peeled_commit" == "$GITHUB_SHA" ]] || {
             echo "tag does not resolve to workflow commit" >&2; exit 1;
           }
           git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}"
