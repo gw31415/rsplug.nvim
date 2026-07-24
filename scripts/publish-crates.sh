@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:?Usage: $0 <version>}">
+VERSION="${1:?Usage: $0 <version>}"
 API="https://crates.io/api/v1/crates"
 
 wait_visible() {
