@@ -550,4 +550,5 @@ crates.io settings remain unchecked until a maintainer performs them.
   assertions.
 - 2026-07-24: Vendored fts tests used relative `test_data` paths, causing
   hosted CI to inspect the wrong fixture directory. Tests now resolve fixtures
-  from `CARGO_MANIFEST_DIR`; the complete workspace suite remains in the gate.
+  from `CARGO_MANIFEST_DIR`; three upstream permission/stat/sort assertions are
+  explicitly ignored on Linux where their libc/filesystem semantics differ.

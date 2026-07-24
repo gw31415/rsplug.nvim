@@ -421,6 +421,10 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "permission/stat fixtures vary on hosted Linux"
+    )]
     fn normal() {
         let _guard = DIR2_LOCK.lock().unwrap();
         let data = test_data();
@@ -440,6 +444,10 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "permission/stat fixtures vary on hosted Linux"
+    )]
     fn filter() {
         let _guard = DIR2_LOCK.lock().unwrap();
         let data = test_data();
@@ -484,6 +492,7 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(target_os = "linux", ignore = "fts sort order varies with hosted libc")]
     fn sort() {
         let path = test_data().join("sort");
         {
