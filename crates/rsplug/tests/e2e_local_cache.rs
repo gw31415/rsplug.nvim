@@ -59,6 +59,10 @@ fn isolated_local_git_install_refresh_and_locked_are_deterministic() {
     git(&work, &["branch", "-M", "main"]);
     git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
     git(&work, &["push", "origin", "main"]);
+    // A bare repository created by `git init --bare` may retain HEAD on the
+    // old default branch.  Point it at the branch used by this fixture so
+    // rev resolution is deterministic across Git versions and runners.
+    git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     let repo = format!("file://{}", bare.display());
     fs::write(&config, format!("[[plugins]]\nrepo = {:?}\n", repo)).unwrap();

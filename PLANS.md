@@ -538,3 +538,6 @@ crates.io settings remain unchecked until a maintainer performs them.
   snapshot to mutate the published pack and making parallel tests flaky. The
   fallback now uses independent content copies; hard links remain only as an
   unused compatibility branch.
+- 2026-07-24: The hosted E2E fixture relied on a bare repository's implicit
+  default branch. It now sets the bare `HEAD` explicitly to `main`, avoiding
+  Git-version-dependent `HEAD` resolution failures.
