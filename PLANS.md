@@ -556,3 +556,5 @@ crates.io settings remain unchecked until a maintainer performs them.
   can still be treated as successful under `|| true`. Draft staging now checks
   for a numeric release id rather than treating any non-empty error body as a
   public release.
+- 2026-07-24: `gh release create --generate-notes` requires a Git checkout;
+  the staging job now checks out the tagged source before creating the draft.
