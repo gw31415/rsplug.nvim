@@ -1301,18 +1301,19 @@ async fn generation_is_current(
 
 // ---- pack copy 戦略（Phase 6c） ----
 // 配置入口を `FileSource::yank` → `place_path` → `copy_tree`/`copy_file_with_strategy`
-// に統一し、実行時に reflink → hardlink → copy へ単調昇格する。
+// に統一し、実行時に reflink → copy へ単調昇格する。ハードリンクは
+// スナップショット編集が公開 pack を変更するため、公開物には使わない。
 
 /// 実行時 copy 戦略。失敗に応じて単調に昇格する。
 /// `0` = reflink（macOS `clonefile` / Linux `FICLONE`）
-/// `1` = hardlink
+/// `1` = hardlink（互換用に残すが、公開コピー戦略では選択しない）
 /// `2` = copy（内容複製）
 static COPY_STRATEGY: AtomicU8 = AtomicU8::new(INITIAL_COPY_STRATEGY);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const INITIAL_COPY_STRATEGY: u8 = STRATEGY_REFLINK;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const INITIAL_COPY_STRATEGY: u8 = STRATEGY_HARDLINK;
+const INITIAL_COPY_STRATEGY: u8 = STRATEGY_COPY;
 
 const STRATEGY_REFLINK: u8 = 0;
 const STRATEGY_HARDLINK: u8 = 1;
@@ -1325,9 +1326,11 @@ fn copy_strategy() -> u8 {
     COPY_STRATEGY.load(AtomicOrdering::Relaxed)
 }
 
-/// 失敗に応じて戦略を昇格（単調）。`EXDev` は hardlink も失敗するため `copy` まで jump する。
+/// 失敗に応じて戦略を昇格（単調）。ハードリンクは内容共有のため経由しない。
 fn advance_strategy(error: &io::Error) {
     let target = if error.raw_os_error() == Some(EXDEV) {
+        STRATEGY_COPY
+    } else if copy_strategy() == STRATEGY_REFLINK {
         STRATEGY_COPY
     } else {
         copy_strategy().saturating_add(1).min(STRATEGY_COPY)
@@ -1335,7 +1338,7 @@ fn advance_strategy(error: &io::Error) {
     COPY_STRATEGY.fetch_max(target, AtomicOrdering::AcqRel);
 }
 
-/// reflink が「この環境では使えない」エラーか（1段昇格して hardlink へ）。
+/// reflink が「この環境では使えない」エラーか（内容複製へフォールバック）。
 #[cfg(target_os = "macos")]
 fn reflink_unsupported(e: &io::Error) -> bool {
     // EXDEV は別経路で copy まで jump するのでここでは除外。
@@ -1378,7 +1381,7 @@ async fn reflink_file(src: &Path, dst: &Path) -> io::Result<()> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 async fn reflink_file(_src: &Path, _dst: &Path) -> io::Result<()> {
-    // reflink 非対応: unsupported（hardlink/copy へフォールバック）。
+    // reflink 非対応: 内容複製へフォールバック。
     Err(io::Error::from_raw_os_error(38)) // ENOSYS
 }
 

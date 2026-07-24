@@ -534,3 +534,7 @@ crates.io settings remain unchecked until a maintainer performs them.
   reference copier must create each destination root before `fs::copy` because
   filesystem directory-entry order is not portable. Both are now covered by
   the workflow or test implementation.
+- 2026-07-24: Linux FICLONE fallback selected hard links, allowing edits to a
+  snapshot to mutate the published pack and making parallel tests flaky. The
+  fallback now uses independent content copies; hard links remain only as an
+  unused compatibility branch.
