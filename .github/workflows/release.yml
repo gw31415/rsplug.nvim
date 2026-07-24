@@ -211,19 +211,23 @@ jobs:
             name="$(basename "$file")"
             # Draft releases have an untagged browser URL that returns 404;
             # use the authenticated asset API endpoint for checksum reads.
-            asset="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .url' <<<"$release")"
-            if [[ -z "$asset" ]]; then
+            asset_id="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' <<<"$release")"
+            if [[ -z "$asset_id" || "$asset_id" == null ]]; then
               missing+=("$file")
               continue
             fi
+            asset="$(jq -r --argjson id "$asset_id" '.assets[] | select(.id == $id) | .url' <<<"$release")"
             remote="$(mktemp)"
             curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' "$asset" -o "$remote"
             local_sha="$(sha256sum "$file" | awk '{print $1}')"
             remote_sha="$(sha256sum "$remote" | awk '{print $1}')"
             rm -f "$remote"
-            [[ "$local_sha" == "$remote_sha" ]] || {
-              echo "existing draft asset differs: $name" >&2; exit 1;
-            }
+            if [[ "$local_sha" != "$remote_sha" ]]; then
+              echo "replacing stale draft asset: $name" >&2
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/releases/$release_id/assets/$asset_id"
+              missing+=("$file")
+            fi
           done
           ((${#missing[@]} == 0)) || gh release upload "$GITHUB_REF_NAME" "${missing[@]}"
 

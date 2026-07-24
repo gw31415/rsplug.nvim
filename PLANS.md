@@ -564,3 +564,5 @@ crates.io settings remain unchecked until a maintainer performs them.
 - 2026-07-24: Draft asset browser URLs are intentionally untagged and return
   404 until publication. Checksum validation now downloads each asset through
   the authenticated API URL instead.
+- 2026-07-24: A rerun can rebuild assets after a workflow-only commit; draft
+  staging now replaces stale draft assets before uploading the new bytes.
