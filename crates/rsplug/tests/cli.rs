@@ -57,7 +57,10 @@ fn version_succeeds_and_contains_package_version() {
 
 #[test]
 fn missing_config_input_is_parse_error() {
-    let output = rsplug().output().expect("run without config");
+    let output = rsplug()
+        .env_remove("RSPLUG_CONFIG_FILES")
+        .output()
+        .expect("run without config");
     assert_eq!(output.status.code(), Some(2));
 }
 
