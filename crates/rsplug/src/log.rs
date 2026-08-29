@@ -1948,12 +1948,30 @@ mod tests {
     }
 
     fn screen_rendered(screen: &Arc<Mutex<Screen>>) -> String {
-        let s = screen.lock().unwrap();
-        s.rows
-            .iter()
-            .map(|r| console::strip_ansi_codes(r))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let snapshot = || {
+            let s = screen.lock().unwrap();
+            s.rows
+                .iter()
+                .map(|r| console::strip_ansi_codes(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // indicatif steady ticks redraw through several TermLike calls. A test can
+        // otherwise observe the synthetic screen between those calls. Wait until two
+        // consecutive snapshots match; the 5ms interval is well below the 100ms tick
+        // period used by these tests, so this synchronizes with a completed frame
+        // without depending on spinner timing.
+        let mut previous = snapshot();
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(5));
+            let current = snapshot();
+            if current == previous {
+                return current;
+            }
+            previous = current;
+        }
+        previous
     }
 
     /// child_order を表示順（category_rank）で整列したビュー。検証は整列後で行う
