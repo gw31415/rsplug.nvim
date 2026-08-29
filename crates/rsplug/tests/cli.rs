@@ -43,6 +43,8 @@ fn help_documents_existing_cli_surface_without_env_value() {
         "--update",
         "--locked",
         "--lockfile",
+        "--completion",
+        "--man",
     ] {
         assert!(
             tokens.contains(&expected),
@@ -50,6 +52,12 @@ fn help_documents_existing_cli_surface_without_env_value() {
         );
     }
     assert!(stdout.contains("CONFIG_FILES"), "{stdout}");
+    for shell in ["bash", "zsh", "fish", "nu", "powershell"] {
+        assert!(
+            stdout.contains(shell),
+            "missing shell {shell:?} in:\n{stdout}"
+        );
+    }
     assert!(
         stdout
             .lines()
@@ -194,4 +202,139 @@ fn repeated_scalar_options_are_rejected() {
         .output()
         .expect("run duplicate lockfile option");
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn man_generation_succeeds_without_config_and_has_no_runtime_side_effects() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let output = isolated_command(&dir)
+        .arg("--man")
+        .output()
+        .expect("generate manpage");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with(".TH RSPLUG 1\n"), "{stdout}");
+    assert!(stdout.contains(".SH NAME"), "{stdout}");
+    assert!(stdout.contains(".SH OPTIONS"), "{stdout}");
+    assert!(stdout.contains("rsplug"), "{stdout}");
+    assert!(!dir.path().join(".cache/rsplug").exists());
+}
+
+#[test]
+fn completion_generation_supports_documented_shells_without_config() {
+    for shell in ["bash", "zsh", "fish", "nu", "powershell"] {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let output = isolated_command(&dir)
+            .args(["--completion", shell])
+            .output()
+            .expect("generate completion");
+
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("rsplug"), "{shell}: {stdout}");
+        assert!(stdout.contains("__complete_word__"), "{shell}: {stdout}");
+        assert!(!dir.path().join(".cache/rsplug").exists());
+    }
+}
+
+#[test]
+fn completion_protocol_uses_current_cli_metadata() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let output = isolated_command(&dir)
+        .args([
+            "__complete_word__",
+            "--shell",
+            "bash",
+            "--line",
+            "rsplug --",
+        ])
+        .output()
+        .expect("ask for completion candidates");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "--completion",
+        "--install",
+        "--locked",
+        "--lockfile",
+        "--man",
+        "--update",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn completion_requires_a_supported_shell() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let missing = isolated_command(&dir)
+        .arg("--completion")
+        .output()
+        .expect("run missing completion shell");
+    assert_eq!(missing.status.code(), Some(2));
+
+    let invalid = isolated_command(&dir)
+        .args(["--completion", "tcsh"])
+        .output()
+        .expect("run unsupported completion shell");
+    assert_eq!(invalid.status.code(), Some(2));
+}
+
+#[test]
+fn generation_modes_are_exclusive_with_normal_cli_inputs() {
+    let normal_inputs: &[&[&str]] = &[
+        &["--install"],
+        &["--update"],
+        &["--locked"],
+        &["--lockfile", "custom.lock.json"],
+        &["a.toml"],
+    ];
+
+    for generation in [&["--man"][..], &["--completion", "bash"][..]] {
+        for normal in normal_inputs {
+            let dir = fixture();
+            let mut args = Vec::from(generation);
+            args.extend_from_slice(normal);
+            let output = isolated_command(&dir)
+                .args(&args)
+                .output()
+                .expect("run exclusive generation mode");
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "expected conflict for {args:?}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    let dir = fixture();
+    let both = isolated_command(&dir)
+        .args(["--man", "--completion", "bash"])
+        .output()
+        .expect("run both generation modes");
+    assert_eq!(both.status.code(), Some(2));
+}
+
+#[test]
+fn generation_modes_conflict_with_config_environment_fallback() {
+    for generation in [&["--man"][..], &["--completion", "bash"][..]] {
+        let dir = fixture();
+        let output = isolated_command(&dir)
+            .env("RSPLUG_CONFIG_FILES", "a.toml")
+            .args(generation)
+            .output()
+            .expect("run generation mode with config environment fallback");
+        assert_eq!(output.status.code(), Some(2), "{generation:?}");
+    }
 }

@@ -698,6 +698,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1308,6 +1310,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "roff"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
 name = "rsplug"
 version = "0.4.0"
 dependencies = [
@@ -1336,6 +1344,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "unicode-width",
+ "usage-lib",
  "usage-rs",
  "wildmatch",
  "xxhash-rust",
@@ -1818,6 +1827,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tera"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52fca06a22977165c6821c26e2bf0387cd7e0822107a6854d5fbb787307c4194"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2108,6 +2126,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "usage-lib"
+version = "6.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481034836180d71c726704fe40a505e66be45891d73542b5bb976096a2f9d2c5"
+dependencies = [
+ "indexmap",
+ "itertools",
+ "log",
+ "num-traits 0.2.19",
+ "regex",
+ "roff",
+ "semver",
+ "serde",
+ "tera",
+ "thiserror",
+ "unicode-width",
+ "winnow",
+]
+
+[[package]]
 name = "usage-rs"
 version = "6.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2115,6 +2153,16 @@ checksum = "c12de82d13507fdafd64170f5f735bd5fa7778f94b1f4a55e3b66e8ea3bde301"
 dependencies = [
  "usage-argv",
  "usage-derive",
+ "usage-test",
+]
+
+[[package]]
+name = "usage-test"
+version = "6.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d3b624c2128c68c730930654cb718ef03c3792bfd7b2e8d4447ee58c2e4dfe7"
+dependencies = [
+ "usage-argv",
 ]
 
 [[package]]

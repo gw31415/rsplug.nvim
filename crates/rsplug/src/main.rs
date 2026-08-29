@@ -10,6 +10,7 @@ use rsplug::config_walker::ConfigWalker;
 use scheduler::{LoadCtx, LoadRev, RunMode, run_load_early, run_load_late};
 use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    io::Write,
     path::PathBuf,
     sync::Arc,
 };
@@ -19,8 +20,10 @@ use std::{
     bin = "rsplug",
     about,
     version,
+    usage = "Usage: rsplug [OPTIONS] <CONFIG_FILES>...\n       rsplug --completion <SHELL>\n       rsplug --man",
     unknown_flags = "error",
-    args_override_self = false
+    args_override_self = false,
+    completion
 )]
 struct Args {
     /// Install plugins which are not installed yet
@@ -35,15 +38,43 @@ struct Args {
     /// Specify the lockfile path
     #[usage(long)]
     lockfile: Option<PathBuf>,
+    /// Generate a shell completion script to stdout
+    #[usage(long, value_enum, value_name = "SHELL", exclusive)]
+    completion: Option<CompletionShell>,
+    /// Generate the rsplug(1) man page to stdout
+    #[usage(long, exclusive)]
+    man: bool,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
     #[usage(
         arg,
-        required,
+        required_unless = ["--completion", "--man"],
         env = "RSPLUG_CONFIG_FILES",
         delimiter = ':',
         hide_env_values
     )]
     config_files: Vec<String>,
+}
+
+#[derive(usage::ValueEnum, Debug, Clone, Copy)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Nu,
+    #[usage(name = "powershell")]
+    PowerShell,
+}
+
+impl From<CompletionShell> for usage::complete::Shell {
+    fn from(shell: CompletionShell) -> Self {
+        match shell {
+            CompletionShell::Bash => Self::Bash,
+            CompletionShell::Zsh => Self::Zsh,
+            CompletionShell::Fish => Self::Fish,
+            CompletionShell::Nu => Self::Nu,
+            CompletionShell::PowerShell => Self::PowerShell,
+        }
+    }
 }
 
 /// EARLY 相の進行状態。EARLY 完了結果（`EarlyOutcome`）を保持する。
@@ -124,8 +155,24 @@ async fn app() -> Result<(), Error> {
         update,
         lockfile,
         locked,
+        completion,
+        man,
         config_files,
     } = Args::parse();
+
+    if let Some(shell) = completion {
+        std::io::stdout()
+            .lock()
+            .write_all(Args::completion_script(shell.into()).as_bytes())?;
+        return Ok(());
+    }
+    if man {
+        let spec = Args::to_kdl().parse::<usage_docs::Spec>()?;
+        let manpage = usage_docs::docs::manpage::ManpageRenderer::new(spec).render()?;
+        std::io::stdout().lock().write_all(manpage.as_bytes())?;
+        return Ok(());
+    }
+
     let mode = RunMode::from_flags(install, update, locked);
     let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));
 
@@ -1303,6 +1350,8 @@ enum Error {
     },
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Usage(#[from] usage_docs::error::UsageErr),
     #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
     /// 同一 canonical リポジトリに複数の異なる rev が指定された（設定ミス）。
