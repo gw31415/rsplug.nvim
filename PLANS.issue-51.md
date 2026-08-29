@@ -38,4 +38,4 @@ Replace the `rsplug` binary's clap-derived parser with the `usage-rs` facade whi
 - [x] Baseline dependency and stripped release-binary measurements recorded.
 - [x] Parser migrated to exact-pinned `usage-rs` 6.5.0.
 - [x] Focused and full validation pass.
-- [ ] Before/after measurements recorded in PR and PR merged.
+- [x] Before/after measurements recorded in PR and PR merged.
