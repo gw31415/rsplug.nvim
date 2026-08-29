@@ -31,7 +31,7 @@ after_first="$(sha256sum "$repo/Cargo.toml" "$repo/Cargo.lock" \
   "$repo/crates/walker/vendor/fts/Cargo.toml.orig" \
   "$repo/crates/walker/vendor/fts/README.md" \
   "$repo/crates/walker/vendor/fts/NOTICE.md")"
-"$repo/scripts/prepare-release.sh" 0.3.1 >/dev/null
+"$repo/scripts/prepare-release.sh" 9.9.9 >/dev/null
 after_second="$(sha256sum "$repo/Cargo.toml" "$repo/Cargo.lock" \
   "$repo/crates/walker/Cargo.toml" \
   "$repo/crates/walker/vendor/fts/Cargo.toml" \
