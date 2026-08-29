@@ -32,11 +32,14 @@ fn help_documents_existing_cli_surface_without_env_value() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let tokens: Vec<_> = stdout.split_whitespace().collect();
+    let tokens: Vec<_> = stdout
+        .split_whitespace()
+        .map(|token| token.trim_end_matches(','))
+        .collect();
     for expected in [
-        "-i,",
+        "-i",
         "--install",
-        "-u,",
+        "-u",
         "--update",
         "--locked",
         "--lockfile",
@@ -140,9 +143,9 @@ fn argv_takes_precedence_over_config_files_environment() {
 
 #[test]
 fn update_and_locked_conflict() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = fixture();
     let output = isolated_command(&dir)
-        .args(["--update", "--locked", "config.toml"])
+        .args(["--update", "--locked", "a.toml"])
         .output()
         .expect("run conflicting args");
     assert_eq!(output.status.code(), Some(2));
@@ -150,9 +153,9 @@ fn update_and_locked_conflict() {
 
 #[test]
 fn unknown_flags_are_rejected() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = fixture();
     let output = isolated_command(&dir)
-        .args(["--definitely-unknown", "config.toml"])
+        .args(["--definitely-unknown", "a.toml"])
         .output()
         .expect("run unknown flag");
     assert_eq!(output.status.code(), Some(2));
@@ -179,14 +182,14 @@ fn lockfile_requires_one_value_and_accepts_a_path() {
 
 #[test]
 fn repeated_scalar_options_are_rejected() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = fixture();
     let output = isolated_command(&dir)
         .args([
             "--lockfile",
             "first.lock.json",
             "--lockfile",
             "second.lock.json",
-            "config.toml",
+            "a.toml",
         ])
         .output()
         .expect("run duplicate lockfile option");
