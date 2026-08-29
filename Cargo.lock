@@ -1400,7 +1400,7 @@ checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
 name = "rsplug"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "console",
  "flate2",
@@ -1435,14 +1435,14 @@ dependencies = [
 
 [[package]]
 name = "rsplug-adaptive-semaphore"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "rsplug-dag"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "hashbrown",
  "thiserror",
@@ -1450,14 +1450,14 @@ dependencies = [
 
 [[package]]
 name = "rsplug-file-specifier"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "wildmatch",
 ]
 
 [[package]]
 name = "rsplug-fts"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bitflags 2.13.1",
  "enum_primitive",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "rsplug-walker"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "hashbrown",
  "path-dedot",
