@@ -22,10 +22,20 @@ Replace the `rsplug` binary's clap-derived parser with the `usage-rs` facade whi
 - Environment values are not exposed in help/diagnostics.
 - No resolved clap dependency remains for the `rsplug` crate after migration.
 
+## Measurements and validation
+
+- Baseline (`7eb37fe`): 230 unique normal dependency-tree lines; stripped release binary 10,048,160 bytes.
+- Migrated: 224 unique normal dependency-tree lines; stripped release binary 10,130,528 bytes (+82,368 bytes, about +0.82%).
+- `clap` is absent from the migrated resolved normal dependency graph.
+- Manual compatibility checks preserve `rsplug` in help/version output and status 2 for missing input, flag conflicts, and unknown flags.
+- Focused CLI compatibility tests: 11/11 passing.
+- Repository validation passing: `cargo fmt --all -- --check`, `cargo check`, `cargo test`, and `cargo clippy --workspace --all-targets -- -D warnings`.
+- One existing log progress test transiently failed under parallel execution during validation; it passed alone, the rsplug unit suite then passed 5/5 consecutive parallel runs, and the final unmodified `cargo test` command passed.
+
 ## Progress
 
-- [ ] Baseline CLI behavior tests added and passing on clap.
-- [ ] Baseline dependency and stripped release-binary measurements recorded.
-- [ ] Parser migrated to an exact-pinned `usage-rs` facade version.
-- [ ] Focused and full validation pass.
+- [x] Baseline CLI behavior characterized against the clap implementation.
+- [x] Baseline dependency and stripped release-binary measurements recorded.
+- [x] Parser migrated to exact-pinned `usage-rs` 6.5.0.
+- [x] Focused and full validation pass.
 - [ ] Before/after measurements recorded in PR and PR merged.

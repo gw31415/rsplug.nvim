@@ -3,7 +3,6 @@ mod osc94;
 mod rsplug;
 mod scheduler;
 
-use usage::Cli;
 use console::style;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
@@ -16,7 +15,13 @@ use std::{
 };
 
 #[derive(usage::Cli, Debug)]
-#[usage(version, unknown_flags = "error", args_override_self = false)]
+#[usage(
+    bin = "rsplug",
+    about,
+    version,
+    unknown_flags = "error",
+    args_override_self = false
+)]
 struct Args {
     /// Install plugins which are not installed yet
     #[usage(short, long)]
@@ -31,7 +36,13 @@ struct Args {
     #[usage(long)]
     lockfile: Option<PathBuf>,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
-    #[usage(arg, required, env = "RSPLUG_CONFIG_FILES", delimiter = ':', hide_env_values)]
+    #[usage(
+        arg,
+        required,
+        env = "RSPLUG_CONFIG_FILES",
+        delimiter = ':',
+        hide_env_values
+    )]
     config_files: Vec<String>,
 }
 
