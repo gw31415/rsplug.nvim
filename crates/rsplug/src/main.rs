@@ -3,7 +3,7 @@ mod osc94;
 mod rsplug;
 mod scheduler;
 
-use clap::Parser;
+use usage::Cli;
 use console::style;
 use log::{Message, close, msg};
 use once_cell::sync::Lazy;
@@ -15,28 +15,23 @@ use std::{
     sync::Arc,
 };
 
-#[derive(clap::Parser, Debug)]
-#[command(about, version)]
+#[derive(usage::Cli, Debug)]
+#[usage(version, unknown_flags = "error", args_override_self = false)]
 struct Args {
     /// Install plugins which are not installed yet
-    #[arg(short, long)]
+    #[usage(short, long)]
     install: bool,
     /// Access remote and update repositories
-    #[arg(conflicts_with = "locked", short, long)]
+    #[usage(short, long, conflicts("--locked"))]
     update: bool,
     /// Fix the repo version with rev in the lockfile
-    #[arg(long)]
+    #[usage(long)]
     locked: bool,
     /// Specify the lockfile path
-    #[arg(long)]
+    #[usage(long)]
     lockfile: Option<PathBuf>,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
-    #[arg(
-        required = true,
-        env = "RSPLUG_CONFIG_FILES",
-        value_delimiter = ':',
-        hide_env_values = true
-    )]
+    #[usage(arg, required, env = "RSPLUG_CONFIG_FILES", delimiter = ':', hide_env_values)]
     config_files: Vec<String>,
 }
 

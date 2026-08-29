@@ -16,7 +16,7 @@ dag = { workspace = true, features = ["hashbrown"] }
 file_specifier.workspace = true
 git2 = { version = "0.21", features = ["ssh", "https"] }
 walker.workspace = true
-clap = { version = "4.6", features = ["derive", "env"] }
+usage = { package = "usage-rs", version = "=6.5.0" }
 console = "0.16"
 indicatif = { version = "0.18", features = ["tokio"] }
 itertools = "0.15"
