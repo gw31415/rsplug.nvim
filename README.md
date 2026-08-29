@@ -253,14 +253,14 @@ An invalid or pruned ID falls back to the latest generation.
 
 ```text
 rsplug [OPTIONS] <CONFIG_FILES>...
-rsplug --completion <SHELL>
+rsplug --completion [SHELL]
 rsplug --man
 
 -i, --install              Install repositories not present in the cache
 -u, --update               Fetch and update repositories
     --locked               Use exact revisions from the lockfile
     --lockfile <LOCKFILE>  Override the lockfile path
-    --completion <SHELL>   Generate shell completion to stdout
+    --completion [SHELL]   Generate shell completion to stdout
                            [bash, zsh, fish, nu, powershell]
     --man                  Generate the rsplug(1) man page to stdout
 -h, --help                 Show help
@@ -268,8 +268,10 @@ rsplug --man
 ```
 
 `--completion` and `--man` are generation modes and cannot be combined with
-normal execution options or config input. For example, `rsplug --completion
-zsh > _rsplug` writes a zsh completion script and `rsplug --man > rsplug.1`
+normal execution options or explicit config input. `RSPLUG_CONFIG_FILES` is
+ignored in these modes. Omitting `SHELL` from `--completion` detects the current
+shell from `$SHELL`. For example, `rsplug --completion zsh > _rsplug` writes a
+zsh completion script and `rsplug --man > rsplug.1`
 writes the section-1 man page.
 
 Default paths below `~/.cache/rsplug/` are `init.lua`, `repos/`,

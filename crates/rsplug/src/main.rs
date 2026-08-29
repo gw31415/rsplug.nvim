@@ -11,7 +11,7 @@ use scheduler::{LoadCtx, LoadRev, RunMode, run_load_early, run_load_late};
 use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -20,7 +20,7 @@ use std::{
     bin = "rsplug",
     about,
     version,
-    usage = "Usage: rsplug [OPTIONS] <CONFIG_FILES>...\n       rsplug --completion <SHELL>\n       rsplug --man",
+    usage = "Usage: rsplug [OPTIONS] <CONFIG_FILES>...\n       rsplug --completion [SHELL]\n       rsplug --man",
     unknown_flags = "error",
     args_override_self = false,
     completion
@@ -39,8 +39,8 @@ struct Args {
     #[usage(long)]
     lockfile: Option<PathBuf>,
     /// Generate a shell completion script to stdout
-    #[usage(long, value_enum, value_name = "SHELL", exclusive)]
-    completion: Option<CompletionShell>,
+    #[usage(long, value_enum, value_name = "SHELL", value_optional, exclusive)]
+    completion: Option<Option<CompletionShell>>,
     /// Generate the rsplug(1) man page to stdout
     #[usage(long, exclusive)]
     man: bool,
@@ -52,6 +52,17 @@ struct Args {
         delimiter = ':',
         hide_env_values
     )]
+    config_files: Vec<String>,
+}
+
+#[derive(usage::Cli, Debug)]
+#[usage(bin = "rsplug", unknown_flags = "error", args_override_self = false)]
+struct GenerationArgs {
+    #[usage(long, value_enum, value_name = "SHELL", value_optional, exclusive)]
+    completion: Option<Option<CompletionShell>>,
+    #[usage(long, exclusive)]
+    man: bool,
+    #[usage(arg)]
     config_files: Vec<String>,
 }
 
@@ -75,6 +86,35 @@ impl From<CompletionShell> for usage::complete::Shell {
             CompletionShell::PowerShell => Self::PowerShell,
         }
     }
+}
+
+impl CompletionShell {
+    fn detect() -> Result<Self, Option<String>> {
+        let shell = std::env::var_os("SHELL");
+        let name = shell
+            .as_deref()
+            .and_then(|value| Path::new(value).file_name())
+            .and_then(|value| value.to_str());
+
+        match name {
+            Some("bash") => Ok(Self::Bash),
+            Some("zsh") => Ok(Self::Zsh),
+            Some("fish") => Ok(Self::Fish),
+            Some("nu") => Ok(Self::Nu),
+            Some("pwsh" | "pwsh.exe" | "powershell" | "powershell.exe") => Ok(Self::PowerShell),
+            _ => Err(shell.map(|value| value.to_string_lossy().into_owned())),
+        }
+    }
+}
+
+fn generation_mode_requested() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg == "--man" || arg == "--completion" || arg.starts_with("--completion=")
+        })
 }
 
 /// EARLY 相の進行状態。EARLY 完了結果（`EarlyOutcome`）を保持する。
@@ -150,28 +190,39 @@ fn should_resolve_graphql(install: bool, update: bool, installed: bool) -> bool 
 }
 
 async fn app() -> Result<(), Error> {
+    if generation_mode_requested() {
+        let GenerationArgs {
+            completion,
+            man,
+            config_files: _,
+        } = GenerationArgs::parse();
+
+        if let Some(shell) = completion {
+            let shell = shell
+                .map_or_else(CompletionShell::detect, Ok)
+                .map_err(|shell| Error::CompletionShellDetection { shell })?;
+            std::io::stdout()
+                .lock()
+                .write_all(Args::completion_script(shell.into()).as_bytes())?;
+            return Ok(());
+        }
+        if man {
+            let spec = Args::to_kdl().parse::<usage_docs::Spec>()?;
+            let manpage = usage_docs::docs::manpage::ManpageRenderer::new(spec).render()?;
+            std::io::stdout().lock().write_all(manpage.as_bytes())?;
+        }
+        return Ok(());
+    }
+
     let Args {
         install,
         update,
         lockfile,
         locked,
-        completion,
-        man,
+        completion: _,
+        man: _,
         config_files,
     } = Args::parse();
-
-    if let Some(shell) = completion {
-        std::io::stdout()
-            .lock()
-            .write_all(Args::completion_script(shell.into()).as_bytes())?;
-        return Ok(());
-    }
-    if man {
-        let spec = Args::to_kdl().parse::<usage_docs::Spec>()?;
-        let manpage = usage_docs::docs::manpage::ManpageRenderer::new(spec).render()?;
-        std::io::stdout().lock().write_all(manpage.as_bytes())?;
-        return Ok(());
-    }
 
     let mode = RunMode::from_flags(install, update, locked);
     let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));
@@ -1352,6 +1403,11 @@ enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Usage(#[from] usage_docs::error::UsageErr),
+    #[error(
+        "could not detect a supported shell from $SHELL{}; pass one explicitly: bash, zsh, fish, nu, or powershell",
+        shell.as_deref().map(|value| format!("={value}")).unwrap_or_default()
+    )]
+    CompletionShellDetection { shell: Option<String> },
     #[error(transparent)]
     Rsplug(#[from] rsplug::Error),
     /// 同一 canonical リポジトリに複数の異なる rev が指定された（設定ミス）。
