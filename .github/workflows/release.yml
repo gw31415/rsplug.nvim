@@ -131,7 +131,7 @@ jobs:
           mkdir -p dist
           cp "$binary" dist/rsplug.exe
           7z a -tzip -mtc=off "rsplug-${{ matrix.target }}-${version}.zip" dist/rsplug.exe
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rsplug-${{ matrix.target }}
           path: rsplug-${{ matrix.target }}-*
@@ -162,7 +162,7 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: artifacts/SHA256SUMS
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets
           path: artifacts
