@@ -1280,6 +1280,54 @@ mod runtime_hot_paths {
         run_scenario(&pack, "map_retires_after_setup", &[]);
     }
 
+    /// on_map 以外の trigger で読み込まれても、プラグインが張った同じパターンの
+    /// 本物のマッピングは仮マッピングの退役で消えない。
+    #[tokio::test]
+    async fn on_map_retire_keeps_real_mapping() {
+        let pack = build_pack(vec![FakePlugin {
+            tag: "map_real",
+            files: vec![(
+                "plugin/init.lua",
+                b"vim.g.map_real = true\nvim.keymap.set('n', 'zL', function() vim.g.map_real_hit = true end)",
+            )],
+            lazy: vec![FakeLazy::Map {
+                mode: Some('n'),
+                pattern: "zL",
+            }],
+        }])
+        .await
+        .expect("build_pack");
+        run_scenario(
+            &pack,
+            "map_keeps_real_mapping_after_other_trigger",
+            &["map_real", "map_real_hit"],
+        );
+    }
+
+    /// モード指定なし（nvo）の on_map でも、本物のマッピングを残したまま
+    /// 他のモードの仮マッピングだけを片付ける。
+    #[tokio::test]
+    async fn on_map_retire_keeps_real_mapping_for_all_modes() {
+        let pack = build_pack(vec![FakePlugin {
+            tag: "map_real",
+            files: vec![(
+                "plugin/init.lua",
+                b"vim.g.map_real = true\nvim.keymap.set('n', 'zL', function() vim.g.map_real_hit = true end)",
+            )],
+            lazy: vec![FakeLazy::Map {
+                mode: None,
+                pattern: "zL",
+            }],
+        }])
+        .await
+        .expect("build_pack");
+        run_scenario(
+            &pack,
+            "map_keeps_real_mapping_after_other_trigger",
+            &["map_real", "map_real_hit"],
+        );
+    }
+
     /// R5: 特殊キー（<F5>）パターンの expr マッピングが termcode replay 付きで機能する。
     #[tokio::test]
     async fn r5_map_special_key_replay_loads_plugins() {
