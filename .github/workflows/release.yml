@@ -60,9 +60,17 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install Neovim test dependency
+        # Ubuntu's apt package is Neovim 0.9; test against a pinned current release.
+        env:
+          NVIM_VERSION: v0.12.5
+          NVIM_SHA256: bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875
         run: |
-          sudo apt-get update
-          sudo apt-get install -y neovim
+          curl -fsSL -o "$RUNNER_TEMP/nvim.tar.gz" \
+            "https://github.com/neovim/neovim/releases/download/$NVIM_VERSION/nvim-linux-x86_64.tar.gz"
+          echo "$NVIM_SHA256  $RUNNER_TEMP/nvim.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nvim.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - run: nvim --version
       - run: cargo fmt --all -- --check
       - run: RUST_TEST_THREADS=1 cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
