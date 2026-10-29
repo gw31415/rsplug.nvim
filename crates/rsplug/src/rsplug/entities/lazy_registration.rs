@@ -218,7 +218,7 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
                 .into_bytes()
                 .into();
                 let (ls_path, ls_item) =
-                    generated_file_item(PathBuf::from("plugin/lua_start.lua"), data);
+                    generated_file_item(PathBuf::from("rsplug/startup/lua_start.lua"), data);
                 files.insert(ls_path, ls_item);
             }
             plugs.push(LoadedPlugin {
@@ -268,7 +268,7 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
             .into_bytes()
             .into();
             let on_event_setup_path = PathBuf::from(format!(
-                "plugin/{}.lua",
+                "rsplug/startup/{}.lua",
                 hash::digest_hash_hex_string(&on_event_setup)
             ));
             let files = BTreeMap::from([
@@ -303,7 +303,7 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
             .into_bytes()
             .into();
             let on_func_setup_path = PathBuf::from(format!(
-                "plugin/{}.lua",
+                "rsplug/startup/{}.lua",
                 hash::digest_hash_hex_string(&on_func_setup)
             ));
             let files = BTreeMap::from([
@@ -338,7 +338,7 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
                 .into_bytes()
                 .into();
                 let on_cmd_setup_path = PathBuf::from(format!(
-                    "plugin/{}.lua",
+                    "rsplug/startup/{}.lua",
                     hash::digest_hash_hex_string(&on_cmd_setup)
                 ));
                 let files = BTreeMap::from([
@@ -382,7 +382,7 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
             .into_bytes()
             .into();
             let plugin_on_lua_path = PathBuf::from(format!(
-                "plugin/{}.lua",
+                "rsplug/startup/{}.lua",
                 hash::digest_hash_hex_string(plugin_on_lua)
             ));
             let files = BTreeMap::from([
@@ -411,7 +411,10 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
             .into_bytes()
             .into();
             plugs.push(instant_startup_pkg(
-                &format!("plugin/{}.lua", hash::digest_hash_hex_string(&on_map_setup)),
+                &format!(
+                    "rsplug/startup/{}.lua",
+                    hash::digest_hash_hex_string(&on_map_setup)
+                ),
                 on_map_setup,
             ));
             plugs.push(instant_startup_pkg(
@@ -1628,6 +1631,67 @@ mod runtime_hot_paths {
             }
         }
         counts
+    }
+
+    /// 実際の起動（init.lua を vimrc として読み、その後 load-plugins が走る）で
+    /// コントロールパッケージの起動スクリプトが各1回だけ source される。
+    /// `luafile` 経由のシナリオは load-plugins の後に init.lua を読むため、この経路を通らない。
+    #[tokio::test]
+    async fn startup_sources_control_scripts_once() {
+        let pack = build_pack(vec![FakePlugin {
+            tag: "once_a",
+            files: vec![("plugin/init.lua", b"vim.g.once_a = true")],
+            lazy: vec![FakeLazy::Event("OnceEvent")],
+        }])
+        .await
+        .expect("build_pack");
+        let nvim = std::env::var_os("RSPLUG_TEST_NVIM").unwrap_or_else(|| OsString::from("nvim"));
+        let packpath =
+            std::fs::canonicalize(&pack.packpath).unwrap_or_else(|_| pack.packpath.clone());
+        let xdg_root = packpath.parent().unwrap().join("xdg-once");
+        let output = Command::new(&nvim)
+            .arg("--headless")
+            .arg("-i")
+            .arg("NONE")
+            .arg("-n")
+            .env("XDG_CONFIG_HOME", xdg_root.join("config"))
+            .env("XDG_DATA_HOME", xdg_root.join("data"))
+            .env("XDG_CACHE_HOME", xdg_root.join("cache"))
+            .env("XDG_STATE_HOME", xdg_root.join("state"))
+            .arg("--cmd")
+            .arg(
+                "lua vim.g.rsplug_sourced = {}; vim.api.nvim_create_autocmd('SourcePost', \
+                 { callback = function(a) local t = vim.g.rsplug_sourced; \
+                 t[a.file] = (t[a.file] or 0) + 1; vim.g.rsplug_sourced = t end })",
+            )
+            .arg("-u")
+            .arg(packpath.join("init.lua"))
+            .arg("-c")
+            .arg(
+                "lua io.stdout:write('SOURCED=' .. vim.json.encode(vim.g.rsplug_sourced) .. '\\n')",
+            )
+            .arg("-c")
+            .arg("qa!")
+            .output()
+            .expect("spawn nvim");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json = stdout
+            .lines()
+            .find_map(|l| l.trim_start_matches('\x0d').strip_prefix("SOURCED="))
+            .unwrap_or_else(|| panic!("no SOURCED line: {stdout}"));
+        let sourced: BTreeMap<String, u64> = serde_json::from_str(json).unwrap();
+        let control: Vec<_> = sourced
+            .iter()
+            .filter(|(path, _)| pack.control_ids.iter().any(|id| path.contains(id.as_str())))
+            .collect();
+        assert!(
+            !control.is_empty(),
+            "no control script was sourced: {sourced:?}"
+        );
+        assert!(
+            control.iter().all(|(_, n)| **n == 1),
+            "control scripts must be sourced exactly once: {control:?}"
+        );
     }
 
     // ---- R0 characterization scenarios (current/slow behavior baseline) ----

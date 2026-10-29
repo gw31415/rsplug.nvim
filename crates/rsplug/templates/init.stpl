@@ -24,6 +24,13 @@ elseif requested ~= nil and requested ~= '' then
 end
 for _, id in ipairs(ids) do
 	vim.cmd.packadd(id)
+	-- 起動スクリプトは plugin/ に置かない。init 中の :packadd で source した plugin/ は
+	-- 直後の load-plugins でもう一度 source されるため、ここで1回だけ source する。
+	local scripts = vim.fn.glob(root .. '/pack/_gen/opt/' .. id .. '/rsplug/startup/*.lua', true, true)
+	table.sort(scripts)
+	for _, script in ipairs(scripts) do
+		vim.cmd.source(vim.fn.fnameescape(script))
+	end
 end
 
 local ok, rsplug = pcall(require, '_rsplug')
