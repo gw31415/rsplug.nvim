@@ -23,28 +23,14 @@ elseif requested ~= nil and requested ~= '' then
 	vim.notify(('[rsplug] RSPLUG_GENERATION %q is not available, falling back to the default generation'):format(requested), vim.log.levels.WARN)
 end
 for _, id in ipairs(ids) do
-	-- :packadd は 'packpath' 全体の glob と runtimepath 各エントリの realpath 解決で遅いため、
-	-- :packadd! と同じ位置 (最初の after ディレクトリの直前) に直接足す。
-	-- エスケープされた区切りを含む runtimepath は分割できないので :packadd! に任せる。
+	-- コントロールパッケージはまだ runtimepath に無いので、読み込み方式を直接 loadfile する。
 	local dir = root .. '/pack/_gen/opt/' .. id
-	local rtp = vim.o.runtimepath
-	if rtp:find('\\', 1, true) then
-		vim.cmd('packadd! ' .. vim.fn.fnameescape(id))
-	elseif not (',' .. rtp .. ','):find(',' .. dir .. ',', 1, true) then
-		local entries = vim.split(rtp, ',', { plain = true })
-		local pos = #entries + 1
-		for i, entry in ipairs(entries) do
-			if entry:match('/after/?$') then
-				pos = i
-				break
-			end
-		end
-		table.insert(entries, pos, dir)
-		vim.o.runtimepath = table.concat(entries, ',')
-	end
+	local loader = assert(loadfile(dir .. '/lua/_rsplug/loader.lua'))()
+	package.loaded['_rsplug/loader'] = package.loaded['_rsplug/loader'] or loader
+	loader.add(id)
 	-- 起動スクリプトは plugin/ に置かない。init 中に source した plugin/ は
 	-- 直後の load-plugins でもう一度 source されるため、ここで1回だけ source する。
-	local scripts = vim.fn.glob(root .. '/pack/_gen/opt/' .. id .. '/rsplug/startup/*.lua', true, true)
+	local scripts = vim.fn.glob(dir .. '/rsplug/startup/*.lua', true, true)
 	table.sort(scripts)
 	for _, script in ipairs(scripts) do
 		vim.cmd.source(vim.fn.fnameescape(script))

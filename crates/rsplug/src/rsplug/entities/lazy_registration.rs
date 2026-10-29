@@ -205,10 +205,21 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
             .unwrap()
             .into_bytes()
             .into();
-            let mut files = BTreeMap::from([generated_file_item(
-                PathBuf::from("lua/_rsplug/init.lua"),
-                init_data,
-            )]);
+            let mut files = BTreeMap::from([
+                generated_file_item(PathBuf::from("lua/_rsplug/init.lua"), init_data),
+                generated_file_item(
+                    PathBuf::from("lua/_rsplug/loader.lua"),
+                    include_bytes!("../../../templates/lua/_rsplug/loader.lua").into(),
+                ),
+                generated_file_item(
+                    PathBuf::from("lua/_rsplug/loader/packadd.lua"),
+                    include_bytes!("../../../templates/lua/_rsplug/loader/packadd.lua").into(),
+                ),
+                generated_file_item(
+                    PathBuf::from("lua/_rsplug/loader/rtp.lua"),
+                    include_bytes!("../../../templates/lua/_rsplug/loader/rtp.lua").into(),
+                ),
+            ]);
             if !startup_scripts.is_empty() {
                 let data: Cow<'static, [u8]> = LuaStartPluginTemplate {
                     startup_scripts: &startup_scripts,
