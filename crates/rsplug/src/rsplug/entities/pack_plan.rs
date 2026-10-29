@@ -2606,12 +2606,15 @@ mod tests {
         let control_id = b"control-package".plugin_id().as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&control_id))).unwrap();
 
-        // The control id is emitted into the ids table and looped over with vim.cmd.packadd(id).
+        // The control id is emitted into the ids table, and each control package is added through
+        // the swappable loader shipped inside it (it is not on 'runtimepath' yet, so loadfile).
         assert!(
             script.contains(&format!("\"{control_id}\"")),
             "control id must appear in the ids table: {script:?}"
         );
-        assert!(script.contains("vim.cmd.packadd(id)"));
+        assert!(script.contains("local dir = root .. '/pack/_gen/opt/' .. id"));
+        assert!(script.contains("loadfile(dir .. '/lua/_rsplug/loader.lua')"));
+        assert!(script.contains("loader.add(id)"));
         assert!(!script.contains("packloadall"));
     }
 

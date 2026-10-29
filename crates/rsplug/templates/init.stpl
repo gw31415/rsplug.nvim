@@ -23,7 +23,18 @@ elseif requested ~= nil and requested ~= '' then
 	vim.notify(('[rsplug] RSPLUG_GENERATION %q is not available, falling back to the default generation'):format(requested), vim.log.levels.WARN)
 end
 for _, id in ipairs(ids) do
-	vim.cmd.packadd(id)
+	-- コントロールパッケージはまだ runtimepath に無いので、読み込み方式を直接 loadfile する。
+	local dir = root .. '/pack/_gen/opt/' .. id
+	local loader = assert(loadfile(dir .. '/lua/_rsplug/loader.lua'))()
+	package.loaded['_rsplug/loader'] = package.loaded['_rsplug/loader'] or loader
+	loader.add(id)
+	-- 起動スクリプトは plugin/ に置かない。init 中に source した plugin/ は
+	-- 直後の load-plugins でもう一度 source されるため、ここで1回だけ source する。
+	local scripts = vim.fn.glob(dir .. '/rsplug/startup/*.lua', true, true)
+	table.sort(scripts)
+	for _, script in ipairs(scripts) do
+		vim.cmd.source(vim.fn.fnameescape(script))
+	end
 end
 
 local ok, rsplug = pcall(require, '_rsplug')
