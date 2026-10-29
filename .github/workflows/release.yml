@@ -279,6 +279,10 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           prerelease=false
           [[ "$version" == *-* ]] && prerelease=true
+          # Publishing a draft via PATCH does not mark it as the latest release by itself,
+          # and tools resolving "latest" (e.g. mise's github backend) follow that flag.
+          make_latest=true
+          [[ "$prerelease" == true ]] && make_latest=false
           gh api --method PATCH \
             "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-            -f draft=false -F prerelease="$prerelease"
+            -f draft=false -F prerelease="$prerelease" -f make_latest="$make_latest"
