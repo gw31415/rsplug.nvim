@@ -49,6 +49,23 @@ local pattern_id_set = {}
 local id_patterns = {}
 local id_pattern_order = {}
 
+-- 仮マッピングの印。プラグインが同じパターンに張った本物のマッピングと区別する。
+local STUB_DESC = 'rsplug: lazy-load on_map'
+
+-- '' と 'v' は複数モードにまたがるので、モードごとに仮マッピングかを確かめる。
+local SUBMODES = { [''] = { 'n', 'x', 's', 'o' }, v = { 'x', 's' } }
+
+---仮マッピングがまだ残っているときだけ削除する。読み込み済みプラグインが lua_after
+---などで張った本物のマッピングは消さない。
+local function del_stub(mode, pattern)
+	for _, m in ipairs(SUBMODES[mode] or { mode }) do
+		local ok, map = pcall(vim.fn.maparg, pattern, m, false, true)
+		if ok and type(map) == 'table' and map.desc == STUB_DESC then
+			pcall(vim.keymap.del, m, pattern, {})
+		end
+	end
+end
+
 ---Retire one package from only the patterns registered by that package.
 local function retire(id)
 	for _, pattern in ipairs(id_pattern_order[id] or {}) do
@@ -59,7 +76,7 @@ local function retire(id)
 			end
 			if #ids == 0 then
 				for _, mode in ipairs(pattern_modes[pattern] or {}) do
-					pcall(vim.keymap.del, mode, pattern, {})
+					del_stub(mode, pattern)
 				end
 				pattern_modes[pattern] = nil
 				pattern_ids[pattern] = nil
@@ -154,7 +171,7 @@ function M.setup(mode)
 
 					-- If plugin is already loaded, delete only this mapping and feed keys
 					if all_loaded(all_ids) then
-						pcall(vim.keymap.del, mode_char, pattern, {})
+						del_stub(mode_char, pattern)
 						vim.api.nvim_feedkeys(replay, 'imt', true)
 						return ''
 					end
@@ -172,7 +189,7 @@ function M.setup(mode)
 					for pattern_to_delete, _ in pairs(patterns_to_delete) do
 						local modes = pattern_modes[pattern_to_delete] or {}
 						for _, m in ipairs(modes) do
-							pcall(vim.keymap.del, m, pattern_to_delete, {})
+							del_stub(m, pattern_to_delete)
 						end
 						-- Clear tracking for this pattern (centralized removal)
 						remove_pattern(pattern_to_delete)
@@ -185,7 +202,7 @@ function M.setup(mode)
 
 					vim.api.nvim_feedkeys(replay, 'imt', true)
 					return ''
-				end, { expr = true, silent = true })
+				end, { expr = true, silent = true, desc = STUB_DESC })
 
 				::continue::
 			end

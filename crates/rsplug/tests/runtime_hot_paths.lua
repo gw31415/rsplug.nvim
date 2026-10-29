@@ -659,6 +659,31 @@ local function user_opt_id()
 	return nil
 end
 
+-- on_map: キー以外の trigger で読み込まれたとき、プラグイン自身が同じパターンに張った
+-- 本物のマッピングを仮マッピングの退役で消さない。
+scenarios.map_keeps_real_mapping_after_other_trigger = function()
+	boot()
+	vim.cmd 'enew'
+	vim.cmd 'stopinsert'
+	require('_rsplug/on_map').setup 'n'
+	local id = user_opt_id()
+	if not id then
+		return 'no user opt id found'
+	end
+	require('_rsplug').packadd(id)
+	if vim.fn.maparg('zL', 'n') == '' then
+		return 'real mapping was deleted when retiring the on_map stub'
+	end
+	for _, m in ipairs { 'n', 'x', 's', 'o' } do
+		if vim.fn.maparg('zL', m, false, true).desc == 'rsplug: lazy-load on_map' then
+			return 'on_map stub left in mode ' .. m
+		end
+	end
+	local keys = vim.api.nvim_replace_termcodes('zL', true, true, true)
+	vim.api.nvim_feedkeys(keys, 'x', false)
+	return check_expect()
+end
+
 -- L1: packadd は成功の境界を通過したときだけ loaded になる。自己再入は loading ガードで
 -- 早期復帰し、plugin/ は1回だけ source される（loaded-once + recursion guard）。
 scenarios.transactional_loaded_after_success = function()
