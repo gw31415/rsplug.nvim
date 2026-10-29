@@ -1694,6 +1694,108 @@ mod runtime_hot_paths {
         );
     }
 
+    /// 起動時は :packadd! を使わず runtimepath に直接足すが、結果の 'runtimepath' は
+    /// 同じ順で :packadd! した場合と一致し、start プラグインの plugin/ と after/plugin/ は
+    /// load-plugins で各1回 source される。
+    #[tokio::test]
+    async fn startup_rtp_matches_packadd_bang() {
+        let pack = build_pack(vec![
+            FakePlugin {
+                tag: "rtp_start",
+                files: vec![
+                    (
+                        "plugin/init.lua",
+                        b"vim.g.rtp_start = (vim.g.rtp_start or 0) + 1",
+                    ),
+                    (
+                        "after/plugin/init.lua",
+                        b"vim.g.rtp_start_after = (vim.g.rtp_start_after or 0) + 1",
+                    ),
+                ],
+                lazy: vec![FakeLazy::Start],
+            },
+            FakePlugin {
+                tag: "rtp_start2",
+                files: vec![("plugin/init.lua", b"vim.g.rtp_start2 = true")],
+                lazy: vec![FakeLazy::Start],
+            },
+            FakePlugin {
+                tag: "rtp_lazy",
+                files: vec![("plugin/init.lua", b"vim.g.rtp_lazy = true")],
+                lazy: vec![FakeLazy::Event("RtpEvent")],
+            },
+        ])
+        .await
+        .expect("build_pack");
+        let nvim = std::env::var_os("RSPLUG_TEST_NVIM").unwrap_or_else(|| OsString::from("nvim"));
+        let packpath =
+            std::fs::canonicalize(&pack.packpath).unwrap_or_else(|_| pack.packpath.clone());
+        let xdg_root = packpath.parent().unwrap().join("xdg-rtp");
+        let run = |args: &[&std::ffi::OsStr]| {
+            let output = Command::new(&nvim)
+                .args(["--headless", "-i", "NONE", "-n"])
+                .env("XDG_CONFIG_HOME", xdg_root.join("config"))
+                .env("XDG_DATA_HOME", xdg_root.join("data"))
+                .env("XDG_CACHE_HOME", xdg_root.join("cache"))
+                .env("XDG_STATE_HOME", xdg_root.join("state"))
+                .args(args)
+                .arg("-c")
+                .arg(
+                    "lua io.stdout:write('RTP=' .. vim.o.runtimepath .. '\\n' .. 'COUNT=' \
+                     .. tostring(vim.g.rtp_start) .. ',' .. tostring(vim.g.rtp_start_after) \
+                     .. ',' .. tostring(vim.g.rtp_lazy) .. '\\n')",
+                )
+                .arg("-c")
+                .arg("qa!")
+                .output()
+                .expect("spawn nvim");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let field = |key: &str| {
+                stdout
+                    .lines()
+                    .find_map(|l| l.trim_start_matches('\x0d').strip_prefix(key))
+                    .unwrap_or_else(|| panic!("no {key} line: {stdout}"))
+                    .to_string()
+            };
+            (field("RTP="), field("COUNT="))
+        };
+
+        let init = packpath.join("init.lua");
+        let (actual_rtp, actual_count) = run(&[std::ffi::OsStr::new("-u"), init.as_os_str()]);
+        assert_eq!(
+            actual_count, "1,1,nil",
+            "start plugin sourced once, lazy one not"
+        );
+
+        // 参照: 同じパッケージを同じ順 (control → 生成ランタイムの startup_plugins 順) で :packadd! する。
+        let control_init = std::fs::read_to_string(
+            packpath
+                .join("pack/_gen/opt")
+                .join(&pack.control_ids[0])
+                .join("lua/_rsplug/init.lua"),
+        )
+        .unwrap();
+        let startup_line = control_init
+            .lines()
+            .find(|l| l.starts_with("local startup_plugins = {"))
+            .expect("startup_plugins table");
+        let startup_ids: Vec<&str> = startup_line.split('"').skip(1).step_by(2).collect();
+        assert_eq!(startup_ids.len(), 2, "{startup_line}");
+        let mut reference = format!("set packpath^={}\n", packpath.display());
+        for id in pack
+            .control_ids
+            .iter()
+            .map(String::as_str)
+            .chain(startup_ids)
+        {
+            reference.push_str(&format!("packadd! {id}\n"));
+        }
+        let reference_init = packpath.parent().unwrap().join("reference.vim");
+        std::fs::write(&reference_init, reference).unwrap();
+        let (expected_rtp, _) = run(&[std::ffi::OsStr::new("-u"), reference_init.as_os_str()]);
+        assert_eq!(actual_rtp, expected_rtp);
+    }
+
     // ---- R0 characterization scenarios (current/slow behavior baseline) ----
 
     /// 共有 User イベントに2プラグインを登録。トリガ1回で両方読み込まれる。

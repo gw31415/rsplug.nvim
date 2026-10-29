@@ -16,6 +16,46 @@ local function core()
 	if not rsplug_core then rsplug_core = require '_rsplug' end
 	return rsplug_core
 end
+
+-- <gen>/opt。このファイルは <gen>/opt/<control-id>/lua/_rsplug/init.lua に置かれる。
+local opt_root = string.match(debug.getinfo(1, 'S').source, '^@?(.*)/[^/]+/lua/_rsplug/init%.lua$')
+
+---`:packadd! id` と同じ位置に runtimepath を足す。
+---`:packadd!` は呼ぶたびに 'packpath' 全体を glob し、runtimepath の各エントリを realpath
+---解決するため1回 0.5ms 前後かかる。場所が分かっているパッケージは直接足す。
+---@param id string
+local function add_to_rtp(id)
+	local rtp = vim.o.runtimepath
+	-- エスケープされた区切りを含む runtimepath は分割できないので :packadd! に任せる。
+	if not opt_root or rtp:find('\\', 1, true) then
+		vim.cmd('packadd! ' .. vim.fn.fnameescape(id))
+		return
+	end
+	local dir = opt_root .. '/' .. id
+	local entries = vim.split(rtp, ',', { plain = true })
+	-- :packadd! と同じく、packpath ルート配下の最初のエントリの直後、無ければ最初の
+	-- after ディレクトリの直前に入れる。after ディレクトリは最初の after の直前に入れる。
+	local pack_root = opt_root:match('^(.*)/pack/[^/]+/opt$')
+	local insp, after_insp
+	for i, entry in ipairs(entries) do
+		if entry == dir then return end
+		if not insp and pack_root and entry:sub(1, #pack_root + 1) == pack_root .. '/' then
+			insp = i + 1
+		end
+		if not after_insp and entry:match('[/\\]after/?$') then
+			after_insp = i
+		end
+	end
+	insp = insp or after_insp or (#entries + 1)
+	table.insert(entries, insp, dir)
+	local after = dir .. '/after'
+	if vim.uv.fs_stat(after) then
+		-- dir を挿入したので、それより後ろにある after の位置は1つずれる。
+		local pos = after_insp and (after_insp >= insp and after_insp + 1 or after_insp) or (#entries + 1)
+		table.insert(entries, pos, after)
+	end
+	vim.o.runtimepath = table.concat(entries, ',')
+end
 -- L1: パッケージ状態は unloaded(nil) | loading | loaded の3状態。
 -- `loaded` は「完全に読み込み完了」した id のみ。`loading` は packadd 実行中の再帰ガード。
 local loading = {}
@@ -62,7 +102,11 @@ return setmetatable({
 		local ok, err = xpcall(function()
 			local hooks = setup_scripts and require(setup_scripts) or nil
 			for _, before in ipairs((hooks and hooks.before) or {}) do before() end
-			vim.cmd((startup and 'packadd! ' or 'packadd ') .. vim.fn.fnameescape(id))
+			if startup then
+				add_to_rtp(id)
+			else
+				vim.cmd('packadd ' .. vim.fn.fnameescape(id))
+			end
 			for _, after in ipairs((hooks and hooks.after) or {}) do after() end
 			for _, on_source_id in ipairs(source2pkgid[id] or {}) do
 				require '_rsplug'.packadd(on_source_id)
