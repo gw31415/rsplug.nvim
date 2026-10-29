@@ -40,7 +40,7 @@ function M.add(id)
 	insp = insp or after_insp or (#entries + 1)
 	table.insert(entries, insp, dir)
 	local after = dir .. '/after'
-	if vim.uv.fs_stat(after) then
+	if (vim.uv or vim.loop).fs_stat(after) then
 		-- dir を挿入したので、それより後ろにある after の位置は1つずれる。
 		local pos = after_insp and (after_insp >= insp and after_insp + 1 or after_insp) or (#entries + 1)
 		table.insert(entries, pos, after)
