@@ -1288,15 +1288,28 @@ async fn generation_is_current(
         .join("generations")
         .join(&generation_name)
         .with_extension("lua");
-    let Ok(loader_content) = tokio::fs::read(loader).await else {
+    let Ok(loader_content) = tokio::fs::read(&loader).await else {
         return false;
     };
     if loader_content != init_content {
         return false;
     }
-    tokio::fs::symlink_metadata(packpath.join("init.lua"))
+    let init_path = packpath.join("init.lua");
+    if !tokio::fs::symlink_metadata(&init_path)
         .await
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return false;
+    }
+    // 同じ内容の generation が残っていても、init.lua が別の generation を指していれば
+    // 再利用ではなく切り替えが必要。
+    match (
+        tokio::fs::canonicalize(&init_path).await,
+        tokio::fs::canonicalize(&loader).await,
+    ) {
+        (Ok(current), Ok(desired)) => current == desired,
+        _ => false,
+    }
 }
 
 // ---- pack copy 戦略（Phase 6c） ----
@@ -4076,6 +4089,41 @@ mod tests {
             "reuse must not recopy the changed snapshot"
         );
         assert!(no_staging_dirs(&genpath), "no staging dirs must remain");
+    }
+
+    /// 別の generation に切り替えた後で元の構成に戻すと、既存 generation を再利用しても
+    /// init.lua はその generation を指し直す。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switching_back_to_an_existing_generation_repoints_init_lua() {
+        let dir = tempfile::tempdir().unwrap();
+        let packpath = dir.path().to_path_buf();
+        let snap_root = dir.path().join("snap");
+        std::fs::create_dir_all(snap_root.join("plugin")).unwrap();
+        std::fs::write(snap_root.join("plugin/a.lua"), b"-- a\n").unwrap();
+        let install = |rev: &'static [u8]| {
+            let mut state = PackPlan::new();
+            state.insert(one_file_plugin(
+                "github.com/owner/a",
+                rev,
+                "plugin/a.lua",
+                &snap_root,
+            ));
+            let packpath = packpath.clone();
+            async move { state.install(&packpath).await.unwrap() }
+        };
+        let resolve_init = || std::fs::canonicalize(packpath.join("init.lua")).unwrap();
+
+        install(b"rev-a").await;
+        let first = resolve_init();
+        install(b"rev-b").await;
+        assert_ne!(resolve_init(), first, "rev-b must publish a new generation");
+        install(b"rev-a").await;
+        assert_eq!(
+            resolve_init(),
+            first,
+            "init.lua must point back at the reused rev-a generation"
+        );
     }
 
     #[tokio::test]
