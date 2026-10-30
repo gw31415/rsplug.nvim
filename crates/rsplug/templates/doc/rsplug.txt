@@ -904,8 +904,7 @@ require('rsplug').watch({cb})
     pointing at a generation other than the one this Neovim was started with,
     `cb(latest, current)` is called once per new generation on the main loop
     with both generation IDs.  If one is already published when `watch()` is
-    called, `cb` is called right away.  In a Neovim started with
-    `RSPLUG_GENERATION` it does nothing.  Returns an object whose `stop()`
+    called, `cb` is called right away.  Returns an object whose `stop()`
     ends the watch.
     rsplug creates no autocommands for this; what to do is up to you:
 >lua

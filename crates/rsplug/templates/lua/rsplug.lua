@@ -5,12 +5,11 @@ local M = {}
 ---新しい世代の公開（`init.lua` の付け替え）を監視する。`init.lua` がこの Neovim の
 ---起動した世代とは別の世代を指すようになると、新しい世代ごとに1回 `cb` をメインループで
 ---呼ぶ。呼んだ時点ですでに別の世代が公開されていれば、そのときも呼ぶ。
----`RSPLUG_GENERATION` で世代を固定して起動した Neovim では何もしない。
 ---@param cb fun(latest: string, current: string)  公開された世代 ID と、この Neovim の世代 ID
 ---@return { stop: fun() }
 function M.watch(cb)
 	local generation = package.loaded['_rsplug/generation']
-	if type(generation) ~= 'table' or generation.root == nil or generation.pinned then
+	if type(generation) ~= 'table' or generation.root == nil then
 		return { stop = function() end }
 	end
 	local uv = vim.uv
