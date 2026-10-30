@@ -240,19 +240,31 @@ preserves correctness. The current and retained generation IDs are tracked in
 `pack/_gen/generations/registry.json`; an identical, intact generation is a
 true no-op and does not recopy packages or regenerate help files.
 
-To boot a retained generation, list `~/.cache/rsplug/pack/_gen/generations/`
-and pass its 32-character generation-plan ID:
+Each generation's bootstrap is kept as `~/.cache/rsplug/generations/<id>.lua`,
+and `~/.cache/rsplug/init.lua` is a symlink to one of them. List the retained
+generations and switch between them with:
+
+```bash
+rsplug --list-generations          # newest first; `*` marks the current one
+rsplug --switch-generation <id>    # full ID or a unique prefix
+```
+
+Switching only repoints `init.lua`; restart Neovim to use it. The next normal
+`rsplug` run publishes the generation built from your configuration again.
+To boot a retained generation for a single Neovim process instead:
 
 ```bash
 RSPLUG_GENERATION=<id> nvim
 ```
 
-An invalid or pruned ID falls back to the latest generation.
+An invalid or pruned ID falls back to the current generation.
 
 ## CLI reference
 
 ```text
 rsplug [OPTIONS] <CONFIG_FILES>...
+rsplug --list-generations
+rsplug --switch-generation <ID>
 rsplug --completion [SHELL]
 rsplug --man
 
@@ -260,6 +272,9 @@ rsplug --man
 -u, --update               Fetch and update repositories
     --locked               Use exact revisions from the lockfile
     --lockfile <LOCKFILE>  Override the lockfile path
+    --list-generations     List retained generations, newest first
+    --switch-generation <ID>
+                           Boot a retained generation from the next start
     --completion [SHELL]   Generate shell completion to stdout
                            [bash, zsh, fish, nu, powershell]
     --man                  Generate the rsplug(1) man page to stdout

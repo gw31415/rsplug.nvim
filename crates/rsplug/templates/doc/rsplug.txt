@@ -115,6 +115,8 @@ current controlled generation and should be replaced with the `dofile` form.
 Synopsis:
 >
     rsplug [OPTIONS] <CONFIG_FILES>...
+    rsplug --list-generations
+    rsplug --switch-generation <ID>
 <
 
 Options:
@@ -137,6 +139,14 @@ Options:
     --lockfile <LOCKFILE>
         Use this JSON lock file instead of the default
         `~/.cache/rsplug/rsplug.lock.json`.
+
+    --list-generations
+        Print the retained generations, newest first, and exit.  See
+        |rsplug-generations|.
+
+    --switch-generation <ID>
+        Point `init.lua` at the retained generation whose ID (or unique ID
+        prefix) is `<ID>`, and exit.  Neovim uses it from the next start.
 
     -h, --help
         Print the command-line help and exit.
@@ -834,11 +844,28 @@ are removed from generated `start/` and `opt/` output.  Generation loader files
 whose control package has been removed are also deleted.  Cleanup is best
 effort after a successful install; a current/retained generation is not
 removed merely because a newer generation was created.  The retained
-generation list is stored in `pack/_gen/generations/registry.json`; older
+generation list is stored in `pack/_gen/generations/registry.json`; the
+manifest and loader of a generation that drops out of it are deleted, so only
+retained generations can be selected.  Older
 installations without this registry are treated as a cache-migration case and
 are rebuilt or conservatively retained as needed.  If the desired generation
 metadata and referenced packages are already intact, refresh is a no-op (no
 package copy or helptags process).
+
+Switching generations:
+
+`rsplug --list-generations` prints the retained generations, newest first.
+The one `init.lua` currently points to is marked with `*`; a generation whose
+packages are gone is marked as missing packages.
+
+`rsplug --switch-generation <ID>` points `init.lua` at a retained generation.
+`<ID>` is a generation ID or a unique prefix of one.  The loader is re-rendered
+with the current template, nothing is copied, and the switched generation
+becomes the newest registry entry.  Restart Neovim to use it.  The next normal
+`rsplug` run publishes the generation built from the configuration again.
+
+To try a retained generation for one Neovim process without switching, set
+`RSPLUG_GENERATION` (|rsplug-environment|).
 
 ==============================================================================
 9. Environment variables and paths                         *rsplug-environment*
@@ -858,9 +885,11 @@ package copy or helptags process).
 `RSPLUG_GENERATION`:
 
     Optional 32-character hexadecimal generation ID read by the generated
-    bootstrap.  If it names an existing `generations/<id>.lua`, that loader is
-    used instead of the default current generation.  Invalid, missing, or
-    pruned IDs produce a warning and fall back to the default.
+    bootstrap.  If it names an existing `generations/<id>.lua`, the bootstrap
+    hands off to that loader instead of the default current generation.  The
+    variable is cleared while the selected loader runs and restored after.
+    Invalid, missing, or pruned IDs produce a warning and fall back to the
+    default.
 
 ==============================================================================
 10. Errors and troubleshooting                              *rsplug-troubleshooting*
