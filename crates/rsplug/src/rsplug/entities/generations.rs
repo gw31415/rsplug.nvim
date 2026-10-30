@@ -311,6 +311,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_keeps_the_newest_retain_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gen_root = tmp.path().join("pack").join("_gen");
+        tokio::fs::create_dir_all(gen_root.join("generations"))
+            .await
+            .unwrap();
+        let ids: Vec<String> = (0..RETAIN_GENERATIONS + 2)
+            .map(|i| format!("{i:032x}"))
+            .collect();
+        for id in &ids {
+            write_generation_registry(&gen_root, id).await.unwrap();
+        }
+        let registry = read_generation_registry(&gen_root).await;
+        assert_eq!(RETAIN_GENERATIONS, 64);
+        assert_eq!(registry.len(), RETAIN_GENERATIONS);
+        assert_eq!(registry.first(), ids.last());
+        assert!(!registry.contains(&ids[0]) && !registry.contains(&ids[1]));
+    }
+
+    #[tokio::test]
     async fn prune_drops_metadata_of_unregistered_generations() {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path()).await;

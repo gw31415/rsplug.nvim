@@ -839,8 +839,8 @@ is a symlink to that loader.  The loader's control manifest lists the
 `pack/_gen/opt/` entries it references.
 
 During installation rsplug retains entries referenced by the current and the
-small set of previous generation manifests.  Unreferenced package directories
-are removed from generated `start/` and `opt/` output.  Generation loader files
+previous generation manifests, up to 64 generations in total.  Unreferenced
+package directories are removed from generated `start/` and `opt/` output.  Generation loader files
 whose control package has been removed are also deleted.  Cleanup is best
 effort after a successful install; a current/retained generation is not
 removed merely because a newer generation was created.  The retained

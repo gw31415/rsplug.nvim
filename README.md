@@ -226,9 +226,9 @@ merge = false
 The CLI builds a generation under a private staging directory and publishes it
 into `pack/_gen/opt/` only after all files, manifests, and the loader succeed,
 swapping `init.lua` atomically — so a failed run leaves the previous generation
-bootable. It writes a generated control package and `init.lua`, and retains a
-small set of previous generations. The bootstrap prepends the generated
-packpath and explicitly loads the current control package. At runtime, a
+bootable. It writes a generated control package and `init.lua`, and retains
+up to 64 generations (the current one and 63 previous ones). The bootstrap
+prepends the generated packpath and explicitly loads the current control package. At runtime, a
 trigger runs `lua_before`, loads the plugin, then runs `lua_after`.
 
 Compatible entries with non-conflicting files can share one pack entry. Help

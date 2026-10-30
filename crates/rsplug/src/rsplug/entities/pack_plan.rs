@@ -1131,7 +1131,8 @@ async fn acquire_install_lock(gen_root: &Path) -> io::Result<InstallLock> {
     })
 }
 
-const RETAIN_GENERATIONS: usize = 3;
+/// 切り替え・ロールバック用に保持する世代数（現在の世代を含む）。
+const RETAIN_GENERATIONS: usize = 64;
 const GENERATION_REGISTRY_FILE: &str = "registry.json";
 
 /// 生成 manifest（R1: v2）。`runtime` は `#[serde(default)]` により、保持されている
