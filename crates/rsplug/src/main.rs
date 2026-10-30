@@ -20,7 +20,7 @@ use std::{
     bin = "rsplug",
     about,
     version,
-    usage = "Usage: rsplug [OPTIONS] <CONFIG_FILES>...\n       rsplug --completion [SHELL]\n       rsplug --man",
+    usage = "Usage: rsplug [OPTIONS] <CONFIG_FILES>...\n       rsplug --list-generations\n       rsplug --switch-generation <ID>\n       rsplug --completion [SHELL]\n       rsplug --man",
     unknown_flags = "error",
     args_override_self = false,
     completion
@@ -44,10 +44,21 @@ struct Args {
     /// Generate the rsplug(1) man page to stdout
     #[usage(long, exclusive)]
     man: bool,
+    /// List retained generations, newest first
+    #[usage(long, exclusive)]
+    list_generations: bool,
+    /// Boot a retained generation (ID or unique prefix) from the next Neovim start
+    #[usage(long, value_name = "ID", exclusive)]
+    switch_generation: Option<String>,
     /// Glob-patterns of the config files. Split by ':' to specify multiple patterns
     #[usage(
         arg,
-        required_unless = ["--completion", "--man"],
+        required_unless = [
+            "--completion",
+            "--man",
+            "--list-generations",
+            "--switch-generation"
+        ],
         env = "RSPLUG_CONFIG_FILES",
         delimiter = ':',
         hide_env_values
@@ -57,11 +68,15 @@ struct Args {
 
 #[derive(usage::Cli, Debug)]
 #[usage(bin = "rsplug", unknown_flags = "error", args_override_self = false)]
-struct GenerationArgs {
+struct StandaloneArgs {
     #[usage(long, value_enum, value_name = "SHELL", value_optional, exclusive)]
     completion: Option<Option<CompletionShell>>,
     #[usage(long, exclusive)]
     man: bool,
+    #[usage(long, exclusive)]
+    list_generations: bool,
+    #[usage(long, value_name = "ID", exclusive)]
+    switch_generation: Option<String>,
     #[usage(arg)]
     config_files: Vec<String>,
 }
@@ -107,14 +122,65 @@ impl CompletionShell {
     }
 }
 
-fn generation_mode_requested() -> bool {
+/// 設定ファイルを読まずに完結するモード（`--completion`/`--man`/世代操作）か。
+/// これらは `RSPLUG_CONFIG_FILES` を無視するため、通常の引数解析より先に判定する。
+fn standalone_mode_requested() -> bool {
     std::env::args_os()
         .skip(1)
         .take_while(|arg| arg != "--")
         .any(|arg| {
             let arg = arg.to_string_lossy();
-            arg == "--man" || arg == "--completion" || arg.starts_with("--completion=")
+            ["--man", "--list-generations"].contains(&arg.as_ref())
+                || ["--completion", "--switch-generation"]
+                    .iter()
+                    .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
         })
+}
+
+/// 経過時間を `--list-generations` 用に丸めて表す。
+fn format_age(published: Option<std::time::SystemTime>) -> String {
+    let Some(elapsed) = published.and_then(|time| time.elapsed().ok()) else {
+        return "-".to_string();
+    };
+    let secs = elapsed.as_secs();
+    match secs {
+        0..60 => "just now".to_string(),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
+async fn list_generations() -> Result<(), Error> {
+    let generations = rsplug::pack_plan::list_generations(DEFAULT_APP_DIR.as_path()).await?;
+    let mut stdout = std::io::stdout().lock();
+    if generations.is_empty() {
+        writeln!(stdout, "no retained generations")?;
+        return Ok(());
+    }
+    for generation in generations {
+        let mut notes = Vec::new();
+        if generation.current {
+            notes.push("current");
+        }
+        if !generation.bootable {
+            notes.push("missing packages");
+        }
+        writeln!(
+            stdout,
+            "{} {}  {:>3} packages  {:>9}{}",
+            if generation.current { '*' } else { ' ' },
+            generation.id,
+            generation.packages,
+            format_age(generation.published),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", notes.join(", "))
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// EARLY 相の進行状態。EARLY 完了結果（`EarlyOutcome`）を保持する。
@@ -190,12 +256,28 @@ fn should_resolve_graphql(install: bool, update: bool, installed: bool) -> bool 
 }
 
 async fn app() -> Result<(), Error> {
-    if generation_mode_requested() {
-        let GenerationArgs {
+    if standalone_mode_requested() {
+        let StandaloneArgs {
             completion,
             man,
+            list_generations: list,
+            switch_generation,
             config_files: _,
-        } = GenerationArgs::parse();
+        } = StandaloneArgs::parse();
+
+        if list {
+            return list_generations().await;
+        }
+        if let Some(query) = switch_generation {
+            let generation =
+                rsplug::pack_plan::switch_generation(DEFAULT_APP_DIR.as_path(), &query).await?;
+            writeln!(
+                std::io::stdout().lock(),
+                "switched to generation {}; restart Neovim to use it",
+                generation.id
+            )?;
+            return Ok(());
+        }
 
         if let Some(shell) = completion {
             let shell = shell
@@ -221,6 +303,8 @@ async fn app() -> Result<(), Error> {
         locked,
         completion: _,
         man: _,
+        list_generations: _,
+        switch_generation: _,
         config_files,
     } = Args::parse();
 

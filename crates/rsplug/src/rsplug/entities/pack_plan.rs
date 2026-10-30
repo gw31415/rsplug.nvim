@@ -25,6 +25,10 @@ use super::*;
 #[path = "merge.rs"]
 mod merge;
 
+#[path = "generations.rs"]
+mod generations;
+pub use generations::{list_generations, switch_generation};
+
 /// Git リポジトリ snapshot の論理 identity。
 ///
 /// **絶対配置パス（cache root や `snapshot_root`）は含めない。** identity は
@@ -1160,6 +1164,58 @@ async fn read_generation_registry(gen_root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn is_generation_name(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// registry から外れた世代の manifest と loader を消す。パッケージは GC 済みか
+/// 次回 GC 対象なので、残しておくと起動できない世代が選べてしまう。
+/// registry の読み書きと競合しないよう install lock 保持中に呼ぶ。
+async fn prune_unregistered_generations(gen_root: &Path, packpath: &Path) {
+    let registry = read_generation_registry(gen_root).await;
+    if registry.is_empty() {
+        return;
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(gen_root.join("generations")).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_generation_name(name) || registry.iter().any(|kept| kept == name) {
+            continue;
+        }
+        let loader = packpath
+            .join("generations")
+            .join(name)
+            .with_extension("lua");
+        tokio::fs::remove_file(&loader).await.ok();
+        tokio::fs::remove_file(&path).await.ok();
+    }
+}
+
+/// `init.lua` を `generations/<name>.lua` への symlink に原子的に付け替える。
+/// remove+symlink には init.lua が一時消失する窓があるため、temp symlink を作って
+/// rename で原子置換する（POSIX では既存ファイルへの rename は原子）。
+async fn point_init_to(packpath: &Path, loader: &Path) -> io::Result<()> {
+    let init_path = packpath.join("init.lua");
+    let tmp = packpath.join(".init.lua.swap");
+    // 中断された前回実行の残骸があると symlink 作成が EEXIST になる。
+    let _ = tokio::fs::remove_file(&tmp).await;
+    symlink_file(loader, &tmp).await?;
+    if tokio::fs::rename(&tmp, &init_path).await.is_err() {
+        // Windows 等で既存ファイルへの rename が失敗する場合は remove+rename に fallback。
+        let _ = tokio::fs::remove_file(&init_path).await;
+        tokio::fs::rename(&tmp, &init_path).await?;
+    }
+    Ok(())
+}
+
 async fn write_generation_registry(gen_root: &Path, current: &str) -> io::Result<()> {
     let mut generations = read_generation_registry(gen_root).await;
     generations.retain(|name| name != current);
@@ -1219,14 +1275,17 @@ impl GenerationPlan {
 #[template(path = "init.stpl")]
 #[template(escape = false)]
 struct InitTemplate<'a> {
-    control_ids: &'a [PluginIDStr],
+    control_ids: &'a [&'a str],
 }
 
-fn render_init(control_ids: &[PluginIDStr]) -> Vec<u8> {
-    InitTemplate { control_ids }
-        .render_once()
-        .map(String::into_bytes)
-        .unwrap_or_else(|_| Vec::new())
+fn render_init<S: AsRef<str>>(control_ids: &[S]) -> Vec<u8> {
+    let control_ids: Vec<&str> = control_ids.iter().map(AsRef::as_ref).collect();
+    InitTemplate {
+        control_ids: &control_ids,
+    }
+    .render_once()
+    .map(String::into_bytes)
+    .unwrap_or_else(|_| Vec::new())
 }
 
 /// `true` は生成物を公開し、`false` は既存の完全な generation を再利用した。
@@ -2429,24 +2488,17 @@ impl PackPlan {
                 .join(&publication_name)
                 .with_extension("lua");
             tokio::fs::write(&gen_path, &init_content).await?;
-            // remove+symlink には init.lua が一時消失する窓があるため、temp symlink を作って
-            // rename で原子置換する（POSIX では既存ファイルへの rename は原子）。これが唯一の
-            // ブータビリティ公開点で、これより前の失敗は init.lua → 旧世代のまま（公開ツリー intact）。
-            let init_path = packpath.join("init.lua");
-            let tmp = packpath.join(".init.lua.swap");
+            // これが唯一のブータビリティ公開点で、これより前の失敗は init.lua → 旧世代のまま
+            // （公開ツリー intact）。
             crate::rsplug::perf::failpoint("pointer_swap_before")?;
             crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::InitLuaSwap);
-            symlink_file(&gen_path, &tmp).await?;
-            if tokio::fs::rename(&tmp, &init_path).await.is_err() {
-                // Windows 等で既存ファイルへの rename が失敗する場合は remove+rename に fallback。
-                let _ = tokio::fs::remove_file(&init_path).await;
-                tokio::fs::rename(&tmp, &init_path).await?;
-            }
+            point_init_to(packpath, &gen_path).await?;
             crate::rsplug::perf::failpoint("pointer_swap_after")?;
         }
 
         if !control_ids.is_empty() {
             write_generation_registry(&gen_root, &publication_name).await?;
+            prune_unregistered_generations(&gen_root, packpath).await;
         }
 
         #[cfg(unix)]
@@ -2628,9 +2680,7 @@ mod tests {
             .split("vim.opt.packpath:prepend(root)\n\n")
             .nth(1)
             .unwrap();
-        let expected = format!(
-            "local requested = vim.env.RSPLUG_GENERATION\nlocal ids = {{ \"{a}\",\"{b}\", }}\n"
-        );
+        let expected = format!("local ids = {{ \"{a}\",\"{b}\", }}\n");
         assert!(
             actual.starts_with(&expected),
             "unexpected init template output: {actual:?}\nexpected prefix: {expected:?}"
@@ -2658,7 +2708,7 @@ mod tests {
         // control_ids が空（プラグイン0件）のとき _rsplug ランタイムモジュールは
         // 生成されない。init.lua が無条件で require('_rsplug') すると nvim 起動が
         // クラッシュするため、require/startup ブロックを出力しない。
-        let script = String::from_utf8(render_init(&[])).unwrap();
+        let script = String::from_utf8(render_init::<&str>(&[])).unwrap();
         assert!(
             !script.contains("require, '_rsplug'"),
             "empty control_ids must not require _rsplug: {script:?}"
@@ -2677,16 +2727,27 @@ mod tests {
     fn init_template_supports_rsplug_generation_override() {
         let id = b"gen".plugin_id().as_str();
         let script = String::from_utf8(render_init(std::slice::from_ref(&id))).unwrap();
-        // Reads RSPLUG_GENERATION and prefers it over the default ids when valid.
+        // Reads RSPLUG_GENERATION and hands off to that generation's own loader file
+        // instead of treating the generation ID as a control package ID.
         assert!(script.contains("vim.env.RSPLUG_GENERATION"));
+        assert!(script.contains("root .. '/generations/' .. generation .. '.lua'"));
+        assert!(script.contains("pcall(dofile, path)"));
+        assert!(!script.contains("ids = { string.lower(requested) }"));
         // Guards the override id: hex-only and exactly 32 chars (no path traversal).
-        assert!(script.contains("^[0-9a-fA-F]+$"));
-        assert!(script.contains("#requested == 32"));
+        assert!(script.contains("^[0-9a-f]+$"));
+        assert!(script.contains("#generation == 32"));
         // Confirms the generation file exists before switching to it.
         assert!(script.contains("vim.fn.filereadable"));
+        // The delegated loader must not re-read the override (older templates misread it).
+        assert!(script.contains("vim.env.RSPLUG_GENERATION = nil"));
         // Falls back with a warning when the override is unusable.
         assert!(script.contains("vim.notify"));
         assert!(script.contains("vim.log.levels.WARN"));
+        // The handoff happens before the loaded guard is set, so the target can run.
+        assert!(
+            script.find("pcall(dofile, path)").unwrap()
+                < script.find("vim.g.rsplug_loaded = true").unwrap()
+        );
     }
 
     #[test]

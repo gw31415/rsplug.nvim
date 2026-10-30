@@ -2,26 +2,44 @@
 if vim.g.rsplug_loaded or not vim.o.loadplugins then
 	return
 end
-vim.g.rsplug_loaded = true
 
 local source = debug.getinfo(1, 'S').source
 source = source:sub(1, 1) == '@' and source:sub(2) or source
+source = vim.fn.resolve(source)
 
-local root = vim.fn.fnamemodify(vim.fn.resolve(source), ':h:h')
+local root = vim.fn.fnamemodify(source, ':h:h')
+<% if !control_ids.is_empty() { %>
+-- 各世代の init.lua は generations/<世代ID>.lua にあり、~/.cache/rsplug/init.lua は
+-- その1つへの symlink。RSPLUG_GENERATION で別の世代を指定されたらそちらへ委譲する。
+local requested = vim.env.RSPLUG_GENERATION
+if requested ~= nil and requested ~= '' then
+	local generation = string.lower(requested)
+	local path = root .. '/generations/' .. generation .. '.lua'
+	if #generation == 32
+		and string.match(generation, '^[0-9a-f]+$') ~= nil
+		and vim.fn.filereadable(path) == 1
+	then
+		if generation ~= vim.fn.fnamemodify(source, ':t:r') then
+			-- 委譲先が古いテンプレートでも再び RSPLUG_GENERATION を解釈しないよう、
+			-- 読み込み中だけ外す。
+			vim.env.RSPLUG_GENERATION = nil
+			local ok, err = pcall(dofile, path)
+			vim.env.RSPLUG_GENERATION = requested
+			if not ok then
+				error(err, 0)
+			end
+			return
+		end
+	else
+		vim.notify(('[rsplug] RSPLUG_GENERATION %q is not available, falling back to the default generation'):format(requested), vim.log.levels.WARN)
+	end
+end
+<% } %>
+vim.g.rsplug_loaded = true
 
 vim.opt.packpath:prepend(root)
 
-<% if !control_ids.is_empty() { %>local requested = vim.env.RSPLUG_GENERATION
-local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }
-if requested ~= nil and requested ~= ''
-	and #requested == 32
-	and string.match(requested, '^[0-9a-fA-F]+$') ~= nil
-	and vim.fn.filereadable(root .. '/generations/' .. string.lower(requested) .. '.lua') == 1
-then
-	ids = { string.lower(requested) }
-elseif requested ~= nil and requested ~= '' then
-	vim.notify(('[rsplug] RSPLUG_GENERATION %q is not available, falling back to the default generation'):format(requested), vim.log.levels.WARN)
-end
+<% if !control_ids.is_empty() { %>local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }
 for _, id in ipairs(ids) do
 	-- コントロールパッケージはまだ runtimepath に無いので、読み込み方式を直接 loadfile する。
 	local dir = root .. '/pack/_gen/opt/' .. id
