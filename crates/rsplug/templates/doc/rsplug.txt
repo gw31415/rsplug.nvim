@@ -41,6 +41,7 @@ CONTENTS                                                    *rsplug-contents*
     8.1 Merging .............................. |rsplug-merging|
     8.2 Help files ........................... |rsplug-help-files|
     8.3 Generations and cleanup .............. |rsplug-generations|
+    8.4 Watching for changes ................. |rsplug-watch|
  9. Environment variables and paths .......... |rsplug-environment|
 10. Errors and troubleshooting ................ |rsplug-troubleshooting|
 11. Updates and compatibility ................ |rsplug-updates|
@@ -115,6 +116,7 @@ current controlled generation and should be replaced with the `dofile` form.
 Synopsis:
 >
     rsplug [OPTIONS] <CONFIG_FILES>...
+    rsplug --watch [OPTIONS] <CONFIG_FILES>...
     rsplug --list-generations
     rsplug --switch-generation <ID>
 <
@@ -139,6 +141,10 @@ Options:
     --lockfile <LOCKFILE>
         Use this JSON lock file instead of the default
         `~/.cache/rsplug/rsplug.lock.json`.
+
+    --watch
+        Keep running, and run rsplug again with the same options whenever a
+        config file changes.  See |rsplug-watch|.
 
     --list-generations
         Print the retained generations, newest first, and exit.  See
@@ -839,7 +845,13 @@ is a symlink to that loader.  The loader's control manifest lists the
 `pack/_gen/opt/` entries it references.
 
 During installation rsplug retains entries referenced by the current and the
-previous generation manifests, up to 64 generations in total.  Unreferenced
+previous generation manifests, up to 64 generations in total.  A generation
+that a running Neovim was started with is also retained, even outside those
+64: on Unix the loader writes a lease `pack/_gen/leases/<generation-id>/<pid>.json`
+at startup and removes it on |VimLeavePre|.  Leases whose process is gone on
+the same host are cleaned up by the next install; leases from another host are
+kept.  Publishing a new generation therefore never breaks lazy loading or
+filetype plugins in a Neovim that is already running.  Unreferenced
 package directories are removed from generated `start/` and `opt/` output.  Generation loader files
 whose control package has been removed are also deleted.  Cleanup is best
 effort after a successful install; a current/retained generation is not
@@ -856,7 +868,8 @@ Switching generations:
 
 `rsplug --list-generations` prints the retained generations, newest first.
 The one `init.lua` currently points to is marked with `*`; a generation whose
-packages are gone is marked as missing packages.
+packages are gone is marked as missing packages, and one used by running
+Neovim processes shows how many.
 
 `rsplug --switch-generation <ID>` points `init.lua` at a retained generation.
 `<ID>` is a generation ID or a unique prefix of one.  The loader is re-rendered
@@ -866,6 +879,42 @@ becomes the newest registry entry.  Restart Neovim to use it.  The next normal
 
 To try a retained generation for one Neovim process without switching, set
 `RSPLUG_GENERATION` (|rsplug-environment|).
+
+8.4 Watching for changes                                       *rsplug-watch*
+
+`rsplug --watch` stays in the foreground, checks the config files once a
+second, and runs rsplug again with the same options (without `--watch`) after
+they change and settle.  It also runs once at startup.  A failed rebuild is
+logged to stderr and retried only after the next change.  On Unix only one
+`--watch` runs at a time (`flock` on `pack/_gen/.watch.lock`); another one
+exits immediately with status 0.  It is meant to be registered as a service,
+for example a systemd user unit:
+>
+    [Service]
+    ExecStart=%h/.local/bin/rsplug --watch %h/.config/nvim_rsplug/*.toml
+    Restart=on-failure
+<
+or a launchd LaunchAgent with the same `ProgramArguments` and `KeepAlive`.
+Pass the config files as arguments; a service usually does not see
+`RSPLUG_CONFIG_FILES`.
+
+                                                        *rsplug.watch()*
+require('rsplug').watch({cb})
+    Watch for a newly published generation.  Whenever `init.lua` starts
+    pointing at a generation other than the one this Neovim was started with,
+    `cb(latest, current)` is called once per new generation on the main loop
+    with both generation IDs.  If one is already published when `watch()` is
+    called, `cb` is called right away.  In a Neovim started with
+    `RSPLUG_GENERATION` it does nothing.  Returns an object whose `stop()`
+    ends the watch.
+    rsplug creates no autocommands for this; what to do is up to you:
+>lua
+    require('rsplug').watch(function()
+      local hint = vim.fn.exists(':restart') == 2 and 'Run :restart to use it.'
+        or 'Restart Neovim to use it.'
+      vim.notify('rsplug: a new generation is available. ' .. hint)
+    end)
+<
 
 ==============================================================================
 9. Environment variables and paths                         *rsplug-environment*

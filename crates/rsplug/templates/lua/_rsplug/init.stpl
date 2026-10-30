@@ -178,7 +178,10 @@ return setmetatable({
 			local script = source:sub(1, 1) == '@' and source:sub(2) or source
 			-- Generation metadata is outside immutable opt packages:
 			-- <gen>/generations/<generation-id>.json.
-			local generation_id = vim.fn.fnamemodify(script, ':h:h:h:t')
+			-- 世代 ID は loader が渡す。古い loader から読まれた場合だけ control id で代用する。
+			local generation = package.loaded['_rsplug/generation']
+			local generation_id = type(generation) == 'table' and generation.id
+				or vim.fn.fnamemodify(script, ':h:h:h:t')
 			local gen_root = vim.fn.fnamemodify(script, ':h:h:h:h:h')
 			local manifest_path = gen_root .. '/generations/' .. generation_id .. '.json'
 			local ok, decoded = pcall(function()

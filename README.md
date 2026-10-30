@@ -259,10 +259,37 @@ RSPLUG_GENERATION=<id> nvim
 
 An invalid or pruned ID falls back to the current generation.
 
+A generation that a running Neovim was started with is kept even beyond the
+64 retained ones (Unix), so publishing never breaks a running Neovim.
+
+## Watching for changes
+
+`rsplug --watch` keeps running, and runs rsplug again with the same options
+whenever a config file changes. Register it as a service, for example a
+systemd user unit or a launchd LaunchAgent; only one runs at a time.
+
+```ini
+[Service]
+ExecStart=%h/.local/bin/rsplug --watch -i %h/.config/nvim_rsplug/*.toml
+Restart=on-failure
+```
+
+Each Neovim can notice the newly published generation with
+`require('rsplug').watch()`. rsplug decides nothing on its own; the callback
+is yours:
+
+```lua
+require('rsplug').watch(function(latest, current)
+  vim.notify(('rsplug: generation %s is available (running %s)'):format(
+    latest:sub(1, 8), current:sub(1, 8)))
+end)
+```
+
 ## CLI reference
 
 ```text
 rsplug [OPTIONS] <CONFIG_FILES>...
+rsplug --watch [OPTIONS] <CONFIG_FILES>...
 rsplug --list-generations
 rsplug --switch-generation <ID>
 rsplug --completion [SHELL]
@@ -272,6 +299,7 @@ rsplug --man
 -u, --update               Fetch and update repositories
     --locked               Use exact revisions from the lockfile
     --lockfile <LOCKFILE>  Override the lockfile path
+    --watch                Rebuild whenever the config files change
     --list-generations     List retained generations, newest first
     --switch-generation <ID>
                            Boot a retained generation from the next start

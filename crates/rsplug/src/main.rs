@@ -20,7 +20,7 @@ use std::{
     bin = "rsplug",
     about,
     version,
-    usage = "Usage: rsplug [OPTIONS] <CONFIG_FILES>...\n       rsplug --list-generations\n       rsplug --switch-generation <ID>\n       rsplug --completion [SHELL]\n       rsplug --man",
+    usage = "Usage: rsplug [OPTIONS] <CONFIG_FILES>...\n       rsplug --watch [OPTIONS] <CONFIG_FILES>...\n       rsplug --list-generations\n       rsplug --switch-generation <ID>\n       rsplug --completion [SHELL]\n       rsplug --man",
     unknown_flags = "error",
     args_override_self = false,
     completion
@@ -38,6 +38,9 @@ struct Args {
     /// Specify the lockfile path
     #[usage(long)]
     lockfile: Option<PathBuf>,
+    /// Keep running and rebuild whenever the config files change
+    #[usage(long)]
+    watch: bool,
     /// Generate a shell completion script to stdout
     #[usage(long, value_enum, value_name = "SHELL", value_optional, exclusive)]
     completion: Option<Option<CompletionShell>>,
@@ -161,10 +164,15 @@ async fn list_generations() -> Result<(), Error> {
     for generation in generations {
         let mut notes = Vec::new();
         if generation.current {
-            notes.push("current");
+            notes.push("current".to_string());
         }
         if !generation.bootable {
-            notes.push("missing packages");
+            notes.push("missing packages".to_string());
+        }
+        match generation.in_use {
+            0 => {}
+            1 => notes.push("in use by 1 Neovim".to_string()),
+            n => notes.push(format!("in use by {n} Neovims")),
         }
         writeln!(
             stdout,
@@ -181,6 +189,104 @@ async fn list_generations() -> Result<(), Error> {
         )?;
     }
     Ok(())
+}
+
+/// `--watch` が設定ファイルを確かめる間隔。
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// 変更を見つけてから、保存途中の連続した書き込みが落ち着くまで待つ時間。
+const WATCH_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// 設定ファイルの一覧と各ファイルの更新時刻・大きさ。どれかが変われば再ビルドする。
+type ConfigSnapshot = Result<Vec<(PathBuf, Option<std::time::SystemTime>, u64)>, String>;
+
+async fn config_snapshot(config_files: &[String]) -> ConfigSnapshot {
+    let mut walker = ConfigWalker::new(config_files.to_vec())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut snapshot = Vec::new();
+    while let Some(path) = walker.recv().await {
+        let path = path.map_err(|e| e.to_string())?;
+        let metadata = tokio::fs::metadata(&path).await.ok();
+        snapshot.push((
+            path,
+            metadata.as_ref().and_then(|m| m.modified().ok()),
+            metadata.map_or(0, |m| m.len()),
+        ));
+    }
+    snapshot.sort();
+    Ok(snapshot)
+}
+
+/// `pack/_gen/.watch.lock` を取る。ほかの `--watch` が持っていれば `None`。
+#[cfg(unix)]
+fn try_lock_watch(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(err)
+    }
+}
+
+/// `--watch`: 設定ファイルの変更を監視し、変わるたびに `--watch` を除いた同じ引数で
+/// rsplug を子プロセスとして実行する。起動直後にも1回実行する。LaunchAgent や
+/// systemd に登録して常駐させる想定で、フォアグラウンドで動き続け、ログは stderr に出す。
+/// 同時に動く `--watch` は1つだけで、2つ目はすぐに終了する。
+async fn watch_config_files(config_files: Vec<String>) -> Result<(), Error> {
+    if config_files.iter().any(|pattern| pattern == "-") {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--watch cannot read the config from standard input",
+        )));
+    }
+    let gen_root = DEFAULT_APP_DIR.join("pack").join("_gen");
+    tokio::fs::create_dir_all(&gen_root).await?;
+    #[cfg(unix)]
+    let Some(_lock) = try_lock_watch(&gen_root.join(".watch.lock"))? else {
+        eprintln!("rsplug --watch is already running");
+        return Ok(());
+    };
+
+    let exe = std::env::current_exe()?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os()
+        .skip(1)
+        .filter(|arg| arg != "--watch")
+        .collect();
+    let mut built: Option<ConfigSnapshot> = None;
+    loop {
+        let snapshot = config_snapshot(&config_files).await;
+        if built.as_ref() != Some(&snapshot) {
+            tokio::time::sleep(WATCH_SETTLE).await;
+            if config_snapshot(&config_files).await != snapshot {
+                continue;
+            }
+            if built.is_some() {
+                eprintln!("rsplug: config files changed, rebuilding");
+            }
+            match tokio::process::Command::new(&exe)
+                .args(&args)
+                .status()
+                .await
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!("rsplug: rebuild failed ({status})"),
+                Err(e) => eprintln!("rsplug: failed to start rebuild: {e}"),
+            }
+            // 失敗しても次の変更までは再実行しない。
+            built = Some(snapshot);
+        }
+        tokio::time::sleep(WATCH_INTERVAL).await;
+    }
 }
 
 /// EARLY 相の進行状態。EARLY 完了結果（`EarlyOutcome`）を保持する。
@@ -301,12 +407,17 @@ async fn app() -> Result<(), Error> {
         update,
         lockfile,
         locked,
+        watch,
         completion: _,
         man: _,
         list_generations: _,
         switch_generation: _,
         config_files,
     } = Args::parse();
+
+    if watch {
+        return watch_config_files(config_files).await;
+    }
 
     let mode = RunMode::from_flags(install, update, locked);
     let lockfile = lockfile.unwrap_or_else(|| DEFAULT_APP_DIR.join("rsplug.lock.json"));

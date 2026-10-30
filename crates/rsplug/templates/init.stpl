@@ -23,6 +23,7 @@ if requested ~= nil and requested ~= '' then
 			-- 委譲先が古いテンプレートでも再び RSPLUG_GENERATION を解釈しないよう、
 			-- 読み込み中だけ外す。
 			vim.env.RSPLUG_GENERATION = nil
+			package.loaded['_rsplug/generation'] = { pinned = true }
 			local ok, err = pcall(dofile, path)
 			vim.env.RSPLUG_GENERATION = requested
 			if not ok then
@@ -39,7 +40,39 @@ vim.g.rsplug_loaded = true
 
 vim.opt.packpath:prepend(root)
 
-<% if !control_ids.is_empty() { %>local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }
+<% if !control_ids.is_empty() { %>-- この Neovim が起動した世代。require('rsplug') と _rsplug が参照する。
+local generation = package.loaded['_rsplug/generation']
+generation = type(generation) == 'table' and generation or {}
+generation.id = vim.fn.fnamemodify(source, ':t:r')
+generation.root = root
+generation.pinned = generation.pinned == true
+package.loaded['_rsplug/generation'] = generation
+
+-- 起動中の世代を GC から守るリース。終了時に消し、異常終了で残ったものは
+-- rsplug が pid の生死を確かめて掃除する。
+if vim.fn.has('unix') == 1 then
+	local uv = vim.uv
+	local leases = root .. '/pack/_gen/leases'
+	local dir = leases .. '/' .. generation.id
+	uv.fs_mkdir(leases, 493)
+	uv.fs_mkdir(dir, 493)
+	local pid = uv.os_getpid()
+	local lease = dir .. '/' .. pid .. '.json'
+	local fd = uv.fs_open(lease, 'w', 420)
+	if fd then
+		uv.fs_write(fd, vim.json.encode({ pid = pid, host = uv.os_gethostname(), started = os.time() }))
+		uv.fs_close(fd)
+		vim.api.nvim_create_autocmd('VimLeavePre', {
+			group = vim.api.nvim_create_augroup('rsplug.lease', {}),
+			callback = function()
+				uv.fs_unlink(lease)
+				uv.fs_rmdir(dir)
+			end,
+		})
+	end
+end
+
+local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }
 for _, id in ipairs(ids) do
 	-- コントロールパッケージはまだ runtimepath に無いので、読み込み方式を直接 loadfile する。
 	local dir = root .. '/pack/_gen/opt/' .. id
