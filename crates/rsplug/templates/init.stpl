@@ -38,8 +38,6 @@ end
 <% } %>
 vim.g.rsplug_loaded = true
 
-vim.opt.packpath:prepend(root)
-
 <% if !control_ids.is_empty() { %>-- この Neovim が起動した世代。require('rsplug') と _rsplug が参照する。
 local generation = package.loaded['_rsplug/generation']
 generation = type(generation) == 'table' and generation or {}
@@ -71,8 +69,10 @@ if vim.fn.has('unix') == 1 then
 		})
 	end
 end
+<% } %>
+vim.opt.packpath:prepend(root)
 
-local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }
+<% if !control_ids.is_empty() { %>local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }
 for _, id in ipairs(ids) do
 	-- コントロールパッケージはまだ runtimepath に無いので、読み込み方式を直接 loadfile する。
 	local dir = root .. '/pack/_gen/opt/' .. id
