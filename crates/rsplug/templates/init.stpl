@@ -37,6 +37,34 @@ end
 <% } %>
 vim.g.rsplug_loaded = true
 
+<% if !control_ids.is_empty() { %>-- この Neovim が起動した世代。require('rsplug') と _rsplug が参照する。
+local generation = { id = vim.fn.fnamemodify(source, ':t:r'), root = root }
+package.loaded['_rsplug/generation'] = generation
+
+-- 起動中の世代を GC から守るリース。終了時に消し、異常終了で残ったものは
+-- rsplug が pid の生死を確かめて掃除する。
+if vim.fn.has('unix') == 1 then
+	local uv = vim.uv
+	local leases = root .. '/pack/_gen/leases'
+	local dir = leases .. '/' .. generation.id
+	uv.fs_mkdir(leases, 493)
+	uv.fs_mkdir(dir, 493)
+	local pid = uv.os_getpid()
+	local lease = dir .. '/' .. pid .. '.json'
+	local fd = uv.fs_open(lease, 'w', 420)
+	if fd then
+		uv.fs_write(fd, vim.json.encode({ pid = pid, host = uv.os_gethostname(), started = os.time() }))
+		uv.fs_close(fd)
+		vim.api.nvim_create_autocmd('VimLeavePre', {
+			group = vim.api.nvim_create_augroup('rsplug.lease', {}),
+			callback = function()
+				uv.fs_unlink(lease)
+				uv.fs_rmdir(dir)
+			end,
+		})
+	end
+end
+<% } %>
 vim.opt.packpath:prepend(root)
 
 <% if !control_ids.is_empty() { %>local ids = { <% for id in control_ids {%><%=lua_string(id)%>,<%}%> }

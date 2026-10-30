@@ -219,6 +219,10 @@ impl From<LazyRegistration> for Vec<LoadedPlugin> {
                     PathBuf::from("lua/_rsplug/loader/rtp.lua"),
                     include_bytes!("../../../templates/lua/_rsplug/loader/rtp.lua").into(),
                 ),
+                generated_file_item(
+                    PathBuf::from("lua/rsplug.lua"),
+                    include_bytes!("../../../templates/lua/rsplug.lua").into(),
+                ),
             ]);
             if !startup_scripts.is_empty() {
                 let data: Cow<'static, [u8]> = LuaStartPluginTemplate {

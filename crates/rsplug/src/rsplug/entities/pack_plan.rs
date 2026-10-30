@@ -27,6 +27,7 @@ mod merge;
 
 #[path = "generations.rs"]
 mod generations;
+use generations::live_leases;
 pub use generations::{list_generations, switch_generation};
 
 /// Git リポジトリ snapshot の論理 identity。
@@ -1131,7 +1132,8 @@ async fn acquire_install_lock(gen_root: &Path) -> io::Result<InstallLock> {
     })
 }
 
-const RETAIN_GENERATIONS: usize = 3;
+/// 切り替え・ロールバック用に保持する世代数（現在の世代を含む）。
+const RETAIN_GENERATIONS: usize = 64;
 const GENERATION_REGISTRY_FILE: &str = "registry.json";
 
 /// 生成 manifest（R1: v2）。`runtime` は `#[serde(default)]` により、保持されている
@@ -1169,13 +1171,15 @@ fn is_generation_name(name: &str) -> bool {
 }
 
 /// registry から外れた世代の manifest と loader を消す。パッケージは GC 済みか
-/// 次回 GC 対象なので、残しておくと起動できない世代が選べてしまう。
+/// 次回 GC 対象なので、残しておくと起動できない世代が選べてしまう。ただし起動中の
+/// Neovim がリースを持つ世代は使用中なので残す。
 /// registry の読み書きと競合しないよう install lock 保持中に呼ぶ。
 async fn prune_unregistered_generations(gen_root: &Path, packpath: &Path) {
     let registry = read_generation_registry(gen_root).await;
     if registry.is_empty() {
         return;
     }
+    let leased = live_leases(gen_root).await;
     let Ok(mut entries) = tokio::fs::read_dir(gen_root.join("generations")).await else {
         return;
     };
@@ -1187,7 +1191,10 @@ async fn prune_unregistered_generations(gen_root: &Path, packpath: &Path) {
         let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !is_generation_name(name) || registry.iter().any(|kept| kept == name) {
+        if !is_generation_name(name)
+            || registry.iter().any(|kept| kept == name)
+            || leased.contains_key(name)
+        {
             continue;
         }
         let loader = packpath
@@ -1793,6 +1800,17 @@ async fn retained_manifest_entries(
             crate::rsplug::perf::incr(crate::rsplug::perf::PerfOp::RetentionManifestRead);
             retained_entries.extend(manifest_entries(&manifest));
             retained_count += 1;
+        }
+    }
+    // 起動中の Neovim が使っている世代は、保持数の外でもパッケージを消さない。
+    for generation_name in live_leases(gen_root).await.into_keys() {
+        let path = generations_root
+            .join(&generation_name)
+            .with_extension("json");
+        if let Ok(content) = tokio::fs::read(&path).await
+            && let Ok(manifest) = serde_json::from_slice::<GenerationManifest>(&content)
+        {
+            retained_entries.extend(manifest_entries(&manifest));
         }
     }
     Ok(retained_entries)
